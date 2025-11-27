@@ -1,54 +1,68 @@
 // realtime/mediaStreamServer.js
-import WebSocket, { WebSocketServer } from "ws";
+import { WebSocketServer } from "ws";
 import { createOpenAISession } from "../utils/ai/openaiRealtimeSession.js";
 import { createElevenLabsStream } from "../utils/voice/elevenlabsStream.js";
 
-const WS_PATH = "/ws/media";   // <--- MUST MATCH TWIML EXACTLY
+const WS_PATH = "/ws/media"; // must match TwiML url exactly
 
 export const attachMediaWebSocketServer = (server) => {
+
   const wss = new WebSocketServer({ noServer: true });
 
-  // Handle WebSocket upgrade
+  // --------------------------------------------------
+  // 1️⃣ Handle WebSocket Upgrade (Twilio handshake)
+  // --------------------------------------------------
   server.on("upgrade", (req, socket, head) => {
+    console.log("🔄 WS Upgrade Request:", req.url);
 
-    console.log("Upgrade request:", req.url);  // DEBUG
-
-    if (req.url === WS_PATH) {
-      console.log("🔄 Upgrading connection to WebSocket…");
+    // Twilio sends: /ws/media?track=inbound_track
+    if (req.url.startsWith(WS_PATH)) {
+      console.log("🔥 Upgrading Twilio → WebSocket");
 
       wss.handleUpgrade(req, socket, head, (ws) => {
-        console.log("🔥 WebSocket upgraded successfully");
         wss.emit("connection", ws, req);
       });
     } else {
-      console.log("❌ Unknown WS path:", req.url);
+      console.log("❌ Invalid WS path:", req.url);
       socket.destroy();
     }
   });
 
-  // WebSocket connection from Twilio
+  // --------------------------------------------------
+  // 2️⃣ Twilio CONNECTED — start AI <> TTS pipelines
+  // --------------------------------------------------
   wss.on("connection", async (twilioWs, req) => {
-    console.log("🔥 Twilio WebSocket CONNECTED at", WS_PATH);
+    console.log("🔗 Twilio WebSocket CONNECTED");
 
-    // Connect OpenAI Realtime
+    // --- Setup OpenAI Realtime Session ---
     const aiWs = await createOpenAISession(process.env.OPENAI_API_KEY);
 
-    // Connect ElevenLabs streaming
+    // --- Setup ElevenLabs Realtime Output ---
     const elevenWs = await createElevenLabsStream({
       voiceId: process.env.ELEVENLABS_DEFAULT_VOICE,
       modelId: process.env.ELEVENLABS_MODEL_ID,
-      apiKey: process.env.ELEVENLABS_API_KEY,
+      apiKey: process.env.ELEVENLABS_API_KEY
     });
 
-    // Twilio → OpenAI
-    twilioWs.on("message", (msg) => {
+    // --------------------------------------------------
+    // 3️⃣ Twilio → OpenAI (speech to AI input)
+    // --------------------------------------------------
+    twilioWs.on("message", (buffer) => {
       let data;
-      try { data = JSON.parse(msg); } catch { return; }
+      try {
+        data = JSON.parse(buffer.toString());
+      } catch {
+        return;
+      }
+
+      if (data.event === "start") {
+        console.log("🎬 Twilio Stream STARTED");
+      }
 
       if (data.event === "media") {
         aiWs.send(JSON.stringify({
           type: "input_audio_buffer.append",
-          audio: data.media.payload,
+          audio: data.media.payload
         }));
       }
 
@@ -56,37 +70,58 @@ export const attachMediaWebSocketServer = (server) => {
         aiWs.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
         aiWs.send(JSON.stringify({
           type: "response.create",
-          response: { instructions: "Respond conversationally." },
+          response: { instructions: "Respond conversationally." }
         }));
       }
     });
 
-    // OpenAI → ElevenLabs
+    // --------------------------------------------------
+    // 4️⃣ OpenAI → ElevenLabs (text → speech)
+    // --------------------------------------------------
     aiWs.on("message", (raw) => {
-      const parsed = JSON.parse(raw.toString());
+      let parsed;
+      try {
+        parsed = JSON.parse(raw.toString());
+      } catch {
+        return;
+      }
+
       if (parsed.type === "response.output_text.delta") {
         elevenWs.send(JSON.stringify({
           text: parsed.delta,
-          voice_settings: { stability: 0.4, similarity_boost: 0.6 },
+          voice_settings: {
+            stability: 0.4,
+            similarity_boost: 0.6
+          }
         }));
       }
     });
 
-    // ElevenLabs → Twilio
-    elevenWs.on("message", (audioData) => {
+    // --------------------------------------------------
+    // 5️⃣ ElevenLabs → Twilio (speech back to caller)
+    // --------------------------------------------------
+    elevenWs.on("message", (audioBuffer) => {
       twilioWs.send(JSON.stringify({
         event: "media",
-        media: { payload: audioData.toString("base64") },
+        media: {
+          payload: audioBuffer.toString("base64")
+        }
       }));
     });
 
-    // Cleanup
+    // --------------------------------------------------
+    // 6️⃣ Cleanup on disconnect
+    // --------------------------------------------------
     twilioWs.on("close", () => {
+      console.log("❌ Twilio WS CLOSED");
       aiWs.close();
       elevenWs.close();
-      console.log("🔌 Twilio WebSocket CLOSED");
+    });
+
+    twilioWs.on("error", (err) => {
+      console.log("⚠️ Twilio WS Error:", err);
     });
   });
 
-  console.log(` Real-Time Media WebSocket active at ${WS_PATH}`);
+  console.log(`🎧 Media WebSocket Ready at ${WS_PATH}`);
 };
