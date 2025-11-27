@@ -4,24 +4,23 @@ import { isBarberOpen } from "../utils/isOpen.js";
 
 export const handleIncomingCall = async (req, res) => {
   try {
-    console.log("Incoming Twilio Call (RAW):", req.body);
+    console.log("📞 Incoming Twilio Call (RAW):", req.body);
 
-    // ------------------------------------------
-    // 1️⃣ Normalize phone number
-    // ------------------------------------------
+    // --------------------------------------------------
+    // 1️⃣ Normalize phone number (Fix leading spaces + add +1)
+    // --------------------------------------------------
     let calledNumber = (req.body.To || req.body.Called || "").trim();
 
-    // Ensure it has +1 prefix
     if (!calledNumber.startsWith("+")) {
-      // remove any leading "1"
+      // Add +1 and remove duplicate leading 1
       calledNumber = "+1" + calledNumber.replace(/^1/, "");
     }
 
-    console.log("Normalized Called Number:", calledNumber);
+    console.log("📟 Normalized Called Number:", calledNumber);
 
-    // ------------------------------------------
-    // 2️⃣ Validate NGROK_DOMAIN / Render domain
-    // ------------------------------------------
+    // --------------------------------------------------
+    // 2️⃣ Prepare DOMAIN (Remove https:// and trailing slash)
+    // --------------------------------------------------
     let DOMAIN = process.env.NGROK_DOMAIN;
 
     if (!DOMAIN) {
@@ -35,12 +34,14 @@ export const handleIncomingCall = async (req, res) => {
       `.trim());
     }
 
-    // remove any accidental https:// or trailing slash
-    DOMAIN = DOMAIN.replace("https://", "").replace("http://", "").replace(/\/$/, "");
+    DOMAIN = DOMAIN
+      .replace("https://", "")
+      .replace("http://", "")
+      .replace(/\/$/, "");
 
-    // ------------------------------------------
-    // 3️⃣ Lookup barber associated with Twilio number
-    // ------------------------------------------
+    // --------------------------------------------------
+    // 3️⃣ Look up barber assigned to this number
+    // --------------------------------------------------
     const barber = await Barber.findOne({ twilioNumber: calledNumber });
 
     if (!barber) {
@@ -54,38 +55,41 @@ export const handleIncomingCall = async (req, res) => {
       `.trim());
     }
 
-    console.log("Matched Barber:", barber.name, barber._id.toString());
+    console.log("💈 Matched Barber:", barber.name, barber._id.toString());
 
-    // ------------------------------------------
-    // 4️⃣ Business hours logic
-    // ------------------------------------------
+    // --------------------------------------------------
+    // 4️⃣ Business hours check
+    // --------------------------------------------------
     const { isOpen } = isBarberOpen(barber);
-    let afterHours = "";
+    let afterHoursMessage = "";
 
     if (!isOpen) {
-      afterHours = `
+      afterHoursMessage = `
         <Say voice="alice">
           The shop is currently closed, but I can still help you.
         </Say>
       `;
     }
 
-    // ------------------------------------------
-    // 5️⃣ Generate TwiML with WebSocket Streaming
-    // ------------------------------------------
+    // --------------------------------------------------
+    // 5️⃣ Generate TwiML for Twilio Streaming
+    //     ❗ FIX: Change track="both_tracks" → track="inbound_track"
+    // --------------------------------------------------
     const twiml = `
       <Response>
-        ${afterHours}
+        ${afterHoursMessage}
         <Connect>
-          <Stream 
+          <Stream
             url="wss://${DOMAIN}/ws/media"
-            track="both_tracks"
+            track="inbound_track"
           >
             <Parameter name="barberId" value="${barber._id.toString()}" />
           </Stream>
         </Connect>
       </Response>
     `.trim();
+
+    console.log("📤 Sending TwiML to Twilio...");
 
     res.type("text/xml");
     return res.send(twiml);
