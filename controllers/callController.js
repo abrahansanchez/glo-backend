@@ -4,13 +4,29 @@ import { isBarberOpen } from "../utils/isOpen.js";
 
 export const handleIncomingCall = async (req, res) => {
   try {
-    console.log("Incoming Twilio Call:", req.body);
+    console.log("Incoming Twilio Call (RAW):", req.body);
 
-    const calledNumber = req.body.To;
-    const DOMAIN = process.env.NGROK_DOMAIN;
+    // ------------------------------------------
+    // 1️⃣ Normalize phone number
+    // ------------------------------------------
+    let calledNumber = (req.body.To || req.body.Called || "").trim();
+
+    // Ensure it has +1 prefix
+    if (!calledNumber.startsWith("+")) {
+      // remove any leading "1"
+      calledNumber = "+1" + calledNumber.replace(/^1/, "");
+    }
+
+    console.log("Normalized Called Number:", calledNumber);
+
+    // ------------------------------------------
+    // 2️⃣ Validate NGROK_DOMAIN / Render domain
+    // ------------------------------------------
+    let DOMAIN = process.env.NGROK_DOMAIN;
 
     if (!DOMAIN) {
       console.error("❌ Missing NGROK_DOMAIN in .env");
+
       res.type("text/xml");
       return res.send(`
         <Response>
@@ -19,10 +35,17 @@ export const handleIncomingCall = async (req, res) => {
       `.trim());
     }
 
-    // Find barber by their assigned Twilio phone number
+    // remove any accidental https:// or trailing slash
+    DOMAIN = DOMAIN.replace("https://", "").replace("http://", "").replace(/\/$/, "");
+
+    // ------------------------------------------
+    // 3️⃣ Lookup barber associated with Twilio number
+    // ------------------------------------------
     const barber = await Barber.findOne({ twilioNumber: calledNumber });
 
     if (!barber) {
+      console.log(`❌ No barber found for number ${calledNumber}`);
+
       res.type("text/xml");
       return res.send(`
         <Response>
@@ -31,7 +54,11 @@ export const handleIncomingCall = async (req, res) => {
       `.trim());
     }
 
-    // Business hours check
+    console.log("Matched Barber:", barber.name, barber._id.toString());
+
+    // ------------------------------------------
+    // 4️⃣ Business hours logic
+    // ------------------------------------------
     const { isOpen } = isBarberOpen(barber);
     let afterHours = "";
 
@@ -43,7 +70,9 @@ export const handleIncomingCall = async (req, res) => {
       `;
     }
 
-    // ✅ FINAL TWIML FOR NGROK (WORKS WITH TWILIO)
+    // ------------------------------------------
+    // 5️⃣ Generate TwiML with WebSocket Streaming
+    // ------------------------------------------
     const twiml = `
       <Response>
         ${afterHours}
@@ -62,7 +91,7 @@ export const handleIncomingCall = async (req, res) => {
     return res.send(twiml);
 
   } catch (err) {
-    console.error("Incoming Call Error:", err);
+    console.error("❌ Incoming Call Error:", err);
 
     res.type("text/xml");
     return res.status(500).send(`
