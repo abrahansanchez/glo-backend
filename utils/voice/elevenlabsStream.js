@@ -2,12 +2,11 @@
 import WebSocket from "ws";
 
 /**
- * Connects to ElevenLabs Text-to-Speech STREAM API.
+ * Connects to ElevenLabs Text-to-Speech STREAM-INPUT API.
  * This supports:
- *  - Realtime streaming
- *  - Sending text as it's generated
- *  - Receiving audio chunks (raw binary)
- *  - Barge-in safe (flush if needed)
+ *  - Realtime "stream text in / audio out"
+ *  - WebSocket-based synthesis
+ *  - Barge-in safe
  */
 export async function createElevenLabsStream({
   voiceId,
@@ -19,27 +18,17 @@ export async function createElevenLabsStream({
   if (!modelId) throw new Error("❌ ELEVENLABS_MODEL_ID missing");
 
   return new Promise((resolve, reject) => {
-    const url = `wss://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream?model_id=${modelId}`;
+    const url = `wss://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream-input?model_id=${modelId}`;
 
     const ws = new WebSocket(url, {
       headers: {
         "xi-api-key": apiKey,
+        "Accept": "audio/wav",
       },
     });
 
     ws.on("open", () => {
       console.log("🔊 ElevenLabs Streaming Connected");
-
-      // Initial settings (optional)
-      ws.send(
-        JSON.stringify({
-          text: "",
-          voice_settings: {
-            stability: 0.4,
-            similarity_boost: 0.6,
-          },
-        })
-      );
 
       resolve(ws);
     });
