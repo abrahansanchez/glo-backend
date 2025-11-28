@@ -1,102 +1,116 @@
-// realtime/mediaStreamServer.js
-import { WebSocketServer } from "ws";
-import { createOpenAISession } from "../utils/ai/openaiRealtimeSession.js";
+import WebSocket, { WebSocketServer } from "ws";
+import OpenAI from "openai";
+import dotenv from "dotenv";
 
-const WS_PATH = "/ws/media"; // must match TwiML exactly
+dotenv.config();
 
-export const attachMediaWebSocketServer = (server) => {
+// Safety: check for missing keys
+if (!process.env.OPENAI_API_KEY) {
+  console.error("❌ Missing OPENAI_API_KEY");
+  process.exit(1);
+}
+
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
+
+// -----------------------------------------------------------------------
+// 🟩 CREATE THE WEBSOCKET SERVER FOR TWILIO MEDIA STREAMS
+// -----------------------------------------------------------------------
+export function createMediaStreamServer(server) {
   const wss = new WebSocketServer({ noServer: true });
 
-  // 1️⃣ Handle Upgrade Handshake from Twilio
   server.on("upgrade", (req, socket, head) => {
-    console.log("🔄 WS Upgrade Request:", req.url);
-
-    if (req.url.startsWith(WS_PATH)) {
-      console.log("🔥 Upgrading Twilio → WebSocket");
-
+    if (req.url === "/ws/media") {
+      console.log("🔄 WS Upgrade Request: /ws/media");
       wss.handleUpgrade(req, socket, head, (ws) => {
         wss.emit("connection", ws, req);
       });
     } else {
-      console.log("❌ Invalid WebSocket path:", req.url);
       socket.destroy();
     }
   });
 
-  // 2️⃣ When Twilio connects → enable AI text mode
-  wss.on("connection", async (twilioWs) => {
+  // -------------------------------------------------------------------
+  // 🟩 HANDLE EACH INCOMING TWILIO MEDIA STREAM CONNECTION
+  // -------------------------------------------------------------------
+  wss.on("connection", async (ws) => {
+    console.log("🔥 Upgrading Twilio → WebSocket");
     console.log("🔗 Twilio WebSocket CONNECTED — AI TEXT MODE");
 
-    // --- START OPENAI SESSION ---
-    let aiWs;
+    // Create OpenAI Realtime Session (TEXT only)
+    let ai;
     try {
-      aiWs = await createOpenAISession(process.env.OPENAI_API_KEY, "A");
+      ai = await openai.realtime.sessions.create({
+        model: "gpt-4o-realtime-preview-2024-12-17",
+        modalities: ["text"], // IMPORTANT: TEXT ONLY
+        instructions:
+          "You are Glo, an AI receptionist for a barbershop. Keep replies short and clear.",
+      });
+
       console.log("🤖 OpenAI Realtime Connected");
     } catch (err) {
-      console.error("❌ Could not start OpenAI session:", err);
+      console.error("❌ Failed to start OpenAI session:", err.message);
+      ws.close();
       return;
     }
 
-    // 3️⃣ Twilio → AI (audio input, transcription)
-    twilioWs.on("message", (buffer) => {
+    // -------------------------------------------------------------------
+    // 🟩 HANDLE INCOMING TWILIO MESSAGES
+    // -------------------------------------------------------------------
+    ws.on("message", async (msg) => {
       let data;
       try {
-        data = JSON.parse(buffer.toString());
+        data = JSON.parse(msg);
       } catch {
         return;
       }
 
+      // Media packets = user speaking but we ignore them since it's TEXT mode
+      if (data.event === "media") return;
+
+      // When Twilio starts the stream
       if (data.event === "start") {
-        console.log("🎬 Twilio stream started");
+        console.log("📩 Twilio event: start");
+
+        // Simulate greeting via text response
+        const greeting = "Hello! This is Glo, your virtual assistant. How can I help you today?";
+        sendAIText(ws, greeting);
       }
 
-      if (data.event === "media") {
-        // Send audio chunks to OpenAI
-        aiWs.send(
-          JSON.stringify({
-            type: "input_audio_buffer.append",
-            audio: data.media.payload,
-          })
-        );
-      }
-
+      // Handle "stop" event
       if (data.event === "stop") {
-        aiWs.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
-        aiWs.send(
-          JSON.stringify({
-            type: "response.create",
-            response: { instructions: "" },
-          })
-        );
+        console.log("📩 Twilio event: stop");
+        ws.close();
       }
     });
 
-    // 4️⃣ AI → Logs only (no TTS yet)
-    aiWs.on("message", (raw) => {
-      let parsed;
-      try {
-        parsed = JSON.parse(raw.toString());
-      } catch {
-        return;
-      }
-
-      // Log transcription
-      if (parsed.type === "response.input_text.done") {
-        console.log("👂 User said:", parsed.text);
-      }
-
-      // Log AI response
-      if (parsed.type === "response.output_text.delta") {
-        console.log("🤖 AI:", parsed.delta);
-      }
-    });
-
-    // 5️⃣ Cleanup
-    twilioWs.on("close", () => {
+    // -------------------------------------------------------------------
+    // 🟥 WebSocket Closed
+    // -------------------------------------------------------------------
+    ws.on("close", () => {
       console.log("❌ Twilio WS CLOSED");
-      aiWs.close();
+    });
+
+    ws.on("error", (err) => {
+      console.error("❌ WS ERROR:", err.message);
     });
   });
 
-  console.log(`🎧 Media WebSocket Ready at ${WS_PATH}`);
-};
+  return wss;
+}
+
+// -----------------------------------------------------------------------
+// 🟩 Helper — send TEXT message to Twilio Stream
+// -----------------------------------------------------------------------
+function sendAIText(ws, text) {
+  const response = {
+    event: "media",
+    streamSid: "AI_TEXT",
+    media: {
+      payload: Buffer.from(text).toString("base64"),
+    },
+  };
+
+  ws.send(JSON.stringify(response));
+}
