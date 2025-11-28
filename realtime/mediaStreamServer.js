@@ -1,4 +1,5 @@
 // realtime/mediaStreamServer.js
+
 import { WebSocketServer } from "ws";
 import { createOpenAISession } from "../utils/ai/openaiRealtimeSession.js";
 import { createElevenLabsStream } from "../utils/voice/elevenlabsStream.js";
@@ -8,14 +9,9 @@ const WS_PATH = "/ws/media";
 export const attachMediaWebSocketServer = (server) => {
   const wss = new WebSocketServer({ noServer: true });
 
-  // --------------------------------------------------
-  // 1. UPGRADE HANDSHAKE
-  // --------------------------------------------------
+  // Handle upgrade
   server.on("upgrade", (req, socket, head) => {
-    console.log("🔄 WS Upgrade Request:", req.url);
-
     if (req.url.startsWith(WS_PATH)) {
-      console.log("🔥 Upgrading Twilio → WebSocket");
       wss.handleUpgrade(req, socket, head, (ws) => {
         wss.emit("connection", ws, req);
       });
@@ -24,55 +20,46 @@ export const attachMediaWebSocketServer = (server) => {
     }
   });
 
-  // --------------------------------------------------
-  // 2. MAIN CONNECTION
-  // --------------------------------------------------
+  // Connection
   wss.on("connection", async (twilioWs, req) => {
     console.log("🔗 Twilio WebSocket CONNECTED — AI VOICE MODE");
 
     let streamSid = null;
+    let canSendAudio = false;
 
-    // --------------------------
-    // OpenAI
-    // --------------------------
+    // OpenAI session
     const ai = await createOpenAISession(process.env.OPENAI_API_KEY);
 
-    // --------------------------
-    // ElevenLabs STREAMING
-    // --------------------------
+    // ElevenLabs session
     const eleven = await createElevenLabsStream({
       voiceId: process.env.ELEVENLABS_DEFAULT_VOICE,
       modelId: process.env.ELEVENLABS_MODEL_ID,
       apiKey: process.env.ELEVENLABS_API_KEY,
     });
 
-    // --------------------------------------------------
-    // 3. TWILIO → OPENAI
-    // --------------------------------------------------
+    console.log("🤖 OpenAI Realtime Connected");
+    console.log("🌐 ElevenLabs stream connected");
+
+    // T W I L I O  →  O P E N A I
     twilioWs.on("message", (msg) => {
       let data;
       try {
         data = JSON.parse(msg.toString());
-      } catch (e) {
-        console.log("⚠️ Non-JSON message from Twilio");
+      } catch (err) {
         return;
       }
 
-      // 🔹 CONNECTED EVENT
-      if (data.event === "connected") {
-        console.log("📡 Twilio says: connected");
-        return;
-      }
-
-      // 🔹 START EVENT — CRITICAL
+      // Twilio sends the start event first — contains streamSid
       if (data.event === "start") {
         streamSid = data.start.streamSid;
-        console.log("🚀 Twilio Stream START — streamSid:", streamSid);
+        canSendAudio = true;
+
+        console.log("🎬 Twilio START event — streamSid:", streamSid);
         return;
       }
 
-      // 🔹 MEDIA AUDIO
-      if (data.event === "media") {
+      // Caller audio
+      if (data.event === "media" && canSendAudio) {
         ai.send(
           JSON.stringify({
             type: "input_audio_buffer.append",
@@ -81,24 +68,19 @@ export const attachMediaWebSocketServer = (server) => {
         );
       }
 
-      // 🔹 STOP TALKING
+      // Caller stops talking
       if (data.event === "stop") {
         ai.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
-
         ai.send(
           JSON.stringify({
             type: "response.create",
-            response: {
-              instructions: "Respond naturally and conversationally.",
-            },
+            response: { instructions: "Respond conversationally." },
           })
         );
       }
     });
 
-    // --------------------------------------------------
-    // 4. OPENAI → ELEVENLABS
-    // --------------------------------------------------
+    // O P E N A I  →  E L E V E N L A B S
     ai.on("message", (raw) => {
       let parsed;
       try {
@@ -107,8 +89,9 @@ export const attachMediaWebSocketServer = (server) => {
         return;
       }
 
-      // Only stream deltas
       if (parsed.type === "response.output_text.delta") {
+        if (!canSendAudio) return;
+
         eleven.send(
           JSON.stringify({
             text: parsed.delta,
@@ -121,16 +104,13 @@ export const attachMediaWebSocketServer = (server) => {
       }
     });
 
-    // --------------------------------------------------
-    // 5. ELEVENLABS → TWILIO
-    // --------------------------------------------------
+    // E L E V E N L A B S  →  T W I L I O  (AUDIO OUT)
     eleven.on("message", (audioBuffer) => {
-      if (!streamSid) {
-        console.log("⚠️ Cannot send audio — streamSid not initialized yet");
+      if (!canSendAudio || !streamSid) {
+        console.log("⚠️ ElevenLabs audio ignored — streamSid not ready");
         return;
       }
 
-      // Must send streamSid for Twilio to play audio
       twilioWs.send(
         JSON.stringify({
           event: "media",
@@ -142,9 +122,7 @@ export const attachMediaWebSocketServer = (server) => {
       );
     });
 
-    // --------------------------------------------------
-    // 6. CLEANUP
-    // --------------------------------------------------
+    // Cleanup
     twilioWs.on("close", () => {
       console.log("❌ Twilio WS CLOSED");
       ai.close();
