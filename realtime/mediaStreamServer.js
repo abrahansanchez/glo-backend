@@ -6,7 +6,6 @@ const WS_PATH = "/ws/media";
 export const attachMediaWebSocketServer = (server) => {
   const wss = new WebSocketServer({ noServer: true });
 
-  // Handle WebSocket Upgrade (Twilio handshake)
   server.on("upgrade", (req, socket, head) => {
     console.log("🔄 WS Upgrade Request:", req.url);
 
@@ -21,21 +20,20 @@ export const attachMediaWebSocketServer = (server) => {
     }
   });
 
-  // Twilio CONNECTED
-  wss.on("connection", async (twilioWs, req) => {
-    console.log("🔗 Twilio WebSocket CONNECTED (TEST MODE — AI DISABLED)");
+  wss.on("connection", (ws, req) => {
+    console.log("🔗 Twilio WebSocket CONNECTED — TEST MODE");
 
-    // Log any incoming messages for debugging
-    twilioWs.on("message", (msg) => {
-      console.log("📩 Incoming WS message:", msg.toString());
+    // Log incoming messages (for debugging)
+    ws.on("message", (msg) => {
+      console.log("📩 Incoming message from WS:", msg.toString());
     });
 
-    twilioWs.on("close", () => {
-      console.log("❌ Twilio WS CLOSED");
+    ws.on("close", () => {
+      console.log("❌ Twilio WebSocket CLOSED");
     });
 
-    twilioWs.on("error", (err) => {
-      console.log("⚠️ Twilio WS Error:", err);
+    ws.on("error", (err) => {
+      console.log("⚠️ Twilio WebSocket ERROR:", err.message);
     });
   });
 
