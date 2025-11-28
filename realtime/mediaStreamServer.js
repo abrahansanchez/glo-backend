@@ -3,15 +3,12 @@ import { WebSocketServer } from "ws";
 import { createOpenAISession } from "../utils/ai/openaiRealtimeSession.js";
 import { createElevenLabsStream } from "../utils/voice/elevenlabsStream.js";
 
-// MUST match the TwiML URL exactly
 const WS_PATH = "/ws/media";
 
 export const attachMediaWebSocketServer = (server) => {
   const wss = new WebSocketServer({ noServer: true });
 
-  // --------------------------------------------------
-  // 1) WebSocket Upgrade Handler (Twilio Handshake)
-  // --------------------------------------------------
+  // Handle upgrade
   server.on("upgrade", (req, socket, head) => {
     console.log("🔄 WS Upgrade Request:", req.url);
 
@@ -21,34 +18,30 @@ export const attachMediaWebSocketServer = (server) => {
         wss.emit("connection", ws, req);
       });
     } else {
-      console.log("❌ Invalid WS Path:", req.url);
       socket.destroy();
     }
   });
 
-  // --------------------------------------------------
-  // 2) Main WebSocket Connection
-  // --------------------------------------------------
-  wss.on("connection", async (twilioWs, req) => {
+  // Main connection
+  wss.on("connection", async (twilioWs) => {
     console.log("🔗 Twilio WebSocket CONNECTED — AI VOICE MODE");
 
-    // --------------------------
-    // Connect OpenAI Realtime
-    // --------------------------
+    // STORE STREAM SID
+    let streamSid = null;
+
+    // Connect OpenAI
     const ai = await createOpenAISession(process.env.OPENAI_API_KEY);
 
-    // --------------------------
     // Connect ElevenLabs
-    // --------------------------
     const eleven = await createElevenLabsStream({
       voiceId: process.env.ELEVENLABS_DEFAULT_VOICE,
       modelId: process.env.ELEVENLABS_MODEL_ID,
       apiKey: process.env.ELEVENLABS_API_KEY,
     });
 
-    // --------------------------------------------------
-    // 3) Twilio → OpenAI
-    // --------------------------------------------------
+    // -------------------------------
+    // Twilio → OpenAI
+    // -------------------------------
     twilioWs.on("message", (msg) => {
       let data;
       try {
@@ -57,7 +50,14 @@ export const attachMediaWebSocketServer = (server) => {
         return;
       }
 
-      // Twilio sends audio data
+      // STORE STREAM SID
+      if (data.event === "start" && data.streamSid) {
+        streamSid = data.streamSid;
+        console.log("🔗 Stream SID Set:", streamSid);
+        return;
+      }
+
+      // Audio from caller
       if (data.event === "media") {
         ai.send(
           JSON.stringify({
@@ -67,23 +67,24 @@ export const attachMediaWebSocketServer = (server) => {
         );
       }
 
-      // When caller stops talking
+      // Caller finished speaking
       if (data.event === "stop") {
         ai.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
-
-        // AI generates a response
         ai.send(
           JSON.stringify({
             type: "response.create",
-            response: { instructions: "Respond naturally and conversationally." },
+            response: {
+              instructions:
+                "Respond naturally and conversationally like a receptionist.",
+            },
           })
         );
       }
     });
 
-    // --------------------------------------------------
-    // 4) OpenAI → ElevenLabs (text → speech)
-    // --------------------------------------------------
+    // -------------------------------
+    // OpenAI → ElevenLabs (TTS)
+    // -------------------------------
     ai.on("message", (raw) => {
       let parsed;
       try {
@@ -105,13 +106,19 @@ export const attachMediaWebSocketServer = (server) => {
       }
     });
 
-    // --------------------------------------------------
-    // 5) ElevenLabs → Twilio (audio base64)
-    // --------------------------------------------------
+    // -------------------------------
+    // ElevenLabs → Twilio
+    // -------------------------------
     eleven.on("message", (audioBuffer) => {
+      if (!streamSid) {
+        console.log("⚠️ Cannot send audio — streamSid not set yet");
+        return;
+      }
+
       twilioWs.send(
         JSON.stringify({
           event: "media",
+          streamSid: streamSid,
           media: {
             payload: audioBuffer.toString("base64"),
           },
@@ -119,9 +126,7 @@ export const attachMediaWebSocketServer = (server) => {
       );
     });
 
-    // --------------------------------------------------
-    // 6) Cleanup connections
-    // --------------------------------------------------
+    // Cleanup
     twilioWs.on("close", () => {
       console.log("❌ Twilio WS CLOSED");
       ai.close();
