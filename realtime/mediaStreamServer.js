@@ -26,7 +26,7 @@ export const attachMediaWebSocketServer = (server) => {
     let callerAudio = [];
     let allowTTS = false;
 
-    // Keepalive ping every 5s
+    // ❤️ PING KEEPALIVE
     const pingInterval = setInterval(() => {
       try { twilioWs.ping(); } catch {}
     }, 5000);
@@ -37,7 +37,7 @@ export const attachMediaWebSocketServer = (server) => {
     });
 
     // ------------------------------------------------------
-    //  A I   S E S S I O N S
+    // 💡 CREATE OPENAI + ELEVENLABS REALTIME SESSIONS
     // ------------------------------------------------------
     const ai = await createOpenAISession(process.env.OPENAI_API_KEY);
     console.log("🤖 OpenAI Connected");
@@ -46,7 +46,7 @@ export const attachMediaWebSocketServer = (server) => {
     console.log("🎤 ElevenLabs TTS Connected");
 
     // ------------------------------------------------------
-    // T W I L I O  →  O P E N A I
+    // 🔹 FORWARD TWILIO AUDIO → OPENAI
     // ------------------------------------------------------
     twilioWs.on("message", (msg) => {
       let data;
@@ -86,36 +86,53 @@ export const attachMediaWebSocketServer = (server) => {
     });
 
     // ------------------------------------------------------
-    // O P E N A I  →  E L E V E N L A B S   (T T S)
+    // 🔹 OPENAI → ELEVENLABS (SEND TEXT FOR TTS)
     // ------------------------------------------------------
     ai.on("message", (raw) => {
       let parsed;
       try { parsed = JSON.parse(raw.toString()); } catch { return; }
 
+      // 🔥 FIX #1:
+      // Correct event type for OpenAI text deltas
       if (parsed.type === "response.output_text.delta") {
         if (!allowTTS) return;
 
+        const text = parsed.delta || "";
+        if (!text.trim()) return;
+
+        console.log("📝 Forwarding text to ElevenLabs:", text);
+
         eleven.send(JSON.stringify({
-          text: parsed.delta,
+          text,
           try_trigger_generation: true
         }));
       }
     });
 
     // ------------------------------------------------------
-    // E L E V E N   L A B S  →  T W I L I O  (audio)
+    // 🔹 ELEVENLABS → TWILIO (SEND AUDIO BACK)
     // ------------------------------------------------------
-    eleven.on("message", (binary) => {
+    eleven.on("message", (raw) => {
       if (!streamSid) return;
 
-      const base64Audio = Buffer.from(binary).toString("base64");
+      let packet;
+      try { packet = JSON.parse(raw.toString()); } catch { return; }
 
-      twilioWs.send(JSON.stringify({
-        event: "media",
-        streamSid,
-        media: { payload: base64Audio }
-      }));
+      // 🔥 FIX #2: ElevenLabs sends JSON with "audio" base64, NOT binary
+      if (packet.audio) {
+        twilioWs.send(JSON.stringify({
+          event: "media",
+          streamSid,
+          media: { payload: packet.audio }
+        }));
+      }
+
+      // 🔥 Optional: detect final message
+      if (packet.isFinal) {
+        console.log("🏁 ElevenLabs Final Output Received");
+      }
     });
+
   });
 
   console.log(`🎧 Media WebSocket READY at ${WS_PATH}`);
