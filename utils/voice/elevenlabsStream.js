@@ -1,32 +1,35 @@
 // utils/voice/elevenlabsStream.js
 import WebSocket from "ws";
 
- export async function createElevenLabsStream({ voiceId, modelId, apiKey }) {
-  if (!apiKey) throw new Error("❌ ELEVENLABS_API_KEY missing");
-
-  const url = `wss://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream-input?model_id=${modelId}&optimize_streaming_latency=0`;
-
+/**
+ * Creates NEW ElevenLabs Realtime TTS WebSocket using the
+ * supported /v1/speech/stream-input protocol.
+ */
+export function createElevenLabsStream({ apiKey }) {
   return new Promise((resolve, reject) => {
-   console.log("🌐 Connecting to ElevenLabs:", url);
+    const url = "wss://api.elevenlabs.io/v1/speech/stream-input";
+
+    console.log("🌐 Connecting to ElevenLabs (Realtime TTS):", url);
 
     const ws = new WebSocket(url, {
       headers: {
         "xi-api-key": apiKey,
-      },
+        "Content-Type": "application/json"
+      }
     });
 
     ws.on("open", () => {
-    console.log("🔊 ElevenLabs Streaming Connected (TTS)");
+      console.log("🔊 ElevenLabs Realtime TTS Connected (NEW API)");
       resolve(ws);
-  });
+    });
 
     ws.on("error", (err) => {
-      console.error("❌ ElevenLabs Streaming Error:", err.message);
+      console.error("❌ ElevenLabs WS Error:", err);
       reject(err);
     });
 
-    ws.on("close", (code) => {
-      console.log("🔌 ElevenLabs Streaming Closed", code);
+    ws.on("close", (code, reason) => {
+      console.error("🔌 ElevenLabs WS Closed:", code, reason?.toString());
     });
   });
 }
