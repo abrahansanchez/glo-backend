@@ -63,18 +63,16 @@ export const handleIncomingCall = async (req, res) => {
     // --------------------------------------------------
     const { isOpen } = isBarberOpen(barber);
 
-    const afterHoursSay =
-      !isOpen
-        ? `<Say voice="alice">The shop is currently closed, but I can still help you.</Say>`
-        : "";
+    const afterHoursSay = !isOpen
+      ? `<Say voice="alice">The shop is currently closed, but I can still help you.</Say>`
+      : "";
 
-    const afterHoursParam =
-      !isOpen
-        ? `<Parameter name="initialPrompt" value="The shop is currently closed, but I can still help you." />`
-        : "";
+    const afterHoursParam = !isOpen
+      ? `<Parameter name="initialPrompt" value="The shop is currently closed, but I can still help you." />`
+      : "";
 
     // --------------------------------------------------
-    // 5️⃣ TwiML — FINAL FIXED VERSION
+    // 5️⃣ Twilio Stream TwiML — FINAL, VALID VERSION
     // --------------------------------------------------
     const twiml = `
       <Response>
@@ -82,8 +80,7 @@ export const handleIncomingCall = async (req, res) => {
         <Connect>
           <Stream
             url="wss://${DOMAIN}/ws/media"
-            track="inbound"
-            statusCallbackEvent="start media stop"
+            track="inbound_track"
             statusCallback="https://${DOMAIN}/api/calls/stream-status"
             statusCallbackMethod="POST"
           >
