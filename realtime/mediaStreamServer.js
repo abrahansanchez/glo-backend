@@ -8,47 +8,39 @@ const WS_PATH = "/ws/media";
 export const attachMediaWebSocketServer = (server) => {
   const wss = new WebSocketServer({ noServer: true });
 
-  // --------------------------------------------------------
-  // UPGRADE HANDSHAKE
-  // --------------------------------------------------------
+  // Twilio WebSocket upgrade
   server.on("upgrade", (req, socket, head) => {
     if (req.url.startsWith(WS_PATH)) {
-      wss.handleUpgrade(req, socket, head, (ws) => {
-        wss.emit("connection", ws, req);
-      });
+      console.log("🔄 WS Upgrade Request:", req.url);
+      wss.handleUpgrade(req, socket, head, (ws) =>
+        wss.emit("connection", ws, req)
+      );
     } else {
       socket.destroy();
     }
   });
 
-  // --------------------------------------------------------
-  // MAIN CONNECTION
-  // --------------------------------------------------------
+  // Handle WebSocket connection
   wss.on("connection", async (twilioWs) => {
     console.log("🔗 Twilio WebSocket CONNECTED — AI VOICE MODE");
 
     let streamSid = null;
-    let canSendAudio = false;
+    let callerBuffer = [];
+    let readyForOutput = false;
 
-    // ---------------------------------------
-    // CONNECT OPENAI REALTIME
-    // ---------------------------------------
+    // Connect OpenAI Realtime
     const ai = await createOpenAISession(process.env.OPENAI_API_KEY);
-    console.log("🤖 OpenAI Realtime Connected");
 
-    // ---------------------------------------
-    // CONNECT ELEVENLABS REALTIME TTS
-    // ---------------------------------------
+    // Connect ElevenLabs
     const eleven = await createElevenLabsStream({
       voiceId: process.env.ELEVENLABS_DEFAULT_VOICE,
       modelId: process.env.ELEVENLABS_MODEL_ID,
       apiKey: process.env.ELEVENLABS_API_KEY,
     });
-    console.log("🌐 ElevenLabs TTS WebSocket Connected");
 
-    // --------------------------------------------------------
-    // T W I L I O  →  O P E N A I
-    // --------------------------------------------------------
+    // -----------------------------
+    // T W I L I O → O P E N A I
+    // -----------------------------
     twilioWs.on("message", (msg) => {
       let data;
       try {
@@ -57,39 +49,49 @@ export const attachMediaWebSocketServer = (server) => {
         return;
       }
 
-      // 🎬 Twilio start event — contains streamSid
+      // Stream started
       if (data.event === "start") {
         streamSid = data.start.streamSid;
-        canSendAudio = true;
-        console.log("🎯 streamSid SET:", streamSid);
+        console.log("🎬 Twilio start — SID:", streamSid);
         return;
       }
 
-      // 🎤 Caller audio
-      if (data.event === "media" && canSendAudio) {
+      // Caller audio chunks → buffer until stop
+      if (data.event === "media") {
+        callerBuffer.push(data.media.payload);
+        return;
+      }
+
+      // Caller finished speaking → send full buffer to OpenAI
+      if (data.event === "stop") {
+        console.log("⏳ Caller finished — sending audio to OpenAI…");
+
         ai.send(
           JSON.stringify({
             type: "input_audio_buffer.append",
-            audio: data.media.payload,
+            audio: callerBuffer.join(""),
           })
         );
-      }
 
-      // 🛑 Caller stops talking
-      if (data.event === "stop" && canSendAudio) {
         ai.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+
         ai.send(
           JSON.stringify({
             type: "response.create",
-            response: { instructions: "Respond conversationally." },
+            response: { instructions: "Respond naturally and conversationally." },
           })
         );
+
+        callerBuffer = []; // Clear buffer
+        readyForOutput = true;
       }
     });
 
-    // --------------------------------------------------------
-    // O P E N A I  →  E L E V E N L A B S
-    // --------------------------------------------------------
+    // -----------------------------
+    // O P E N A I → E L E V E N L A B S
+    // -----------------------------
+    let textBuffer = "";
+
     ai.on("message", (raw) => {
       let parsed;
       try {
@@ -98,29 +100,36 @@ export const attachMediaWebSocketServer = (server) => {
         return;
       }
 
+      // Every delta of text → build sentence
       if (parsed.type === "response.output_text.delta") {
-        if (!canSendAudio) return;
+        textBuffer += parsed.delta;
+      }
+
+      // End of response → send final text to ElevenLabs
+      if (parsed.type === "response.completed") {
+        if (!readyForOutput) return;
+
+        console.log("🗣️ OpenAI Final Response:", textBuffer);
 
         eleven.send(
           JSON.stringify({
-            text: parsed.delta,
+            text: textBuffer,
             voice_settings: {
-              stability: 0.45,
+              stability: 0.5,
               similarity_boost: 0.7,
             },
           })
         );
+
+        textBuffer = "";
       }
     });
 
-    // --------------------------------------------------------
-    // E L E V E N L A B S  →  T W I L I O  (AUDIO OUT)
-    // --------------------------------------------------------
+    // -----------------------------
+    // E L E V E N L A B S → T W I L I O
+    // -----------------------------
     eleven.on("message", (audioBuffer) => {
-      if (!streamSid) {
-        console.log("⚠️ Audio skipped — no streamSid yet");
-        return;
-      }
+      if (!streamSid) return;
 
       twilioWs.send(
         JSON.stringify({
@@ -133,19 +142,15 @@ export const attachMediaWebSocketServer = (server) => {
       );
     });
 
-    // --------------------------------------------------------
-    // CLEANUP
-    // --------------------------------------------------------
+    // -----------------------------
+    // Cleanup
+    // -----------------------------
     twilioWs.on("close", () => {
       console.log("❌ Twilio WS CLOSED");
       ai.close();
       eleven.close();
     });
-
-    twilioWs.on("error", (err) => {
-      console.log("⚠️ Twilio WS Error:", err);
-    });
-  });
+});
 
   console.log(`🎧 Media WebSocket Ready at ${WS_PATH}`);
 };
