@@ -1,5 +1,10 @@
 // utils/voice/elevenlabsStream.js
 import WebSocket from "ws";
+console.log("DEBUG >> ELEVENLABS_API_KEY:", process.env.ELEVENLABS_API_KEY ? "LOADED" : "MISSING");
+console.log("DEBUG >> ELEVENLABS_API_KEY Length:", process.env.ELEVENLABS_API_KEY?.length || 0);
+console.log("DEBUG >> ELEVENLABS_MODEL_ID:", process.env.ELEVENLABS_MODEL_ID);
+console.log("DEBUG >> ELEVENLABS_VOICE_ID:", process.env.ELEVENLABS_VOICE_ID);
+
 
 /**
  * Creates a ElevenLabs WebSocket TTS connection
