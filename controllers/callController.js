@@ -74,13 +74,19 @@ export const handleIncomingCall = async (req, res) => {
         : "";
 
     // --------------------------------------------------
-    // 5️⃣ TwiML — FINAL FIX ➜ MUST USE inbound_track
+    // 5️⃣ TwiML — FINAL FIXED VERSION
     // --------------------------------------------------
     const twiml = `
       <Response>
         ${afterHoursSay}
         <Connect>
-          <Stream url="wss://${DOMAIN}/ws/media" track="inbound_track">
+          <Stream
+            url="wss://${DOMAIN}/ws/media"
+            track="inbound"
+            statusCallbackEvent="start media stop"
+            statusCallback="https://${DOMAIN}/api/calls/stream-status"
+            statusCallbackMethod="POST"
+          >
             <Parameter name="barberId" value="${barber._id.toString()}" />
             ${afterHoursParam}
           </Stream>
