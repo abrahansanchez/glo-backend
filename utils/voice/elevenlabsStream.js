@@ -1,32 +1,26 @@
 // utils/voice/elevenlabsStream.js
+
 import WebSocket from "ws";
-console.log("DEBUG >> ELEVENLABS_API_KEY:", process.env.ELEVENLABS_API_KEY ? "LOADED" : "MISSING");
-console.log("DEBUG >> ELEVENLABS_API_KEY Length:", process.env.ELEVENLABS_API_KEY?.length || 0);
-console.log("DEBUG >> ELEVENLABS_MODEL_ID:", process.env.ELEVENLABS_MODEL_ID);
-console.log("DEBUG >> ELEVENLABS_VOICE_ID:", process.env.ELEVENLABS_VOICE_ID);
 
+export const createElevenLabsStream = async () => {
+  try {
+    const apiKey = process.env.ELEVENLABS_API_KEY;
+    const voiceId = process.env.ELEVENLABS_VOICE_ID;
+    const modelId = process.env.ELEVENLABS_MODEL_ID || "eleven_turbo_v2";
 
-/**
- * Creates a ElevenLabs WebSocket TTS connection
- * using the REQUIRED endpoint:
- *
- *  wss://api.elevenlabs.io/v1/text-to-speech/:voice_id/stream-input
- *
- * THIS VERSION:
- * - Works with your plan
- * - Uses xi-api-key header
- * - Uses initializeConnection + sendText messages (required)
- */
-export function createElevenLabsStream(apiKey, voiceId) {
-  if (!apiKey) throw new Error("❌ ELEVENLABS_API_KEY missing");
-  if (!voiceId) throw new Error("❌ ELEVENLABS_VOICE_ID missing");
+    console.log("DEBUG >> ELEVENLABS_API_KEY:", apiKey ? "LOADED" : "MISSING");
+    console.log("DEBUG >> ELEVENLABS_API_KEY Length:", apiKey?.length || 0);
+    console.log("DEBUG >> ELEVENLABS_MODEL_ID:", modelId);
+    console.log("DEBUG >> ELEVENLABS_VOICE_ID:", voiceId);
 
-  const wsURL = `wss://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream-input`;
+    if (!apiKey) throw new Error("❌ ELEVENLABS_API_KEY missing");
+    if (!voiceId) throw new Error("❌ ELEVENLABS_VOICE_ID missing");
 
-  console.log("🌐 ELEVEN WS URL:", wsURL);
+    const wsUrl = `wss://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream-input?model_id=${modelId}`;
 
-  return new Promise((resolve, reject) => {
-    const ws = new WebSocket(wsURL, {
+    console.log("🌐 ELEVEN WS URL:", wsUrl);
+
+    const ws = new WebSocket(wsUrl, {
       headers: {
         "xi-api-key": apiKey,
       },
@@ -35,29 +29,59 @@ export function createElevenLabsStream(apiKey, voiceId) {
     ws.on("open", () => {
       console.log("🎤 ElevenLabs TTS WebSocket Connected");
 
-      // REQUIRED first message
-      ws.send(
-        JSON.stringify({
-          initializeConnection: {
-            voice_settings: {
-              stability: 0.5,
-              similarity_boost: 0.8,
-              speed: 1,
-            },
-          },
-        })
-      );
+      const initPayload = {
+        text: "",
+        voice_settings: {
+          stability: 0.5,
+          similarity_boost: 0.7,
+          style: 0.0,
+          use_speaker_boost: true,
+        },
+        // VERY IMPORTANT
+        // Enables immediate generation based on partial text
+        try_trigger_generation: true,
+      };
 
-      resolve(ws);
+      console.log("📨 Sending initializeConnection to ElevenLabs...");
+      ws.send(JSON.stringify(initPayload));
+
+      console.log("🎤 ElevenLabs TTS Ready");
     });
 
     ws.on("error", (err) => {
-      console.error("❌ ElevenLabs TTS WS ERROR:", err);
-      reject(err);
+      console.error("❌ ELEVENLABS WS ERROR:", err.message);
+      console.error("FULL ERROR:", err);
     });
 
     ws.on("close", (code, reason) => {
-      console.log("🔌 ElevenLabs WS Closed:", code, reason?.toString());
+      console.error(
+        "🔌 ELEVENLABS WS CLOSED:",
+        code,
+        reason?.toString() || ""
+      );
     });
-  });
-}
+
+    ws.on("message", (raw) => {
+      console.log("🎧 ElevenLabs Message Received (raw length):", raw?.length);
+
+      try {
+        const json = JSON.parse(raw.toString());
+
+        if (json.audio) {
+          console.log("🔊 ElevenLabs → Audio Chunk (base64) Len:", json.audio.length);
+        }
+
+        if (json.isFinal) {
+          console.log("🏁 ElevenLabs Final Output Received");
+        }
+      } catch {
+        console.log("🔊 ElevenLabs → NON-JSON audio chunk");
+      }
+    });
+
+    return ws;
+  } catch (err) {
+    console.error("❌ ELEVENLABS STREAM INIT FAILED:", err);
+    throw err;
+  }
+};
