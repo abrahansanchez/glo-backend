@@ -1,12 +1,12 @@
-// utils/voice/elevenlabsStream.js
+
 import WebSocket from "ws";
 
 /**
  * Creates NEW ElevenLabs Realtime TTS WebSocket using
- * wss://api.elevenlabs.io/v1/speech/stream-input
+ * the supported /v1/speech/stream-input protocol.
  */
 export function createElevenLabsStream({ apiKey }) {
-  console.log(">> ELEVEN: KEY LENGTH =", apiKey?.length, " VALUE START =", apiKey?.substring(0, 5));
+  console.log(">> ELEVEN: KEY LENGTH =", apiKey?.length, " VALUE START=", apiKey?.substring(0, 5));
 
   return new Promise((resolve, reject) => {
     const url = "wss://api.elevenlabs.io/v1/speech/stream-input";
@@ -16,6 +16,7 @@ export function createElevenLabsStream({ apiKey }) {
     const ws = new WebSocket(url, {
       headers: {
         "xi-api-key": apiKey,
+        "Authorization": `Bearer ${apiKey}`,   // 🔥 CRITICAL FIX
         "Content-Type": "application/json"
       }
     });
