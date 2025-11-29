@@ -18,7 +18,7 @@ export const handleIncomingCall = async (req, res) => {
     console.log("📟 Normalized Called Number:", calledNumber);
 
     // --------------------------------------------------
-    // 2️⃣ DOMAIN CLEANING
+    // 2️⃣ Clean DOMAIN
     // --------------------------------------------------
     let DOMAIN = process.env.NGROK_DOMAIN;
 
@@ -36,7 +36,7 @@ export const handleIncomingCall = async (req, res) => {
     DOMAIN = DOMAIN
       .replace("https://", "")
       .replace("http://", "")
-      .replace(/\/$/, ""); // remove trailing slash
+      .replace(/\/$/, "");
 
     console.log("🌍 Cleaned DOMAIN:", DOMAIN);
 
@@ -46,7 +46,7 @@ export const handleIncomingCall = async (req, res) => {
     const barber = await Barber.findOne({ twilioNumber: calledNumber });
 
     if (!barber) {
-      console.log(`❌ No barber found for number: ${calledNumber}`);
+      console.log(`❌ Barber not found for: ${calledNumber}`);
 
       res.type("text/xml");
       return res.send(`
@@ -59,29 +59,30 @@ export const handleIncomingCall = async (req, res) => {
     console.log("💈 Matched Barber:", barber.name, barber._id.toString());
 
     // --------------------------------------------------
-    // 4️⃣ Business Hours Check
+    // 4️⃣ Business hours
     // --------------------------------------------------
     const { isOpen } = isBarberOpen(barber);
-    let afterHoursMessage = "";
 
-    if (!isOpen) {
-      afterHoursMessage = `<Say voice="alice">The shop is currently closed, but I can still help you.</Say>`;
-    }
+    const afterHoursSay =
+      !isOpen
+        ? `<Say voice="alice">The shop is currently closed, but I can still help you.</Say>`
+        : "";
+
+    const afterHoursParam =
+      !isOpen
+        ? `<Parameter name="initialPrompt" value="The shop is currently closed, but I can still help you." />`
+        : "";
 
     // --------------------------------------------------
-    // 5️⃣ TwiML — FIXED: track="inbound" ONLY (VALID)
+    // 5️⃣ TwiML — FINAL FIX ➜ MUST USE inbound_track
     // --------------------------------------------------
     const twiml = `
       <Response>
-        ${afterHoursMessage}
+        ${afterHoursSay}
         <Connect>
-          <Stream url="wss://${DOMAIN}/ws/media" track="inbound">
+          <Stream url="wss://${DOMAIN}/ws/media" track="inbound_track">
             <Parameter name="barberId" value="${barber._id.toString()}" />
-            ${
-              !isOpen
-                ? `<Parameter name="initialPrompt" value="The shop is currently closed, but I can still help you." />`
-                : ""
-            }
+            ${afterHoursParam}
           </Stream>
         </Connect>
       </Response>
