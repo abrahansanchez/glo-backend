@@ -17,7 +17,7 @@
 
 export const handleStreamEvent = async (req, res) => {
   console.warn(
-    "⚠️  Deprecated callStreamController invoked. V2 realtime WebSocket pipeline is active."
+    "⚠️ Deprecated callStreamController invoked. V2 realtime WebSocket pipeline is active."
   );
 
   return res.status(410).json({
@@ -29,20 +29,38 @@ export const handleStreamEvent = async (req, res) => {
 
 /**
  * ****************************************************
- * NOTE:
- * - All previous logic for:
- *     • session tracking
- *     • OpenAI realtime WS
- *     • audio handling
- *     • transcript writing
- *     • intent detection
- *   has been intentionally REMOVED.
+ * 🆕 ACTIVE CONTROLLER — STREAM STATUS CALLBACK (V2)
+ * ****************************************************
  *
- * - The new logic lives in:
- *     realtime/mediaStreamServer.js
+ * Twilio calls this endpoint for:
+ *   • stream-started
+ *   • media-received
+ *   • stream-stopped
  *
- * - Do NOT delete this file yet. It prevents Twilio
- *   HTTP media calls from breaking your system.
+ * IMPORTANT:
+ *   Twilio REQUIRES an EMPTY TwiML <Response/>.
+ *   Any JSON or large response will cause:
+ *
+ *      ❌ Error 11750: Response body too large
+ *
+ *   And Twilio will CANCEL the media stream.
+ *
+ *   This is the #1 reason you weren’t receiving audio.
  *
  * ****************************************************
  */
+
+export const handleStreamStatus = async (req, res) => {
+  try {
+    // Log safely on server, NOT returned to Twilio
+    console.log("📡 Twilio Stream Status Callback:", req.body);
+  } catch (err) {
+    console.error("❌ Error logging Twilio stream callback:", err);
+  }
+
+  // Twilio PREFER this content type (safe)
+  res.set("Content-Type", "text/xml");
+
+  // MUST send empty TwiML or Twilio will kill the stream
+  return res.send("<Response></Response>");
+};
