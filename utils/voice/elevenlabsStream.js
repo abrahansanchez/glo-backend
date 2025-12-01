@@ -1,5 +1,4 @@
-// utils/voice/elevenlabsStream.js
-
+ // utils/voice/elevenlabsStream.js
 import WebSocket from "ws";
 
 export const createElevenLabsStream = async () => {
@@ -8,7 +7,10 @@ export const createElevenLabsStream = async () => {
     const voiceId = process.env.ELEVENLABS_VOICE_ID;
     const modelId = process.env.ELEVENLABS_MODEL_ID || "eleven_turbo_v2";
 
-    console.log("DEBUG >> ELEVENLABS_API_KEY:", apiKey ? "LOADED" : "MISSING");
+    console.log(
+      "DEBUG >> ELEVENLABS_API_KEY:",
+      apiKey ? "LOADED" : "MISSING"
+    );
     console.log("DEBUG >> ELEVENLABS_API_KEY Length:", apiKey?.length || 0);
     console.log("DEBUG >> ELEVENLABS_MODEL_ID:", modelId);
     console.log("DEBUG >> ELEVENLABS_VOICE_ID:", voiceId);
@@ -37,15 +39,13 @@ export const createElevenLabsStream = async () => {
           style: 0.0,
           use_speaker_boost: true,
         },
-        // VERY IMPORTANT
-        // Enables immediate generation based on partial text
+        // important so it’s ready to speak as text arrives
         try_trigger_generation: true,
       };
 
       console.log("📨 Sending initializeConnection to ElevenLabs...");
       ws.send(JSON.stringify(initPayload));
-
-      console.log("🎤 ElevenLabs TTS Ready");
+     console.log("🎤 ElevenLabs TTS Ready");
     });
 
     ws.on("error", (err) => {
@@ -61,16 +61,21 @@ export const createElevenLabsStream = async () => {
       );
     });
 
+    // This log handler is for debugging only – our media server
+    // will attach its own 'message' listener to forward audio to Twilio.
     ws.on("message", (raw) => {
-      console.log("🎧 ElevenLabs Message Received (raw length):", raw?.length);
-
+      console.log(
+        "🎧 ElevenLabs Message Received (raw length):",
+        raw?.length
+      );
       try {
-        const json = JSON.parse(raw.toString());
-
+      const json = JSON.parse(raw.toString());
         if (json.audio) {
-          console.log("🔊 ElevenLabs → Audio Chunk (base64) Len:", json.audio.length);
-        }
-
+          console.log(
+            "🔊 ElevenLabs → Audio Chunk (base64) Len:",
+            json.audio.length
+          );
+       }
         if (json.isFinal) {
           console.log("🏁 ElevenLabs Final Output Received");
         }
