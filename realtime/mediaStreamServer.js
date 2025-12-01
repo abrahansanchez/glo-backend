@@ -1,10 +1,26 @@
 // realtime/mediaStreamServer.js
-import { WebSocketServer } from "ws";
-import mulaw from "mulaw-js";
-import { getGlobalOpenAI } from "../utils/ai/globalOpenAI.js";
-import { createElevenLabsStream } from "../utils/voice/elevenlabsStream.js";
+ import { WebSocketServer } from "ws";
+ import { getGlobalOpenAI } from "../utils/ai/globalOpenAI.js";
+ import { createElevenLabsStream } from "../utils/voice/elevenlabsStream.js";
 
 const WS_PATH = "/ws/media";
+
+/**  μ-law → PCM16 (Twilio 8kHz G711 μ-law → Linear PCM 16-bit LE)  **/
+function mulawToPcm16(mulawByte) {
+  const MULAW_MAX = 0x1FFF;
+  mulawByte = ~mulawByte;
+
+  let sign = (mulawByte & 0x80) ? -1 : 1;
+  let exponent = (mulawByte >> 4) & 0x07;
+  let mantissa = mulawByte & 0x0F;
+
+  let magnitude = ((mantissa << 4) + 0x08) << exponent;
+  magnitude -= 0x84;
+
+  if (magnitude > MULAW_MAX) magnitude = MULAW_MAX;
+
+  return sign * magnitude;
+}
 
 export const attachMediaWebSocketServer = (server) => {
   const wss = new WebSocketServer({ noServer: true });
@@ -25,17 +41,24 @@ export const attachMediaWebSocketServer = (server) => {
     const url = new URL(req.url, `http://${req.headers.host}`);
     const initialPrompt = url.searchParams.get("initialPrompt");
 
+    /** STREAM STATE **/
     let streamSid = null;
-    let audioBuffer = [];
-    let lastCommitTime = Date.now();
-    let allowSpeech = true; // 👈 allow responses DURING call
+    let pcmBuffer = [];
+    let lastAudioTime = Date.now();
+    let allowSpeech = true;
 
+    /** Silence detection threshold **/
+    const SILENCE_WINDOW_MS = 900;   // if no audio for 0.9s → commit
+    const CHUNK_COMMIT_MS = 900;     // commit every ~0.9s of voice
+
+    /** PRE-WARMED OPENAI + ELEVENLABS **/
     const ai = getGlobalOpenAI();
     const eleven = await createElevenLabsStream();
 
-    // Send initial greeting AFTER OpenAI is ready
+    /** Send initial greeting AFTER OpenAI is ready **/
     ai.once("open", () => {
       if (initialPrompt) {
+        console.log("💬 Sending initial Prompt to OpenAI:", initialPrompt);
         ai.send(
           JSON.stringify({
             type: "input_text",
@@ -45,16 +68,16 @@ export const attachMediaWebSocketServer = (server) => {
       }
     });
 
-    // Ping to keep WS alive
+    /** Prevent Twilio WS timeout **/
     const pingInterval = setInterval(() => {
       try { twilioWs.ping(); } catch {}
     }, 5000);
 
     twilioWs.on("close", () => clearInterval(pingInterval));
 
-    // -------------------------
-    // HANDLE TWILIO EVENTS
-    // -------------------------
+    // ---------------------------------------------------------
+    // 📥 TWILIO → OPENAI — handle incoming audio/media frames
+    // ---------------------------------------------------------
     twilioWs.on("message", (raw) => {
       let data;
       try { data = JSON.parse(raw.toString()); } catch { return; }
@@ -65,61 +88,71 @@ export const attachMediaWebSocketServer = (server) => {
         return;
       }
 
+      // -------------------------------
+      // 🎙 MEDIA (incoming μ-law audio)
+      // -------------------------------
       if (data.event === "media") {
-        const mulawBuffer = Buffer.from(data.media.payload, "base64");
-        const pcm = mulaw.decode(mulawBuffer);
-        audioBuffer.push(Buffer.from(pcm));
+        const mulawBytes = Buffer.from(data.media.payload, "base64");
 
-        const now = Date.now();
-
-        // Commit audio every 400ms
-        if (now - lastCommitTime > 400) {
-          const combined = Buffer.concat(audioBuffer);
-          const base64 = combined.toString("base64");
-
-          ai.send(
-            JSON.stringify({
-              type: "input_audio_buffer.append",
-              audio: base64,
-            })
-          );
-
-          ai.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
-
-          audioBuffer = [];
-          lastCommitTime = now;
-
-          console.log("📤 Committed audio chunk to OpenAI");
+        // Convert each μ-law byte → PCM16
+        for (let i = 0; i < mulawBytes.length; i++) {
+          const pcm = mulawToPcm16(mulawBytes[i]);
+          const pcmLE = Buffer.alloc(2);
+          pcmLE.writeInt16LE(pcm, 0);
+          pcmBuffer.push(pcmLE);
         }
 
+        lastAudioTime = Date.now();
         return;
       }
 
+      // -------------------------------
+      // ⛔ STOP from Twilio
+      // -------------------------------
       if (data.event === "stop") {
         console.log("⛔ STOP received — final commit");
-
-        if (audioBuffer.length > 0) {
-          const combined = Buffer.concat(audioBuffer);
-          const base64 = combined.toString("base64");
-
-          ai.send(
-            JSON.stringify({
-              type: "input_audio_buffer.append",
-              audio: base64,
-            })
-          );
-        }
-
-        ai.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
-        audioBuffer = [];
+        flushAudioToOpenAI();
         return;
       }
     });
 
-    // --------------------------------------
-    // OPENAI → ELEVENLABS TEXT STREAM
-    // --------------------------------------
+    // ---------------------------------------------------------
+    // 🧠 FUNCTION — push PCM16 to OpenAI (with silence detection)
+    // ---------------------------------------------------------
+    function flushAudioToOpenAI() {
+      if (pcmBuffer.length === 0) return;
+
+      const combined = Buffer.concat(pcmBuffer);
+      pcmBuffer = [];
+
+      ai.send({
+        type: "input_audio_buffer.append",
+        audio: combined,   // RAW PCM16, NOT BASE64
+      });
+
+      ai.send({ type: "input_audio_buffer.commit" });
+
+      console.log("📤 Committed audio chunk to OpenAI");
+    }
+
+    // ---------------------------------------------------------
+    // 🔇 SILENCE DETECTION TIMER
+    // ---------------------------------------------------------
+    setInterval(() => {
+      const now = Date.now();
+
+      if (now - lastAudioTime > SILENCE_WINDOW_MS) {
+        flushAudioToOpenAI();
+        lastAudioTime = now;
+      }
+    }, 200);
+
+    // ---------------------------------------------------------
+    // 🧠 OPENAI → ELEVENLABS (text output)
+    // ---------------------------------------------------------
     ai.on("message", (raw) => {
+      if (!allowSpeech) return;
+
       let evt;
       try { evt = JSON.parse(raw); } catch { return; }
 
@@ -135,9 +168,9 @@ export const attachMediaWebSocketServer = (server) => {
       }
     });
 
-    // --------------------------------------
-    // ELEVENLABS → TWILIO AUDIO STREAM
-    // --------------------------------------
+    // ---------------------------------------------------------
+    // 🔊 ELEVENLABS → TWILIO (PCM WAV output)
+    // ---------------------------------------------------------
     eleven.on("message", (audioFrame) => {
       if (!streamSid) return;
 
