@@ -1,85 +1,66 @@
 // controllers/callController.js
 import Barber from "../models/Barber.js";
-import { isBarberOpen } from "../utils/isOpen.js";
 
 export const handleIncomingCall = async (req, res) => {
   try {
     console.log("📞 Incoming Twilio Call (RAW):", req.body);
 
-    // Normalize number
-    let calledNumber = (req.body.To || req.body.Called || "").trim();
-    if (!calledNumber.startsWith("+")) {
-      calledNumber = "+1" + calledNumber.replace(/^1/, "");
-    }    console.log("📟 Normalized Called Number:", calledNumber);
+    const called = req.body.Called || req.body.To;
+    const cleanNumber = called ? called.trim() : null;
 
-    // DOMAIN
-    let DOMAIN = process.env.NGROK_DOMAIN;
-    if (!DOMAIN) {
-      console.error("❌ Missing NGROK_DOMAIN");
-      res.type("text/xml");
-      return res.send(`
-        <Response>
-          <Say voice="alice">Configuration error.</Say>
-        </Response>
-      `.trim());
-    }
+    console.log("📟 Normalized Called Number:", cleanNumber);
 
-    DOMAIN = DOMAIN.replace("https://", "")
-      .replace("http://", "")
-      .replace(/\/$/, "");
+    const barber = await Barber.findOne({
+      "twilioNumber": cleanNumber,
+    });
 
-    console.log("🌍 Cleaned DOMAIN:", DOMAIN);
-
-    // Find barber assigned to this number
-    const barber = await Barber.findOne({ twilioNumber: calledNumber });
     if (!barber) {
-      console.log(`❌ Barber not found for: ${calledNumber}`);
-
-      res.type("text/xml");
-      return res.send(`
+      console.log("❌ No barber found for number:", cleanNumber);
+      return res.type("text/xml").send(`
         <Response>
-          <Say voice="alice">This number is not assigned to any barber.</Say>
+          <Say>Sorry, this number is not assigned.</Say>
         </Response>
-      `.trim());
+      `);
     }
 
     console.log("💈 Matched Barber:", barber.name, barber._id.toString());
 
-    // Check hours
-    const { isOpen } = isBarberOpen(barber);
+    // Initial greeting text to send into AI as input_text
+    const initialPrompt = `You are Glō, the AI receptionist for ${barber.name}. Greet the caller and ask how you can help.`;
 
-    const initialPromptText = isOpen
-      ? "Hello, how can I help you today?"
-      : "The shop is currently closed, but I can still help you.";
+    const DOMAIN = process.env.NGROK_DOMAIN || req.headers.host;
+    const cleanDomain = DOMAIN.replace(/\/$/, "");
 
-    // Twilio Stream TwiML
+    console.log("🌍 Cleaned DOMAIN:", cleanDomain);
+
+    const wsUrl = `wss://${cleanDomain}/ws/media`;
+
     const twiml = `
       <Response>
         <Connect>
           <Stream
-            url="wss://${DOMAIN}/ws/media"            track="inbound_track"
-            statusCallback="https://${DOMAIN}/api/calls/stream-status"
+            url="${wsUrl}"
+            track="inbound_track"
+            statusCallback="https://${cleanDomain}/api/calls/stream-status"
             statusCallbackMethod="POST"
           >
             <Parameter name="barberId" value="${barber._id.toString()}" />
-            <Parameter name="initialPrompt" value="${initialPromptText}" />
+            <Parameter name="initialPrompt" value="${initialPrompt}" />
           </Stream>
         </Connect>
       </Response>
-    `.trim();
+    `;
 
     console.log("📤 Sending TwiML to Twilio...");
-    res.type("text/xml");
-    return res.send(twiml);
+    res.type("text/xml").send(twiml);
 
-  } catch (err) {
-    console.error("❌ Incoming Call Error:", err);
+  } catch (error) {
+    console.error("❌ Error In handleIncomingCall:", error);
 
-    res.type("text/xml");
-    return res.status(500).send(`
+    res.type("text/xml").send(`
       <Response>
-        <Say voice="alice">There was an error handling your call.</Say>
+        <Say>We are experiencing issues. Try again later.</Say>
       </Response>
-    `.trim());
+    `);
   }
 };

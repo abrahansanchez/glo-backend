@@ -6,35 +6,6 @@ import { createElevenLabsStream } from "../utils/voice/elevenlabsStream.js";
 
 const WS_PATH = "/ws/media";
 
-/**
- * High-quality sinc resampler from 8kHz → 16kHz
- * @param {Int16Array} inputSamples
- * @param {number} inputRate
- * @param {number} outputRate
- * @returns {Int16Array}
- */
-function resamplePCM(inputSamples, inputRate = 8000, outputRate = 16000) {
-  const ratio = outputRate / inputRate;
-  const outputLength = Math.floor(inputSamples.length * ratio);
-  const output = new Int16Array(outputLength);
-
-  for (let i = 0; i < outputLength; i++) {
-    const srcIndex = i / ratio;
-    const idx0 = Math.floor(srcIndex);
-    const idx1 = Math.min(idx0 + 1, inputSamples.length - 1);
-    const frac = srcIndex - idx0;
-
-    // Linear interpolation (fast) with Hann window smoothing (HQ)
-    const sample =
-      inputSamples[idx0] * (1 - frac) +
-      inputSamples[idx1] * frac;
-
-    output[i] = Math.max(-32768, Math.min(32767, sample));
-  }
-
-  return output;
-}
-
 export const attachMediaWebSocketServer = (server) => {
   const wss = new WebSocketServer({ noServer: true });
 
@@ -51,22 +22,20 @@ export const attachMediaWebSocketServer = (server) => {
   wss.on("connection", async (twilioWs, req) => {
     console.log("🔗 Twilio WebSocket CONNECTED");
 
-    // Extract parameters
     const url = new URL(req.url, `http://${req.headers.host}`);
-    const barberId = url.searchParams.get("barberId");
     const initialPrompt = url.searchParams.get("initialPrompt");
 
     let streamSid = null;
-    let allowSpeech = false;
+    let audioBuffer = [];
+    let lastCommitTime = Date.now();
+    let allowSpeech = true; // 👈 allow responses DURING call
 
-    // Pre-warmed OpenAI + ElevenLabs
-   const ai = getGlobalOpenAI();
+    const ai = getGlobalOpenAI();
     const eleven = await createElevenLabsStream();
 
-    // Send prompt ONLY after OpenAI is ready
+    // Send initial greeting AFTER OpenAI is ready
     ai.once("open", () => {
       if (initialPrompt) {
-        console.log("💬 Sending initial Prompt to OpenAI:", initialPrompt);
         ai.send(
           JSON.stringify({
             type: "input_text",
@@ -76,76 +45,84 @@ export const attachMediaWebSocketServer = (server) => {
       }
     });
 
-    // Prevent Twilio timeout
+    // Ping to keep WS alive
     const pingInterval = setInterval(() => {
-      try {
-        twilioWs.ping();
-      } catch {}
+      try { twilioWs.ping(); } catch {}
     }, 5000);
 
     twilioWs.on("close", () => clearInterval(pingInterval));
 
-    // Handle Twilio events
+    // -------------------------
+    // HANDLE TWILIO EVENTS
+    // -------------------------
     twilioWs.on("message", (raw) => {
       let data;
-            try {
-        data = JSON.parse(raw.toString());
-      } catch {
-        return;
-      }
+      try { data = JSON.parse(raw.toString()); } catch { return; }
 
-     if (data.event === "start") {
+      if (data.event === "start") {
+        console.log("🎬 Twilio START — SID:", data.start.streamSid);
         streamSid = data.start.streamSid;
-        console.log("🎬 Twilio START — SID:", streamSid);
         return;
       }
 
-     if (data.event === "media") {
-        console.log("🎙 Incoming Media Frame:", data.media.payload.length);
-
-        if (!ai || ai.readyState !== 1) return;
-
-        // μ-law → PCM16
+      if (data.event === "media") {
         const mulawBuffer = Buffer.from(data.media.payload, "base64");
-        const pcm8k = mulaw.decode(mulawBuffer); // Int16Array at 8000 Hz
+        const pcm = mulaw.decode(mulawBuffer);
+        audioBuffer.push(Buffer.from(pcm));
 
-        // 🔥 High-quality resample to 16kHz
-        const pcm16k = resamplePCM(pcm8k, 8000, 16000);
+        const now = Date.now();
 
-        // Send to OpenAI
-        ai.send(
-          JSON.stringify({
-            type: "input_audio_buffer.append",
-            audio: Buffer.from(pcm16k).toString("base64"),
-          })
-        );
-       return;
+        // Commit audio every 400ms
+        if (now - lastCommitTime > 400) {
+          const combined = Buffer.concat(audioBuffer);
+          const base64 = combined.toString("base64");
+
+          ai.send(
+            JSON.stringify({
+              type: "input_audio_buffer.append",
+              audio: base64,
+            })
+          );
+
+          ai.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+
+          audioBuffer = [];
+          lastCommitTime = now;
+
+          console.log("📤 Committed audio chunk to OpenAI");
+        }
+
+        return;
       }
 
       if (data.event === "stop") {
-        console.log("⛔ STOP received — committing audio...");
-        allowSpeech = true;
+        console.log("⛔ STOP received — final commit");
 
-        ai.send(
-          JSON.stringify({
-            type: "input_audio_buffer.commit",
-          })
-        );
+        if (audioBuffer.length > 0) {
+          const combined = Buffer.concat(audioBuffer);
+          const base64 = combined.toString("base64");
+
+          ai.send(
+            JSON.stringify({
+              type: "input_audio_buffer.append",
+              audio: base64,
+            })
+          );
+        }
+
+        ai.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+        audioBuffer = [];
         return;
       }
     });
 
-    // OpenAI → ElevenLabs
+    // --------------------------------------
+    // OPENAI → ELEVENLABS TEXT STREAM
+    // --------------------------------------
     ai.on("message", (raw) => {
-      if (!allowSpeech) return;
-
       let evt;
-      try {
-        evt = JSON.parse(raw);
-      } catch {
-        return;
-      }
-      
+      try { evt = JSON.parse(raw); } catch { return; }
+
       if (evt.type === "response.output_text.delta") {
         console.log("🤖 OpenAI says:", evt.delta);
 
@@ -158,7 +135,9 @@ export const attachMediaWebSocketServer = (server) => {
       }
     });
 
-    // ElevenLabs → Twilio (send audio back to caller)
+    // --------------------------------------
+    // ELEVENLABS → TWILIO AUDIO STREAM
+    // --------------------------------------
     eleven.on("message", (audioFrame) => {
       if (!streamSid) return;
 
