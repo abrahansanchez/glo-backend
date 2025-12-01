@@ -1,4 +1,5 @@
 // utils/ai/openaiRealtimeSession.js
+
 import WebSocket from "ws";
 
 export function createOpenAISession(apiKey) {
@@ -15,15 +16,15 @@ export function createOpenAISession(apiKey) {
   ws.on("open", () => {
     console.log("🤖 OpenAI Realtime Connected");
 
-    // 🔥 CRITICAL: tell OpenAI how to behave
+    // 🔥 CRITICAL FIX — REQUIRED FOR AI TO ACTUALLY RESPOND
     ws.send(
       JSON.stringify({
         type: "session.update",
         session: {
           instructions:
-            "You are a professional and friendly AI barbershop receptionist. Respond clearly, naturally, and keep answers concise.",
+            "You are a professional and friendly AI barbershop receptionist. Respond conversationally.",
           turn_detection: {
-            type: "server_vad", // OpenAI listens for speech and decides turns
+            type: "server_vad", // <— AI listens automatically and decides when user is done talking
           },
         },
       })
@@ -31,8 +32,9 @@ export function createOpenAISession(apiKey) {
   });
 
   ws.on("close", () => console.log("🔌 OpenAI Realtime Closed"));
+
   ws.on("error", (err) =>
-    console.log("❌ OpenAI Error:", err?.message || err.toString())
+    console.log("❌ OpenAI Error:", err?.message || err)
   );
 
   return ws;

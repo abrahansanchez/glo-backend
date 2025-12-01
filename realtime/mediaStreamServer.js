@@ -1,15 +1,16 @@
 // realtime/mediaStreamServer.js
 import { WebSocketServer } from "ws";
+import WebSocket from "ws";
 import mulaw from "mulaw-js";
+
 import { createOpenAISession } from "../utils/ai/openaiRealtimeSession.js";
 import { createElevenLabsStream } from "../utils/voice/elevenlabsStream.js";
 
 const WS_PATH = "/ws/media";
 
 export const attachMediaWebSocketServer = (server) => {
-  const wss = new WebSocketServer({ noServer: true });
+  const wss = new WebSocketServer({ noServer: true }); 
 
-  // Upgrade HTTP → WS for Twilio media stream
   server.on("upgrade", (req, socket, head) => {
     if (req.url.startsWith(WS_PATH)) {
       console.log("🔄 WS Upgrade Request:", req.url);
@@ -24,42 +25,54 @@ export const attachMediaWebSocketServer = (server) => {
   wss.on("connection", async (twilioWs) => {
     console.log("🔗 Twilio WebSocket CONNECTED");
 
-  let streamSid = null;
+    let streamSid = null;
+    let allowTTS = false;
+    let openaiReady = false; // FIX #1 — block audio until OpenAI is ready
 
-    // Keep Twilio WS alive
+    // Keepalive ping to prevent Twilio timeout
     const pingInterval = setInterval(() => {
-      try {
-        if (twilioWs.readyState === twilioWs.OPEN) {
-          twilioWs.ping();
-        }
-      } catch {
-        // ignore ping errors
-      }
+      try { twilioWs.ping(); } catch {}
     }, 5000);
 
     twilioWs.on("close", () => {
       console.log("❌ Twilio WS CLOSED");
       clearInterval(pingInterval);
-      try {
-        ai.close();
-      } catch {}
-      try {
-        eleven.close();
-      } catch {}
+   });
+
+    // -----------------------------------------------------------
+    // 1️⃣ CREATE OPENAI SESSION
+    // -----------------------------------------------------------
+    const ai = createOpenAISession(process.env.OPENAI_API_KEY);
+
+    ai.on("open", () => {
+      console.log("🤖 OpenAI Realtime Connected");
+      openaiReady = true; // FIX #2 — OpenAI is now ready
+
+      // Enable instructions + VAD
+      ai.send(
+        JSON.stringify({
+          type: "session.update",
+          session: {
+            instructions:
+              "You are a helpful and friendly AI receptionist. Respond clearly and conversationally.",
+            turn_detection: { type: "server_vad" },
+          },
+        })
+      );
     });
 
-    // -----------------------------
-    //  A I   C O N N E C T I O N S
-    // -----------------------------
-    const ai = createOpenAISession(process.env.OPENAI_API_KEY);
-    console.log("🤖 OpenAI Connected (session requested)");
+    ai.on("error", (err) =>
+      console.log("❌ OpenAI Realtime WS ERROR:", err.message)
+    );
 
-    const eleven = await createElevenLabsStream();
-    console.log("🎤 ElevenLabs TTS Connected (session requested)");
+    // -----------------------------------------------------------
+    // 2️⃣ CREATE ELEVENLABS STREAM
+    // -----------------------------------------------------------
+  const eleven = await createElevenLabsStream();
 
-    // ---------------------------------------
-    //  T W I L I O   →   O P E N A I  (audio)
-    // ---------------------------------------
+    // -----------------------------------------------------------
+    // TWILIO → OPENAI (REAL-TIME AUDIO STREAMING)
+    // -----------------------------------------------------------
     twilioWs.on("message", (msg) => {
       let data;
       try {
@@ -75,12 +88,15 @@ export const attachMediaWebSocketServer = (server) => {
       }
 
       if (data.event === "media") {
-        // Twilio sends μ-law 8kHz audio as base64
-        const mulawBuffer = Buffer.from(data.media.payload, "base64");
-        const pcmInt16 = mulaw.decode(mulawBuffer); // Int16Array
-        const pcmBase64 = Buffer.from(pcmInt16).toString("base64");
+        if (!openaiReady) {
+          console.log("⏳ OpenAI not ready yet — skipping frame");
+          return;
+        }
 
-        // Stream PCM16 frames to OpenAI in real time
+        // μ-law → PCM16 conversion
+        const mulawBuffer = Buffer.from(data.media.payload, "base64");
+        const pcmSamples = mulaw.decode(mulawBuffer);
+        const pcmBase64 = Buffer.from(pcmSamples).toString("base64");
         ai.send(
           JSON.stringify({
             type: "input_audio_buffer.append",
@@ -92,84 +108,50 @@ export const attachMediaWebSocketServer = (server) => {
       }
 
       if (data.event === "stop") {
-        // We don't batch anymore; just log and let VAD handle it
-        console.log("⛔ Twilio STOP event (no batching, just closing soon)");
+        console.log("⛔ STOP received — enabling TTS");
+        allowTTS = true;
         return;
       }
     });
 
-    // ----------------------------------------
-    //  O P E N A I   →   E L E V E N L A B S
-    // ----------------------------------------
+    // -----------------------------------------------------------
+    // OPENAI → ELEVENLABS (TEXT → TTS)
+    // -----------------------------------------------------------
     ai.on("message", (raw) => {
-      let parsed;
+      let evt;
       try {
-        parsed = JSON.parse(raw.toString());
+        evt = JSON.parse(raw.toString());
       } catch {
         return;
       }
 
-      // When OpenAI produces text chunks for the response
-      if (parsed.type === "response.output_text.delta" && parsed.delta) {
-        const textDelta = parsed.delta;
-        if (!textDelta || textDelta.length === 0) return;
+      if (evt.type === "response.output_text.delta" && allowTTS) {
+        const text = evt.delta;
+        console.log("💬 OpenAI text:", text);
 
-        console.log("🔤 OpenAI text delta:", textDelta);
-
-        // Stream text to ElevenLabs
-        try {
-          eleven.send(
-            JSON.stringify({
-              text: textDelta,
-              // Let Eleven continue speaking as text comes in
-              try_trigger_generation: true,
-            })
-          );
-        } catch (err) {
-          console.error("❌ Error sending text to ElevenLabs:", err.message);
-        }
+        eleven.send(
+          JSON.stringify({
+            text,
+            try_trigger_generation: true,
+          })
+        );
       }
     });
 
-    ai.on("error", (err) => {
-      console.error("❌ OpenAI WS ERROR:", err?.message || err.toString());
-    });
+    // -----------------------------------------------------------
+    // ELEVENLABS → TWILIO (STREAM AUDIO BACK)
+    // -----------------------------------------------------------
+    eleven.on("message", (binaryFrame) => {
+      if (!streamSid) return;
 
-    // ----------------------------------------
-    //  E L E V E N L A B S   →   T W I L I O
-    // ----------------------------------------
-    eleven.on("message", (raw) => {
-      if (!streamSid) return; // we don't know which stream to send to yet
+      const base64Audio = Buffer.from(binaryFrame).toString("base64");
 
-      try {
-        const json = JSON.parse(raw.toString());
-
-        if (json.audio) {
-          // ElevenLabs returns base64 PCM16 audio in json.audio
-          const audioBase64 = json.audio;
-
-          twilioWs.send(
-            JSON.stringify({
-              event: "media",
-              streamSid,
-              media: { payload: audioBase64 },
-            })
-          );
-        }
-      } catch {
-        // Non-JSON payload – ignore or log if needed
-      }
-    });
-
-    eleven.on("error", (err) => {
-      console.error("❌ ElevenLabs WS ERROR:", err?.message || err.toString());
-    });
-
-    eleven.on("close", (code, reason) => {
-      console.log(
-        "🔌 ElevenLabs WS CLOSED:",
-        code,
-        reason?.toString() || ""
+      twilioWs.send(
+        JSON.stringify({
+          event: "media",
+          streamSid,
+          media: { payload: base64Audio },
+        })
       );
     });
   });
