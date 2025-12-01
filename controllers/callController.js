@@ -6,29 +6,18 @@ export const handleIncomingCall = async (req, res) => {
   try {
     console.log("📞 Incoming Twilio Call (RAW):", req.body);
 
-    // --------------------------------------------------
-    // 1️⃣ Normalize number
-    // --------------------------------------------------
     let calledNumber = (req.body.To || req.body.Called || "").trim();
-
     if (!calledNumber.startsWith("+")) {
       calledNumber = "+1" + calledNumber.replace(/^1/, "");
     }
 
     console.log("📟 Normalized Called Number:", calledNumber);
 
-    // --------------------------------------------------
-    // 2️⃣ Clean DOMAIN
-    // --------------------------------------------------
     let DOMAIN = process.env.NGROK_DOMAIN;
-
     if (!DOMAIN) {
-      console.error("❌ Missing NGROK_DOMAIN in .env");
-
-      res.type("text/xml");
-      return res.send(`
+      return res.type("text/xml").send(`
         <Response>
-          <Say voice="alice">Configuration error. Please try again later.</Say>
+          <Say>Configuration error. Missing domain.</Say>
         </Response>
       `.trim());
     }
@@ -40,44 +29,25 @@ export const handleIncomingCall = async (req, res) => {
 
     console.log("🌍 Cleaned DOMAIN:", DOMAIN);
 
-    // --------------------------------------------------
-    // 3️⃣ Find assigned barber
-    // --------------------------------------------------
     const barber = await Barber.findOne({ twilioNumber: calledNumber });
-
     if (!barber) {
-      console.log(`❌ Barber not found for: ${calledNumber}`);
-
-      res.type("text/xml");
-      return res.send(`
+      return res.type("text/xml").send(`
         <Response>
-          <Say voice="alice">This number is not assigned to any barber.</Say>
+          <Say>This number is not assigned to any barber.</Say>
         </Response>
       `.trim());
     }
 
     console.log("💈 Matched Barber:", barber.name, barber._id.toString());
 
-    // --------------------------------------------------
-    // 4️⃣ Business hours
-    // --------------------------------------------------
     const { isOpen } = isBarberOpen(barber);
 
-    const afterHoursSay = !isOpen
-      ? `<Say voice="alice">The shop is currently closed, but I can still help you.</Say>`
-      : "";
+    const initialPromptText = !isOpen
+      ? "The shop is currently closed, but I can still help you."
+      : "Hello, how can I help you today?";
 
-    const afterHoursParam = !isOpen
-      ? `<Parameter name="initialPrompt" value="The shop is currently closed, but I can still help you." />`
-      : "";
-
-    // --------------------------------------------------
-    // 5️⃣ Twilio Stream TwiML — FIXED VERSION
-    //     IMPORTANT: audioTracks="inbound" ADDED
-    // --------------------------------------------------
     const twiml = `
       <Response>
-        ${afterHoursSay}
         <Connect>
           <Stream
             url="wss://${DOMAIN}/ws/media"
@@ -87,24 +57,21 @@ export const handleIncomingCall = async (req, res) => {
             statusCallbackMethod="POST"
           >
             <Parameter name="barberId" value="${barber._id.toString()}" />
-            ${afterHoursParam}
+            <Parameter name="initialPrompt" value="${initialPromptText}" />
           </Stream>
         </Connect>
       </Response>
     `.trim();
 
     console.log("📤 Sending TwiML to Twilio...");
-
     res.type("text/xml");
     return res.send(twiml);
 
   } catch (err) {
     console.error("❌ Incoming Call Error:", err);
-
-    res.type("text/xml");
-    return res.status(500).send(`
+    return res.type("text/xml").send(`
       <Response>
-        <Say voice="alice">There was an error handling your call.</Say>
+        <Say>Error processing the call.</Say>
       </Response>
     `.trim());
   }
