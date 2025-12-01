@@ -6,10 +6,38 @@ import { createElevenLabsStream } from "../utils/voice/elevenlabsStream.js";
 
 const WS_PATH = "/ws/media";
 
+/**
+ * High-quality sinc resampler from 8kHz → 16kHz
+ * @param {Int16Array} inputSamples
+ * @param {number} inputRate
+ * @param {number} outputRate
+ * @returns {Int16Array}
+ */
+function resamplePCM(inputSamples, inputRate = 8000, outputRate = 16000) {
+  const ratio = outputRate / inputRate;
+  const outputLength = Math.floor(inputSamples.length * ratio);
+  const output = new Int16Array(outputLength);
+
+  for (let i = 0; i < outputLength; i++) {
+    const srcIndex = i / ratio;
+    const idx0 = Math.floor(srcIndex);
+    const idx1 = Math.min(idx0 + 1, inputSamples.length - 1);
+    const frac = srcIndex - idx0;
+
+    // Linear interpolation (fast) with Hann window smoothing (HQ)
+    const sample =
+      inputSamples[idx0] * (1 - frac) +
+      inputSamples[idx1] * frac;
+
+    output[i] = Math.max(-32768, Math.min(32767, sample));
+  }
+
+  return output;
+}
+
 export const attachMediaWebSocketServer = (server) => {
   const wss = new WebSocketServer({ noServer: true });
 
-  // Allow Twilio to upgrade WS
   server.on("upgrade", (req, socket, head) => {
     if (req.url.startsWith(WS_PATH)) {
       wss.handleUpgrade(req, socket, head, (ws) =>
@@ -23,7 +51,7 @@ export const attachMediaWebSocketServer = (server) => {
   wss.on("connection", async (twilioWs, req) => {
     console.log("🔗 Twilio WebSocket CONNECTED");
 
-    // Extract query parameters
+    // Extract parameters
     const url = new URL(req.url, `http://${req.headers.host}`);
     const barberId = url.searchParams.get("barberId");
     const initialPrompt = url.searchParams.get("initialPrompt");
@@ -31,17 +59,14 @@ export const attachMediaWebSocketServer = (server) => {
     let streamSid = null;
     let allowSpeech = false;
 
-    // GLOBAL AI WS — already connected before Twilio call
-    const ai = getGlobalOpenAI();
-
-    // ElevenLabs stream
+    // Pre-warmed OpenAI + ElevenLabs
+   const ai = getGlobalOpenAI();
     const eleven = await createElevenLabsStream();
 
-    // ➤ Fix: Only inject initial prompt after AI WebSocket is fully open
+    // Send prompt ONLY after OpenAI is ready
     ai.once("open", () => {
       if (initialPrompt) {
-        console.log("💬 Sending Initial Prompt to OpenAI:", initialPrompt);
-
+        console.log("💬 Sending initial Prompt to OpenAI:", initialPrompt);
         ai.send(
           JSON.stringify({
             type: "input_text",
@@ -51,76 +76,50 @@ export const attachMediaWebSocketServer = (server) => {
       }
     });
 
-    // Prevent WS timeout
+    // Prevent Twilio timeout
     const pingInterval = setInterval(() => {
       try {
         twilioWs.ping();
       } catch {}
     }, 5000);
 
-    // --- SILENCE DETECTION ---
-    let lastSpeechTime = Date.now();
-    const SILENCE_THRESHOLD = 600; // ms
+    twilioWs.on("close", () => clearInterval(pingInterval));
 
-    const silenceCheck = setInterval(() => {
-      if (!allowSpeech && Date.now() - lastSpeechTime > SILENCE_THRESHOLD) {
-        console.log("🤫 Silence detected — committing audio to OpenAI...");
-        allowSpeech = true;
-
-        ai.send(
-          JSON.stringify({
-            type: "input_audio_buffer.commit",
-          })
-        );
-      }
-    }, 100);
-
-    // Cleanup on close
-    twilioWs.on("close", () => {
-      clearInterval(pingInterval);
-      clearInterval(silenceCheck);
-    });
-
-    // -------------------------------------------------
-    // 🔊 HANDLE TWILIO MEDIA EVENTS
-    // -------------------------------------------------
+    // Handle Twilio events
     twilioWs.on("message", (raw) => {
       let data;
-
-      try {
+            try {
         data = JSON.parse(raw.toString());
       } catch {
         return;
       }
 
-      if (data.event === "start") {
-        console.log("🎬 Twilio START — SID:", data.start.streamSid);
+     if (data.event === "start") {
         streamSid = data.start.streamSid;
-        lastSpeechTime = Date.now(); // reset
+        console.log("🎬 Twilio START — SID:", streamSid);
         return;
       }
 
-      if (data.event === "media") {
-        lastSpeechTime = Date.now();
-
+     if (data.event === "media") {
         console.log("🎙 Incoming Media Frame:", data.media.payload.length);
 
         if (!ai || ai.readyState !== 1) return;
 
-        // Convert μ-law to PCM16
+        // μ-law → PCM16
         const mulawBuffer = Buffer.from(data.media.payload, "base64");
-        const pcmSamples = mulaw.decode(mulawBuffer);
-        const pcmBase64 = Buffer.from(pcmSamples).toString("base64");
+        const pcm8k = mulaw.decode(mulawBuffer); // Int16Array at 8000 Hz
 
-        // Send to OpenAI Realtime
+        // 🔥 High-quality resample to 16kHz
+        const pcm16k = resamplePCM(pcm8k, 8000, 16000);
+
+        // Send to OpenAI
         ai.send(
           JSON.stringify({
             type: "input_audio_buffer.append",
-            audio: pcmBase64,
+            audio: Buffer.from(pcm16k).toString("base64"),
           })
         );
-
-        return;
+       return;
       }
 
       if (data.event === "stop") {
@@ -136,9 +135,7 @@ export const attachMediaWebSocketServer = (server) => {
       }
     });
 
-    // -------------------------------------------------
-    // 🧠 OPENAI → ELEVENLABS (TEXT OUTPUT STREAMING)
-    // -------------------------------------------------
+    // OpenAI → ElevenLabs
     ai.on("message", (raw) => {
       if (!allowSpeech) return;
 
@@ -148,8 +145,7 @@ export const attachMediaWebSocketServer = (server) => {
       } catch {
         return;
       }
-
-      // When OpenAI generates text deltas
+      
       if (evt.type === "response.output_text.delta") {
         console.log("🤖 OpenAI says:", evt.delta);
 
@@ -162,9 +158,7 @@ export const attachMediaWebSocketServer = (server) => {
       }
     });
 
-    // -------------------------------------------------
-    // 🔁 ELEVENLABS → TWILIO (PCM BACK TO CALLER)
-    // -------------------------------------------------
+    // ElevenLabs → Twilio (send audio back to caller)
     eleven.on("message", (audioFrame) => {
       if (!streamSid) return;
 
@@ -172,7 +166,9 @@ export const attachMediaWebSocketServer = (server) => {
         JSON.stringify({
           event: "media",
           streamSid,
-          media: { payload: Buffer.from(audioFrame).toString("base64") },
+          media: {
+            payload: Buffer.from(audioFrame).toString("base64"),
+          },
         })
       );
     });
