@@ -72,7 +72,8 @@ export const handleIncomingCall = async (req, res) => {
       : "";
 
     // --------------------------------------------------
-    // 5️⃣ Twilio Stream TwiML — FINAL, VALID VERSION
+    // 5️⃣ Twilio Stream TwiML — FIXED VERSION
+    //     IMPORTANT: audioTracks="inbound" ADDED
     // --------------------------------------------------
     const twiml = `
       <Response>
@@ -81,6 +82,7 @@ export const handleIncomingCall = async (req, res) => {
           <Stream
             url="wss://${DOMAIN}/ws/media"
             track="inbound_track"
+            audioTracks="inbound"
             statusCallback="https://${DOMAIN}/api/calls/stream-status"
             statusCallbackMethod="POST"
           >
