@@ -1,7 +1,13 @@
+// server.js
 import express from "express";
 import http from "http";
 import dotenv from "dotenv";
 import cors from "cors";
+
+// Load ENV FIRST (critical!)
+dotenv.config();
+
+import { attachMediaWebSocketServer } from "./realtime/mediaStreamServer.js";
 import { getGlobalOpenAI } from "./utils/ai/globalOpenAI.js";
 import connectDB from "./config/db.js";
 
@@ -22,14 +28,10 @@ import availabilityRoutes from "./routes/availabilityRoutes.js";
 import appointment from "./routes/appointmentRoutes.js";
 import analyticsRoutes from "./routes/analyticsRoutes.js";
 
-import { attachMediaWebSocketServer } from "./realtime/mediaStreamServer.js";
+// ENV debug AFTER dotenv is loaded
 console.log("NGROK_DOMAIN =", process.env.NGROK_DOMAIN);
 
-dotenv.config();
-
-getGlobalOpenAI(); // Initialize the global OpenAI WebSocket connection
-
-//console.log("DEBUG ELEVEN:", JSON.stringify(process.env.ELEVENLABS_API_KEY));
+// Connect DB
 connectDB();
 
 const app = express();
@@ -38,12 +40,12 @@ app.use(express.urlencoded({ extended: false }));
 app.use(cors());
 app.use(express.static("public"));
 
-// Base route test
+// Base route
 app.get("/", (req, res) => {
   res.send("Glo Backend API Running");
 });
 
-// Register All Routes
+// Routes
 app.use("/api/auth", authRoutes);
 app.use("/api/calls", callStreamRoutes);
 app.use("/api/calls", callRoutes);
@@ -61,13 +63,14 @@ app.use("/api/barber/availability", availabilityRoutes);
 app.use("/api/appointments", appointment);
 app.use("/api/analytics", analyticsRoutes);
 
-// ----------------------------------------------------
-// STEP 1.5 — Create HTTP server + attach WebSocket
-// ----------------------------------------------------
+// Create HTTP server
 const server = http.createServer(app);
 
 // Attach WebSocket media server
 attachMediaWebSocketServer(server);
+
+// 🚀 AFTER server is ready = now we pre-connect OpenAI
+getGlobalOpenAI();
 
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, "0.0.0.0", () => {
