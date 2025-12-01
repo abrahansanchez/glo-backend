@@ -2,6 +2,7 @@ import express from "express";
 import http from "http";
 import dotenv from "dotenv";
 import cors from "cors";
+import { getGlobalOpenAI } from "./utils/ai/globalOpenAI.js";
 import connectDB from "./config/db.js";
 
 import callRoutes from "./routes/callRoutes.js";
@@ -25,6 +26,9 @@ import { attachMediaWebSocketServer } from "./realtime/mediaStreamServer.js";
 console.log("NGROK_DOMAIN =", process.env.NGROK_DOMAIN);
 
 dotenv.config();
+
+getGlobalOpenAI(); // Initialize the global OpenAI WebSocket connection
+
 //console.log("DEBUG ELEVEN:", JSON.stringify(process.env.ELEVENLABS_API_KEY));
 connectDB();
 
