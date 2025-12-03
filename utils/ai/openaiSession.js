@@ -20,18 +20,18 @@ export function createOpenAISession() {
         JSON.stringify({
           type: "session.update",
           session: {
-            modalities: ["text", "audio"],
-            instructions:
-              "You are Sofia, the AI receptionist for a barbershop. Be friendly, fast, and helpful. Keep responses short.",
+            voice: "alloy",
+            modalities: ["audio", "text"],
             input_audio_format: "pcm16",
             output_audio_format: "pcm16",
             input_audio_transcription: { model: "whisper-1" },
             turn_detection: {
               type: "server_vad",
               threshold: 0.5,
-              silence_duration_ms: 500,
+              silence_duration_ms: 700,
             },
-            temperature: 0.7,
+            instructions:
+              "You are Sofia, a friendly, natural-sounding barbershop AI receptionist. Keep replies short, helpful, and conversational.",
           },
         })
       );
@@ -40,7 +40,7 @@ export function createOpenAISession() {
     });
 
     ws.on("error", (err) => {
-      console.error("❌ OpenAI ERROR:", err.message);
+      console.error("❌ OpenAI WS Error:", err.message);
       reject(err);
     });
   });

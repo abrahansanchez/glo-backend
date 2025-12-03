@@ -1,43 +1,48 @@
 // utils/audio/audioUtils.js
-import { Buffer } from "buffer";
+import mulaw from "mulaw-js";
 
 /**
- * Convert 16-bit PCM (raw) → 8-bit μ-law for Twilio
+ * Resample PCM16 audio buffer
+ * @param {Buffer} buffer - pcm16 buffer
+ * @param {number} inRate 
+ * @param {number} outRate 
+ * @returns Buffer
  */
-export function pcm16ToMulaw(sample) {
-  const MU = 255;
-  const MAX = 32635;
+export function resamplePCM16(buffer, inRate, outRate) {
+  if (buffer.length % 2 !== 0) buffer = buffer.slice(0, buffer.length - 1);
+  if (buffer.length < 4) return Buffer.alloc(0);
 
-  let sign = (sample >> 8) & 0x80;
-  if (sign !== 0) sample = -sample;
-  if (sample > MAX) sample = MAX;
+  const inSamples = buffer.length / 2;
+  const outSamples = Math.floor(inSamples * (outRate / inRate));
+  const out = Buffer.alloc(outSamples * 2);
 
-  let exponent = 7;
-  for (let expMask = 0x4000; (sample & expMask) === 0 && exponent > 0; exponent--, expMask >>= 1) {}
+  for (let i = 0; i < outSamples; i++) {
+    const t = i * (inRate / outRate);
+    const idx = Math.floor(t);
+    const frac = t - idx;
 
-  const mantissa = (sample >> ((exponent === 0) ? 4 : (exponent + 3))) & 0x0F;
-  const mulaw = ~(sign | (exponent << 4) | mantissa);
+    const offset1 = idx * 2;
+    const offset2 = offset1 + 2;
 
-  return mulaw & 0xFF;
-}
+    if (offset1 >= buffer.length - 1) break;
 
-/**
- * Convert PCM16 LE Buffer to μ-law Buffer (Twilio format)
- */
-export function pcmBufferToMulaw(pcmBuffer) {
-  const mulaw = Buffer.alloc(pcmBuffer.length / 2);
+    const s1 = buffer.readInt16LE(offset1);
+    const s2 = offset2 >= buffer.length - 1 ? s1 : buffer.readInt16LE(offset2);
+    const value = s1 + (s2 - s1) * frac;
 
-  for (let i = 0, j = 0; i < pcmBuffer.length; i += 2, j++) {
-    const sample = pcmBuffer.readInt16LE(i);
-    mulaw[j] = pcm16ToMulaw(sample);
+    out.writeInt16LE(Math.round(value), i * 2);
   }
 
-  return mulaw;
+  return out;
 }
 
-/**
- * Convert μ-law buffer to Base64 (Twilio requires base64 payload)
- */
-export function mulawToBase64(mulawBuffer) {
-  return mulawBuffer.toString("base64");
+/** Decode μ-law → PCM16 Buffer */
+export function mulawToPCM16(base64) {
+  const ulaw = Buffer.from(base64, "base64");
+  return Buffer.from(mulaw.decode(ulaw));
+}
+
+/** Encode PCM16 → μ-law Buffer */
+export function pcm16ToMulaw(pcm) {
+  return Buffer.from(mulaw.encode(pcm));
 }
