@@ -1,14 +1,14 @@
 // realtime/mediaStreamServer.js
 import { WebSocketServer } from "ws";
 import mulaw from "mulaw-js";
-import { createOpenAIRealtimeSession } from "../utils/ai/openaiSession.js";
+import { createOpenAISession } from "../utils/ai/openaiSession.js";
 import { createElevenLabsStream } from "../utils/voice/elevenlabsStream.js";
 
 const WS_PATH = "/ws/media";
 
-// --------------------------------------------------
-// PCM RESAMPLER — 8k → 16k
-// --------------------------------------------------
+// -----------------------------
+// PCM RESAMPLE 8k → 16k
+// -----------------------------
 function resamplePCM16(buffer, inRate = 8000, outRate = 16000) {
   const inSamples = buffer.length / 2;
   const outSamples = Math.floor(inSamples * (outRate / inRate));
@@ -32,47 +32,45 @@ function resamplePCM16(buffer, inRate = 8000, outRate = 16000) {
 export const attachMediaWebSocketServer = (server) => {
   const wss = new WebSocketServer({ noServer: true });
 
+  // Handle Twilio WS upgrade
   server.on("upgrade", (req, socket, head) => {
     if (req.url.startsWith(WS_PATH)) {
       wss.handleUpgrade(req, socket, head, (ws) =>
         wss.emit("connection", ws, req)
       );
-    } else {
-      socket.destroy();
-    }
+    } else socket.destroy();
   });
 
+  // ---------------------------------------
+  // MAIN TWILIO CONNECTION
+  // ---------------------------------------
   wss.on("connection", async (twilioWs, req) => {
     console.log("🔗 Twilio WebSocket CONNECTED");
 
-    // Parse initial system greeting
     const url = new URL(req.url, `http://${req.headers.host}`);
     const initialPrompt = url.searchParams.get("initialPrompt") || "";
 
-    // ---------------------------
-    // Create NEW OpenAI session
-    // ---------------------------
-    const ai = await createOpenAIRealtimeSession();
+    // OpenAI per-call session
+    const ai = await createOpenAISession();
     console.log("🤖 OpenAI Session Active for Call");
 
-    // ---------------------------
-    // Create ElevenLabs TTS
-    // ---------------------------
+    // ElevenLabs stream
     const eleven = await createElevenLabsStream();
 
     let streamSid = null;
     let audioBuffer = [];
+
     let lastSpeech = Date.now();
     let lastCommit = Date.now();
 
     const VAD_THRESHOLD = 600;
     const SILENCE_MS = 1200;
-    const COMMIT_EVERY_MS = 800;
+    const COMMIT_EVERY_MS = 900;
 
-    // -------------------------------------
-    // INITIAL PROMPT (WELCOME MESSAGE)
-    // -------------------------------------
-    if (initialPrompt.length > 0) {
+    // ---------------------------
+    // SEND INITIAL PROMPT
+    // ---------------------------
+    if (initialPrompt) {
       setTimeout(() => {
         ai.send(
           JSON.stringify({
@@ -83,9 +81,9 @@ export const attachMediaWebSocketServer = (server) => {
       }, 300);
     }
 
-    // ------------------------------
+    // ---------------------------
     // KEEP TWILIO WS ALIVE
-    // ------------------------------
+    // ---------------------------
     const pingInterval = setInterval(() => {
       try {
         twilioWs.ping();
@@ -94,33 +92,30 @@ export const attachMediaWebSocketServer = (server) => {
 
     twilioWs.on("close", () => clearInterval(pingInterval));
 
-    // -------------------------------------
-    // AUTO-FLUSH LOOP
-    // -------------------------------------
+    // ---------------------------
+    // AUTO FLUSH LOOP
+    // ---------------------------
     const flushInterval = setInterval(() => {
       if (audioBuffer.length === 0) return;
 
       const now = Date.now();
-      const longEnough = now - lastCommit > COMMIT_EVERY_MS;
+      const enoughTime = now - lastCommit > COMMIT_EVERY_MS;
       const silent = now - lastSpeech > SILENCE_MS;
 
-      if (longEnough || silent) {
-        flushAudio();
-      }
+      if (enoughTime || silent) flushAudio();
     }, 120);
 
     twilioWs.on("close", () => clearInterval(flushInterval));
 
-    // -------------------------------------
-    // FLUSH AUDIO → OPENAI
-    // -------------------------------------
+    // ---------------------------
+    // FLUSH PCM → OPENAI
+    // ---------------------------
     function flushAudio() {
       if (audioBuffer.length === 0) return;
 
       const combined = Buffer.concat(audioBuffer);
       const base64 = combined.toString("base64");
 
-      // Append
       ai.send(
         JSON.stringify({
           type: "input_audio_buffer.append",
@@ -128,7 +123,6 @@ export const attachMediaWebSocketServer = (server) => {
         })
       );
 
-      // Commit
       ai.send(
         JSON.stringify({
           type: "input_audio_buffer.commit",
@@ -141,43 +135,41 @@ export const attachMediaWebSocketServer = (server) => {
       lastCommit = Date.now();
     }
 
-    // -------------------------------------
-    // HANDLE TWILIO STREAM EVENTS
-    // -------------------------------------
+    // ---------------------------
+    // TWILIO MEDIA
+    // ---------------------------
     twilioWs.on("message", (raw) => {
       let msg;
+
       try {
         msg = JSON.parse(raw);
       } catch {
         return;
       }
 
+      // START
       if (msg.event === "start") {
         streamSid = msg.start.streamSid;
         console.log("🎬 Twilio START — SID:", streamSid);
         return;
       }
 
+      // MEDIA
       if (msg.event === "media") {
         try {
-          // µ-law → PCM16 8kHz
           const mulawBuf = Buffer.from(msg.media.payload, "base64");
-          let pcm = mulaw.decode(mulawBuf);
-          let pcmBuf = Buffer.from(pcm);
+          let pcm8k = Buffer.from(mulaw.decode(mulawBuf));
 
-          // FIX: ensure EVEN number of bytes (no crashes)
-          if (pcmBuf.length % 2 !== 0) {
-            pcmBuf = pcmBuf.slice(0, pcmBuf.length - 1);
+          if (pcm8k.length % 2 !== 0) {
+            pcm8k = pcm8k.slice(0, pcm8k.length - 1);
           }
 
-          // Resample to 16kHz for OpenAI
-          const pcm16k = resamplePCM16(pcmBuf, 8000, 16000);
+          const pcm16k = resamplePCM16(pcm8k);
 
-          // VAD: detect speech
+          // VAD check
           let silent = true;
           for (let i = 0; i < pcm16k.length; i += 2) {
-            const sample = pcm16k.readInt16LE(i);
-            if (Math.abs(sample) > VAD_THRESHOLD) {
+            if (Math.abs(pcm16k.readInt16LE(i)) > VAD_THRESHOLD) {
               silent = false;
               break;
             }
@@ -187,24 +179,26 @@ export const attachMediaWebSocketServer = (server) => {
 
           audioBuffer.push(pcm16k);
         } catch (err) {
-          console.error("❌ MEDIA PROCESS ERROR:", err);
+          console.error("❌ MEDIA ERROR:", err);
         }
 
         return;
       }
 
+      // STOP
       if (msg.event === "stop") {
-        console.log("⛔ STOP received — Final Commit");
+        console.log("⛔ STOP — Final Commit");
         flushAudio();
         return;
       }
     });
 
-    // -------------------------------------
-    // OPENAI → ELEVENLABS (TTS)
-    // -------------------------------------
+    // ---------------------------
+    // OPENAI → ELEVENLABS
+    // ---------------------------
     ai.on("message", (raw) => {
       let evt;
+
       try {
         evt = JSON.parse(raw);
       } catch {
@@ -223,10 +217,10 @@ export const attachMediaWebSocketServer = (server) => {
       }
     });
 
-    // -------------------------------------
-    // ELEVENLABS → TWILIO AUDIO
-    // -------------------------------------
-    eleven.on("message", (audioFrame) => {
+    // ---------------------------
+    // ELEVENLABS → TWILIO
+    // ---------------------------
+    eleven.on("message", (frame) => {
       if (!streamSid) return;
 
       twilioWs.send(
@@ -234,7 +228,7 @@ export const attachMediaWebSocketServer = (server) => {
           event: "media",
           streamSid,
           media: {
-            payload: Buffer.from(audioFrame).toString("base64"),
+            payload: Buffer.from(frame).toString("base64"),
           },
         })
       );
