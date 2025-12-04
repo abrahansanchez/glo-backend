@@ -4,7 +4,7 @@ import { handleIncomingCall } from "../controllers/callController.js";
 
 const router = express.Router();
 
-// Twilio will POST here on every inbound phone call
+// Twilio posts here on EVERY inbound call
 router.post("/", handleIncomingCall);
 
 export default router;

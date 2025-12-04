@@ -15,7 +15,7 @@ import connectDB from "./config/db.js";
 connectDB();
 
 // ---------------------------------------------------------
-// REALTIME TWILIO MEDIA STREAM WEBSOCKET
+// REALTIME TWILIO MEDIA STREAM SERVER
 // ---------------------------------------------------------
 import { attachMediaWebSocketServer } from "./realtime/mediaStreamServer.js";
 
@@ -23,13 +23,13 @@ import { attachMediaWebSocketServer } from "./realtime/mediaStreamServer.js";
 // ROUTES
 // ---------------------------------------------------------
 
-// NEW — TWILIO INBOUND CALL WEBHOOK (FIXES 404 ERROR)
+// Twilio inbound call webhook → RETURNS TWIML
 import voiceWebhook from "./routes/voiceWebhook.js";
 
 // Twilio stream-status route
 import callStreamStatusRoutes from "./routes/callStreamRoutes.js";
 
-// Auth + Barber
+// Auth
 import authRoutes from "./routes/authRoutes.js";
 import profileRoutes from "./routes/profileRoutes.js";
 import adminRoutes from "./routes/adminRoutes.js";
@@ -38,18 +38,21 @@ import adminRoutes from "./routes/adminRoutes.js";
 import numberRoutes from "./routes/numberRoutes.js";
 import cancelRoutes from "./routes/cancelRoutes.js";
 
-// AI CORE
+// AI
 import aiIntentRoutes from "./routes/aiIntentRoutes.js";
 import aiConversationRoutes from "./routes/aiConversationRoutes.js";
 
-// SMS + Notifications
+// SMS
 import smsRoutes from "./routes/smsRoutes.js";
 
-// Business Logic
+// Business logic
 import dashboardRoutes from "./routes/dashboardRoutes.js";
 import availabilityRoutes from "./routes/availabilityRoutes.js";
 import appointmentRoutes from "./routes/appointmentRoutes.js";
 import analyticsRoutes from "./routes/analyticsRoutes.js";
+
+// Voicemail CRUD
+import voiceRoutes from "./routes/voiceRoutes.js";
 
 // ---------------------------------------------------------
 // APP INITIALIZATION
@@ -79,10 +82,10 @@ app.get("/", (req, res) => {
 });
 
 // ---------------------------------------------------------
-// ROUTES (ORDER MATTERS)
+// ROUTES (ORDER MATTERS — DO NOT CHANGE ORDER)
 // ---------------------------------------------------------
 
-// 1️⃣ Twilio incoming phone call webhook (FIXED)
+// 1️⃣ Twilio incoming phone call → TwiML
 app.use("/voice", voiceWebhook);
 
 // 2️⃣ Twilio audio stream status callback
@@ -120,8 +123,11 @@ app.use("/api/appointments", appointmentRoutes);
 // 1️⃣2️⃣ Analytics
 app.use("/api/analytics", analyticsRoutes);
 
+// 1️⃣3️⃣ Voicemail API
+app.use("/api/voicemail", voiceRoutes);
+
 // ---------------------------------------------------------
-// ATTACH WebSocket Media Stream Server
+// ATTACH TWILIO MEDIA STREAM WEBSOCKET SERVER
 // ---------------------------------------------------------
 attachMediaWebSocketServer(server);
 

@@ -10,16 +10,18 @@ router.get("/", async (req, res) => {
     const voicemails = await Voicemail.find().sort({ createdAt: -1 });
     res.json(voicemails);
   } catch (err) {
+    console.error(err);
     res.status(500).json({ error: true });
   }
 });
 
-// DELETE voicemail
+// DELETE voicemail by ID
 router.delete("/:id", async (req, res) => {
   try {
     await Voicemail.findByIdAndDelete(req.params.id);
     res.json({ ok: true });
   } catch (err) {
+    console.error(err);
     res.status(500).json({ error: true });
   }
 });
