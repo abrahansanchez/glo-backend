@@ -1,23 +1,19 @@
-// utils/ai/convoState.js
 import ConversationState from "../../models/ConversationState.js";
 
-/** Load or create */
 export async function loadState(phone, barberId) {
-  let state = await ConversationState.findOne({ phone, barberId });
-  if (!state) state = await ConversationState.create({ phone, barberId });
-  return state;
+  return (
+    await ConversationState.findOne({ phone, barberId })
+  ) || { intent: null, step: null };
 }
 
-/** Reset state */
-export async function resetState(phone, barberId) {
-  await ConversationState.deleteOne({ phone, barberId });
-}
-
-/** Update fields */
 export async function updateState(phone, barberId, updates) {
-  return ConversationState.findOneAndUpdate(
+  return await ConversationState.findOneAndUpdate(
     { phone, barberId },
-    { ...updates, lastMessageAt: new Date() },
-    { new: true }
+    { $set: updates },
+    { new: true, upsert: true }
   );
+}
+
+export async function resetState(phone, barberId) {
+  return await ConversationState.findOneAndDelete({ phone, barberId });
 }
