@@ -44,7 +44,7 @@ import smsRoutes from "./routes/smsRoutes.js";
 
 // Business Logic
 import dashboardRoutes from "./routes/dashboardRoutes.js";
-import voiceRoutes from "./routes/voiceRoutes.js";
+
 import availabilityRoutes from "./routes/availabilityRoutes.js";
 import appointmentRoutes from "./routes/appointmentRoutes.js";
 import analyticsRoutes from "./routes/analyticsRoutes.js";
@@ -106,8 +106,7 @@ app.use("/api/sms", smsRoutes);
 // 8️⃣ Dashboard backend
 app.use("/api/dashboard", dashboardRoutes);
 
-// 9️⃣ Voicemail
-app.use("/api/voice", voiceRoutes);
+
 
 // 🔟 Availability settings
 app.use("/api/barber/availability", availabilityRoutes);
