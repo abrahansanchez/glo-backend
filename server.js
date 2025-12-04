@@ -23,7 +23,10 @@ import { attachMediaWebSocketServer } from "./realtime/mediaStreamServer.js";
 // ROUTES
 // ---------------------------------------------------------
 
-// Twilio stream-status route (ONLY Twilio callback that remains)
+// NEW — TWILIO INBOUND CALL WEBHOOK (FIXES 404 ERROR)
+import voiceWebhook from "./routes/voiceWebhook.js";
+
+// Twilio stream-status route
 import callStreamStatusRoutes from "./routes/callStreamRoutes.js";
 
 // Auth + Barber
@@ -44,7 +47,6 @@ import smsRoutes from "./routes/smsRoutes.js";
 
 // Business Logic
 import dashboardRoutes from "./routes/dashboardRoutes.js";
-
 import availabilityRoutes from "./routes/availabilityRoutes.js";
 import appointmentRoutes from "./routes/appointmentRoutes.js";
 import analyticsRoutes from "./routes/analyticsRoutes.js";
@@ -63,62 +65,63 @@ app.use(express.urlencoded({ extended: false }));
 app.use(cors());
 
 // ---------------------------------------------------------
-// STATIC FILES (MP3, assets, etc.)
+// STATIC FILES
 // ---------------------------------------------------------
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-app.use(express.static(path.join(__dirname, "public")));
+app.use(express.static(path.join(__dirname, "/public")));
 
 // ---------------------------------------------------------
-// HEALTH CHECK (RENDER/TWILIO CHECKS THIS OFTEN)
+// HEALTH CHECK
 // ---------------------------------------------------------
 app.get("/", (req, res) => {
   res.send("🚀 Glō Backend API Running");
 });
 
 // ---------------------------------------------------------
-// ROUTES (ORDER MATTERS — DO NOT MOVE THESE AROUND)
+// ROUTES (ORDER MATTERS)
 // ---------------------------------------------------------
 
-// 1️⃣ Twilio stream-status callback (REQUIRED for media events)
+// 1️⃣ Twilio incoming phone call webhook (FIXED)
+app.use("/voice", voiceWebhook);
+
+// 2️⃣ Twilio audio stream status callback
 app.use("/api/calls", callStreamStatusRoutes);
 
-// 2️⃣ Authentication
+// 3️⃣ Auth
 app.use("/api/auth", authRoutes);
 
-// 3️⃣ Number lifecycle (signup → assign number)
+// 4️⃣ Phone number lifecycle
 app.use("/api/number", numberRoutes);
 
-// 4️⃣ Cancel subscription
+// 5️⃣ Cancel subscription
 app.use("/api/cancel", cancelRoutes);
 
-// 5️⃣ Profile + Admin
+// 6️⃣ Profile + Admin
 app.use("/api/profile", profileRoutes);
 app.use("/api/admin", adminRoutes);
 
-// 6️⃣ AI Logic
+// 7️⃣ AI Logic
 app.use("/api/ai", aiIntentRoutes);
 app.use("/api/ai", aiConversationRoutes);
 
-// 7️⃣ SMS Inbound/Outbound
+// 8️⃣ SMS Inbound/Outbound
 app.use("/api/sms", smsRoutes);
 
-// 8️⃣ Dashboard backend
+// 9️⃣ Dashboard backend
 app.use("/api/dashboard", dashboardRoutes);
-
-
 
 // 🔟 Availability settings
 app.use("/api/barber/availability", availabilityRoutes);
 
-// 1️⃣1️⃣ Appointment CRUD + sync
+// 1️⃣1️⃣ Appointments
 app.use("/api/appointments", appointmentRoutes);
 
 // 1️⃣2️⃣ Analytics
 app.use("/api/analytics", analyticsRoutes);
 
 // ---------------------------------------------------------
-// ATTACH WEBSOCKET MEDIA SERVER (TWILIO REALTIME AUDIO)
+// ATTACH WebSocket Media Stream Server
 // ---------------------------------------------------------
 attachMediaWebSocketServer(server);
 
