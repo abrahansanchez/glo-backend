@@ -1,6 +1,6 @@
 // controllers/callController.js
-import pkg from "twilio";
-const { VoiceResponse } = pkg;
+import twilio from "twilio";
+const VoiceResponse = twilio.twiml.VoiceResponse;
 
 import Barber from "../models/Barber.js";
 
@@ -13,9 +13,7 @@ export const handleIncomingCall = async (req, res) => {
 
     console.log("📟 Normalized Called Number:", cleanNumber);
 
-    const barber = await Barber.findOne({
-      twilioNumber: cleanNumber,
-    });
+    const barber = await Barber.findOne({ twilioNumber: cleanNumber });
 
     if (!barber) {
       console.log("❌ No barber found for number:", cleanNumber);
@@ -32,6 +30,7 @@ export const handleIncomingCall = async (req, res) => {
 
     const DOMAIN = process.env.APP_BASE_URL || req.headers.host;
     const cleanDomain = DOMAIN.replace(/\/$/, "");
+
     console.log("🌍 Cleaned DOMAIN:", cleanDomain);
 
     const wsUrl = `wss://${cleanDomain}/ws/media`;
@@ -46,15 +45,8 @@ export const handleIncomingCall = async (req, res) => {
       statusCallbackMethod: "POST",
     });
 
-    stream.parameter({
-      name: "barberId",
-      value: barber._id.toString(),
-    });
-
-    stream.parameter({
-      name: "initialPrompt",
-      value: initialPrompt,
-    });
+    stream.parameter({ name: "barberId", value: barber._id.toString() });
+    stream.parameter({ name: "initialPrompt", value: initialPrompt });
 
     console.log("📤 Sending TwiML to Twilio...");
     res.type("text/xml").send(response.toString());
