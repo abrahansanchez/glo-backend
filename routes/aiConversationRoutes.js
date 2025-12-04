@@ -1,10 +1,9 @@
+// routes/aiConversationRoutes.js
 import express from "express";
-import { handleAIConversation } from "../controllers/aiConversationController.js";
-import { protect } from "../middleware/authMiddleware.js";
+import { aiConversation } from "../controllers/aiConversationController.js";
 
 const router = express.Router();
 
-// Full conversation route
-router.post("/conversation", protect, express.json({ limit: "2mb" }), handleAIConversation);
+router.post("/conversation", aiConversation);
 
 export default router;

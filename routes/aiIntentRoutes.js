@@ -1,7 +1,9 @@
+// routes/aiIntentRoutes.js
 import express from "express";
-import { handleAIIntent } from "../controllers/aiIntentController.js";
+import { detectAIIntent } from "../controllers/aiIntentController.js";
+
 const router = express.Router();
 
-router.post("/intent", express.json({ limit: "1mb" }), handleAIIntent);
+router.post("/intent", detectAIIntent);
 
 export default router;

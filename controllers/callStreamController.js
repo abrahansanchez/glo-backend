@@ -15,7 +15,7 @@
  * This file is kept ONLY for rollback and legacy safety.
  */
 
-export const handleStreamEvent = async (req, res) => {
+/*export const handleStreamEvent = async (req, res) => {
   console.warn(
     "⚠️ Deprecated callStreamController invoked. V2 realtime WebSocket pipeline is active."
   );
@@ -25,7 +25,7 @@ export const handleStreamEvent = async (req, res) => {
     message:
       "This endpoint (/api/calls/stream) is no longer used. Glō now uses WebSocket media streaming via <Connect><Stream>."
   });
-};
+};*/
 
 /**
  * ****************************************************

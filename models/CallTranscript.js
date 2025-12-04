@@ -41,7 +41,7 @@ const CallTranscriptSchema = new mongoose.Schema(
       ref: "Appointment",
     },
 
-        outcome: {
+    outcome: {
       type: String,
       enum: [
         "BOOKED",
@@ -56,8 +56,7 @@ const CallTranscriptSchema = new mongoose.Schema(
       default: "NO_ACTION",
     },
 
-
-    //  AI-generated call summary
+    // AI-generated call summary
     summary: {
       type: String,
     },
@@ -74,6 +73,15 @@ const CallTranscriptSchema = new mongoose.Schema(
 
     callEndedAt: {
       type: Date,
+    },
+
+    // ✅ NEW FIELDS
+    preferredTimes: {
+      type: String, // e.g. "mornings", "evenings", "fridays"
+    },
+
+    clientName: {
+      type: String, // caller’s name if known
     },
   },
   { timestamps: true }
