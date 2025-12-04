@@ -1,117 +1,84 @@
-import twilio from "twilio";
-import Client from "../models/Client.js";
+// controllers/smsController.js
 import Barber from "../models/Barber.js";
-import { sendTransactionalSMS } from "../utils/sendSMS.js";
-import { isBarberOpen } from "../utils/isOpen.js"; // NEW
+import Client from "../models/Client.js";
+import axios from "axios";
+import { sendSMS } from "../utils/sendSMS.js";
+import { isBarberOpenForSMS } from "../utils/booking/businessRules.js";
 
-const twimlMessagingResponse = twilio.twiml.MessagingResponse;
-
-// Helper
-function getKeyword(body) {
-  if (!body) return null;
-  const trimmed = body.trim().toUpperCase();
-
-  const stopKeywords = ["STOP", "STOPALL", "UNSUBSCRIBE", "CANCEL", "END", "QUIT"];
-  const startKeywords = ["START", "UNSTOP"];
-
-  if (stopKeywords.includes(trimmed)) return "STOP";
-  if (startKeywords.includes(trimmed)) return "START";
-  return null;
-}
-
+/**
+ * Handle inbound SMS messages from Twilio
+ */
 export const handleInboundSMS = async (req, res) => {
   try {
-    const from = req.body.From;
-    const to = req.body.To;
-    const body = req.body.Body;
+    const { From, Body, To } = req.body;
 
-    const keyword = getKeyword(body);
-    const normalizedFrom = Client.normalizePhone(from);
+    const phone = From.replace("+1", "");
+    const barberPhone = To;
+    const message = Body?.trim() || "";
 
-    const barber = await Barber.findOne({ twilioPhoneNumber: to });
-    const barberId = barber?._id;
+    // -----------------------------------------------
+    // 1. Load barber by assigned phone number
+    // -----------------------------------------------
+    const barber = await Barber.findOne({ assignedNumber: barberPhone });
 
-    const twiml = new twimlMessagingResponse();
-
-    // If Twilio number not recognized
-    if (!barberId) {
-      twiml.message("You have reached Glō. This number is not currently active.");
-      return res.type("text/xml").send(twiml.toString());
+    if (!barber) {
+      await sendSMS(phone, "Barber not found.");
+      return res.send("<Response></Response>");
     }
 
-    let client = await Client.findOne({ barberId, phone: normalizedFrom });
+    // -----------------------------------------------
+    // 2. Check business hours (new rule)
+    // -----------------------------------------------
+    const smsAllowed = isBarberOpenForSMS(barber);
+
+    if (!smsAllowed) {
+      await sendSMS(
+        phone,
+        "Hey! The shop is currently closed right now, but I can help you when we reopen. 💈"
+      );
+      return res.send("<Response></Response>");
+    }
+
+    // -----------------------------------------------
+    // 3. Store client profile if new
+    // -----------------------------------------------
+    let client = await Client.findOne({ phone });
 
     if (!client) {
-      client = new Client({
-        barberId,
-        phone: normalizedFrom,
+      client = await Client.create({
+        phone,
+        barberId: barber._id,
       });
     }
 
-    // ---------------------------------------
-    // 1. STOP → Unsubscribe
-    // ---------------------------------------
-    if (keyword === "STOP") {
-      client.isUnsubscribed = true;
-      client.unsubscribedAt = new Date();
-      client.hasConsent = false;
-      await client.save();
+    // -----------------------------------------------
+    // 4. Detect intent from AI microservice
+    // -----------------------------------------------
+    const aiRes = await axios.post(
+      `${process.env.APP_BASE_URL}/api/ai/intent`,
+      { message },
+      { headers: { "Content-Type": "application/json" } }
+    );
 
-      twiml.message(
-        "You have been unsubscribed from Glō messages for this barber. Reply START to re-subscribe."
-      );
-      return res.type("text/xml").send(twiml.toString());
+    const intent = aiRes?.data?.intent || "OTHER";
+
+    // -----------------------------------------------
+    // 5. Respond based on client intent
+    // -----------------------------------------------
+    if (intent === "BOOK") {
+      await sendSMS(phone, "Got you! What day and time would you like to book? 💈");
+    } else if (intent === "RESCHEDULE") {
+      await sendSMS(phone, "No problem! What new date and time works for you? 💈");
+    } else if (intent === "CANCEL") {
+      await sendSMS(phone, "Sure thing! Which appointment do you want to cancel? 💈");
+    } else {
+      await sendSMS(phone, "I got your message! How can I help you today? 💈");
     }
 
-    // ---------------------------------------
-    // 2. START → Re-subscribe
-    // ---------------------------------------
-    if (keyword === "START") {
-      client.isUnsubscribed = false;
-      client.unsubscribedAt = null;
-      client.hasConsent = true;
-      client.consentSource = "inbound_sms";
-      client.consentTimestamp = new Date();
-      client.consentProof.push({
-        source: "inbound_sms",
-        details: { body },
-        timestamp: new Date(),
-      });
-      await client.save();
-
-      twiml.message(
-        "You are now subscribed again to Glō appointment messages for this barber."
-      );
-      return res.type("text/xml").send(twiml.toString());
-    }
-
-    // ---------------------------------------
-    // 3. AFTER-HOURS AUTO-REPLY
-    // ---------------------------------------
-    const { isOpen } = isBarberOpen(barber);
-
-    if (!isOpen) {
-      // MUST include STOP footer for Twilio compliance
-      const msg = `The shop is currently closed, but I can still assist you with booking, rescheduling, or questions. Reply STOP to unsubscribe.`;
-
-      await sendTransactionalSMS({
-        barberId,
-        to: normalizedFrom,
-        baseBody: msg,
-        isFirstMessage: true,
-      });
-
-      return res.status(200).end();
-    }
-
-    // ---------------------------------------
-    // 4. OPEN HOURS → No direct reply (silent)
-    // The AI or dashboard will handle logic later.
-    // ---------------------------------------
-    return res.status(200).end();
+    return res.send("<Response></Response>");
 
   } catch (err) {
-    console.error("Error handling inbound SMS:", err);
-    return res.status(500).send("Error");
+    console.error("❌ SMS Handler Error:", err);
+    return res.send("<Response></Response>");
   }
 };

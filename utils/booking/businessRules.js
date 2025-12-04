@@ -19,7 +19,6 @@ export function getBusinessRules(barber) {
     sameDayCutoffHour: barber?.settings?.sameDayCutoffHour ?? 15,
 
     bufferMinutes: barber?.settings?.bufferMinutes ?? 5,
-
     minNoticeMinutes: barber?.settings?.minNoticeMinutes ?? 60,
 
     timezone: barber?.availability?.timezone ?? "America/New_York",
@@ -31,16 +30,31 @@ export function getBusinessRules(barber) {
       thu: { open: "09:00", close: "18:00" },
       fri: { open: "09:00", close: "18:00" },
       sat: { open: "10:00", close: "16:00" },
-      sun: { isClosed: true }
-    }
+      sun: { isClosed: true },
+    },
   };
 }
 
 /**
- * Determine if barber is open for responding to SMS.
- * For now it's simple, always true.
- * We will upgrade it later to match business hours.
+ * Determine if barber is open for responding to SMS
  */
-export function isBarberOpenForSMS(barberPhone) {
-  return true;
+export function isBarberOpenForSMS(barber) {
+  try {
+    const rules = barber?.availability?.businessHours;
+    if (!rules) return true;
+
+    const now = new Date();
+    const weekday = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"][now.getDay()];
+    const today = rules[weekday];
+
+    // Closed all day
+    if (!today || today.isClosed) return false;
+
+    const current = now.toTimeString().slice(0, 5); // "HH:MM"
+
+    return current >= today.open && current <= today.close;
+  } catch (err) {
+    console.error("Business rules error:", err);
+    return true; // fail-safe: allow SMS
+  }
 }
