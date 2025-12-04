@@ -5,7 +5,9 @@ import Appointment from "../models/Appointment.js";
 import { formatDateSpoken } from "../utils/voice/formatDateSpoken.js";
 
 /**
- * Detect intent: BOOK, CANCEL, RESCHEDULE, INQUIRE, OTHER
+ * 🔍 detectAIIntent
+ * Classifies the intent into:
+ * BOOK, CANCEL, RESCHEDULE, INQUIRE, OTHER
  */
 export const detectAIIntent = async (req, res) => {
   try {
@@ -14,26 +16,27 @@ export const detectAIIntent = async (req, res) => {
     if (!message)
       return res.status(400).json({ ok: false, message: "Missing message" });
 
+    // Pull the user's memory (previous appointments, preferences, etc.)
     const memory = await recallClientMemory(phone, barberId);
 
     const prompt = `
-Classify intent with EXACTLY one word:
+Classify the caller's intent with EXACTLY one word:
 BOOK, CANCEL, RESCHEDULE, INQUIRE, OTHER
 
-Caller message: "${message}"
-Client known info: ${JSON.stringify(memory || {})}
+Caller said: "${message}"
+Known client info: ${JSON.stringify(memory || {})}
 `;
 
     const aiRes = await axios.post(
       "https://api.openai.com/v1/chat/completions",
       {
         model: "gpt-4o-mini",
-        messages: [{ role: "user", content: prompt }],
+        messages: [{ role: "user", content: prompt }]
       },
       {
         headers: {
-          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-        },
+          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`
+        }
       }
     );
 
@@ -44,41 +47,52 @@ Client known info: ${JSON.stringify(memory || {})}
     return res.status(200).json({ ok: true, intent });
   } catch (err) {
     console.error("AI Intent Error:", err);
-    res.status(500).json({ ok: false, message: "AI intent detection failed" });
+    return res.status(500).json({ ok: false, message: "AI intent detection failed" });
   }
 };
-// controllers/aiIntentController.js
-import axios from "axios";
 
+
+/**
+ * 🔍 detectIntent (Structured version)
+ * (This endpoint is still optional—kept for structured responses)
+ */
 export const detectIntent = async (req, res) => {
-  const { message } = req.body;
+  try {
+    const { message } = req.body;
 
-  const { data } = await axios.post(
-    "https://api.openai.com/v1/chat/completions",
-    {
-      model: "gpt-4o-mini",
-      messages: [
-        {
-          role: "system",
-          content:
-            "Extract intent: BOOK, CANCEL, RESCHEDULE, INQUIRE. Also detect if date or time is missing.",
-        },
-        {
-          role: "user",
-          content: message,
-        },
-      ],
-    },
-    {
-      headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
-    }
-  );
+    const { data } = await axios.post(
+      "https://api.openai.com/v1/chat/completions",
+      {
+        model: "gpt-4o-mini",
+        messages: [
+          {
+            role: "system",
+            content:
+              "Extract intent as BOOK, CANCEL, RESCHEDULE, INQUIRE. Also reply whether date or time is missing. Respond strictly in JSON."
+          },
+          {
+            role: "user",
+            content: message
+          }
+        ]
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`
+        }
+      }
+    );
 
-  const parsed = JSON.parse(data.choices[0].message.content);
+    const parsed = JSON.parse(data.choices[0].message.content);
 
-  return res.json({
-    intent: parsed.intent,
-    missingDate: parsed.missingDate,
-    missingTime: parsed.missingTime,
-  });
+    return res.status(200).json({
+      intent: parsed.intent,
+      missingDate: parsed.missingDate,
+      missingTime: parsed.missingTime
+    });
+
+  } catch (err) {
+    console.error("Structured Intent Error:", err);
+    return res.status(500).json({ ok: false, message: "Intent parsing failed" });
+  }
 };
