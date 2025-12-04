@@ -1,36 +1,70 @@
 // controllers/callController.js
-import { VoiceResponse } from "twilio";
+import pkg from "twilio";
+const { VoiceResponse } = pkg;
+
+import Barber from "../models/Barber.js";
 
 export const handleIncomingCall = async (req, res) => {
   try {
     console.log("📞 Incoming Twilio Call (RAW):", req.body);
 
-    // Your Render domain
-    const DOMAIN =
-      process.env.APP_BASE_URL || "https://glo-backend-yaho.onrender.com";
+    const called = req.body.Called || req.body.To;
+    const cleanNumber = called ? called.trim() : null;
 
-    console.log("🌍 Using Media Stream URL:", `${DOMAIN}/ws/media`);
+    console.log("📟 Normalized Called Number:", cleanNumber);
 
-    const twiml = new VoiceResponse();
-
-    // CONNECT <Stream> → Twilio → Your WebSocket → OpenAI
-    const connect = twiml.connect();
-    connect.stream({
-      url: `${DOMAIN}/ws/media`,
-      track: "inbound_track",
+    const barber = await Barber.findOne({
+      twilioNumber: cleanNumber,
     });
 
-    res.type("text/xml");
-    return res.send(twiml.toString());
+    if (!barber) {
+      console.log("❌ No barber found for number:", cleanNumber);
+
+      const twiml = new VoiceResponse();
+      twiml.say("Sorry, this number is not assigned.");
+
+      return res.type("text/xml").send(twiml.toString());
+    }
+
+    console.log("💈 Matched Barber:", barber.name, barber._id.toString());
+
+    const initialPrompt = `You are Glō, the AI receptionist for ${barber.name}. Greet the caller and ask how you can help.`;
+
+    const DOMAIN = process.env.APP_BASE_URL || req.headers.host;
+    const cleanDomain = DOMAIN.replace(/\/$/, "");
+    console.log("🌍 Cleaned DOMAIN:", cleanDomain);
+
+    const wsUrl = `wss://${cleanDomain}/ws/media`;
+
+    const response = new VoiceResponse();
+    const connect = response.connect();
+
+    const stream = connect.stream({
+      url: wsUrl,
+      track: "inbound_track",
+      statusCallback: `https://${cleanDomain}/api/calls/stream-status`,
+      statusCallbackMethod: "POST",
+    });
+
+    stream.parameter({
+      name: "barberId",
+      value: barber._id.toString(),
+    });
+
+    stream.parameter({
+      name: "initialPrompt",
+      value: initialPrompt,
+    });
+
+    console.log("📤 Sending TwiML to Twilio...");
+    res.type("text/xml").send(response.toString());
+
   } catch (error) {
-    console.error("❌ Error in handleIncomingCall:", error);
+    console.error("❌ Error In handleIncomingCall:", error);
 
-    const errorTwiml = `
-      <Response>
-        <Say>We are experiencing issues. Please try again later.</Say>
-      </Response>
-    `;
+    const fallback = new VoiceResponse();
+    fallback.say("We are experiencing issues. Try again later.");
 
-    res.type("text/xml").send(errorTwiml);
+    res.type("text/xml").send(fallback.toString());
   }
 };
