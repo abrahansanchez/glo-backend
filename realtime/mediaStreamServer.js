@@ -5,22 +5,24 @@ import { createOpenAISession } from "../utils/ai/openaiSession.js";
 const WS_PATH = "/ws/media";
 
 /* -----------------------------------------------------
-   🔥 FIXED — WORKING μ-LAW DECODER (Twilio → PCM16)
+   ✔ PROPER μ-LAW DECODER (Twilio → PCM16)
 ------------------------------------------------------ */
-function mulawByteToPcm16(muLawByte) {
+function mulawByteToPcm16(byte) {
   const MULAW_MAX = 0x1FFF;
   const MULAW_BIAS = 33;
 
-  muLawByte = ~muLawByte & 0xFF;
-  let sign = muLawByte & 0x80;
-  let exponent = (muLawByte >> 4) & 0x07;
-  let mantissa = muLawByte & 0x0F;
-  let sample = ((mantissa << 4) + MULAW_BIAS) << (exponent + 3);
+  byte = ~byte & 0xFF;
+  const sign = byte & 0x80;
+  const exponent = (byte >> 4) & 0x07;
+  const mantissa = byte & 0x0F;
+  const sample = ((mantissa << 4) + MULAW_BIAS) << (exponent + 3);
 
   return sign ? (MULAW_BIAS - sample) : (sample - MULAW_BIAS);
 }
 
 function decodeMulaw(buffer) {
+  if (!buffer || buffer.length === 0) return null;
+
   const out = new Int16Array(buffer.length);
   for (let i = 0; i < buffer.length; i++) {
     out[i] = mulawByteToPcm16(buffer[i]);
@@ -29,7 +31,7 @@ function decodeMulaw(buffer) {
 }
 
 /* -----------------------------------------------------
-   ATTACH TWILIO MEDIA STREAM SERVER
+   TWILIO STREAM SERVER
 ------------------------------------------------------ */
 export const attachMediaWebSocketServer = (server) => {
   const wss = new WebSocketServer({ noServer: true });
@@ -54,11 +56,12 @@ export const attachMediaWebSocketServer = (server) => {
     let lastAudio = Date.now();
     const SILENCE_TIMEOUT = 700;
 
-    // Keep WS alive
+    /* Keep WS alive */
     const ping = setInterval(() => {
       try { twilioWs.ping(); } catch {}
     }, 5000);
 
+    /* Flush loop */
     const flushLoop = setInterval(() => {
       if (audioBuffer.length === 0) return;
 
@@ -67,10 +70,21 @@ export const attachMediaWebSocketServer = (server) => {
       }
     }, 120);
 
+    /* -----------------------------------------------------
+       ✔ FIXED: Safe Flush
+    ------------------------------------------------------ */
     function flushAudio() {
       if (audioBuffer.length === 0) return;
 
-      const pcm24 = Buffer.concat(audioBuffer);
+      const safe = audioBuffer.filter(b => Buffer.isBuffer(b));
+
+      if (safe.length === 0) {
+        console.warn("⚠️ flushAudio skipped — no valid buffers");
+        audioBuffer = [];
+        return;
+      }
+
+      const pcm24 = Buffer.concat(safe);
       audioBuffer = [];
 
       ai.send(JSON.stringify({
@@ -81,11 +95,11 @@ export const attachMediaWebSocketServer = (server) => {
       ai.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
       ai.send(JSON.stringify({ type: "response.create" }));
 
-      console.log("📤 Sent speech chunk to OpenAI");
+      console.log("📤 Sent audio chunk → OpenAI");
     }
 
     /* -----------------------------------------------------
-       🔥 FIXED — Incoming Twilio audio
+       INCOMING TWILIO AUDIO
     ------------------------------------------------------ */
     twilioWs.on("message", (message) => {
       try {
@@ -98,14 +112,21 @@ export const attachMediaWebSocketServer = (server) => {
         }
 
         if (msg.event === "media") {
-          // Twilio sends base64 mulaw audio
           const ulaw = Buffer.from(msg.media.payload, "base64");
 
-          // 🔥 FIXED — decode it properly
           const pcm8 = decodeMulaw(ulaw);
+          if (!pcm8 || pcm8.length === 0) {
+            console.warn("❌ Bad μ-law frame skipped.");
+            return;
+          }
 
-          // Resample 8k → 24k
-          const pcm24 = resamplePCM16(pcm8, 8000, 24000);
+          let pcm24;
+          try {
+            pcm24 = resamplePCM16(pcm8, 8000, 24000);
+          } catch (err) {
+            console.warn("❌ Resample failed:", err.message);
+            return;
+          }
 
           audioBuffer.push(pcm24);
           lastAudio = Date.now();
@@ -123,7 +144,7 @@ export const attachMediaWebSocketServer = (server) => {
     });
 
     /* -----------------------------------------------------
-       🔥 OUTGOING AUDIO — OpenAI → Twilio
+       OUTGOING AUDIO — OpenAI → Twilio
     ------------------------------------------------------ */
     ai.on("message", (raw) => {
       let evt;
@@ -132,10 +153,14 @@ export const attachMediaWebSocketServer = (server) => {
       if (evt.type === "response.audio.delta") {
         const pcm24 = Buffer.from(evt.delta, "base64");
 
-        // Downsample 24k → 8k
-        const pcm8 = resamplePCM16(pcm24, 24000, 8000);
+        let pcm8;
+        try {
+          pcm8 = resamplePCM16(pcm24, 24000, 8000);
+        } catch {
+          return;
+        }
 
-        const FRAME = 320; // 20ms @ 8k required
+        const FRAME = 320;
         for (let i = 0; i < pcm8.length; i += FRAME) {
           const chunk = pcm8.slice(i, i + FRAME);
           if (chunk.length < FRAME) break;
