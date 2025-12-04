@@ -16,7 +16,7 @@ export function getBusinessRules(barber) {
     },
 
     allowSameDay: barber?.settings?.allowSameDay ?? false,
-    sameDayCutoffHour: barber?.settings?.sameDayCutoffHour ?? 15, // 3 PM
+    sameDayCutoffHour: barber?.settings?.sameDayCutoffHour ?? 15,
 
     bufferMinutes: barber?.settings?.bufferMinutes ?? 5,
 
@@ -34,4 +34,13 @@ export function getBusinessRules(barber) {
       sun: { isClosed: true }
     }
   };
+}
+
+/**
+ * Determine if barber is open for responding to SMS.
+ * For now it's simple, always true.
+ * We will upgrade it later to match business hours.
+ */
+export function isBarberOpenForSMS(barberPhone) {
+  return true;
 }
