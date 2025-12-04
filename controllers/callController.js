@@ -13,27 +13,35 @@ export const handleIncomingCall = async (req, res) => {
 
     console.log("📟 Normalized Called Number:", cleanNumber);
 
+    // Find Barber
     const barber = await Barber.findOne({ twilioNumber: cleanNumber });
 
     if (!barber) {
       console.log("❌ No barber found for number:", cleanNumber);
-
       const twiml = new VoiceResponse();
       twiml.say("Sorry, this number is not assigned.");
-
       return res.type("text/xml").send(twiml.toString());
     }
 
     console.log("💈 Matched Barber:", barber.name, barber._id.toString());
 
-    const initialPrompt = `You are Glō, the AI receptionist for ${barber.name}. Greet the caller and ask how you can help.`;
+    // Initial AI prompt
+    const initialPrompt = `You are Glō, the AI receptionist for ${barber.name}. Greet the caller politely and ask how you can help.`;
 
-    const DOMAIN = process.env.APP_BASE_URL || req.headers.host;
-    const cleanDomain = DOMAIN.replace(/\/$/, "");
+    // ----------------------------
+    // FIXED DOMAIN SANITIZER
+    // ----------------------------
+    let DOMAIN = process.env.APP_BASE_URL || req.headers.host;
 
-    console.log("🌍 Cleaned DOMAIN:", cleanDomain);
+    // Remove protocol (http:// or https://)
+    DOMAIN = DOMAIN.replace(/(^\w+:|^)\/\//, "");
+    DOMAIN = DOMAIN.replace(/\/$/, "");
 
-    const wsUrl = `wss://${cleanDomain}/ws/media`;
+    console.log("🌍 Cleaned DOMAIN:", DOMAIN);
+
+    // Build URLs
+    const wsUrl = `wss://${DOMAIN}/ws/media`;
+    const statusUrl = `https://${DOMAIN}/api/calls/stream-status`;
 
     const response = new VoiceResponse();
     const connect = response.connect();
@@ -41,22 +49,23 @@ export const handleIncomingCall = async (req, res) => {
     const stream = connect.stream({
       url: wsUrl,
       track: "inbound_track",
-      statusCallback: `https://${cleanDomain}/api/calls/stream-status`,
+      statusCallback: statusUrl,
       statusCallbackMethod: "POST",
     });
 
+    // Pass barber + prompt into stream metadata
     stream.parameter({ name: "barberId", value: barber._id.toString() });
     stream.parameter({ name: "initialPrompt", value: initialPrompt });
 
     console.log("📤 Sending TwiML to Twilio...");
-    res.type("text/xml").send(response.toString());
+    return res.type("text/xml").send(response.toString());
 
   } catch (error) {
     console.error("❌ Error In handleIncomingCall:", error);
 
     const fallback = new VoiceResponse();
-    fallback.say("We are experiencing issues. Try again later.");
+    fallback.say("We are experiencing issues. Please try again later.");
 
-    res.type("text/xml").send(fallback.toString());
+    return res.type("text/xml").send(fallback.toString());
   }
 };
