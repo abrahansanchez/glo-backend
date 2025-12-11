@@ -4,17 +4,19 @@ import twilio from "twilio";
 const router = express.Router();
 
 router.post("/voice", (req, res) => {
-  const response = new twilio.twiml.VoiceResponse();
+  const twiml = new twilio.twiml.VoiceResponse();
 
-  response.pause({ length: 1 });
+  const connect = twiml.connect();
 
-  response.connect().stream({
+  connect.stream({
     url: `${process.env.APP_BASE_URL}/ws/media`,
-    track: "inbound_track",
+    track: "inbound",     // ✅ FIXED — Twilio expects this
+    statusCallback: `${process.env.APP_BASE_URL}/twilio/stream-status`,
+    statusCallbackMethod: "POST"
   });
 
-  res.type("text/xml");
-  res.send(response.toString());
+  res.set("Content-Type", "text/xml");
+  res.send(twiml.toString());
 });
 
 export default router;
