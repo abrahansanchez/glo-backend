@@ -17,7 +17,7 @@ export function createOpenAISession() {
     console.log("🤖 OpenAI Realtime Connected");
 
     //
-    // MAIN SESSION SETTINGS — AUDIO ONLY
+    // UPDATED SESSION SETTINGS — AUDIO ONLY (NO input_text_format)
     //
     ws.send(
       JSON.stringify({
@@ -25,15 +25,13 @@ export function createOpenAISession() {
         session: {
           instructions: SYSTEM_PERSONALITY,
 
-          // AUDIO ONLY
           modalities: ["audio"],
+
           input_audio_format: "pcm16",
           output_audio_format: "pcm16",
 
-          // DISABLE TEXT INPUT — CRITICAL
-          input_text_format: "none",
+          // Removed input_text_format — causes error in new API
 
-          // VAD SPEECH-END DETECTION
           turn_detection: {
             type: "server_vad",
           },
@@ -63,7 +61,7 @@ export function createOpenAISession() {
   });
 
   //
-  // IMPORTANT DEBUG LOGGING
+  // DEBUG EVENTS
   //
   ws.on("message", (raw) => {
     try {
