@@ -17,31 +17,28 @@ export function createOpenAISession() {
     console.log("🤖 OpenAI Realtime Connected");
 
     //
-    // CORE SESSION SETTINGS
+    // MAIN SESSION SETTINGS — AUDIO ONLY
     //
     ws.send(
       JSON.stringify({
         type: "session.update",
         session: {
-          // Your AI's personality and behavior
           instructions: SYSTEM_PERSONALITY,
 
-          // AI IN + OUT: audio only for phone calls
+          // AUDIO ONLY
           modalities: ["audio"],
-
-          // OpenAI expects PCM16 in and out
           input_audio_format: "pcm16",
           output_audio_format: "pcm16",
 
-          // Automatic speaking mode
+          // DISABLE TEXT INPUT — CRITICAL
+          input_text_format: "none",
+
+          // VAD SPEECH-END DETECTION
           turn_detection: {
-            type: "server_vad",  // OpenAI cuts off input when user stops talking
+            type: "server_vad",
           },
 
-          // How the AI speaks
-          voice: "alloy", // (default is fine; alloy has best clarity)
-
-          // Creativity and token limits
+          voice: "alloy",
           temperature: 0.8,
           max_response_output_tokens: 4096,
         },
@@ -49,22 +46,49 @@ export function createOpenAISession() {
     );
 
     //
-    // SEND HEARTBEATS — keeps the ws session alive on Render
+    // RAW WS PING — KEEP CONNECTION ALIVE
     //
-    const heartbeat = setInterval(() => {
-      try {
-        ws.send(JSON.stringify({ type: "ping" }));
-      } catch (err) {
-        clearInterval(heartbeat);
+    const interval = setInterval(() => {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.ping();
+      } else {
+        clearInterval(interval);
       }
     }, 3000);
 
-    ws.on("close", () => clearInterval(heartbeat));
+    ws.on("close", () => {
+      console.log("🔌 OpenAI Session Closed");
+      clearInterval(interval);
+    });
   });
 
-  ws.on("error", (err) => {
-    console.error("❌ OpenAI Session Error:", err.message);
+  //
+  // IMPORTANT DEBUG LOGGING
+  //
+  ws.on("message", (raw) => {
+    try {
+      const evt = JSON.parse(raw);
+
+      if (evt.type === "error") {
+        console.error("❌ OpenAI Error:", evt);
+      }
+
+      if (evt.type === "response.created") {
+        console.log("📡 OpenAI: response created");
+      }
+
+      if (evt.type === "response.audio.delta") {
+        console.log("🔊 OpenAI: audio delta received");
+      }
+
+    } catch {
+      console.log("📥 Non-JSON OpenAI frame");
+    }
   });
+
+  ws.on("error", (err) =>
+    console.error("❌ OpenAI Session Error:", err.message)
+  );
 
   return ws;
 }
