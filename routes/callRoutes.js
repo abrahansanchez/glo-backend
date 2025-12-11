@@ -6,12 +6,15 @@ const router = express.Router();
 router.post("/voice", (req, res) => {
   const twiml = new twilio.twiml.VoiceResponse();
 
+  // Give Twilio time to set up the stream
+  twiml.pause({ length: 1 });
+
   const connect = twiml.connect();
 
   connect.stream({
-    url: `${process.env.APP_BASE_URL}/ws/media`,
-    track: "inbound",     // ✅ FIXED — Twilio expects this
-    statusCallback: `${process.env.APP_BASE_URL}/twilio/stream-status`,
+    url: `wss://${process.env.APP_BASE_URL}/ws/media`,   // MUST be wss://
+    track: "inbound",                                   // VALID per Twilio docs
+    statusCallback: `https://${process.env.APP_BASE_URL}/api/calls/stream-status`,
     statusCallbackMethod: "POST"
   });
 
