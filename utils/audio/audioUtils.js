@@ -1,15 +1,13 @@
 // utils/audio/audioUtils.js
-
-import { encode, decode } from "mulaw-js";
+import { decode, encode } from "mulaw-js";
 
 /**
- * μ-law (base64) → PCM16 Buffer
- * Twilio → Glo backend
+ * μ-law → PCM16 (Twilio → backend)
  */
 export function mulawToPCM16(base64) {
   try {
-    const ulawBuf = Buffer.from(base64, "base64");
-    const pcm16 = decode(ulawBuf); // Int16Array
+    const buf = Buffer.from(base64, "base64");
+    const pcm16 = decode(buf); // Int16Array
     return Buffer.from(pcm16.buffer);
   } catch (err) {
     console.error("❌ mulawToPCM16 error:", err);
@@ -18,8 +16,7 @@ export function mulawToPCM16(base64) {
 }
 
 /**
- * PCM16 Buffer → μ-law Buffer
- * Glo backend → Twilio
+ * PCM16 → μ-law (backend → Twilio)
  */
 export function pcm16ToMulaw(pcm16Buffer) {
   try {
