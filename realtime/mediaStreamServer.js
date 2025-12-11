@@ -1,12 +1,12 @@
 // realtime/mediaStreamServer.js
 import { WebSocketServer } from "ws";
-import { resamplePCM16, pcm16ToMulaw } from "../utils/audio/audioUtils.js";
+import { mulawToPCM16, pcm16ToMulaw } from "../utils/audio/audioUtils.js";
 import { createOpenAISession } from "../utils/ai/openaiSession.js";
 
 const WS_PATH = "/ws/media";
 
 /* -----------------------------------------------------
-   μ-LAW → PCM16 (RELIABLE DECODER)
+   μ-LAW → PCM16 DECODER (using your custom implementation)
 ------------------------------------------------------ */
 function mulawByteToPcm16(byte) {
   byte = ~byte & 0xff;
@@ -34,7 +34,6 @@ function decodeMulaw(buffer) {
 export const attachMediaWebSocketServer = (server) => {
   const wss = new WebSocketServer({ noServer: true });
 
-  // Upgrade from HTTP → WS
   server.on("upgrade", (req, socket, head) => {
     if (req.url.startsWith(WS_PATH)) {
       wss.handleUpgrade(req, socket, head, (ws) =>
@@ -45,15 +44,10 @@ export const attachMediaWebSocketServer = (server) => {
     }
   });
 
-  // Connection START
-  wss.on("connection", async (twilioWs, req) => {
+  wss.on("connection", async (twilioWs) => {
     console.log("🔗 Twilio Media WebSocket Connected");
 
-    // -----------------------------------------
-    // CONNECT TO OPENAI
-    // -----------------------------------------
     const ai = await createOpenAISession();
-
     let aiReady = false;
     let pendingAudio = [];
 
@@ -62,15 +56,11 @@ export const attachMediaWebSocketServer = (server) => {
     let lastAudio = Date.now();
     const SILENCE_TIMEOUT = 500;
 
-    // -----------------------------------------
-    // HANDLE OPENAI READY
-    // -----------------------------------------
     ai.on("open", () => {
       console.log("🤖 OpenAI session READY");
       aiReady = true;
 
-      // Flush buffered audio to OpenAI
-      for (let base64 of pendingAudio) {
+      for (const base64 of pendingAudio) {
         ai.send(
           JSON.stringify({
             type: "input_audio_buffer.append",
@@ -87,46 +77,33 @@ export const attachMediaWebSocketServer = (server) => {
       pendingAudio = [];
     });
 
-    // -----------------------------------------
-    // HEARTBEAT PING (Twilio WebSocket)
-    // -----------------------------------------
     const ping = setInterval(() => {
       try {
         twilioWs.ping();
       } catch {}
     }, 5000);
 
-    // -----------------------------------------
-    // AUTO-FLUSH LOOP (batch PCM → OpenAI)
-    // -----------------------------------------
     const flushLoop = setInterval(() => {
       if (audioBuffer.length === 0) return;
 
       if (Date.now() - lastAudio > SILENCE_TIMEOUT) {
         flushAudio();
       }
-    }, 110);
+    }, 120);
 
-    // -----------------------------------------
-    // FLUSH AUDIO TO OPENAI
-    // -----------------------------------------
     function flushAudio() {
       if (audioBuffer.length === 0) return;
 
       const valid = audioBuffer.filter((b) => Buffer.isBuffer(b));
-
-      if (valid.length === 0) {
-        audioBuffer = [];
-        return;
-      }
-
-      const pcm24 = Buffer.concat(valid);
       audioBuffer = [];
 
-      const base64Audio = pcm24.toString("base64");
+      if (valid.length === 0) return;
+
+      const pcm16 = Buffer.concat(valid);
+
+      const base64Audio = pcm16.toString("base64");
 
       if (!aiReady) {
-        console.log("⏳ Buffering audio: OpenAI not ready yet");
         pendingAudio.push(base64Audio);
         return;
       }
@@ -144,15 +121,11 @@ export const attachMediaWebSocketServer = (server) => {
       console.log("📤 Sent audio chunk → OpenAI");
     }
 
-    // -----------------------------------------
-    // HANDLE INBOUND TWILIO AUDIO
-    // -----------------------------------------
     twilioWs.on("message", (msgString) => {
       let msg;
       try {
         msg = JSON.parse(msgString);
       } catch {
-        console.log("📥 Non-JSON WS frame:", msgString);
         return;
       }
 
@@ -165,18 +138,10 @@ export const attachMediaWebSocketServer = (server) => {
       if (msg.event === "media") {
         const ulawFrame = Buffer.from(msg.media.payload, "base64");
 
-        const pcm8 = decodeMulaw(ulawFrame);
-        if (!pcm8) return;
+        const pcm16 = decodeMulaw(ulawFrame);
+        if (!pcm16) return;
 
-        let pcm24;
-        try {
-          pcm24 = resamplePCM16(pcm8, 8000, 24000);
-        } catch (err) {
-          console.log("❌ Resample error:", err.message);
-          return;
-        }
-
-        audioBuffer.push(pcm24);
+        audioBuffer.push(pcm16);
         lastAudio = Date.now();
         return;
       }
@@ -188,9 +153,11 @@ export const attachMediaWebSocketServer = (server) => {
       }
     });
 
-    // -----------------------------------------
-    // OUTGOING AUDIO (OpenAI → Twilio)
-    // -----------------------------------------
+    /* -----------------------------------------------------
+       OUTGOING AUDIO (OpenAI → Twilio)
+       OpenAI gives PCM16 @ 24k; Twilio needs μ-law @ 8k.
+       We simply downsample by SKIPPING samples.
+------------------------------------------------------ */
     ai.on("message", (raw) => {
       let evt;
       try {
@@ -203,15 +170,17 @@ export const attachMediaWebSocketServer = (server) => {
 
       const pcm24 = Buffer.from(evt.delta, "base64");
 
-      let pcm8;
-      try {
-        pcm8 = resamplePCM16(pcm24, 24000, 8000);
-      } catch (err) {
-        console.log("❌ Outgoing resample error:", err.message);
-        return;
+      // SIMPLE 24k → 8k DOWNSAMPLE (every 3rd sample)
+      const down = new Int16Array(pcm24.length / 6);
+      const view = new Int16Array(pcm24.buffer);
+
+      for (let i = 0, j = 0; i < view.length; i += 3, j++) {
+        down[j] = view[i];
       }
 
-      const FRAME = 320; // Twilio expects 20ms @ 8kHz μ-law
+      const pcm8 = Buffer.from(down.buffer);
+
+      const FRAME = 320; // 20ms audio @ 8000 Hz
 
       for (let i = 0; i < pcm8.length; i += FRAME) {
         const chunk = pcm8.slice(i, i + FRAME);
@@ -229,9 +198,6 @@ export const attachMediaWebSocketServer = (server) => {
       }
     });
 
-    // -----------------------------------------
-    // CLEANUP
-    // -----------------------------------------
     twilioWs.on("close", () => {
       clearInterval(ping);
       clearInterval(flushLoop);
