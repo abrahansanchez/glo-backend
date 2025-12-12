@@ -17,7 +17,6 @@ export const attachMediaWebSocketServer = (server) => {
     console.log("═══════════════════════════════════════════════════");
     console.log("🔄 UPGRADE REQUEST");
     console.log("📍 URL:", requestUrl);
-    console.log("⬆️  Upgrade:", upgradeHeader);
     console.log("═══════════════════════════════════════════════════");
 
     if (upgradeHeader.toLowerCase() !== "websocket") {
@@ -30,17 +29,16 @@ export const attachMediaWebSocketServer = (server) => {
                         requestUrl.startsWith(WS_PATH + "/");
 
     if (pathMatches) {
-      console.log("✅ Path matched! Handling upgrade...");
+      console.log("✅ Path matched!");
       wss.handleUpgrade(req, socket, head, (ws) => {
         wss.emit("connection", ws, req);
       });
     } else {
-      console.log(`❌ Path mismatch: expected "${WS_PATH}", got "${requestUrl}"`);
       socket.destroy();
     }
   });
 
-  wss.on("connection", async (twilioWs, req) => {
+  wss.on("connection", async (twilioWs) => {
     console.log("═══════════════════════════════════════════════════");
     console.log("🔗 TWILIO MEDIA WEBSOCKET CONNECTED");
     console.log("═══════════════════════════════════════════════════");
@@ -48,60 +46,24 @@ export const attachMediaWebSocketServer = (server) => {
     const ai = createOpenAISession();
     let aiReady = false;
     let streamSid = null;
-    let buffer = [];
-    let pending = [];
-    let lastAudio = Date.now();
     let mediaFrameCount = 0;
-    let validPayloadCount = 0;
-
-    const SILENCE_TIMEOUT = 500;
+    let audioSentToAI = 0;
+    let audioReceivedFromAI = 0;
 
     // OpenAI Ready
     ai.on("open", () => {
-      console.log("🤖 OpenAI session READY");
+      console.log("🤖 OpenAI session READY - streaming audio now");
       aiReady = true;
-
-      for (const b64 of pending) {
-        ai.send(JSON.stringify({ type: "input_audio_buffer.append", audio: b64 }));
-      }
-      if (pending.length > 0) {
-        console.log(`📤 Flushed ${pending.length} pending chunks`);
-        ai.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
-        ai.send(JSON.stringify({ type: "response.create" }));
-      }
-      pending = [];
     });
 
     ai.on("error", (err) => console.error("❌ OpenAI Error:", err.message));
 
-    // Keep-alive
+    // Keep-alive ping
     const pingInterval = setInterval(() => {
       if (twilioWs.readyState === twilioWs.OPEN) twilioWs.ping();
     }, 5000);
 
-    // Auto-flush on silence
-    const flushLoop = setInterval(() => {
-      if (buffer.length > 0 && Date.now() - lastAudio > SILENCE_TIMEOUT) flushAudio();
-    }, 120);
-
-    function flushAudio() {
-      if (buffer.length === 0) return;
-      const pcm16 = Buffer.concat(buffer);
-      buffer = [];
-      const base64Audio = pcm16.toString("base64");
-
-      if (!aiReady) {
-        pending.push(base64Audio);
-        return;
-      }
-
-      ai.send(JSON.stringify({ type: "input_audio_buffer.append", audio: base64Audio }));
-      ai.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
-      ai.send(JSON.stringify({ type: "response.create" }));
-      console.log("📤 Sent audio → OpenAI");
-    }
-
-    // Twilio messages
+    // Twilio → OpenAI (stream continuously, no batching)
     twilioWs.on("message", (msgData) => {
       let msg;
       try {
@@ -114,7 +76,6 @@ export const attachMediaWebSocketServer = (server) => {
         console.log("═══════════════════════════════════════════════════");
         console.log("🎬 STREAM START");
         console.log("📞 Stream SID:", streamSid);
-        console.log("🎵 Format:", JSON.stringify(msg.start?.mediaFormat));
         console.log("═══════════════════════════════════════════════════");
         return;
       }
@@ -122,28 +83,32 @@ export const attachMediaWebSocketServer = (server) => {
       if (msg.event === "media") {
         mediaFrameCount++;
         const payload = msg.media?.payload;
-
         if (!payload || payload.length === 0) return;
-
-        if (mediaFrameCount <= 3) {
-          console.log(`🎤 Frame #${mediaFrameCount}: payload=${payload.length} chars`);
-        }
 
         const pcm16 = mulawToPCM16(payload);
         if (!pcm16) return;
 
-        if (validPayloadCount === 0) {
-          console.log("✅ First valid audio decoded! PCM16 bytes:", pcm16.length);
+        if (mediaFrameCount === 1) {
+          console.log("✅ First audio frame decoded:", pcm16.length, "bytes");
         }
-        validPayloadCount++;
-        buffer.push(pcm16);
-        lastAudio = Date.now();
+
+        // Stream directly to OpenAI (no batching!)
+        if (aiReady && ai.readyState === ai.OPEN) {
+          ai.send(JSON.stringify({
+            type: "input_audio_buffer.append",
+            audio: pcm16.toString("base64"),
+          }));
+          audioSentToAI++;
+          
+          if (audioSentToAI === 1) {
+            console.log("📤 First audio chunk sent to OpenAI");
+          }
+        }
         return;
       }
 
       if (msg.event === "stop") {
-        console.log("⛔ STREAM STOP | Frames:", mediaFrameCount, "| Valid:", validPayloadCount);
-        flushAudio();
+        console.log("⛔ STREAM STOP | Frames:", mediaFrameCount, "| Sent to AI:", audioSentToAI);
         return;
       }
     });
@@ -156,8 +121,37 @@ export const attachMediaWebSocketServer = (server) => {
         evt = JSON.parse(text);
       } catch { return; }
 
+      // Log important events
+      if (evt.type === "session.created") {
+        console.log("📋 OpenAI session created");
+      }
+      if (evt.type === "session.updated") {
+        console.log("📋 OpenAI session updated");
+      }
+      if (evt.type === "input_audio_buffer.speech_started") {
+        console.log("🎙️ OpenAI detected speech START");
+      }
+      if (evt.type === "input_audio_buffer.speech_stopped") {
+        console.log("🎙️ OpenAI detected speech STOP");
+      }
+      if (evt.type === "response.created") {
+        console.log("💬 OpenAI generating response...");
+      }
+      if (evt.type === "response.done") {
+        console.log("✅ OpenAI response complete");
+      }
+      if (evt.type === "error") {
+        console.error("❌ OpenAI error:", JSON.stringify(evt.error));
+      }
+
+      // Handle audio response
       if (evt.type !== "response.audio.delta") return;
       if (!streamSid) return;
+
+      audioReceivedFromAI++;
+      if (audioReceivedFromAI === 1) {
+        console.log("🔊 First audio chunk received from OpenAI");
+      }
 
       const pcm24 = Buffer.from(evt.delta, "base64");
       if (pcm24.length === 0) return;
@@ -168,7 +162,7 @@ export const attachMediaWebSocketServer = (server) => {
       for (let i = 0; i < samples8.length; i++) samples8[i] = samples24[i * 3];
 
       const pcm8 = Buffer.from(samples8.buffer, samples8.byteOffset, samples8.byteLength);
-      const FRAME_SIZE = 320;
+      const FRAME_SIZE = 320; // 20ms @ 8kHz
 
       for (let i = 0; i < pcm8.length; i += FRAME_SIZE) {
         const chunk = pcm8.slice(i, i + FRAME_SIZE);
@@ -177,18 +171,19 @@ export const attachMediaWebSocketServer = (server) => {
         const ulaw = pcm16ToMulaw(chunk);
         if (!ulaw) continue;
 
-        twilioWs.send(JSON.stringify({
-          event: "media",
-          streamSid,
-          media: { payload: ulaw.toString("base64") },
-        }));
+        if (twilioWs.readyState === twilioWs.OPEN) {
+          twilioWs.send(JSON.stringify({
+            event: "media",
+            streamSid,
+            media: { payload: ulaw.toString("base64") },
+          }));
+        }
       }
     });
 
     twilioWs.on("close", () => {
-      console.log("📞 Twilio WS closed | Frames:", mediaFrameCount);
+      console.log("📞 Twilio WS closed | Frames:", mediaFrameCount, "| AI audio chunks:", audioReceivedFromAI);
       clearInterval(pingInterval);
-      clearInterval(flushLoop);
       if (ai.readyState === ai.OPEN) ai.close();
     });
 
