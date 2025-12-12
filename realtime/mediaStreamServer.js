@@ -12,15 +12,12 @@ export const attachMediaWebSocketServer = (server) => {
   const wss = new WebSocketServer({ noServer: true });
 
   // ═══════════════════════════════════════════════════════════
-  // HTTP → WebSocket Upgrade Handler (CRITICAL FOR DEBUGGING)
+  // HTTP → WebSocket Upgrade Handler
   // ═══════════════════════════════════════════════════════════
   server.on("upgrade", (req, socket, head) => {
     const requestUrl = req.url || "";
     const upgradeHeader = req.headers.upgrade || "";
-    const connectionHeader = req.headers.connection || "";
     const hostHeader = req.headers.host || "";
-    const originHeader = req.headers.origin || "";
-    const userAgent = req.headers["user-agent"] || "";
 
     console.log("═══════════════════════════════════════════════════");
     console.log("🔄 UPGRADE REQUEST RECEIVED");
@@ -28,10 +25,6 @@ export const attachMediaWebSocketServer = (server) => {
     console.log("📍 URL:", requestUrl);
     console.log("🏠 Host:", hostHeader);
     console.log("⬆️  Upgrade:", upgradeHeader);
-    console.log("🔗 Connection:", connectionHeader);
-    console.log("🌐 Origin:", originHeader);
-    console.log("🤖 User-Agent:", userAgent);
-    console.log("📋 All Headers:", JSON.stringify(req.headers, null, 2));
     console.log("═══════════════════════════════════════════════════");
 
     // Check if this is a WebSocket upgrade
@@ -41,7 +34,7 @@ export const attachMediaWebSocketServer = (server) => {
       return;
     }
 
-    // Check path matching (be more lenient)
+    // Check path matching
     const pathMatches = requestUrl === WS_PATH || 
                         requestUrl.startsWith(WS_PATH + "?") ||
                         requestUrl.startsWith(WS_PATH + "/");
@@ -57,17 +50,6 @@ export const attachMediaWebSocketServer = (server) => {
     } else {
       console.log(`❌ Path mismatch: expected "${WS_PATH}", got "${requestUrl}"`);
       socket.destroy();
-    }
-  });
-
-  // Also log if server gets any 'request' events (for debugging)
-  server.on("request", (req, res) => {
-    if (req.url && req.url.startsWith("/ws")) {
-      console.log("⚠️ HTTP request to WS path (should be upgrade):", {
-        method: req.method,
-        url: req.url,
-        upgrade: req.headers.upgrade,
-      });
     }
   });
 
@@ -97,6 +79,7 @@ export const attachMediaWebSocketServer = (server) => {
     let lastAudio = Date.now();
     let mediaFrameCount = 0;
     let validPayloadCount = 0;
+    let decodeErrorCount = 0;
 
     const SILENCE_TIMEOUT = 500;
 
@@ -180,7 +163,8 @@ export const attachMediaWebSocketServer = (server) => {
     twilioWs.on("message", (msgData) => {
       let msg;
       try {
-        const text = typeof msgData === "string" ? msgData : msgData.toString();
+        // Handle both string and Buffer message types
+        const text = Buffer.isBuffer(msgData) ? msgData.toString("utf8") : String(msgData);
         msg = JSON.parse(text);
       } catch (err) {
         console.log("⚠️ Non-JSON WebSocket message:", err.message);
@@ -223,29 +207,56 @@ export const attachMediaWebSocketServer = (server) => {
           console.log(`🎤 Media frame #${mediaFrameCount}:`, {
             hasPayload: !!(msg.media?.payload),
             payloadLength: msg.media?.payload?.length || 0,
+            payloadType: typeof msg.media?.payload,
             track: msg.media?.track,
           });
         }
 
-        // Guard: Skip frames without valid payload
-        if (!msg.media?.payload || typeof msg.media.payload !== "string" || msg.media.payload.length === 0) {
+        // Extract and validate payload
+        const rawPayload = msg.media?.payload;
+        
+        // Skip frames without valid payload
+        if (rawPayload === undefined || rawPayload === null) {
           if (mediaFrameCount <= 10) {
-            console.warn(`⚠️ Empty payload in frame #${mediaFrameCount}`);
+            console.warn(`⚠️ No payload in frame #${mediaFrameCount}`);
+          }
+          return;
+        }
+
+        // Ensure payload is a string
+        let payloadString;
+        if (typeof rawPayload === "string") {
+          payloadString = rawPayload;
+        } else if (Buffer.isBuffer(rawPayload)) {
+          payloadString = rawPayload.toString("utf8");
+        } else {
+          console.warn(`⚠️ Unexpected payload type: ${typeof rawPayload}`);
+          return;
+        }
+
+        // Skip empty payloads
+        if (payloadString.length === 0) {
+          if (mediaFrameCount <= 10) {
+            console.warn(`⚠️ Empty payload string in frame #${mediaFrameCount}`);
           }
           return;
         }
 
         // Decode μ-law → PCM16
-        const pcm16 = mulawToPCM16(msg.media.payload);
+        const pcm16 = mulawToPCM16(payloadString);
 
         if (!pcm16) {
-          console.log("⚠️ Failed to decode μ-law frame");
+          decodeErrorCount++;
+          if (decodeErrorCount <= 5) {
+            console.log(`⚠️ Failed to decode μ-law frame #${mediaFrameCount} (error ${decodeErrorCount})`);
+          }
           return;
         }
 
         validPayloadCount++;
         if (validPayloadCount === 1) {
           console.log("✅ First VALID audio payload received and decoded!");
+          console.log(`   PCM16 buffer length: ${pcm16.length} bytes`);
         }
 
         buffer.push(pcm16);
@@ -262,6 +273,7 @@ export const attachMediaWebSocketServer = (server) => {
         console.log("═══════════════════════════════════════════════════");
         console.log("📊 Total media frames:", mediaFrameCount);
         console.log("✅ Valid payloads:", validPayloadCount);
+        console.log("❌ Decode errors:", decodeErrorCount);
         console.log("═══════════════════════════════════════════════════");
         flushAudio();
         return;
@@ -286,7 +298,8 @@ export const attachMediaWebSocketServer = (server) => {
     ai.on("message", (raw) => {
       let evt;
       try {
-        evt = JSON.parse(raw);
+        const text = Buffer.isBuffer(raw) ? raw.toString("utf8") : String(raw);
+        evt = JSON.parse(text);
       } catch {
         return;
       }
@@ -299,7 +312,12 @@ export const attachMediaWebSocketServer = (server) => {
         return;
       }
 
+      // Decode base64 PCM16 from OpenAI
       const pcm24 = Buffer.from(evt.delta, "base64");
+
+      if (pcm24.length === 0) {
+        return;
+      }
 
       // Downsample 24kHz → 8kHz (factor of 3)
       const samples24 = new Int16Array(
@@ -313,7 +331,11 @@ export const attachMediaWebSocketServer = (server) => {
         samples8[i] = samples24[i * 3];
       }
 
-      const pcm8 = Buffer.from(samples8.buffer);
+      const pcm8 = Buffer.from(
+        samples8.buffer,
+        samples8.byteOffset,
+        samples8.byteLength
+      );
       
       // 20ms frames for Twilio (160 samples @ 8kHz = 320 bytes)
       const FRAME_SIZE = 320;
@@ -349,6 +371,7 @@ export const attachMediaWebSocketServer = (server) => {
       console.log("📝 Reason:", reason?.toString() || "N/A");
       console.log("📊 Total media frames:", mediaFrameCount);
       console.log("✅ Valid payloads:", validPayloadCount);
+      console.log("❌ Decode errors:", decodeErrorCount);
       console.log("═══════════════════════════════════════════════════");
 
       clearInterval(pingInterval);
