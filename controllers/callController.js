@@ -17,6 +17,7 @@ export const handleIncomingCall = async (req, res) => {
     const barber = await Barber.findOne({ twilioNumber: cleanNumber });
 
     if (!barber) {
+      console.log("⚠️ No barber found for number:", cleanNumber);
       const twiml = new VoiceResponse();
       twiml.say("Sorry, this number is not assigned.");
       return res.type("text/xml").send(twiml.toString());
@@ -45,11 +46,11 @@ export const handleIncomingCall = async (req, res) => {
 
     response.pause({ length: 1 });
 
-    // 🔑 THEN attach Media Stream with track: "inbound"
+    // 🔑 THEN attach Media Stream
     const connect = response.connect();
     const stream = connect.stream({
       url: wsUrl,
-      track: "inbound"  // ✅ RE-ADDED per Twilio docs
+      track: "inbound_track"  // ✅ FIXED: Changed from "inbound" to "inbound_track"
     });
 
     // Metadata passed to WebSocket via start event
