@@ -36,6 +36,8 @@ export const attachMediaWebSocketServer = (server) => {
     let buffer = [];
     let pending = [];
     let lastAudio = Date.now();
+    let mediaFrameCount = 0;
+    let validPayloadCount = 0;
 
     const SILENCE_TIMEOUT = 500;
 
@@ -46,8 +48,13 @@ export const attachMediaWebSocketServer = (server) => {
       console.log("🤖 OpenAI session READY");
       aiReady = true;
 
-      for (let b64 of pending) {
-        ai.send(JSON.stringify({ type: "input_audio_buffer.append", audio: b64 }));
+      for (const b64 of pending) {
+        ai.send(
+          JSON.stringify({
+            type: "input_audio_buffer.append",
+            audio: b64,
+          })
+        );
       }
 
       if (pending.length > 0) {
@@ -59,7 +66,7 @@ export const attachMediaWebSocketServer = (server) => {
     });
 
     /* -----------------------------------------------------
-       SAFETY: PING TWILIO WS
+       SAFETY: KEEP WS ALIVE
     ------------------------------------------------------ */
     const ping = setInterval(() => {
       try {
@@ -89,7 +96,12 @@ export const attachMediaWebSocketServer = (server) => {
         return;
       }
 
-      ai.send(JSON.stringify({ type: "input_audio_buffer.append", audio: base64Audio }));
+      ai.send(
+        JSON.stringify({
+          type: "input_audio_buffer.append",
+          audio: base64Audio,
+        })
+      );
       ai.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
       ai.send(JSON.stringify({ type: "response.create" }));
 
@@ -97,36 +109,74 @@ export const attachMediaWebSocketServer = (server) => {
     }
 
     /* -----------------------------------------------------
-       INBOUND AUDIO (Twilio → Glo)
+       INBOUND AUDIO (Twilio → Glō)
     ------------------------------------------------------ */
-    twilioWs.on("message", (msgString) => {
+    twilioWs.on("message", (msgData) => {
       let msg;
       try {
-        msg = JSON.parse(msgString);
-      } catch {
-        console.log("⚠️ Non-JSON WS message received");
+        const text = typeof msgData === "string" ? msgData : msgData.toString();
+        msg = JSON.parse(text);
+      } catch (err) {
+        console.log("⚠️ Non-JSON WebSocket message:", err.message);
         return;
       }
 
-      // START
+      // START EVENT
       if (msg.event === "start") {
-        streamSid = msg.start.streamSid;
-        console.log("🎬 Stream SID:", streamSid);
+        streamSid = msg.start?.streamSid || null;
+        console.log("🎬 Stream START:", {
+          streamSid,
+          accountSid: msg.start?.accountSid,
+          callSid: msg.start?.callSid,
+          tracks: msg.start?.tracks,
+          mediaFormat: msg.start?.mediaFormat,
+          customParameters: msg.start?.customParameters,
+        });
         return;
       }
 
-      // MEDIA
+      // MEDIA EVENT
       if (msg.event === "media") {
-        if (!msg.media || !msg.media.payload) {
-          console.log("⚠️ Received media event WITHOUT payload (NO AUDIO)");
+        mediaFrameCount++;
+
+        // 🔍 DIAGNOSTIC: Log every 50th frame to avoid log spam
+        if (mediaFrameCount <= 5 || mediaFrameCount % 50 === 0) {
+          console.log(`🎤 Media frame #${mediaFrameCount}:`, {
+            hasMedia: !!msg.media,
+            hasPayload: !!(msg.media && msg.media.payload),
+            payloadLength: msg.media?.payload?.length || 0,
+            payloadType: typeof msg.media?.payload,
+            track: msg.media?.track,
+            timestamp: msg.media?.timestamp,
+            chunk: msg.media?.chunk,
+          });
+        }
+
+        // CRITICAL GUARD: Twilio may send media events WITHOUT audio payload
+        if (
+          !msg.media ||
+          typeof msg.media.payload !== "string" ||
+          msg.media.payload.length === 0
+        ) {
+          if (mediaFrameCount <= 10) {
+            console.warn("⚠️ Media frame without valid payload:", {
+              frameNumber: mediaFrameCount,
+              media: msg.media,
+            });
+          }
           return;
         }
 
         const pcm16 = mulawToPCM16(msg.media.payload);
 
         if (!pcm16) {
-          console.log("⚠️ Failed to decode mulaw frame");
+          console.log("⚠️ Failed to decode μ-law frame");
           return;
+        }
+
+        validPayloadCount++;
+        if (validPayloadCount === 1) {
+          console.log("✅ First VALID audio payload received!");
         }
 
         buffer.push(pcm16);
@@ -134,19 +184,32 @@ export const attachMediaWebSocketServer = (server) => {
         return;
       }
 
-      // STOP
+      // STOP EVENT
       if (msg.event === "stop") {
-        console.log("⛔ Twilio STOP");
+        console.log("⛔ Twilio STOP:", {
+          totalMediaFrames: mediaFrameCount,
+          validPayloads: validPayloadCount,
+          streamSid,
+        });
         flushAudio();
         return;
       }
+
+      // MARK EVENT (optional, for debugging)
+      if (msg.event === "mark") {
+        console.log("📍 Twilio MARK:", msg.mark);
+        return;
+      }
+
+      // UNKNOWN EVENT
+      console.log("❓ Unknown Twilio event:", msg.event);
     });
 
     /* -----------------------------------------------------
        OUTBOUND AUDIO (OpenAI → Twilio)
-       OpenAI gives PCM16 @ 24kHz
-       Twilio needs μ-law @ 8kHz
------------------------------------------------------- */
+       OpenAI: PCM16 @ 24kHz
+       Twilio: μ-law @ 8kHz
+    ------------------------------------------------------ */
     ai.on("message", (raw) => {
       let evt;
       try {
@@ -159,16 +222,20 @@ export const attachMediaWebSocketServer = (server) => {
 
       const pcm24 = Buffer.from(evt.delta, "base64");
 
-      // Downsample 24k → 8kHz (skip 2 samples)
-      const view = new Int16Array(pcm24.buffer);
-      const down = new Int16Array(view.length / 3);
+      // Downsample 24kHz → 8kHz
+      const view = new Int16Array(
+        pcm24.buffer,
+        pcm24.byteOffset,
+        pcm24.length / 2
+      );
+      const down = new Int16Array(Math.floor(view.length / 3));
 
-      for (let i = 0, j = 0; i < view.length; i += 3, j++) {
-        down[j] = view[i];
+      for (let i = 0, j = 0; i < down.length; j++, i++) {
+        down[i] = view[j * 3];
       }
 
       const pcm8 = Buffer.from(down.buffer);
-      const FRAME = 320; // 20ms audio for Twilio
+      const FRAME = 320; // 20ms frame for Twilio (160 samples * 2 bytes)
 
       for (let i = 0; i < pcm8.length; i += FRAME) {
         const chunk = pcm8.slice(i, i + FRAME);
@@ -176,15 +243,17 @@ export const attachMediaWebSocketServer = (server) => {
 
         const ulaw = pcm16ToMulaw(chunk);
         if (!ulaw) {
-          console.log("⚠️ Failed PCM16→μlaw encode");
-          return;
+          console.log("⚠️ Failed PCM16 → μ-law encode");
+          continue;
         }
 
         twilioWs.send(
           JSON.stringify({
             event: "media",
             streamSid,
-            media: { payload: ulaw.toString("base64") },
+            media: {
+              payload: ulaw.toString("base64"),
+            },
           })
         );
       }
@@ -197,7 +266,14 @@ export const attachMediaWebSocketServer = (server) => {
       clearInterval(ping);
       clearInterval(flushLoop);
       ai.close();
-      console.log("📞 Twilio WS Closed");
+      console.log("📞 Twilio WS Closed:", {
+        totalMediaFrames: mediaFrameCount,
+        validPayloads: validPayloadCount,
+      });
+    });
+
+    twilioWs.on("error", (err) => {
+      console.error("❌ Twilio WS Error:", err.message);
     });
   });
 
