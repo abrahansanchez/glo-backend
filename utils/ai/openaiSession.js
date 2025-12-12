@@ -20,35 +20,18 @@ export function createOpenAISession() {
       JSON.stringify({
         type: "session.update",
         session: {
-          instructions: SYSTEM_PERSONALITY,
-
-          // MUST include BOTH for voice calls
+          instructions: `You MUST respond ONLY in English. Never switch to any other language unless explicitly requested.\n\n${SYSTEM_PERSONALITY}`,
           modalities: ["audio", "text"],
-
           input_audio_format: "pcm16",
           output_audio_format: "pcm16",
-
-          turn_detection: {
-            type: "server_vad", 
-          },
-
+          turn_detection: { type: "server_vad" },
           voice: "alloy",
           temperature: 0.8,
           max_response_output_tokens: 4096,
         },
       })
     );
-
-    // Keep the connection alive
-    const heartbeat = setInterval(() => {
-      try {
-        ws.send(JSON.stringify({ type: "ping" }));
-      } catch (err) {
-        clearInterval(heartbeat);
-      }
-    }, 3000);
-
-    ws.on("close", () => clearInterval(heartbeat));
+    // NO ping needed - OpenAI manages the connection
   });
 
   ws.on("error", (err) => {
