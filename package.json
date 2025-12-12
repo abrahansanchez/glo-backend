@@ -22,13 +22,13 @@
     "jsonwebtoken": "^9.0.2",
     "moment-timezone": "^0.6.0",
     "mongoose": "^8.19.2",
-    "mulaw-js": "^1.0.1",
     "multer": "^2.0.2",
     "node-fetch": "^3.3.2",
     "nodemon": "^3.1.10",
     "openai": "^6.9.1",
     "stripe": "^19.1.0",
     "twilio": "^5.10.4",
+    "wavefile": "^11.0.0",
     "ws": "^8.18.3"
   }
 }
