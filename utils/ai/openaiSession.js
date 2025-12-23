@@ -3,10 +3,8 @@ import WebSocket from "ws";
 import { SYSTEM_PERSONALITY } from "./aiPersonality.js";
 
 /**
- * OpenAI Realtime session
- * NOTE:
- * - We keep session defaults safe.
- * - Call-specific prompt + final rules are applied in mediaStreamServer.js on Twilio "start".
+ * Create OpenAI Realtime session.
+ * We use server_vad, but we create responses manually from mediaStreamServer.js.
  */
 export function createOpenAISession() {
   const model = process.env.OPENAI_MODEL;
@@ -31,10 +29,8 @@ export function createOpenAISession() {
           input_audio_format: "pcm16",
           output_audio_format: "pcm16",
 
-          // Enables transcripts so we can see exactly what it heard
           input_audio_transcription: { model: "whisper-1" },
 
-          // We rely on server_vad events; we manually decide when to respond
           turn_detection: {
             type: "server_vad",
             create_response: false,
@@ -42,15 +38,13 @@ export function createOpenAISession() {
 
           voice: "alloy",
 
-          // IMPORTANT: must be >= platform minimum
+          // 🔥 must be >= 0.6 based on your logs
           temperature: 0.7,
 
-          max_response_output_tokens: 260,
+          max_response_output_tokens: 250,
 
           instructions:
-            `You are a phone receptionist.\n` +
-            `Speak ONLY English.\n` +
-            `Be brief. One question at a time.\n\n` +
+            `You are a phone receptionist. Be brief. Ask one question at a time.\n\n` +
             `${SYSTEM_PERSONALITY}`,
         },
       })

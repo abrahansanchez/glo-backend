@@ -5,8 +5,10 @@ import { createOpenAISession } from "../utils/ai/openaiSession.js";
 
 const WS_PATH = "/ws/media";
 
-// 20ms frames @ 8kHz => 320 bytes PCM16
+// Twilio sends 20ms μ-law frames
 const TWILIO_FRAME_MS = 20;
+
+// OpenAI complains if we commit < 100ms
 const MIN_COMMIT_MS = 100;
 const MIN_COMMIT_FRAMES = Math.ceil(MIN_COMMIT_MS / TWILIO_FRAME_MS); // 5 frames
 
@@ -17,9 +19,9 @@ export const attachMediaWebSocketServer = (server) => {
 
   server.on("upgrade", (req, socket, head) => {
     const requestUrl = req.url || "";
-    const upgradeHeader = req.headers.upgrade || "";
+    const upgradeHeader = (req.headers.upgrade || "").toString().toLowerCase();
 
-    if (String(upgradeHeader).toLowerCase() !== "websocket") {
+    if (upgradeHeader !== "websocket") {
       socket.destroy();
       return;
     }
@@ -40,7 +42,9 @@ export const attachMediaWebSocketServer = (server) => {
   });
 
   wss.on("connection", (twilioWs) => {
+    console.log("═══════════════════════════════════════════════════");
     console.log("🔗 TWILIO MEDIA WEBSOCKET CONNECTED");
+    console.log("═══════════════════════════════════════════════════");
 
     const ai = createOpenAISession();
 
@@ -48,27 +52,34 @@ export const attachMediaWebSocketServer = (server) => {
     // Per-call state
     // ----------------------------
     let aiReady = false;
+
     let streamSid = null;
     let callSid = null;
     let barberId = null;
 
     let mediaFrameCount = 0;
+
+    // These track how much audio is appended since last commit
     let framesSinceLastCommit = 0;
 
     let audioSentToAI = 0;
     let audioReceivedFromAI = 0;
 
     let aiResponseInProgress = false;
-    let pendingResponseCreate = false;
 
+    // We'll schedule a response AFTER user stops speaking
+    let pendingUserTurn = false;
+
+    // Greeting is queued until OpenAI is ready AND session.update applied
+    let greetingQueued = false;
+    let greetingSent = false;
+
+    // For debugging what it heard
     let lastUserTranscript = "";
     let lastTranscriptAt = null;
 
-    // 🔑 CRITICAL FIX: queue greeting until OpenAI is ready
-    let pendingGreeting = null;
-
+    // Metrics
     const t0 = Date.now();
-
     const metrics = {
       callSid: null,
       streamSid: null,
@@ -84,41 +95,53 @@ export const attachMediaWebSocketServer = (server) => {
     };
 
     // ----------------------------
-    // OpenAI events
+    // Helpers
     // ----------------------------
-    ai.on("open", () => {
-      console.log("🤖 OpenAI session READY");
-      aiReady = true;
-
-      // 🔥 SEND GREETING NOW (never dropped)
-      if (pendingGreeting) {
-        ai.send(JSON.stringify(pendingGreeting));
-        aiResponseInProgress = true;
-        metrics.turns += 1;
-        pendingGreeting = null;
-      }
-    });
-
-    ai.on("error", (err) => {
-      console.error("❌ OpenAI Error:", err.message);
-    });
-
-    const pingInterval = setInterval(() => {
-      if (twilioWs.readyState === twilioWs.OPEN) {
-        twilioWs.ping();
-      }
-    }, 5000);
+    const canSendAI = () => aiReady && ai.readyState === ai.OPEN;
 
     const sendToAI = (obj) => {
-      if (!aiReady) return false;
-      if (ai.readyState !== ai.OPEN) return false;
+      if (!canSendAI()) return false;
       ai.send(JSON.stringify(obj));
       return true;
     };
 
-    const commitAndRespond = () => {
+    const queueGreeting = () => {
+      greetingQueued = true;
+      trySendGreeting();
+    };
+
+    const trySendGreeting = () => {
+      if (!greetingQueued || greetingSent) return;
+      if (!canSendAI()) return;
+
+      // DO NOT send greeting if AI is currently speaking
       if (aiResponseInProgress) return;
-      if (framesSinceLastCommit < MIN_COMMIT_FRAMES) return;
+
+      const ok = sendToAI({
+        type: "response.create",
+        response: {
+          modalities: ["audio", "text"],
+          instructions: "Greet the caller now. One sentence + a question. Natural.",
+          max_output_tokens: 120,
+        },
+      });
+
+      if (ok) {
+        greetingSent = true;
+        aiResponseInProgress = true;
+        metrics.turns += 1;
+      }
+    };
+
+    // Commit audio safely and request a response
+    const commitAndCreateResponse = () => {
+      // Never create while a response is active
+      if (aiResponseInProgress) return;
+
+      // Hard guard against commit_empty
+      if (framesSinceLastCommit < MIN_COMMIT_FRAMES) {
+        return;
+      }
 
       const committed = sendToAI({ type: "input_audio_buffer.commit" });
       if (!committed) return;
@@ -131,20 +154,56 @@ export const attachMediaWebSocketServer = (server) => {
           modalities: ["audio", "text"],
           instructions:
             `PHONE RULES:\n` +
-            `- NEVER invent dates or times\n` +
-            `- Repeat EXACTLY what caller said\n` +
-            `- Confirm date & time before booking\n\n` +
-            `Last caller transcript: "${lastUserTranscript || "N/A"}"`,
+            `- Never invent dates/times.\n` +
+            `- Ask one question at a time.\n` +
+            `- If booking: require BOTH date and time.\n` +
+            `- Repeat back EXACTLY what caller said then ask YES/NO.\n` +
+            `- If NO: apologize and ask them to repeat date+time.\n\n` +
+            `Last transcript: "${lastUserTranscript || "N/A"}"\n`,
           max_output_tokens: 250,
         },
       });
 
       if (created) {
         aiResponseInProgress = true;
-        pendingResponseCreate = false;
         metrics.turns += 1;
       }
     };
+
+    // Debounced response trigger (prevents commit_empty)
+    let respondTimer = null;
+    const scheduleRespond = () => {
+      pendingUserTurn = true;
+
+      // Wait a moment so we definitely have >=100ms appended
+      if (respondTimer) clearTimeout(respondTimer);
+      respondTimer = setTimeout(() => {
+        respondTimer = null;
+        if (!pendingUserTurn) return;
+        pendingUserTurn = false;
+        commitAndCreateResponse();
+      }, 160); // 160ms > 100ms guard
+    };
+
+    // Keep-alive ping
+    const pingInterval = setInterval(() => {
+      if (twilioWs.readyState === twilioWs.OPEN) twilioWs.ping();
+    }, 5000);
+
+    // ----------------------------
+    // OpenAI events
+    // ----------------------------
+    ai.on("open", () => {
+      console.log("🤖 OpenAI session READY");
+      aiReady = true;
+
+      // If we queued greeting on start, try now.
+      trySendGreeting();
+    });
+
+    ai.on("error", (err) => {
+      console.error("❌ OpenAI Error:", err.message);
+    });
 
     // ----------------------------
     // Twilio → OpenAI
@@ -152,9 +211,10 @@ export const attachMediaWebSocketServer = (server) => {
     twilioWs.on("message", (msgData) => {
       let msg;
       try {
-        msg = JSON.parse(
-          Buffer.isBuffer(msgData) ? msgData.toString("utf8") : msgData
-        );
+        const text = Buffer.isBuffer(msgData)
+          ? msgData.toString("utf8")
+          : String(msgData);
+        msg = JSON.parse(text);
       } catch {
         return;
       }
@@ -170,34 +230,33 @@ export const attachMediaWebSocketServer = (server) => {
         metrics.callSid = callSid;
         metrics.streamSid = streamSid;
 
-        console.log("🎬 STREAM START", streamSid, callSid);
+        console.log("═══════════════════════════════════════════════════");
+        console.log("🎬 STREAM START");
+        console.log("📞 Stream SID:", streamSid);
+        console.log("🧾 Call SID:", callSid);
+        if (barberId) console.log("💈 barberId:", barberId);
+        console.log("═══════════════════════════════════════════════════");
 
-        // Update session instructions
+        // Apply per-call instructions ASAP (if OpenAI ready, it sends now; if not, it will send once ready by openaiSession default + subsequent updates)
+        // We'll still call session.update when AI is ready by simply attempting; if not ready it will no-op and openaiSession already set baseline.
         sendToAI({
           type: "session.update",
           session: {
             instructions:
               `${initialPrompt}\n\n` +
-              `BOOKING RULES:\n` +
-              `- Never invent date/time\n` +
-              `- Ask for missing info\n` +
-              `- Confirm before booking\n`,
-            temperature: 0.7, // 🔥 FIXED (must be >= 0.6)
+              `CRITICAL BOOKING RULES:\n` +
+              `- NEVER invent dates or times.\n` +
+              `- If booking: require BOTH date and time.\n` +
+              `- Repeat back EXACTLY, then ask YES/NO.\n` +
+              `- Only finalize after YES.\n` +
+              `- One question at a time.\n`,
+            temperature: 0.7,
             max_response_output_tokens: 250,
           },
         });
 
-        // 🔥 Queue greeting (DO NOT send yet)
-        pendingGreeting = {
-          type: "response.create",
-          response: {
-            modalities: ["audio", "text"],
-            instructions:
-              "Greet the caller. One sentence + a question. Be natural.",
-            max_output_tokens: 120,
-          },
-        };
-
+        // Queue greeting (it will send once OpenAI is ready)
+        queueGreeting();
         return;
       }
 
@@ -215,21 +274,30 @@ export const attachMediaWebSocketServer = (server) => {
         const pcm16 = mulawToPCM16(payload);
         if (!pcm16) return;
 
-        if (aiReady && ai.readyState === ai.OPEN) {
+        // Append audio to OpenAI
+        if (canSendAI()) {
           const ok = sendToAI({
             type: "input_audio_buffer.append",
             audio: pcm16.toString("base64"),
           });
+
           if (ok) {
             audioSentToAI++;
             metrics.chunksSentToAI = audioSentToAI;
-            framesSinceLastCommit += 1;
+            framesSinceLastCommit++;
+
+            if (audioSentToAI === 1) {
+              console.log("📤 First audio chunk sent to OpenAI");
+            }
           }
         }
+
+        return;
       }
 
       if (msg.event === "stop") {
-        console.log("⛔ STREAM STOP");
+        console.log("⛔ STREAM STOP | Frames:", mediaFrameCount, "| Sent to AI:", audioSentToAI);
+        return;
       }
     });
 
@@ -239,46 +307,106 @@ export const attachMediaWebSocketServer = (server) => {
     ai.on("message", (raw) => {
       let evt;
       try {
-        evt = JSON.parse(
-          Buffer.isBuffer(raw) ? raw.toString("utf8") : raw
-        );
+        const text = Buffer.isBuffer(raw) ? raw.toString("utf8") : String(raw);
+        evt = JSON.parse(text);
       } catch {
         return;
       }
 
+      // Optional: keep a tiny bit of visibility
+      if (evt.type === "session.created") console.log("📋 OpenAI session created");
+      if (evt.type === "session.updated") console.log("📋 OpenAI session updated");
+
+      // Transcripts
+      if (evt.type === "conversation.item.input_audio_transcription.completed") {
+        const transcript = (evt.transcript || "").trim();
+        if (transcript) {
+          lastUserTranscript = transcript;
+          lastTranscriptAt = Date.now();
+          metrics.lastUserTranscript = transcript;
+          console.log("📝 TRANSCRIPT (caller):", transcript);
+        }
+      }
+      if (evt.type === "input_audio_transcription.completed") {
+        const transcript = (evt.transcript || "").trim();
+        if (transcript) {
+          lastUserTranscript = transcript;
+          lastTranscriptAt = Date.now();
+          metrics.lastUserTranscript = transcript;
+          console.log("📝 TRANSCRIPT (caller):", transcript);
+        }
+      }
+
+      // Speech events (server VAD)
       if (evt.type === "input_audio_buffer.speech_started") {
+        console.log("🎙️ OpenAI detected speech START");
         if (aiResponseInProgress) metrics.bargeIns += 1;
+        return;
       }
 
       if (evt.type === "input_audio_buffer.speech_stopped") {
-        pendingResponseCreate = true;
-        commitAndRespond();
+        console.log("🎙️ OpenAI detected speech STOP");
+
+        // If greeting hasn't fired yet, try it now (common if start/open timing is weird)
+        trySendGreeting();
+
+        // Schedule respond (debounced) to avoid commit_empty
+        scheduleRespond();
+        return;
+      }
+
+      if (evt.type === "response.created") {
+        console.log("💬 OpenAI generating response...");
+        aiResponseInProgress = true;
+        return;
       }
 
       if (evt.type === "response.done") {
+        console.log("✅ OpenAI response complete");
         aiResponseInProgress = false;
-        if (pendingResponseCreate) commitAndRespond();
+
+        // after finishing, if greeting still queued and never sent, attempt again
+        trySendGreeting();
+        return;
       }
 
-      if (evt.type !== "response.audio.delta") return;
+      if (evt.type === "error") {
+        console.error("❌ OpenAI error:", JSON.stringify(evt.error));
+        return;
+      }
+
+      // ✅ Accept multiple possible delta event names
+      const isAudioDelta =
+        evt.type === "response.audio.delta" ||
+        evt.type === "response.output_audio.delta";
+
+      if (!isAudioDelta) return;
       if (!streamSid) return;
 
       audioReceivedFromAI++;
       metrics.chunksFromAI = audioReceivedFromAI;
 
-      if (metrics.timeToFirstAIAudioMs === null) {
-        metrics.timeToFirstAIAudioMs = Date.now() - t0;
+      if (audioReceivedFromAI === 1) {
+        console.log("🔊 First audio chunk received from OpenAI");
+        if (metrics.timeToFirstAIAudioMs === null) {
+          metrics.timeToFirstAIAudioMs = Date.now() - t0;
+        }
       }
 
       const pcm24 = Buffer.from(evt.delta, "base64");
-      const samples24 = new Int16Array(pcm24.buffer);
-      const samples8 = new Int16Array(Math.floor(samples24.length / 3));
-      for (let i = 0; i < samples8.length; i++) {
-        samples8[i] = samples24[i * 3];
-      }
+      if (!pcm24.length) return;
 
-      const pcm8 = Buffer.from(samples8.buffer);
-      const FRAME_SIZE = 320;
+      // Downsample 24kHz -> 8kHz (simple decimate)
+      const samples24 = new Int16Array(
+        pcm24.buffer,
+        pcm24.byteOffset,
+        pcm24.length / 2
+      );
+      const samples8 = new Int16Array(Math.floor(samples24.length / 3));
+      for (let i = 0; i < samples8.length; i++) samples8[i] = samples24[i * 3];
+
+      const pcm8 = Buffer.from(samples8.buffer, samples8.byteOffset, samples8.byteLength);
+      const FRAME_SIZE = 320; // 20ms @ 8kHz
 
       for (let i = 0; i < pcm8.length; i += FRAME_SIZE) {
         const chunk = pcm8.slice(i, i + FRAME_SIZE);
@@ -287,20 +415,43 @@ export const attachMediaWebSocketServer = (server) => {
         const ulaw = pcm16ToMulaw(chunk);
         if (!ulaw) continue;
 
-        twilioWs.send(
-          JSON.stringify({
-            event: "media",
-            streamSid,
-            media: { payload: ulaw.toString("base64") },
-          })
-        );
+        if (twilioWs.readyState === twilioWs.OPEN) {
+          twilioWs.send(
+            JSON.stringify({
+              event: "media",
+              streamSid,
+              media: { payload: ulaw.toString("base64") },
+            })
+          );
+        }
       }
     });
 
     twilioWs.on("close", () => {
       clearInterval(pingInterval);
+      if (respondTimer) clearTimeout(respondTimer);
+
       if (ai.readyState === ai.OPEN) ai.close();
-      console.log("📞 Twilio WS closed");
+
+      metrics.durationMs = Date.now() - t0;
+
+      console.log("📞 Twilio WS closed | Frames:", mediaFrameCount, "| AI audio chunks:", audioReceivedFromAI);
+
+      console.log("📊 CALL METRICS SUMMARY:", {
+        callSid: metrics.callSid,
+        streamSid: metrics.streamSid,
+        durationMs: metrics.durationMs,
+        timeToFirstMediaMs: metrics.timeToFirstMediaMs,
+        timeToFirstAIAudioMs: metrics.timeToFirstAIAudioMs,
+        turns: metrics.turns,
+        bargeIns: metrics.bargeIns,
+        framesFromTwilio: metrics.framesFromTwilio,
+        chunksSentToAI: metrics.chunksSentToAI,
+        chunksFromAI: metrics.chunksFromAI,
+        lastUserTranscript: metrics.lastUserTranscript || "",
+        framesSinceLastCommit,
+        lastTranscriptAt,
+      });
     });
 
     twilioWs.on("error", (err) => {
