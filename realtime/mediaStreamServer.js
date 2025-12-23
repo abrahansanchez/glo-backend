@@ -1,6 +1,5 @@
 // realtime/mediaStreamServer.js
 import { WebSocketServer } from "ws";
-import { mulawToPCM16, pcm16ToMulaw } from "../utils/audio/audioUtils.js";
 import { createOpenAISession } from "../utils/ai/openaiSession.js";
 
 const WS_PATH = "/ws/media";
@@ -59,7 +58,7 @@ export const attachMediaWebSocketServer = (server) => {
 
     let mediaFrameCount = 0;
 
-    // These track how much audio is appended since last commit
+    // Tracks how many Twilio frames appended since last commit
     let framesSinceLastCommit = 0;
 
     let audioSentToAI = 0;
@@ -139,9 +138,7 @@ export const attachMediaWebSocketServer = (server) => {
       if (aiResponseInProgress) return;
 
       // Hard guard against commit_empty
-      if (framesSinceLastCommit < MIN_COMMIT_FRAMES) {
-        return;
-      }
+      if (framesSinceLastCommit < MIN_COMMIT_FRAMES) return;
 
       const committed = sendToAI({ type: "input_audio_buffer.commit" });
       if (!committed) return;
@@ -196,8 +193,6 @@ export const attachMediaWebSocketServer = (server) => {
     ai.on("open", () => {
       console.log("🤖 OpenAI session READY");
       aiReady = true;
-
-      // If we queued greeting on start, try now.
       trySendGreeting();
     });
 
@@ -237,8 +232,7 @@ export const attachMediaWebSocketServer = (server) => {
         if (barberId) console.log("💈 barberId:", barberId);
         console.log("═══════════════════════════════════════════════════");
 
-        // Apply per-call instructions ASAP (if OpenAI ready, it sends now; if not, it will send once ready by openaiSession default + subsequent updates)
-        // We'll still call session.update when AI is ready by simply attempting; if not ready it will no-op and openaiSession already set baseline.
+        // Apply per-call instructions
         sendToAI({
           type: "session.update",
           session: {
@@ -255,7 +249,7 @@ export const attachMediaWebSocketServer = (server) => {
           },
         });
 
-        // Queue greeting (it will send once OpenAI is ready)
+        // Queue greeting
         queueGreeting();
         return;
       }
@@ -268,17 +262,15 @@ export const attachMediaWebSocketServer = (server) => {
           metrics.timeToFirstMediaMs = Date.now() - t0;
         }
 
-        const payload = msg.media?.payload;
-        if (!payload) return;
+        const payloadB64 = msg.media?.payload;
+        if (!payloadB64) return;
 
-        const pcm16 = mulawToPCM16(payload);
-        if (!pcm16) return;
-
-        // Append audio to OpenAI
+        // ✅ g711_ulaw end-to-end:
+        // Twilio payload is base64 μ-law bytes. We forward as-is to OpenAI.
         if (canSendAI()) {
           const ok = sendToAI({
             type: "input_audio_buffer.append",
-            audio: pcm16.toString("base64"),
+            audio: payloadB64,
           });
 
           if (ok) {
@@ -296,7 +288,12 @@ export const attachMediaWebSocketServer = (server) => {
       }
 
       if (msg.event === "stop") {
-        console.log("⛔ STREAM STOP | Frames:", mediaFrameCount, "| Sent to AI:", audioSentToAI);
+        console.log(
+          "⛔ STREAM STOP | Frames:",
+          mediaFrameCount,
+          "| Sent to AI:",
+          audioSentToAI
+        );
         return;
       }
     });
@@ -313,7 +310,6 @@ export const attachMediaWebSocketServer = (server) => {
         return;
       }
 
-      // Optional: keep a tiny bit of visibility
       if (evt.type === "session.created") console.log("📋 OpenAI session created");
       if (evt.type === "session.updated") console.log("📋 OpenAI session updated");
 
@@ -347,7 +343,7 @@ export const attachMediaWebSocketServer = (server) => {
       if (evt.type === "input_audio_buffer.speech_stopped") {
         console.log("🎙️ OpenAI detected speech STOP");
 
-        // If greeting hasn't fired yet, try it now (common if start/open timing is weird)
+        // If greeting hasn't fired yet, try it now
         trySendGreeting();
 
         // Schedule respond (debounced) to avoid commit_empty
@@ -364,8 +360,6 @@ export const attachMediaWebSocketServer = (server) => {
       if (evt.type === "response.done") {
         console.log("✅ OpenAI response complete");
         aiResponseInProgress = false;
-
-        // after finishing, if greeting still queued and never sent, attempt again
         trySendGreeting();
         return;
       }
@@ -393,37 +387,17 @@ export const attachMediaWebSocketServer = (server) => {
         }
       }
 
-      const pcm24 = Buffer.from(evt.delta, "base64");
-      if (!pcm24.length) return;
+      const ulawB64 = evt.delta; // ✅ already base64 g711_ulaw bytes
+      if (!ulawB64) return;
 
-      // Downsample 24kHz -> 8kHz (simple decimate)
-      const samples24 = new Int16Array(
-        pcm24.buffer,
-        pcm24.byteOffset,
-        pcm24.length / 2
-      );
-      const samples8 = new Int16Array(Math.floor(samples24.length / 3));
-      for (let i = 0; i < samples8.length; i++) samples8[i] = samples24[i * 3];
-
-      const pcm8 = Buffer.from(samples8.buffer, samples8.byteOffset, samples8.byteLength);
-      const FRAME_SIZE = 320; // 20ms @ 8kHz
-
-      for (let i = 0; i < pcm8.length; i += FRAME_SIZE) {
-        const chunk = pcm8.slice(i, i + FRAME_SIZE);
-        if (chunk.length < FRAME_SIZE) break;
-
-        const ulaw = pcm16ToMulaw(chunk);
-        if (!ulaw) continue;
-
-        if (twilioWs.readyState === twilioWs.OPEN) {
-          twilioWs.send(
-            JSON.stringify({
-              event: "media",
-              streamSid,
-              media: { payload: ulaw.toString("base64") },
-            })
-          );
-        }
+      if (twilioWs.readyState === twilioWs.OPEN) {
+        twilioWs.send(
+          JSON.stringify({
+            event: "media",
+            streamSid,
+            media: { payload: ulawB64 },
+          })
+        );
       }
     });
 
@@ -435,7 +409,12 @@ export const attachMediaWebSocketServer = (server) => {
 
       metrics.durationMs = Date.now() - t0;
 
-      console.log("📞 Twilio WS closed | Frames:", mediaFrameCount, "| AI audio chunks:", audioReceivedFromAI);
+      console.log(
+        "📞 Twilio WS closed | Frames:",
+        mediaFrameCount,
+        "| AI audio chunks:",
+        audioReceivedFromAI
+      );
 
       console.log("📊 CALL METRICS SUMMARY:", {
         callSid: metrics.callSid,

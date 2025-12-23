@@ -4,15 +4,20 @@ import { SYSTEM_PERSONALITY } from "./aiPersonality.js";
 
 /**
  * Create OpenAI Realtime session.
- * We use server_vad, but we create responses manually from mediaStreamServer.js.
+ * IMPORTANT:
+ * - Use telephony-native g711_ulaw to match Twilio Media Streams (8kHz μ-law).
+ * - This drastically improves server_vad turn detection + transcription reliability.
  */
 export function createOpenAISession() {
   const model = process.env.OPENAI_MODEL;
   if (!model) throw new Error("OPENAI_MODEL is missing");
 
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) throw new Error("OPENAI_API_KEY is missing");
+
   const ws = new WebSocket(`wss://api.openai.com/v1/realtime?model=${model}`, {
     headers: {
-      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+      Authorization: `Bearer ${apiKey}`,
       "OpenAI-Beta": "realtime=v1",
     },
   });
@@ -26,14 +31,22 @@ export function createOpenAISession() {
         session: {
           modalities: ["audio", "text"],
 
-          input_audio_format: "pcm16",
-          output_audio_format: "pcm16",
+          // ✅ Match Twilio Media Streams format exactly
+          input_audio_format: "g711_ulaw",
+          output_audio_format: "g711_ulaw",
 
+          // ✅ Enable caller transcription
           input_audio_transcription: { model: "whisper-1" },
 
+          // ✅ Let backend manually create responses (your design)
           turn_detection: {
             type: "server_vad",
             create_response: false,
+
+            // These values are safe defaults for phone calls.
+            // If you still get delayed turns, reduce silence_duration_ms slightly.
+            silence_duration_ms: 450,
+            prefix_padding_ms: 300,
           },
 
           voice: "alloy",
