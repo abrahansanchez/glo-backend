@@ -5,6 +5,11 @@ import { createOpenAISession } from "../utils/ai/openaiSession.js";
 
 const WS_PATH = "/ws/media";
 
+// 20ms frames @ 8kHz => 320 bytes PCM16 (160 samples * 2 bytes)
+const TWILIO_FRAME_MS = 20;
+const MIN_COMMIT_MS = 100; // OpenAI error complains when <100ms
+const MIN_COMMIT_FRAMES = Math.ceil(MIN_COMMIT_MS / TWILIO_FRAME_MS); // 5 frames
+
 export const attachMediaWebSocketServer = (server) => {
   console.log("🔰 attachMediaWebSocketServer() called");
 
@@ -45,111 +50,117 @@ export const attachMediaWebSocketServer = (server) => {
     console.log("🔗 TWILIO MEDIA WEBSOCKET CONNECTED");
     console.log("═══════════════════════════════════════════════════");
 
+    const ai = createOpenAISession();
+
     // ----------------------------
-    // Call metrics (4.95.2)
+    // Per-call state
     // ----------------------------
+    let aiReady = false;
+    let streamSid = null;
+    let callSid = null;
+    let barberId = null;
+
+    let mediaFrameCount = 0;
+    let framesSinceLastCommit = 0;
+
+    let audioSentToAI = 0;
+    let audioReceivedFromAI = 0;
+
+    // Active response gating
+    let aiResponseInProgress = false;
+    let pendingResponseCreate = false;
+
+    // For confirmation enforcement + debugging mishears
+    let lastUserTranscript = "";
+    let lastTranscriptAt = null;
+
+    // Metrics
     const t0 = Date.now();
     const metrics = {
       callSid: null,
       streamSid: null,
-      callStartedAtMs: t0,
-      streamStartedAtMs: null,
-      firstMediaAtMs: null,
-      openaiOpenAtMs: null,
-      firstAudioToOpenAIAtMs: null,
-      firstAudioFromOpenAIAtMs: null,
-      speechStopAtMs: null,
-      responseCreatedAtMs: null,
+      durationMs: 0,
+      timeToFirstMediaMs: null,
+      timeToFirstAIAudioMs: null,
       turns: 0,
       bargeIns: 0,
       framesFromTwilio: 0,
       chunksSentToAI: 0,
       chunksFromAI: 0,
+      lastUserTranscript: "",
     };
 
     // ----------------------------
-    // Session state
+    // OpenAI events
     // ----------------------------
-    let streamSid = null;
-    let callSid = null;
-
-    let barberId = null;
-    let initialPrompt = null;
-
-    let aiReady = false;
-    let aiSpeaking = false; // used for barge-in counting
-    let audioSentToAI = 0;
-    let audioReceivedFromAI = 0;
-
-    // Guard so we don't spam response.create
-    let responseInFlight = false;
-
-    // Create OpenAI session (we will update instructions once we get Twilio start params)
-    const ai = createOpenAISession();
-
     ai.on("open", () => {
-      metrics.openaiOpenAtMs = Date.now();
       console.log("🤖 OpenAI session READY - streaming audio now");
       aiReady = true;
     });
 
-    ai.on("error", (err) => console.error("❌ OpenAI Error:", err.message));
+    ai.on("error", (err) => {
+      console.error("❌ OpenAI Error:", err.message);
+    });
 
-    // Keep-alive ping (Twilio WS)
+    // Keep-alive ping (Twilio WS only)
     const pingInterval = setInterval(() => {
       if (twilioWs.readyState === twilioWs.OPEN) twilioWs.ping();
     }, 5000);
 
     // ----------------------------
-    // Helper: update OpenAI instructions + greet once
+    // Helper: safe send to OpenAI
     // ----------------------------
-    const sendSessionUpdateAndGreet = () => {
-      if (!aiReady || ai.readyState !== ai.OPEN) return;
+    const sendToAI = (obj) => {
+      if (!aiReady) return false;
+      if (ai.readyState !== ai.OPEN) return false;
+      ai.send(JSON.stringify(obj));
+      return true;
+    };
 
-      const enforcement = `
-CRITICAL BOOKING RULES (MUST FOLLOW):
-- You are a receptionist. Be natural, brief.
-- NEVER book anything unless the caller explicitly confirms.
-- Confirmation means: You repeat the exact day + time back to the caller, then ask "Yes or No?"
-- If caller says "no", do NOT book. Ask for a different day/time.
-- If caller gives a day/time (e.g., "Thursday at 4pm"), you must repeat it back and ask to confirm.
-- If caller gives only a day or only a time, ask for the missing piece.
-- Do NOT invent times or dates. Do NOT assume "tomorrow at 10" unless the caller said it.
-`;
+    // ----------------------------
+    // Helper: commit + create response safely
+    // ----------------------------
+    const commitAndRespond = () => {
+      // Do NOT create a new response if one is still speaking
+      if (aiResponseInProgress) return;
 
-      const fullInstructions =
-        `${initialPrompt || "You are Glō, an AI receptionist. Greet the caller politely and ask how you can help."}\n\n` +
-        `Be natural and brief (1 sentence + a question).\n\n` +
-        enforcement;
+      // Do NOT commit empty/too-small buffers
+      if (framesSinceLastCommit < MIN_COMMIT_FRAMES) {
+        // Not enough audio to commit; skip to avoid commit_empty
+        return;
+      }
 
-      ai.send(
-        JSON.stringify({
-          type: "session.update",
-          session: {
-            instructions: fullInstructions,
-            modalities: ["audio", "text"],
-            input_audio_format: "pcm16",
-            output_audio_format: "pcm16",
-            turn_detection: { type: "server_vad" },
-            temperature: 0.6,
-            max_response_output_tokens: 1200,
-          },
-        })
-      );
+      // Commit buffer
+      const committed = sendToAI({ type: "input_audio_buffer.commit" });
+      if (!committed) return;
 
-      // Force a greeting immediately (so we never depend on "silence triggers")
-      ai.send(
-        JSON.stringify({
-          type: "response.create",
-          response: {
-            modalities: ["audio", "text"],
-            instructions: "Greet the caller now (1 sentence), then ask how you can help.",
-          },
-        })
-      );
+      // Reset commit counter
+      framesSinceLastCommit = 0;
 
-      metrics.responseCreatedAtMs = Date.now();
-      responseInFlight = true;
+      // Create response (one at a time)
+      const created = sendToAI({
+        type: "response.create",
+        response: {
+          modalities: ["audio", "text"],
+          // Keep it short for phone
+          instructions:
+            `PHONE RULES (MUST FOLLOW):\n` +
+            `- NEVER invent a date or time.\n` +
+            `- Repeat back EXACTLY what you heard the caller request.\n` +
+            `- If the caller gives a date+time, you must confirm: "Just to confirm, you want <day> at <time>, correct?"\n` +
+            `- If caller says NO, apologize and ask them to restate the date and time.\n` +
+            `- Do not finalize booking unless caller explicitly confirms YES.\n` +
+            `- Ask only ONE question at a time.\n\n` +
+            `Last transcript heard from caller: "${lastUserTranscript || "N/A"}"\n`,
+          max_output_tokens: 250,
+        },
+      });
+
+      if (created) {
+        aiResponseInProgress = true;
+        pendingResponseCreate = false;
+        metrics.turns += 1;
+      }
     };
 
     // ----------------------------
@@ -158,79 +169,117 @@ CRITICAL BOOKING RULES (MUST FOLLOW):
     twilioWs.on("message", (msgData) => {
       let msg;
       try {
-        const text = Buffer.isBuffer(msgData) ? msgData.toString("utf8") : String(msgData);
+        const text = Buffer.isBuffer(msgData)
+          ? msgData.toString("utf8")
+          : String(msgData);
         msg = JSON.parse(text);
       } catch {
         return;
       }
 
       if (msg.event === "start") {
-        streamSid = msg.start?.streamSid;
-        callSid = msg.start?.callSid || msg.start?.callSid;
-        metrics.streamSid = streamSid || null;
-        metrics.callSid = callSid || null;
-        metrics.streamStartedAtMs = Date.now();
+        streamSid = msg.start?.streamSid || null;
+        callSid = msg.start?.callSid || null;
 
-        // Twilio passes <Parameter> values here
-        const params = msg.start?.customParameters || {};
-        barberId = params.barberId || null;
-        initialPrompt = params.initialPrompt || null;
+        // Twilio <Parameter> shows up here:
+        const custom = msg.start?.customParameters || {};
+        barberId = custom.barberId || null;
+        const initialPrompt = custom.initialPrompt || "";
+
+        metrics.callSid = callSid;
+        metrics.streamSid = streamSid;
 
         console.log("═══════════════════════════════════════════════════");
         console.log("🎬 STREAM START");
         console.log("📞 Stream SID:", streamSid);
         console.log("🧾 Call SID:", callSid);
-        console.log("💈 barberId:", barberId);
+        if (barberId) console.log("💈 barberId:", barberId);
         console.log("═══════════════════════════════════════════════════");
 
-        // Once we have the prompt, update the OpenAI session and greet
-        // (If OpenAI isn't open yet, this will run once it is)
-        const tryUpdate = () => {
-          if (aiReady && ai.readyState === ai.OPEN) {
-            sendSessionUpdateAndGreet();
-          } else {
-            setTimeout(tryUpdate, 50);
-          }
-        };
-        tryUpdate();
+        // Apply call-specific instructions NOW
+        // This controls the greeting + booking confirmation behavior.
+        const enforcedInstructions =
+          `${initialPrompt}\n\n` +
+          `CRITICAL BOOKING RULES:\n` +
+          `1) Never invent a date or time.\n` +
+          `2) If the user requests booking, you must ask for date AND time if missing.\n` +
+          `3) If user gives date+time, repeat it back EXACTLY and ask for confirmation.\n` +
+          `4) Only after user says YES, you confirm the appointment.\n` +
+          `5) If user says NO, ask them to repeat the date/time.\n` +
+          `6) One question at a time. Be brief.\n`;
+
+        sendToAI({
+          type: "session.update",
+          session: {
+            instructions: enforcedInstructions,
+            temperature: 0.2,
+            max_response_output_tokens: 250,
+          },
+        });
+
+        // Start by prompting the model to greet immediately
+        // We do it via response.create (no audio commit needed).
+        if (!aiResponseInProgress) {
+          sendToAI({
+            type: "response.create",
+            response: {
+              modalities: ["audio", "text"],
+              instructions:
+                `Greet now. One sentence + a question. Do NOT invent details.`,
+              max_output_tokens: 120,
+            },
+          });
+          aiResponseInProgress = true;
+          metrics.turns += 1;
+        }
 
         return;
       }
 
       if (msg.event === "media") {
-        metrics.framesFromTwilio++;
-        if (!metrics.firstMediaAtMs) metrics.firstMediaAtMs = Date.now();
+        mediaFrameCount++;
+        metrics.framesFromTwilio = mediaFrameCount;
+
+        if (metrics.timeToFirstMediaMs === null) {
+          metrics.timeToFirstMediaMs = Date.now() - t0;
+        }
 
         const payload = msg.media?.payload;
-        if (!payload || payload.length === 0) return;
+        if (!payload) return;
 
-        // Decode μ-law → PCM16
         const pcm16 = mulawToPCM16(payload);
         if (!pcm16) return;
 
-        if (metrics.framesFromTwilio === 1) {
+        if (mediaFrameCount === 1) {
           console.log("✅ First audio frame decoded:", pcm16.length, "bytes");
         }
 
+        // Send to OpenAI continuously
         if (aiReady && ai.readyState === ai.OPEN) {
-          ai.send(
-            JSON.stringify({
-              type: "input_audio_buffer.append",
-              audio: pcm16.toString("base64"),
-            })
-          );
+          const ok = sendToAI({
+            type: "input_audio_buffer.append",
+            audio: pcm16.toString("base64"),
+          });
+          if (ok) {
+            audioSentToAI++;
+            metrics.chunksSentToAI = audioSentToAI;
+            framesSinceLastCommit += 1;
 
-          metrics.chunksSentToAI++;
-          audioSentToAI++;
-
-          if (!metrics.firstAudioToOpenAIAtMs) metrics.firstAudioToOpenAIAtMs = Date.now();
-          if (metrics.chunksSentToAI === 1) console.log("📤 First audio chunk sent to OpenAI");
+            if (audioSentToAI === 1) {
+              console.log("📤 First audio chunk sent to OpenAI");
+            }
+          }
         }
         return;
       }
 
       if (msg.event === "stop") {
-        console.log("⛔ STREAM STOP | Frames:", metrics.framesFromTwilio, "| Sent to AI:", metrics.chunksSentToAI);
+        console.log(
+          "⛔ STREAM STOP | Frames:",
+          mediaFrameCount,
+          "| Sent to AI:",
+          audioSentToAI
+        );
         return;
       }
     });
@@ -247,79 +296,102 @@ CRITICAL BOOKING RULES (MUST FOLLOW):
         return;
       }
 
+      // ---- logging / control events ----
       if (evt.type === "session.created") console.log("📋 OpenAI session created");
       if (evt.type === "session.updated") console.log("📋 OpenAI session updated");
+
+      // Transcription: log EXACTLY what OpenAI heard
+      // Depending on Realtime event names, we handle a couple possibilities.
+      if (evt.type === "conversation.item.input_audio_transcription.completed") {
+        const transcript = evt.transcript?.trim?.() || "";
+        if (transcript) {
+          lastUserTranscript = transcript;
+          lastTranscriptAt = Date.now();
+          metrics.lastUserTranscript = transcript;
+          console.log("📝 TRANSCRIPT (caller):", transcript);
+        }
+      }
+      if (evt.type === "input_audio_transcription.completed") {
+        const transcript = evt.transcript?.trim?.() || "";
+        if (transcript) {
+          lastUserTranscript = transcript;
+          lastTranscriptAt = Date.now();
+          metrics.lastUserTranscript = transcript;
+          console.log("📝 TRANSCRIPT (caller):", transcript);
+        }
+      }
 
       if (evt.type === "input_audio_buffer.speech_started") {
         console.log("🎙️ OpenAI detected speech START");
 
-        // If AI is currently speaking and caller starts speaking => barge-in count
-        if (aiSpeaking) metrics.bargeIns++;
+        // If caller starts speaking while AI is speaking, count as barge-in.
+        // (We will implement full barge-in later; for now, metric only.)
+        if (aiResponseInProgress) {
+          metrics.bargeIns += 1;
+        }
       }
 
       if (evt.type === "input_audio_buffer.speech_stopped") {
         console.log("🎙️ OpenAI detected speech STOP");
-        metrics.speechStopAtMs = Date.now();
 
-        // Every time speech stops, force a response (prevents the "silent after 2nd turn" bug)
-        // Commit buffer + create response, but only if we don't already have one in flight
-        if (aiReady && ai.readyState === ai.OPEN && !responseInFlight) {
-          metrics.turns++;
-          metrics.responseCreatedAtMs = Date.now();
-          responseInFlight = true;
-
-          ai.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
-          ai.send(
-            JSON.stringify({
-              type: "response.create",
-              response: {
-                modalities: ["audio", "text"],
-                instructions:
-                  "Respond naturally and briefly. If the caller provided a day/time, repeat it back and ask to confirm yes/no. If missing info, ask for it.",
-              },
-            })
-          );
-        }
+        // We only respond after speech stops, using commit+response.create safely
+        pendingResponseCreate = true;
+        commitAndRespond();
       }
 
-      if (evt.type === "response.created") console.log("💬 OpenAI generating response...");
+      if (evt.type === "response.created") {
+        console.log("💬 OpenAI generating response...");
+        aiResponseInProgress = true;
+      }
+
       if (evt.type === "response.done") {
         console.log("✅ OpenAI response complete");
-        responseInFlight = false;
-        aiSpeaking = false;
+        aiResponseInProgress = false;
+
+        // If speech stopped while we were mid-response, try to respond now.
+        if (pendingResponseCreate) {
+          commitAndRespond();
+        }
       }
 
       if (evt.type === "error") {
         console.error("❌ OpenAI error:", JSON.stringify(evt.error));
-        responseInFlight = false;
-        aiSpeaking = false;
+
+        // Hard protection: if OpenAI complains about active response,
+        // we wait until response.done clears the flag.
+        // If it complains commit_empty, our commit guard should prevent it next turn.
+        return;
       }
 
-      // Audio delta
+      // ---- audio delta handling ----
       if (evt.type !== "response.audio.delta") return;
       if (!streamSid) return;
 
-      metrics.chunksFromAI++;
       audioReceivedFromAI++;
+      metrics.chunksFromAI = audioReceivedFromAI;
 
-      if (!metrics.firstAudioFromOpenAIAtMs) {
-        metrics.firstAudioFromOpenAIAtMs = Date.now();
+      if (audioReceivedFromAI === 1) {
         console.log("🔊 First audio chunk received from OpenAI");
+        if (metrics.timeToFirstAIAudioMs === null) {
+          metrics.timeToFirstAIAudioMs = Date.now() - t0;
+        }
       }
 
-      aiSpeaking = true;
-
       const pcm24 = Buffer.from(evt.delta, "base64");
-      if (pcm24.length === 0) return;
+      if (!pcm24.length) return;
 
       // Downsample 24kHz → 8kHz
-      const samples24 = new Int16Array(pcm24.buffer, pcm24.byteOffset, pcm24.length / 2);
+      const samples24 = new Int16Array(
+        pcm24.buffer,
+        pcm24.byteOffset,
+        pcm24.length / 2
+      );
       const samples8 = new Int16Array(Math.floor(samples24.length / 3));
       for (let i = 0; i < samples8.length; i++) samples8[i] = samples24[i * 3];
 
       const pcm8 = Buffer.from(samples8.buffer, samples8.byteOffset, samples8.byteLength);
-
       const FRAME_SIZE = 320; // 20ms @ 8kHz
+
       for (let i = 0; i < pcm8.length; i += FRAME_SIZE) {
         const chunk = pcm8.slice(i, i + FRAME_SIZE);
         if (chunk.length < FRAME_SIZE) break;
@@ -342,48 +414,37 @@ CRITICAL BOOKING RULES (MUST FOLLOW):
     twilioWs.on("close", () => {
       clearInterval(pingInterval);
 
-      // Metrics summary
-      const end = Date.now();
-      const durationMs = end - metrics.callStartedAtMs;
+      if (ai.readyState === ai.OPEN) ai.close();
 
-      const timeToFirstMediaMs = metrics.firstMediaAtMs
-        ? metrics.firstMediaAtMs - metrics.streamStartedAtMs
-        : null;
-
-      const timeToFirstAIAudioMs = metrics.firstAudioFromOpenAIAtMs
-        ? metrics.firstAudioFromOpenAIAtMs - metrics.streamStartedAtMs
-        : null;
-
-      const speechEndToAudioStartMs =
-        metrics.speechStopAtMs && metrics.firstAudioFromOpenAIAtMs
-          ? metrics.firstAudioFromOpenAIAtMs - metrics.speechStopAtMs
-          : null;
+      metrics.durationMs = Date.now() - t0;
 
       console.log(
         "📞 Twilio WS closed | Frames:",
-        metrics.framesFromTwilio,
+        mediaFrameCount,
         "| AI audio chunks:",
-        metrics.chunksFromAI
+        audioReceivedFromAI
       );
 
       console.log("📊 CALL METRICS SUMMARY:", {
         callSid: metrics.callSid,
         streamSid: metrics.streamSid,
-        durationMs,
-        timeToFirstMediaMs,
-        timeToFirstAIAudioMs,
-        speechEndToAudioStartMs,
+        durationMs: metrics.durationMs,
+        timeToFirstMediaMs: metrics.timeToFirstMediaMs,
+        timeToFirstAIAudioMs: metrics.timeToFirstAIAudioMs,
         turns: metrics.turns,
         bargeIns: metrics.bargeIns,
         framesFromTwilio: metrics.framesFromTwilio,
         chunksSentToAI: metrics.chunksSentToAI,
         chunksFromAI: metrics.chunksFromAI,
+        lastUserTranscript: metrics.lastUserTranscript || "",
+        framesSinceLastCommit,
+        lastTranscriptAt,
       });
-
-      if (ai.readyState === ai.OPEN) ai.close();
     });
 
-    twilioWs.on("error", (err) => console.error("❌ Twilio WS Error:", err.message));
+    twilioWs.on("error", (err) => {
+      console.error("❌ Twilio WS Error:", err.message);
+    });
   });
 
   console.log(`🎧 Media WebSocket Ready → ${WS_PATH}`);

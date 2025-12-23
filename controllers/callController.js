@@ -1,5 +1,4 @@
 // controllers/callController.js
-
 import twilio from "twilio";
 import Barber from "../models/Barber.js";
 
@@ -25,10 +24,14 @@ export const handleIncomingCall = async (req, res) => {
 
     console.log("💈 Matched Barber:", barber.name, barber._id.toString());
 
+    // Later we’ll enforce barber language here (4.95.6).
     const initialPrompt =
-      `You are Glō, the AI receptionist for ${barber.name}. ` +
-      `Greet the caller politely and ask how you can help. ` +
-      `Be natural and brief (1 sentence + a question).`;
+      `You are Glō, the AI receptionist for ${barber.name}.\n` +
+      `When you answer:\n` +
+      `- Say: "Thanks for calling Glō. This is ${barber.name}'s AI receptionist. How can I help you today?"\n` +
+      `- Be natural and brief (1 sentence + a question).\n` +
+      `- NEVER invent dates or times.\n` +
+      `- If booking: require BOTH date and time, repeat back EXACTLY, then confirm YES before finalizing.\n`;
 
     let DOMAIN = process.env.APP_BASE_URL || req.headers.host;
     DOMAIN = DOMAIN.replace(/(^\w+:|^)\/\//, "").replace(/\/$/, "");
@@ -38,7 +41,6 @@ export const handleIncomingCall = async (req, res) => {
 
     const response = new VoiceResponse();
 
-    // ✅ Stream immediately — AI will be the first voice now
     const connect = response.connect();
     const stream = connect.stream({
       url: wsUrl,
