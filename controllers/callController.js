@@ -27,33 +27,24 @@ export const handleIncomingCall = async (req, res) => {
 
     const initialPrompt =
       `You are Glō, the AI receptionist for ${barber.name}. ` +
-      `Greet the caller politely and ask how you can help.`;
+      `Greet the caller politely and ask how you can help. ` +
+      `Be natural and brief (1 sentence + a question).`;
 
     let DOMAIN = process.env.APP_BASE_URL || req.headers.host;
     DOMAIN = DOMAIN.replace(/(^\w+:|^)\/\//, "").replace(/\/$/, "");
 
     const wsUrl = `wss://${DOMAIN}/ws/media`;
-
     console.log("🌐 WebSocket URL:", wsUrl);
 
     const response = new VoiceResponse();
 
-    // 🔑 CRITICAL: establish audio path FIRST with <Say>
-    response.say(
-      { voice: "Polly.Joanna" },
-      "Please hold while I connect you."
-    );
-
-    response.pause({ length: 1 });
-
-    // 🔑 THEN attach Media Stream
+    // ✅ Stream immediately — AI will be the first voice now
     const connect = response.connect();
     const stream = connect.stream({
       url: wsUrl,
-      track: "inbound_track"  // ✅ FIXED: Changed from "inbound" to "inbound_track"
+      track: "inbound_track",
     });
 
-    // Metadata passed to WebSocket via start event
     stream.parameter({ name: "barberId", value: barber._id.toString() });
     stream.parameter({ name: "initialPrompt", value: initialPrompt });
 
@@ -61,7 +52,6 @@ export const handleIncomingCall = async (req, res) => {
     console.log("📤 Sending TwiML to Twilio:\n", twimlOutput);
 
     return res.type("text/xml").send(twimlOutput);
-
   } catch (error) {
     console.error("❌ Error in handleIncomingCall:", error);
 

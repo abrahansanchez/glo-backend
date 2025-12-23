@@ -39,60 +39,89 @@ export const attachMediaWebSocketServer = (server) => {
     }
   });
 
-  wss.on("connection", async (twilioWs, req) => {
+  wss.on("connection", async (twilioWs) => {
     console.log("═══════════════════════════════════════════════════");
     console.log("🔗 TWILIO MEDIA WEBSOCKET CONNECTED");
     console.log("═══════════════════════════════════════════════════");
 
-    // -----------------------------
-    // 4.95.2 CALL-LEVEL METRICS LOGGING (NO BEHAVIOR CHANGES)
-    // -----------------------------
-    const callMetrics = {
-      callSid: null,
-      streamSid: null,
-
-      timestamps: {
-        callStart: Date.now(),
-        streamStart: null,
-        firstMediaIn: null,
-        openAIConnected: null,
-        firstAudioSentToAI: null,
-        firstAudioFromAI: null,
-        callEnd: null,
-      },
-
-      counts: {
-        turns: 0, // counts caller turns (speech_stopped)
-        bargeIns: 0, // counts speech_started events (we'll refine later in 4.95.4)
-      },
-
-      // Used to compute speech_end -> AI_audio_start delta
-      lastSpeechStopTs: null,
-    };
-
-    // Optional: attempt to capture CallSid from querystring if you ever pass it
-    // (Twilio Media Streams does not include CallSid in WS URL by default)
-    try {
-      const u = new URL(req?.url || "", "http://localhost");
-      callMetrics.callSid = u.searchParams.get("CallSid") || null;
-    } catch {
-      // ignore
-    }
-
     const ai = createOpenAISession();
     let aiReady = false;
+
+    // Twilio stream/session state
     let streamSid = null;
+    let callSid = null;
+    let initialPrompt = null;
+
+    // Counters
     let mediaFrameCount = 0;
     let audioSentToAI = 0;
     let audioReceivedFromAI = 0;
+
+    // Greeting state
+    let greetingSent = false;
+
+    // ===== Metrics (4.95.2) =====
+    const t0_callStart = Date.now();
+    let t_streamStart = null;
+    let t_firstMedia = null;
+    let t_aiReady = null;
+    let t_firstAudioToAI = null;
+    let t_speechStopped = null;
+    let t_firstAIAudio = null;
+
+    let turns = 0;
+    let bargeIns = 0; // NOTE: true barge-in polish comes later; we still count speech_started events.
+    let lastSpeechStartAt = null;
+    let awaitingAIAudioAfterSpeechStop = false;
+
+    const summarizeMetrics = () => {
+      const now = Date.now();
+      const summary = {
+        callSid,
+        streamSid,
+        durationMs: now - t0_callStart,
+        timeToFirstMediaMs: t_firstMedia ? (t_firstMedia - (t_streamStart ?? t0_callStart)) : null,
+        timeToFirstAIAudioMs: t_firstAIAudio ? (t_firstAIAudio - (t_streamStart ?? t0_callStart)) : null,
+        turns,
+        bargeIns,
+        framesFromTwilio: mediaFrameCount,
+        chunksSentToAI: audioSentToAI,
+        chunksFromAI: audioReceivedFromAI,
+      };
+
+      console.log("📊 CALL METRICS SUMMARY:", summary);
+    };
+
+    const maybeSendGreeting = () => {
+      if (!aiReady) return;
+      if (!streamSid) return;
+      if (greetingSent) return;
+      if (ai.readyState !== ai.OPEN) return;
+
+      const prompt =
+        initialPrompt ||
+        "You are Glō, the AI receptionist. Greet the caller politely and ask how you can help. Be brief.";
+
+      // ✅ Force the greeting immediately so caller hears AI first
+      ai.send(
+        JSON.stringify({
+          type: "response.create",
+          response: {
+            modalities: ["audio", "text"],
+            instructions: prompt,
+          },
+        })
+      );
+
+      greetingSent = true;
+    };
 
     // OpenAI Ready
     ai.on("open", () => {
       console.log("🤖 OpenAI session READY - streaming audio now");
       aiReady = true;
-
-      // Metrics
-      callMetrics.timestamps.openAIConnected = Date.now();
+      t_aiReady = Date.now();
+      maybeSendGreeting();
     });
 
     ai.on("error", (err) => console.error("❌ OpenAI Error:", err.message));
@@ -102,47 +131,39 @@ export const attachMediaWebSocketServer = (server) => {
       if (twilioWs.readyState === twilioWs.OPEN) twilioWs.ping();
     }, 5000);
 
-    // Twilio → OpenAI (stream continuously, no batching)
+    // Twilio → OpenAI
     twilioWs.on("message", (msgData) => {
       let msg;
       try {
-        const text = Buffer.isBuffer(msgData)
-          ? msgData.toString("utf8")
-          : String(msgData);
+        const text = Buffer.isBuffer(msgData) ? msgData.toString("utf8") : String(msgData);
         msg = JSON.parse(text);
       } catch {
         return;
       }
 
       if (msg.event === "start") {
-        streamSid = msg.start?.streamSid;
-        callMetrics.streamSid = streamSid;
-        callMetrics.timestamps.streamStart = Date.now();
+        streamSid = msg.start?.streamSid || null;
+        callSid = msg.start?.callSid || null;
+        const params = msg.start?.customParameters || {};
+        initialPrompt = params.initialPrompt || null;
 
-        // Twilio start includes custom parameters; CallSid is NOT always present here.
-        // We'll still try to log anything useful.
-        const callSidFromStart =
-          msg.start?.callSid ||
-          msg.start?.customParameters?.CallSid ||
-          msg.start?.customParameters?.callSid;
-
-        if (callSidFromStart) callMetrics.callSid = callSidFromStart;
+        t_streamStart = Date.now();
 
         console.log("═══════════════════════════════════════════════════");
         console.log("🎬 STREAM START");
         console.log("📞 Stream SID:", streamSid);
-        if (callMetrics.callSid) console.log("🧾 Call SID:", callMetrics.callSid);
+        console.log("🧾 Call SID:", callSid);
         console.log("═══════════════════════════════════════════════════");
+
+        // If OpenAI already connected, greet immediately
+        maybeSendGreeting();
         return;
       }
 
       if (msg.event === "media") {
         mediaFrameCount++;
 
-        // Metrics: first inbound audio frame timestamp
-        if (!callMetrics.timestamps.firstMediaIn) {
-          callMetrics.timestamps.firstMediaIn = Date.now();
-        }
+        if (!t_firstMedia) t_firstMedia = Date.now();
 
         const payload = msg.media?.payload;
         if (!payload || payload.length === 0) return;
@@ -154,12 +175,9 @@ export const attachMediaWebSocketServer = (server) => {
           console.log("✅ First audio frame decoded:", pcm16.length, "bytes");
         }
 
-        // Stream directly to OpenAI (no batching!)
+        // Stream directly to OpenAI
         if (aiReady && ai.readyState === ai.OPEN) {
-          // Metrics: first audio chunk sent to OpenAI
-          if (!callMetrics.timestamps.firstAudioSentToAI) {
-            callMetrics.timestamps.firstAudioSentToAI = Date.now();
-          }
+          if (!t_firstAudioToAI) t_firstAudioToAI = Date.now();
 
           ai.send(
             JSON.stringify({
@@ -178,12 +196,7 @@ export const attachMediaWebSocketServer = (server) => {
       }
 
       if (msg.event === "stop") {
-        console.log(
-          "⛔ STREAM STOP | Frames:",
-          mediaFrameCount,
-          "| Sent to AI:",
-          audioSentToAI
-        );
+        console.log("⛔ STREAM STOP | Frames:", mediaFrameCount, "| Sent to AI:", audioSentToAI);
         return;
       }
     });
@@ -198,53 +211,48 @@ export const attachMediaWebSocketServer = (server) => {
         return;
       }
 
-      // Log important events
-      if (evt.type === "session.created") {
-        console.log("📋 OpenAI session created");
-      }
-      if (evt.type === "session.updated") {
-        console.log("📋 OpenAI session updated");
-      }
+      // Logs
+      if (evt.type === "session.created") console.log("📋 OpenAI session created");
+      if (evt.type === "session.updated") console.log("📋 OpenAI session updated");
+
       if (evt.type === "input_audio_buffer.speech_started") {
         console.log("🎙️ OpenAI detected speech START");
-
-        // Metrics: barge-in count (we refine meaning later)
-        callMetrics.counts.bargeIns += 1;
+        lastSpeechStartAt = Date.now();
+        bargeIns++; // (Later we’ll make this a real “barge-in” counter)
       }
+
       if (evt.type === "input_audio_buffer.speech_stopped") {
         console.log("🎙️ OpenAI detected speech STOP");
+        t_speechStopped = Date.now();
+        turns++;
+        awaitingAIAudioAfterSpeechStop = true;
+      }
 
-        // Metrics: count a caller "turn" and record end time for delta calc
-        callMetrics.counts.turns += 1;
-        callMetrics.lastSpeechStopTs = Date.now();
-      }
-      if (evt.type === "response.created") {
-        console.log("💬 OpenAI generating response...");
-      }
-      if (evt.type === "response.done") {
-        console.log("✅ OpenAI response complete");
-      }
+      if (evt.type === "response.created") console.log("💬 OpenAI generating response...");
+      if (evt.type === "response.done") console.log("✅ OpenAI response complete");
+
       if (evt.type === "error") {
         console.error("❌ OpenAI error:", JSON.stringify(evt.error));
+        return;
       }
 
-      // Handle audio response
+      // Only handle audio deltas
       if (evt.type !== "response.audio.delta") return;
       if (!streamSid) return;
 
       audioReceivedFromAI++;
 
-      // Metrics: first AI audio received
-      if (!callMetrics.timestamps.firstAudioFromAI) {
-        callMetrics.timestamps.firstAudioFromAI = Date.now();
+      const now = Date.now();
+
+      // Metric: SpeechEnd → AI AudioStart
+      if (awaitingAIAudioAfterSpeechStop && t_speechStopped) {
+        const delta = now - t_speechStopped;
+        console.log(`⏱️ SpeechEnd → AI AudioStart: ${delta}ms`);
+        awaitingAIAudioAfterSpeechStop = false;
       }
 
-      // Metrics: speech_end -> AI audio start delta (per turn)
-      if (callMetrics.lastSpeechStopTs) {
-        const deltaMs = Date.now() - callMetrics.lastSpeechStopTs;
-        console.log(`⏱️ SpeechEnd → AI AudioStart: ${deltaMs}ms`);
-        callMetrics.lastSpeechStopTs = null;
-      }
+      // Metric: first AI audio overall
+      if (!t_firstAIAudio) t_firstAIAudio = now;
 
       if (audioReceivedFromAI === 1) {
         console.log("🔊 First audio chunk received from OpenAI");
@@ -254,20 +262,14 @@ export const attachMediaWebSocketServer = (server) => {
       if (pcm24.length === 0) return;
 
       // Downsample 24kHz → 8kHz
-      const samples24 = new Int16Array(
-        pcm24.buffer,
-        pcm24.byteOffset,
-        pcm24.length / 2
-      );
+      const samples24 = new Int16Array(pcm24.buffer, pcm24.byteOffset, pcm24.length / 2);
       const samples8 = new Int16Array(Math.floor(samples24.length / 3));
       for (let i = 0; i < samples8.length; i++) samples8[i] = samples24[i * 3];
 
-      const pcm8 = Buffer.from(
-        samples8.buffer,
-        samples8.byteOffset,
-        samples8.byteLength
-      );
-      const FRAME_SIZE = 320; // 20ms @ 8kHz PCM16 (160 samples * 2 bytes)
+      const pcm8 = Buffer.from(samples8.buffer, samples8.byteOffset, samples8.byteLength);
+
+      // 20ms @ 8kHz = 160 samples = 320 bytes PCM16
+      const FRAME_SIZE = 320;
 
       for (let i = 0; i < pcm8.length; i += FRAME_SIZE) {
         const chunk = pcm8.slice(i, i + FRAME_SIZE);
@@ -289,34 +291,6 @@ export const attachMediaWebSocketServer = (server) => {
     });
 
     twilioWs.on("close", () => {
-      // Metrics summary
-      callMetrics.timestamps.callEnd = Date.now();
-
-      const timeToFirstMediaMs =
-        callMetrics.timestamps.firstMediaIn && callMetrics.timestamps.streamStart
-          ? callMetrics.timestamps.firstMediaIn - callMetrics.timestamps.streamStart
-          : null;
-
-      const timeToFirstAIAudioMs =
-        callMetrics.timestamps.firstAudioFromAI && callMetrics.timestamps.streamStart
-          ? callMetrics.timestamps.firstAudioFromAI - callMetrics.timestamps.streamStart
-          : null;
-
-      const summary = {
-        callSid: callMetrics.callSid,
-        streamSid: callMetrics.streamSid,
-        durationMs: callMetrics.timestamps.callEnd - callMetrics.timestamps.callStart,
-        timeToFirstMediaMs,
-        timeToFirstAIAudioMs,
-        turns: callMetrics.counts.turns,
-        bargeIns: callMetrics.counts.bargeIns,
-        framesFromTwilio: mediaFrameCount,
-        chunksSentToAI: audioSentToAI,
-        chunksFromAI: audioReceivedFromAI,
-      };
-
-      console.log("📊 CALL METRICS SUMMARY:", summary);
-
       console.log(
         "📞 Twilio WS closed | Frames:",
         mediaFrameCount,
@@ -325,12 +299,14 @@ export const attachMediaWebSocketServer = (server) => {
       );
 
       clearInterval(pingInterval);
+
+      // Print metrics summary on hangup
+      summarizeMetrics();
+
       if (ai.readyState === ai.OPEN) ai.close();
     });
 
-    twilioWs.on("error", (err) =>
-      console.error("❌ Twilio WS Error:", err.message)
-    );
+    twilioWs.on("error", (err) => console.error("❌ Twilio WS Error:", err.message));
   });
 
   console.log(`🎧 Media WebSocket Ready → ${WS_PATH}`);
