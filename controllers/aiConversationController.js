@@ -1,44 +1,42 @@
 // controllers/aiConversationController.js
+import axios from "axios";
 
 import { detectLanguage } from "../utils/ai/languageDetector.js";
 import { normalizeAIText } from "../utils/ai/normalizeAIText.js";
 import { loadState, updateState, resetState } from "../utils/ai/convoState.js";
-import { askForMissingInfo } from "../utils/ai/followUpQuestions.js";
 
 import { recallClientMemory, updateClientMemory } from "../utils/ai/aiMemory.js";
 import { parseNaturalDateTime } from "../utils/ai/dateParser.js";
 
-// Validator + booking
+// Booking + availability
 import { validateRequest } from "../utils/ai/bookingValidator.js";
+import { getNextAvailableSlot } from "../utils/booking/availabilityEngine.js";
 import { createAppointment } from "../utils/booking/createAppointment.js";
 
-// Voice synthesis
+// Voice synthesis (for HTTP TTS responses)
 import { synthesizeSpeech } from "../utils/voice/elevenLabsTTS.js";
 
-// Emotion engine
-import { detectEmotion, emotionToToneInstruction } from "../utils/ai/aiEmotion.js";
-
 /**
- * ------------------------------------------------------------
- * 4.95.4 — Booking confirmation enforcement
+ * 4.95.4 — Booking confirmation enforcement (PROPER)
  *
- * RULES:
- * 1) Caller provides date/time → we restate it → ask "Confirm?"
- * 2) Caller must explicitly confirm (YES) before we create appt
- * 3) If caller says NO → clear pending + ask for a new day/time
- * 4) NEVER parse date/time from "yes" (use stored pending datetime)
- * ------------------------------------------------------------
+ * ✅ Confirmation happens ONLY AFTER:
+ *   1) intent is known
+ *   2) date/time parsed
+ *   3) availability checked
+ *   4) we have a concrete slot to confirm
+ *
+ * ❌ We do NOT confirm "intent" before availability.
  */
 
-function normalizeBaseUrl(raw) {
-  // Accept:
-  // - glo-backend-yaho.onrender.com
-  // - https://glo-backend-yaho.onrender.com
-  // - http://localhost:10000
-  if (!raw) return null;
-  let base = String(raw).trim();
+// -----------------------------
+// Small helpers
+// -----------------------------
+function getBaseUrl(req) {
+  // Prefer APP_BASE_URL (domain or full URL). Fallback to request host.
+  let base = process.env.APP_BASE_URL || req.headers.host || "";
+  base = String(base).trim();
 
-  // If it's just host (no protocol), assume https in production
+  // If env is like "glo-backend-yaho.onrender.com", normalize to https://...
   if (!base.startsWith("http://") && !base.startsWith("https://")) {
     base = `https://${base}`;
   }
@@ -49,332 +47,310 @@ function normalizeBaseUrl(raw) {
 }
 
 function isYes(text) {
-  const t = text.toLowerCase();
-  const yesPatterns = [
-    "yes",
-    "yeah",
-    "yep",
-    "correct",
-    "confirm",
-    "confirmed",
-    "sounds good",
-    "that's fine",
-    "that works",
-    "book it",
-    "do it",
-    "go ahead",
-    "sure",
-    "okay",
-    "ok",
-    "si",
-    "sí",
-    "dale",
-    "claro",
-    "perfecto",
-    "hazlo",
-  ];
-  return yesPatterns.some((p) => t.includes(p));
+  const t = (text || "").toLowerCase();
+  const yesWords = ["yes", "yeah", "yep", "yup", "correct", "that’s right", "thats right", "si", "sí", "dale", "ok", "okay"];
+  return yesWords.some((w) => t.includes(w));
 }
 
 function isNo(text) {
-  const t = text.toLowerCase();
-  const noPatterns = [
-    "no",
-    "nah",
-    "nope",
-    "don't",
-    "do not",
-    "not anymore",
-    "not that",
-    "cancel",
-    "stop",
-    "nevermind",
-    "never mind",
-    "no gracias",
-    "negativo",
-  ];
-  return noPatterns.some((p) => t.includes(p));
+  const t = (text || "").toLowerCase();
+  const noWords = ["no", "nah", "nope", "negative", "cancel", "not that", "wrong"];
+  return noWords.some((w) => t.includes(w));
 }
 
-/**
- * A simple display helper.
- * We rely on parseNaturalDateTime() to give us a readable `date` field.
- * If it doesn't, we fall back to ISO.
- */
-function buildConfirmText({ lang, pretty, iso }) {
-  const when = pretty || iso;
-  if (lang === "es") {
-    return `Perfecto. Tengo **${when}**. ¿Confirmas que quieres que te lo agende? Di "sí" o "no".`;
-  }
-  return `Perfect. I have **${when}**. Do you want me to book that? Say "yes" or "no".`;
+function ttsLine(lang, en, es) {
+  return lang === "es" ? es : en;
 }
 
-function buildAskDateTimeText(lang) {
-  if (lang === "es") {
-    return `Dime el día y la hora que te gustaría. Por ejemplo: "sábado a las 3".`;
-  }
-  return `Tell me the day and time you want. For example: "Saturday at 3".`;
-}
-
+// -----------------------------
 // MAIN CONTROLLER
+// -----------------------------
 export const handleAIConversation = async (req, res) => {
   try {
     const { message, phone, barberId } = req.body;
 
-    if (!message) {
-      return res.status(400).json({ error: true, message: "Missing message" });
-    }
-    if (!phone || !barberId) {
-      return res.status(400).json({ error: true, message: "Missing phone or barberId" });
-    }
-
-    const lang = detectLanguage(message);
-    let state = await loadState(phone, barberId);
-
-    // ✅ FIX: keep argument order consistent with your aiIntentController usage pattern (phone, barberId)
-    // If your aiMemory.js expects (barberId, phone), it will still work if it uses named keys internally,
-    // but this keeps things consistent for your codebase.
-    const memory = await recallClientMemory(phone, barberId);
-
-    // -----------------------------------------------------
-    // STEP 1 — Detect user intent
-    // -----------------------------------------------------
-    const baseUrl = normalizeBaseUrl(process.env.APP_BASE_URL) || normalizeBaseUrl(req.headers.host);
-
-    // If req.headers.host is used, it's missing protocol and might be "glo-backend...onrender.com"
-    // normalizeBaseUrl() handles that.
-    const intentUrl = `${baseUrl}/api/ai/intent`;
-
-    const intentRes = await (
-      await fetch(intentUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message, phone, barberId }),
-      })
-    ).json();
-
-    const { intent, missingDate, missingTime } = intentRes;
-
-    // Reset if user changed tasks mid-convo
-    if (state.intent && state.intent !== intent) {
-      await resetState(phone, barberId);
-      state = await loadState(phone, barberId);
-    }
-
-    // Persist intent
-    if (!state.intent || state.intent !== intent) {
-      state = await updateState(phone, barberId, {
-        intent,
-        step: "listening",
+    if (!message || !phone || !barberId) {
+      return res.status(400).json({
+        error: true,
+        message: "Missing required fields: message, phone, barberId",
       });
     }
 
-    // -----------------------------------------------------
-    // STEP 2 — If we are awaiting confirmation, handle YES/NO ONLY
-    // -----------------------------------------------------
-    if (state.step === "awaiting_confirmation") {
-      // If they confirm, we book using the stored pending datetime (NO parsing from "yes")
+    const lang = detectLanguage(message);
+
+    // Load convo state (persisted)
+    // We’ll store:
+    // - intent
+    // - step
+    // - pendingIso
+    // - pendingSlot (the actual slot we will confirm/book)
+    let state = await loadState(phone, barberId);
+
+    // If state is missing keys, normalize
+    state = state || {};
+    state.intent = state.intent ?? null;
+    state.step = state.step ?? null;
+    state.pendingIso = state.pendingIso ?? null;
+    state.pendingSlot = state.pendingSlot ?? null;
+
+    // Load memory for personalization (keep signature consistent)
+    const memory = await recallClientMemory(phone, barberId);
+
+    const baseUrl = getBaseUrl(req);
+
+    // ---------------------------------------------
+    // STEP 1 — Detect intent (BOOK/CANCEL/RESCHEDULE/INQUIRE/OTHER)
+    // IMPORTANT: Your /api/ai/intent endpoint currently only returns { intent }
+    // so we will not rely on missingDate/missingTime from it.
+    // ---------------------------------------------
+    let intent = "OTHER";
+
+    try {
+      const intentResp = await axios.post(
+        `${baseUrl}/api/ai/intent`,
+        { message, phone, barberId },
+        { headers: { "Content-Type": "application/json" } }
+      );
+
+      intent = String(intentResp.data?.intent || "OTHER").trim().toUpperCase();
+      if (!["BOOK", "CANCEL", "RESCHEDULE", "INQUIRE", "OTHER"].includes(intent)) {
+        intent = "OTHER";
+      }
+    } catch (e) {
+      // If intent detection fails, degrade gracefully
+      intent = state.intent || "OTHER";
+    }
+
+    // If user switched intent mid-stream, reset to avoid mixed states
+    if (state.intent && state.intent !== intent) {
+      await resetState(phone, barberId);
+      state = { intent: null, step: null, pendingIso: null, pendingSlot: null };
+    }
+
+    // ---------------------------------------------
+    // Non-booking intents (keep simple for now)
+    // ---------------------------------------------
+    if (intent === "INQUIRE") {
+      await resetState(phone, barberId);
+      return sendTTS(res, ttsLine(lang, "What can I help you with today?", "¿En qué te puedo ayudar hoy?"));
+    }
+
+    if (intent === "CANCEL") {
+      // You can wire this into your cancel flow later—keeping minimal + safe.
+      await resetState(phone, barberId);
+      return sendTTS(
+        res,
+        ttsLine(
+          lang,
+          "No problem. What’s the date and time of the appointment you want to cancel?",
+          "Dale. ¿Qué día y a qué hora es la cita que quieres cancelar?"
+        )
+      );
+    }
+
+    if (intent === "RESCHEDULE") {
+      // Minimal safe prompt for now
+      // (You can mirror BOOK flow once you attach existing appt lookup + modify)
+      await updateState(phone, barberId, { intent: "RESCHEDULE", step: "collecting_datetime", pendingIso: null, pendingSlot: null });
+      return sendTTS(
+        res,
+        ttsLine(
+          lang,
+          "Sure — what day and time would you like to move it to?",
+          "Perfecto — ¿para qué día y hora la quieres mover?"
+        )
+      );
+    }
+
+    // ---------------------------------------------
+    // BOOK FLOW (4.95.4 done correctly)
+    // ---------------------------------------------
+    // We only do confirmation AFTER we have a real slot.
+    // Steps:
+    // 1) collecting_datetime (ask for date/time)
+    // 2) checking_availability (validate + find slot)
+    // 3) awaiting_confirmation (confirm the *actual slot*)
+    // 4) book + reset
+    // ---------------------------------------------
+    if (intent !== "BOOK") {
+      // If it’s OTHER, keep it natural
+      await resetState(phone, barberId);
+      return sendTTS(
+        res,
+        ttsLine(lang, "How can I help you today?", "¿Cómo te puedo ayudar hoy?")
+      );
+    }
+
+    // Ensure intent stored
+    if (!state.intent) {
+      await updateState(phone, barberId, { intent: "BOOK" });
+      state.intent = "BOOK";
+    }
+
+    // If we are awaiting confirmation, handle YES/NO first
+    if (state.step === "awaiting_confirmation" && state.pendingSlot) {
       if (isYes(message)) {
-        const pendingIso = state.pendingIso;
-        const pendingPretty = state.pendingPretty;
+        // Book it
+        const result = await createAppointment(
+          barberId,
+          memory?.name || "Client",
+          phone,
+          state.pendingSlot,
+          "default_service"
+        );
 
-        if (!pendingIso) {
-          // Somehow lost pending data — recover gracefully
-          state = await updateState(phone, barberId, {
-            step: "awaiting_details",
-            pendingIso: null,
-            pendingPretty: null,
-          });
-          return sendTTS(res, buildAskDateTimeText(lang));
-        }
-
-        // Emotion → Tone Adjustment (optional)
-        const emotion = await detectEmotion(message);
-        const toneInstruction = emotionToToneInstruction(emotion);
-
-        // Validate barber rules (hours, blackout, etc.)
-        const validation = await validateRequest(barberId, pendingIso);
-        if (!validation.ok) {
-          // Clear pending so they can pick a new time
-          await updateState(phone, barberId, {
-            step: "awaiting_details",
-            pendingIso: null,
-            pendingPretty: null,
-          });
-          return sendTTS(res, validation.message);
-        }
-
-        // BOOK
-        if (intent === "BOOK") {
-          const result = await createAppointment(
-            barberId,
-            memory?.name || "Client",
-            phone,
-            pendingIso,
-            "default_service"
-          );
-
-          if (result?.ok) {
-            await updateClientMemory(phone, barberId, {
-              lastAppointment: pendingIso,
-              lastIntent: "BOOK",
-            });
-
-            await resetState(phone, barberId);
-
-            if (lang === "es") {
-              return sendTTS(res, `Listo. Quedaste confirmado para ${pendingPretty || pendingIso}.`);
-            }
-            return sendTTS(res, `You’re all set — confirmed for ${pendingPretty || pendingIso}.`);
-          }
-
-          // Failed booking → ask for new time, clear pending
-          await updateState(phone, barberId, {
-            step: "awaiting_details",
-            pendingIso: null,
-            pendingPretty: null,
-          });
-          return sendTTS(
-            res,
-            lang === "es"
-              ? "No pude agendar eso. Dime otro día y hora."
-              : "I couldn’t book that. Give me another day and time."
-          );
-        }
-
-        // RESCHEDULE (placeholder — keep your existing logic or implement later)
-        if (intent === "RESCHEDULE") {
-          // You can wire reschedule logic here later the same way:
-          // - validate
-          // - update existing appt
-          // For now we’ll just store memory and confirm.
+        if (result?.ok) {
           await updateClientMemory(phone, barberId, {
-            lastAppointment: pendingIso,
-            lastIntent: "RESCHEDULE",
+            lastIntent: "BOOK",
+            lastAppointment: state.pendingSlot,
           });
 
           await resetState(phone, barberId);
 
           return sendTTS(
             res,
-            lang === "es"
-              ? `Perfecto. Moví tu cita para ${pendingPretty || pendingIso}.`
-              : `Done. I moved your appointment to ${pendingPretty || pendingIso}.`
+            ttsLine(
+              lang,
+              `Perfect — you’re confirmed for ${state.pendingSlot}. See you then.`,
+              `Perfecto — estás confirmado para ${state.pendingSlot}. Te veo ahí.`
+            )
           );
         }
 
-        // Other intents while awaiting confirmation → reset
+        // Booking failed (DB, conflict, etc.)
         await resetState(phone, barberId);
-        return sendTTS(res, lang === "es" ? "¿Cómo te puedo ayudar?" : "How can I help?");
-      }
-
-      // If they say NO, clear pending and ask again
-      if (isNo(message)) {
-        await updateState(phone, barberId, {
-          step: "awaiting_details",
-          pendingIso: null,
-          pendingPretty: null,
-        });
-
         return sendTTS(
           res,
-          lang === "es"
-            ? "Perfecto. Dime entonces qué día y hora prefieres."
-            : "No problem. Tell me what day and time you prefer."
+          ttsLine(
+            lang,
+            "I couldn’t lock that in right now. Want to try another time?",
+            "No pude agendarlo ahora mismo. ¿Quieres intentar otra hora?"
+          )
         );
       }
 
-      // If they say something else while we're waiting for YES/NO, re-prompt
+      if (isNo(message)) {
+        // Clear pending and go back to collecting date/time
+        await updateState(phone, barberId, { step: "collecting_datetime", pendingIso: null, pendingSlot: null });
+        return sendTTS(
+          res,
+          ttsLine(
+            lang,
+            "No worries — what day and time would you prefer instead?",
+            "Dale — ¿qué día y hora prefieres entonces?"
+          )
+        );
+      }
+
+      // If they didn’t clearly say yes/no, reprompt (short)
       return sendTTS(
         res,
-        lang === "es"
-          ? `Solo para confirmar: ¿quieres que lo agende? Di "sí" o "no".`
-          : `Just to confirm — do you want me to book it? Say "yes" or "no".`
+        ttsLine(
+          lang,
+          `Just to confirm — should I book you for ${state.pendingSlot}?`,
+          `Solo para confirmar — ¿te agendo para ${state.pendingSlot}?`
+        )
       );
     }
 
-    // -----------------------------------------------------
-    // STEP 3 — Ask missing questions (date/time) from intent detector (optional)
-    // -----------------------------------------------------
-    const needMoreInfo = askForMissingInfo({
-      intent,
-      missingDate,
-      missingTime,
-      lang,
+    // Otherwise, we need to extract date/time from the user message
+    // If state indicates we are collecting, parse now
+    const parsed = await parseNaturalDateTime(message);
+
+    if (!parsed) {
+      // Ask for date & time explicitly
+      await updateState(phone, barberId, { intent: "BOOK", step: "collecting_datetime", pendingIso: null, pendingSlot: null });
+
+      return sendTTS(
+        res,
+        ttsLine(
+          lang,
+          "Sure — what day and what time would you like to come in?",
+          "Perfecto — ¿qué día y a qué hora quieres venir?"
+        )
+      );
+    }
+
+    // We have a parse — but we still must enforce both date + time exist.
+    // Your parser returns { iso, date } in your prior usage.
+    const iso = parsed.iso || null;
+    const date = parsed.date || null;
+
+    // If parser gives date but iso missing, treat as missing time
+    // (We keep it strict to prevent hallucinated bookings)
+    if (!iso || !date) {
+      await updateState(phone, barberId, { intent: "BOOK", step: "collecting_datetime", pendingIso: null, pendingSlot: null });
+
+      return sendTTS(
+        res,
+        ttsLine(
+          lang,
+          "I got the day, but I need the exact time too — what time works?",
+          "Entendí el día, pero necesito la hora exacta — ¿a qué hora te queda bien?"
+        )
+      );
+    }
+
+    // ---------------------------------------------
+    // CHECK AVAILABILITY FIRST (NO confirmation yet)
+    // ---------------------------------------------
+    await updateState(phone, barberId, { intent: "BOOK", step: "checking_availability", pendingIso: iso, pendingSlot: null });
+
+    // Validate barber rules (hours/blackouts/buffers, etc.)
+    const validation = await validateRequest(barberId, iso);
+    if (!validation?.ok) {
+      // Keep it natural and ask for another option
+      await updateState(phone, barberId, { step: "collecting_datetime", pendingIso: null, pendingSlot: null });
+
+      return sendTTS(
+        res,
+        validation?.message ||
+          ttsLine(lang, "That time doesn’t work — what other day or time works for you?", "Ese horario no sirve — ¿qué otro día u hora te sirve?")
+      );
+    }
+
+    // Find slot. Your engine currently finds “next available slot” for that date.
+    // IMPORTANT: This is where your “requested time” mismatch can happen
+    // if the engine isn’t time-specific. 4.95.4 will still prevent booking
+    // the wrong time silently, because we confirm the slot explicitly.
+    const availability = await getNextAvailableSlot(barberId, date, "default_service");
+
+    if (!availability?.ok || !availability?.slot) {
+      await updateState(phone, barberId, { step: "collecting_datetime", pendingIso: null, pendingSlot: null });
+
+      return sendTTS(
+        res,
+        ttsLine(
+          lang,
+          availability?.reasonMessage || "Looks like we’re booked around then. What other day or time works?",
+          availability?.reasonMessage || "Parece que está lleno para ese tiempo. ¿Qué otro día u hora te sirve?"
+        )
+      );
+    }
+
+    // ---------------------------------------------
+    // NOW (and only now) we ask for confirmation
+    // ---------------------------------------------
+    await updateState(phone, barberId, {
+      step: "awaiting_confirmation",
+      pendingIso: iso,
+      pendingSlot: availability.slot,
     });
 
-    // If intent detector says we’re missing info, go straight to details collection
-    if (needMoreInfo) {
-      await updateState(phone, barberId, {
-        intent,
-        step: "awaiting_details",
-        pendingIso: null,
-        pendingPretty: null,
-      });
-
-      return sendTTS(res, needMoreInfo);
-    }
-
-    // -----------------------------------------------------
-    // STEP 4 — Collect date/time from the caller message
-    // We DO THIS before any booking action.
-    // -----------------------------------------------------
-    if (intent === "BOOK" || intent === "RESCHEDULE") {
-      const parsed = await parseNaturalDateTime(message);
-
-      if (!parsed?.iso) {
-        await updateState(phone, barberId, {
-          intent,
-          step: "awaiting_details",
-        });
-        return sendTTS(res, buildAskDateTimeText(lang));
-      }
-
-      const pendingIso = parsed.iso;
-      const pendingPretty = parsed.date || pendingIso;
-
-      // Validate rules (hours/blackouts) BEFORE asking for confirmation
-      const validation = await validateRequest(barberId, pendingIso);
-      if (!validation.ok) {
-        await updateState(phone, barberId, {
-          step: "awaiting_details",
-          pendingIso: null,
-          pendingPretty: null,
-        });
-        return sendTTS(res, validation.message);
-      }
-
-      // Store pending + ask for explicit confirmation
-      await updateState(phone, barberId, {
-        intent,
-        step: "awaiting_confirmation",
-        pendingIso,
-        pendingPretty,
-      });
-
-      return sendTTS(res, buildConfirmText({ lang, pretty: pendingPretty, iso: pendingIso }));
-    }
-
-    // -----------------------------------------------------
-    // STEP 5 — Other intents fallback (INQUIRE, CANCEL, OTHER)
-    // Keep it simple here (you can expand later).
-    // -----------------------------------------------------
-    if (intent === "INQUIRE") {
-      return sendTTS(res, lang === "es" ? "Claro, ¿qué te gustaría saber?" : "Sure — what would you like to know?");
-    }
-
-    if (intent === "CANCEL") {
-      return sendTTS(res, lang === "es" ? "Entendido. ¿Cuál es tu nombre y para qué día es la cita?" : "Got it. What’s your name and what day is your appointment?");
-    }
-
-    return sendTTS(res, lang === "es" ? "¿Cómo te puedo ayudar?" : "How can I help you?");
+    return sendTTS(
+      res,
+      ttsLine(
+        lang,
+        `I can get you in at ${availability.slot}. Want me to lock that in?`,
+        `Te puedo agendar para ${availability.slot}. ¿Quieres que lo confirme?`
+      )
+    );
 
   } catch (err) {
     console.error("AI Conversation Error:", err);
-    return res.status(500).json({ error: true });
+    return res.status(500).json({ error: true, message: "AI conversation failed" });
   }
 };
-
 
 // -----------------------------------------------------
 // 🔊 SPEECH RESPONSE
