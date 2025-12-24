@@ -1,4 +1,3 @@
-// realtime/mediaStreamServer.js
 import { WebSocketServer } from "ws";
 import { createOpenAISession } from "../utils/ai/openaiSession.js";
 
@@ -109,7 +108,10 @@ export const attachMediaWebSocketServer = (server) => {
 
     const queueGreeting = () => {
       greetingQueued = true;
-      trySendGreeting();
+      // ⏱️ slight delay to let Twilio audio flow stabilize
+      setTimeout(() => {
+        trySendGreeting();
+      }, 200);
     };
 
     const trySendGreeting = () => {
@@ -123,7 +125,10 @@ export const attachMediaWebSocketServer = (server) => {
         type: "response.create",
         response: {
           modalities: ["audio", "text"],
-          instructions: `Thanks for calling Glō. This is the AI receptionist for ${barberId}. How can I help you today?`,
+          instructions:
+            `Thanks for calling Glō. ` +
+            `This is the AI receptionist for ${barberId}. ` +
+            `How can I help you today?`,
           max_output_tokens: 60,
         },
       });
@@ -169,6 +174,9 @@ export const attachMediaWebSocketServer = (server) => {
       if (created) {
         aiResponseInProgress = true;
         metrics.turns += 1;
+
+        // ✅ reset transcript for next turn
+        lastUserTranscript = "";
       }
     };
 
@@ -182,14 +190,20 @@ export const attachMediaWebSocketServer = (server) => {
         if (!pendingUserTurn) return;
         pendingUserTurn = false;
 
-        // ✅ Guard: don’t commit tiny utterances
+        // ✅ Guard 1: enough audio
         if (framesSinceLastCommit < MIN_COMMIT_FRAMES) {
           console.log("⚠️ Skipping respond: insufficient audio (<100ms)");
           return;
         }
 
+        // ✅ Guard 2: must have transcript
+        if (!lastUserTranscript) {
+          console.log("⚠️ Skipping respond: no transcript detected");
+          return;
+        }
+
         commitAndCreateResponse();
-      }, 160);
+      }, 220); // stabilized timing for μ-law
     };
 
     let silenceTimer = null;
@@ -204,7 +218,8 @@ export const attachMediaWebSocketServer = (server) => {
           type: "response.create",
           response: {
             modalities: ["audio", "text"],
-            instructions: "Are you still there? Take your time — how can I help you?",
+            instructions:
+              "Are you still there? Take your time — how can I help you?",
             max_output_tokens: 40,
           },
         });
@@ -239,6 +254,17 @@ export const attachMediaWebSocketServer = (server) => {
         console.log("📋 OpenAI session updated");
         sessionUpdated = true;
         trySendGreeting();
+      }
+
+      if (evt.type === "conversation.item.input_audio_transcription.completed" ||
+          evt.type === "input_audio_transcription.completed") {
+        const transcript = (evt.transcript || "").trim();
+        if (transcript) {
+          lastUserTranscript = transcript;
+          lastTranscriptAt = Date.now();
+          metrics.lastUserTranscript = transcript;
+          console.log("📝 TRANSCRIPT (caller):", transcript);
+        }
       }
 
       if (evt.type === "input_audio_buffer.speech_started") {
