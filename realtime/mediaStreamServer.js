@@ -68,6 +68,8 @@ export const attachMediaWebSocketServer = (server) => {
 
     // We'll schedule a response AFTER user stops speaking
     let pendingUserTurn = false;
+    let hasCommittedUserAudioForTurn = false;
+
 
     // Greeting is queued until OpenAI is ready AND session.update applied
     let greetingQueued = false;
@@ -76,6 +78,8 @@ export const attachMediaWebSocketServer = (server) => {
     // For debugging what it heard
     let lastUserTranscript = "";
     let lastTranscriptAt = null;
+    let silencePromptSent = false;
+
 
     // Metrics
     const t0 = Date.now();
@@ -104,12 +108,23 @@ export const attachMediaWebSocketServer = (server) => {
       return true;
     };
 
+  const cancelAIResponse = () => {
+  if (!aiResponseInProgress) return;
+
+  console.log("⛔ BARGE-IN: Cancelling AI response");
+
+  sendToAI({ type: "response.cancel" });
+
+  aiResponseInProgress = false;
+};
+
     const queueGreeting = () => {
       greetingQueued = true;
       trySendGreeting();
     };
 
     const trySendGreeting = () => {
+      if (!barberId) return;
       if (!greetingQueued || greetingSent) return;
       if (!canSendAI()) return;
 
@@ -120,8 +135,8 @@ export const attachMediaWebSocketServer = (server) => {
         type: "response.create",
         response: {
           modalities: ["audio", "text"],
-          instructions: "Greet the caller now. One sentence + a question. Natural.",
-          max_output_tokens: 120,
+          instructions: `Thanks for calling Glō. This is the AI receptionist for ${barberId || "your barber"}. How can I help you today?`,
+          max_output_tokens: 60,
         },
       });
 
@@ -136,12 +151,11 @@ export const attachMediaWebSocketServer = (server) => {
     const commitAndCreateResponse = () => {
       // Never create while a response is active
       if (aiResponseInProgress) return;
-
-      // Hard guard against commit_empty
-      if (framesSinceLastCommit < MIN_COMMIT_FRAMES) return;
+     if (!hasCommittedUserAudioForTurn && framesSinceLastCommit < MIN_COMMIT_FRAMES) return;
 
       const committed = sendToAI({ type: "input_audio_buffer.commit" });
       if (!committed) return;
+      hasCommittedUserAudioForTurn = true;
 
       framesSinceLastCommit = 0;
 
@@ -150,14 +164,19 @@ export const attachMediaWebSocketServer = (server) => {
         response: {
           modalities: ["audio", "text"],
           instructions:
-            `PHONE RULES:\n` +
-            `- Never invent dates/times.\n` +
-            `- Ask one question at a time.\n` +
+            `VOICE STYLE:\n` +
+            `- Be brief and natural.\n` +
+            `- One sentence unless clarification is required.\n` +
+            `- Ask only ONE question.\n` +
+            `- Never answer your own question.\n` +
+            `- Never repeat rules aloud.\n\n` +
+            `BOOKING RULES:\n` +
+            `- Never invent dates or times.\n` +
             `- If booking: require BOTH date and time.\n` +
-            `- Repeat back EXACTLY what caller said then ask YES/NO.\n` +
-            `- If NO: apologize and ask them to repeat date+time.\n\n` +
-            `Last transcript: "${lastUserTranscript || "N/A"}"\n`,
-          max_output_tokens: 250,
+            `- Repeat back EXACTLY what caller said, then ask YES or NO.\n` +
+            `- If NO: apologize once and ask them to repeat.\n\n` +
+            `Last caller message: "${lastUserTranscript || "N/A"}"\n`,
+          max_output_tokens: 140,
         },
       });
 
@@ -181,6 +200,35 @@ export const attachMediaWebSocketServer = (server) => {
         commitAndCreateResponse();
       }, 160); // 160ms > 100ms guard
     };
+
+    let silenceTimer = null;
+    const scheduleSilencePrompt = () => {
+      if (silencePromptSent) return;
+
+      if (silenceTimer) clearTimeout(silenceTimer);
+
+      silenceTimer = setTimeout(() => {
+        if (aiResponseInProgress) return;
+        if (silencePromptSent) return;
+
+        console.log("🕒 Silence detected — prompting caller");
+
+        sendToAI({
+          type: "response.create",
+          response: {
+            modalities: ["audio", "text"],
+            instructions:
+              "Are you still there? Take your time — how can I help you?",
+            max_output_tokens: 40,
+          },
+        });
+
+        silencePromptSent = true;
+        aiResponseInProgress = true;
+        metrics.turns += 1;
+      }, 4000); // 4 seconds of silence
+    };
+
 
     // Keep-alive ping
     const pingInterval = setInterval(() => {
@@ -234,20 +282,26 @@ export const attachMediaWebSocketServer = (server) => {
 
         // Apply per-call instructions
         sendToAI({
-          type: "session.update",
-          session: {
-            instructions:
-              `${initialPrompt}\n\n` +
-              `CRITICAL BOOKING RULES:\n` +
-              `- NEVER invent dates or times.\n` +
-              `- If booking: require BOTH date and time.\n` +
-              `- Repeat back EXACTLY, then ask YES/NO.\n` +
-              `- Only finalize after YES.\n` +
-              `- One question at a time.\n`,
-            temperature: 0.7,
-            max_response_output_tokens: 250,
-          },
-        });
+        type: "session.update",
+        session: {
+          instructions:
+            `LANGUAGE RULES:\n` +
+            `- Always respond in the same language as the caller.\n` +
+            `- Do NOT switch languages unless the caller explicitly asks.\n` +
+            `- If unclear, default to English.\n\n` +
+
+            `${initialPrompt}\n\n` +
+
+            `CRITICAL BOOKING RULES:\n` +
+            `- NEVER invent dates or times.\n` +
+            `- If booking: require BOTH date and time.\n` +
+            `- Repeat back EXACTLY, then ask YES/NO.\n` +
+            `- Only finalize after YES.\n` +
+            `- One question at a time.\n`,
+          temperature: 0.7,
+          max_response_output_tokens: 250,
+        },
+      });
 
         // Queue greeting
         queueGreeting();
@@ -337,6 +391,9 @@ export const attachMediaWebSocketServer = (server) => {
       if (evt.type === "input_audio_buffer.speech_started") {
         console.log("🎙️ OpenAI detected speech START");
         if (aiResponseInProgress) metrics.bargeIns += 1;
+        cancelAIResponse();
+        silencePromptSent = false;
+
         return;
       }
 
@@ -348,6 +405,7 @@ export const attachMediaWebSocketServer = (server) => {
 
         // Schedule respond (debounced) to avoid commit_empty
         scheduleRespond();
+        scheduleSilencePrompt();
         return;
       }
 
@@ -360,6 +418,7 @@ export const attachMediaWebSocketServer = (server) => {
       if (evt.type === "response.done") {
         console.log("✅ OpenAI response complete");
         aiResponseInProgress = false;
+        hasCommittedUserAudioForTurn = false;
         trySendGreeting();
         return;
       }
