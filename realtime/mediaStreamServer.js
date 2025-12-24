@@ -3,12 +3,9 @@ import { createOpenAISession } from "../utils/ai/openaiSession.js";
 
 const WS_PATH = "/ws/media";
 
-// Twilio sends 20ms μ-law frames
 const TWILIO_FRAME_MS = 20;
-
-// OpenAI complains if we commit < 100ms
 const MIN_COMMIT_MS = 100;
-const MIN_COMMIT_FRAMES = Math.ceil(MIN_COMMIT_MS / TWILIO_FRAME_MS); // 5 frames
+const MIN_COMMIT_FRAMES = Math.ceil(MIN_COMMIT_MS / TWILIO_FRAME_MS); // 5
 
 export const attachMediaWebSocketServer = (server) => {
   console.log("🔰 attachMediaWebSocketServer() called");
@@ -56,11 +53,8 @@ export const attachMediaWebSocketServer = (server) => {
     let callSid = null;
     let barberId = null;
 
-    let mediaFrameCount = 0;
     let framesSinceLastCommit = 0;
-
-    let audioSentToAI = 0;
-    let audioReceivedFromAI = 0;
+    let mediaFrameCount = 0;
 
     let aiResponseInProgress = false;
     let pendingUserTurn = false;
@@ -70,23 +64,12 @@ export const attachMediaWebSocketServer = (server) => {
     let greetingSent = false;
 
     let lastUserTranscript = "";
-    let lastTranscriptAt = null;
     let silencePromptSent = false;
 
+    // 🌐 AUTO language detection (default English)
+    let currentLanguage = "en"; // "en" | "es"
+
     const t0 = Date.now();
-    const metrics = {
-      callSid: null,
-      streamSid: null,
-      durationMs: 0,
-      timeToFirstMediaMs: null,
-      timeToFirstAIAudioMs: null,
-      turns: 0,
-      bargeIns: 0,
-      framesFromTwilio: 0,
-      chunksSentToAI: 0,
-      chunksFromAI: 0,
-      lastUserTranscript: "",
-    };
 
     // ----------------------------
     // Helpers
@@ -99,16 +82,30 @@ export const attachMediaWebSocketServer = (server) => {
       return true;
     };
 
-    const cancelAIResponse = () => {
-      if (!aiResponseInProgress) return;
-      console.log("⛔ BARGE-IN: Cancelling AI response");
-      sendToAI({ type: "response.cancel" });
-      aiResponseInProgress = false;
+    const detectLanguage = (text) => {
+      // Spanish markers
+      if (/[áéíóúñ¿¡]/i.test(text)) return "es";
+
+      const spanishWords = [
+        "hola",
+        "cita",
+        "mañana",
+        "hoy",
+        "barbero",
+        "precio",
+        "gracias",
+        "quiero",
+        "tienes",
+      ];
+
+      const lower = text.toLowerCase();
+      if (spanishWords.some((w) => lower.includes(w))) return "es";
+
+      return "en";
     };
 
     const queueGreeting = () => {
       greetingQueued = true;
-      // ⏱️ slight delay to let Twilio audio flow stabilize
       setTimeout(() => {
         trySendGreeting();
       }, 200);
@@ -121,14 +118,16 @@ export const attachMediaWebSocketServer = (server) => {
       if (!canSendAI()) return;
       if (aiResponseInProgress) return;
 
+      const greetingText =
+        currentLanguage === "es"
+          ? `Gracias por llamar a Glō. Soy la recepcionista virtual de ${barberId}. ¿En qué puedo ayudarte hoy?`
+          : `Thanks for calling Glō. This is the AI receptionist for ${barberId}. How can I help you today?`;
+
       const ok = sendToAI({
         type: "response.create",
         response: {
           modalities: ["audio", "text"],
-          instructions:
-            `Thanks for calling Glō. ` +
-            `This is the AI receptionist for ${barberId}. ` +
-            `How can I help you today?`,
+          instructions: greetingText,
           max_output_tokens: 60,
         },
       });
@@ -136,48 +135,44 @@ export const attachMediaWebSocketServer = (server) => {
       if (ok) {
         greetingSent = true;
         aiResponseInProgress = true;
-        metrics.turns += 1;
       }
     };
 
     const commitAndCreateResponse = () => {
       if (aiResponseInProgress) return;
-      if (!hasCommittedUserAudioForTurn && framesSinceLastCommit < MIN_COMMIT_FRAMES) return;
+      if (framesSinceLastCommit < MIN_COMMIT_FRAMES) return;
+      if (!lastUserTranscript) return;
 
-      const committed = sendToAI({ type: "input_audio_buffer.commit" });
-      if (!committed) return;
+      sendToAI({ type: "input_audio_buffer.commit" });
 
-      hasCommittedUserAudioForTurn = true;
       framesSinceLastCommit = 0;
+      hasCommittedUserAudioForTurn = true;
 
-      const created = sendToAI({
+      const instructions =
+        `LANGUAGE: Respond ONLY in ${
+          currentLanguage === "es" ? "Spanish" : "English"
+        }.\n\n` +
+        `VOICE STYLE:\n` +
+        `- Be brief and natural.\n` +
+        `- One sentence unless clarification is required.\n` +
+        `- Ask only ONE question.\n\n` +
+        `BOOKING RULES:\n` +
+        `- Never invent dates or times.\n` +
+        `- Require BOTH date and time.\n` +
+        `- Repeat back EXACTLY and confirm YES.\n\n` +
+        `Caller said: "${lastUserTranscript}"`;
+
+      sendToAI({
         type: "response.create",
         response: {
           modalities: ["audio", "text"],
-          instructions:
-            `VOICE STYLE:\n` +
-            `- Be brief and natural.\n` +
-            `- One sentence unless clarification is required.\n` +
-            `- Ask only ONE question.\n` +
-            `- Never answer your own question.\n` +
-            `- Never repeat rules aloud.\n\n` +
-            `BOOKING RULES:\n` +
-            `- Never invent dates or times.\n` +
-            `- If booking: require BOTH date and time.\n` +
-            `- Repeat back EXACTLY what caller said, then ask YES or NO.\n` +
-            `- If NO: apologize once and ask them to repeat.\n\n` +
-            `Last caller message: "${lastUserTranscript || "N/A"}"\n`,
-          max_output_tokens: 140,
+          instructions,
+          max_output_tokens: 120,
         },
       });
 
-      if (created) {
-        aiResponseInProgress = true;
-        metrics.turns += 1;
-
-        // ✅ reset transcript for next turn
-        lastUserTranscript = "";
-      }
+      aiResponseInProgress = true;
+      lastUserTranscript = "";
     };
 
     let respondTimer = null;
@@ -189,50 +184,9 @@ export const attachMediaWebSocketServer = (server) => {
         respondTimer = null;
         if (!pendingUserTurn) return;
         pendingUserTurn = false;
-
-        // ✅ Guard 1: enough audio
-        if (framesSinceLastCommit < MIN_COMMIT_FRAMES) {
-          console.log("⚠️ Skipping respond: insufficient audio (<100ms)");
-          return;
-        }
-
-        // ✅ Guard 2: must have transcript
-        if (!lastUserTranscript) {
-          console.log("⚠️ Skipping respond: no transcript detected");
-          return;
-        }
-
         commitAndCreateResponse();
-      }, 220); // stabilized timing for μ-law
+      }, 250);
     };
-
-    let silenceTimer = null;
-    const scheduleSilencePrompt = () => {
-      if (silencePromptSent) return;
-      if (silenceTimer) clearTimeout(silenceTimer);
-
-      silenceTimer = setTimeout(() => {
-        if (aiResponseInProgress || silencePromptSent) return;
-
-        sendToAI({
-          type: "response.create",
-          response: {
-            modalities: ["audio", "text"],
-            instructions:
-              "Are you still there? Take your time — how can I help you?",
-            max_output_tokens: 40,
-          },
-        });
-
-        silencePromptSent = true;
-        aiResponseInProgress = true;
-        metrics.turns += 1;
-      }, 4000);
-    };
-
-    const pingInterval = setInterval(() => {
-      if (twilioWs.readyState === twilioWs.OPEN) twilioWs.ping();
-    }, 5000);
 
     // ----------------------------
     // OpenAI events
@@ -256,30 +210,34 @@ export const attachMediaWebSocketServer = (server) => {
         trySendGreeting();
       }
 
-      if (evt.type === "conversation.item.input_audio_transcription.completed" ||
-          evt.type === "input_audio_transcription.completed") {
+      if (
+        evt.type === "conversation.item.input_audio_transcription.completed" ||
+        evt.type === "input_audio_transcription.completed"
+      ) {
         const transcript = (evt.transcript || "").trim();
         if (transcript) {
           lastUserTranscript = transcript;
-          lastTranscriptAt = Date.now();
-          metrics.lastUserTranscript = transcript;
-          console.log("📝 TRANSCRIPT (caller):", transcript);
+
+          // 🌐 auto detect language per turn
+          const detected = detectLanguage(transcript);
+          if (detected !== currentLanguage) {
+            console.log("🌐 Language switched to:", detected);
+            currentLanguage = detected;
+          }
+
+          console.log("📝 TRANSCRIPT:", transcript);
         }
       }
 
       if (evt.type === "input_audio_buffer.speech_started") {
-        if (aiResponseInProgress) metrics.bargeIns += 1;
-        cancelAIResponse();
         silencePromptSent = false;
       }
 
       if (evt.type === "input_audio_buffer.speech_stopped") {
         scheduleRespond();
-        scheduleSilencePrompt();
       }
 
       if (evt.type === "response.done") {
-        console.log("✅ OpenAI response complete");
         aiResponseInProgress = false;
         hasCommittedUserAudioForTurn = false;
       }
@@ -317,24 +275,15 @@ export const attachMediaWebSocketServer = (server) => {
 
         const custom = msg.start?.customParameters || {};
         barberId = custom.barberId || null;
-        const initialPrompt = custom.initialPrompt || "";
 
         sendToAI({
           type: "session.update",
           session: {
             instructions:
-              `LANGUAGE RULES:\n` +
-              `- Always respond in the same language as the caller.\n` +
-              `- Do NOT switch languages unless the caller explicitly asks.\n` +
-              `- If unclear, default to English.\n\n` +
-              `${initialPrompt}\n\n` +
-              `CRITICAL BOOKING RULES:\n` +
-              `- NEVER invent dates or times.\n` +
-              `- If booking: require BOTH date and time.\n` +
-              `- Repeat back EXACTLY, then ask YES/NO.\n` +
-              `- Only finalize after YES.\n` +
-              `- One question at a time.\n`,
-            temperature: 0.7,
+              `You are Glō, an AI phone receptionist.\n` +
+              `Follow booking rules strictly.\n` +
+              `Do not invent dates or times.\n`,
+            temperature: 0.3,
             max_response_output_tokens: 250,
           },
         });
@@ -343,29 +292,20 @@ export const attachMediaWebSocketServer = (server) => {
       }
 
       if (msg.event === "media") {
-        mediaFrameCount++;
-        metrics.framesFromTwilio = mediaFrameCount;
-
         const payloadB64 = msg.media?.payload;
         if (!payloadB64) return;
 
         if (canSendAI()) {
-          const ok = sendToAI({
+          sendToAI({
             type: "input_audio_buffer.append",
             audio: payloadB64,
           });
-
-          if (ok) {
-            audioSentToAI++;
-            metrics.chunksSentToAI = audioSentToAI;
-            framesSinceLastCommit++;
-          }
+          framesSinceLastCommit++;
         }
       }
     });
 
     twilioWs.on("close", () => {
-      clearInterval(pingInterval);
       if (respondTimer) clearTimeout(respondTimer);
       if (ai.readyState === ai.OPEN) ai.close();
     });
