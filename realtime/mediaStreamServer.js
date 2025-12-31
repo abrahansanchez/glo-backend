@@ -62,15 +62,12 @@ export const attachMediaWebSocketServer = (server) => {
 
     let greetingQueued = false;
     let greetingSent = false;
-    let greetingComplete = false; // ✅ NEW
+    let greetingComplete = false; // ✅ FIX
 
     let lastUserTranscript = "";
     let silencePromptSent = false;
 
-    // 🌐 AUTO language detection (default English)
-    let currentLanguage = "en"; // "en" | "es"
-
-    const t0 = Date.now();
+    let currentLanguage = "en"; // en | es
 
     // ----------------------------
     // Helpers
@@ -85,29 +82,18 @@ export const attachMediaWebSocketServer = (server) => {
 
     const detectLanguage = (text) => {
       if (/[áéíóúñ¿¡]/i.test(text)) return "es";
-
-      const spanishWords = [
-        "hola",
-        "cita",
-        "mañana",
-        "hoy",
-        "barbero",
-        "precio",
-        "gracias",
-        "quiero",
-        "tienes",
-      ];
-
+      const spanishWords = ["hola", "cita", "mañana", "precio", "gracias"];
       const lower = text.toLowerCase();
       if (spanishWords.some((w) => lower.includes(w))) return "es";
-
       return "en";
     };
 
-    // ✅ FIX 1: remove timer race
+    // ----------------------------
+    // Greeting (FIXED)
+    // ----------------------------
     const queueGreeting = () => {
       greetingQueued = true;
-      // greeting is triggered ONLY by session.updated
+      // No timer — greeting fires ONLY after session.updated
     };
 
     const trySendGreeting = () => {
@@ -138,14 +124,21 @@ export const attachMediaWebSocketServer = (server) => {
     };
 
     // ----------------------------
-    // Response creation
+    // Response creation (FIXED)
     // ----------------------------
     const commitAndCreateResponse = () => {
-      // ✅ FIX 3: block until greeting finished
       if (!greetingComplete) return;
-
       if (aiResponseInProgress) return;
-      if (framesSinceLastCommit < MIN_COMMIT_FRAMES) return;
+
+      const isFirstTurnAfterGreeting =
+        greetingComplete && !hasCommittedUserAudioForTurn;
+
+      if (
+        framesSinceLastCommit < MIN_COMMIT_FRAMES &&
+        !isFirstTurnAfterGreeting
+      )
+        return;
+
       if (!lastUserTranscript) return;
 
       sendToAI({ type: "input_audio_buffer.commit" });
@@ -159,8 +152,7 @@ export const attachMediaWebSocketServer = (server) => {
         }.\n\n` +
         `VOICE STYLE:\n` +
         `- Be brief and natural.\n` +
-        `- One sentence unless clarification is required.\n` +
-        `- Ask only ONE question.\n\n` +
+        `- Ask ONE question.\n\n` +
         `BOOKING RULES:\n` +
         `- Never invent dates or times.\n` +
         `- Require BOTH date and time.\n` +
@@ -222,19 +214,9 @@ export const attachMediaWebSocketServer = (server) => {
         const transcript = (evt.transcript || "").trim();
         if (transcript) {
           lastUserTranscript = transcript;
-
-          const detected = detectLanguage(transcript);
-          if (detected !== currentLanguage) {
-            console.log("🌐 Language switched to:", detected);
-            currentLanguage = detected;
-          }
-
+          currentLanguage = detectLanguage(transcript);
           console.log("📝 TRANSCRIPT:", transcript);
         }
-      }
-
-      if (evt.type === "input_audio_buffer.speech_started") {
-        silencePromptSent = false;
       }
 
       if (evt.type === "input_audio_buffer.speech_stopped") {
@@ -242,12 +224,10 @@ export const attachMediaWebSocketServer = (server) => {
       }
 
       if (evt.type === "response.done") {
-        // ✅ FIX 2: mark greeting complete
         if (greetingSent && !greetingComplete) {
           greetingComplete = true;
           console.log("✅ Greeting complete");
         }
-
         aiResponseInProgress = false;
         hasCommittedUserAudioForTurn = false;
       }
