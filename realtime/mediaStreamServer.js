@@ -10,7 +10,7 @@ const MIN_COMMIT_FRAMES = Math.ceil(MIN_COMMIT_MS / TWILIO_FRAME_MS); // 5
 // Silence injection constants
 const SILENCE_FRAME_SIZE = 160; // 20ms of μ-law audio at 8kHz
 
-// ✅ Helper to extract the exact greeting phrase from initialPrompt
+// Helper to extract the exact greeting phrase from initialPrompt
 const extractGreetingPhrase = (prompt) => {
   if (!prompt) return null;
   // Look for the greeting in quotes after "Say:"
@@ -56,9 +56,9 @@ export const attachMediaWebSocketServer = (server) => {
     console.log("🔗 TWILIO MEDIA WEBSOCKET CONNECTED");
     console.log("═══════════════════════════════════════════════════");
 
-    // ✅ FIX #3: Declare ai as null, create session only once in "start" event
-    let ai = null;
+    // ✅ FIX #1: Session guard - MUST be checked before ANY session creation
     let aiSessionCreated = false;
+    let ai = null;
 
     // ----------------------------
     // Per-call state
@@ -72,7 +72,6 @@ export const attachMediaWebSocketServer = (server) => {
     let initialPrompt = null;
 
     let framesSinceLastCommit = 0;
-    let mediaFrameCount = 0;
 
     let aiResponseInProgress = false;
     let pendingUserTurn = false;
@@ -83,14 +82,13 @@ export const attachMediaWebSocketServer = (server) => {
     let greetingComplete = false;
 
     let lastUserTranscript = "";
-    let silencePromptSent = false;
-
     let currentLanguage = "en"; // en | es
+    let previousLanguage = "en"; // Track language changes
 
     // Silence injection state
     let silenceInterval = null;
     let sendingSilence = false;
-    let silenceStopped = false; // ✅ FIX #4: Track if silence was already stopped
+    let silenceStopped = false;
 
     // ----------------------------
     // Silence Injection
@@ -98,10 +96,8 @@ export const attachMediaWebSocketServer = (server) => {
     const startSilence = () => {
       if (sendingSilence) return;
       sendingSilence = true;
-      silenceStopped = false;
       console.log("🔇 Starting silence injection...");
 
-      // 160 bytes of 0xFF = μ-law silence
       const silenceBuffer = Buffer.alloc(SILENCE_FRAME_SIZE, 0xff);
       const silenceB64 = silenceBuffer.toString("base64");
 
@@ -115,17 +111,13 @@ export const attachMediaWebSocketServer = (server) => {
             })
           );
         }
-      }, TWILIO_FRAME_MS); // every 20ms
+      }, TWILIO_FRAME_MS);
     };
 
     const stopSilence = () => {
-      // ✅ FIX #4: Prevent duplicate stop logs
       if (silenceStopped) return;
-      if (!sendingSilence) return;
-      
       silenceStopped = true;
       sendingSilence = false;
-      
       if (silenceInterval) {
         clearInterval(silenceInterval);
         silenceInterval = null;
@@ -146,7 +138,7 @@ export const attachMediaWebSocketServer = (server) => {
 
     const detectLanguage = (text) => {
       if (/[áéíóúñ¿¡]/i.test(text)) return "es";
-      const spanishWords = ["hola", "cita", "mañana", "precio", "gracias"];
+      const spanishWords = ["hola", "cita", "mañana", "precio", "gracias", "quiero", "para", "una"];
       const lower = text.toLowerCase();
       if (spanishWords.some((w) => lower.includes(w))) return "es";
       return "en";
@@ -162,20 +154,17 @@ export const attachMediaWebSocketServer = (server) => {
     const trySendGreeting = () => {
       if (!sessionUpdated) return;
       if (!greetingQueued || greetingSent) return;
-      if (greetingComplete) return; // ✅ FIX #2: Don't re-send after completion
+      if (greetingComplete) return; // ✅ Prevent re-sending after VAD enable
       if (!canSendAI()) return;
       if (aiResponseInProgress) return;
 
-      // Extract EXACT greeting from initialPrompt
       const exactGreeting = extractGreetingPhrase(initialPrompt);
       
       let greetingInstruction;
       if (exactGreeting) {
-        // Force verbatim speech - no improvisation allowed
         greetingInstruction = `You MUST speak this EXACTLY, word for word, with no changes, additions, or omissions: "${exactGreeting}"`;
         console.log("📜 Using exact greeting from TwiML:", exactGreeting);
       } else {
-        // Fallback if no initialPrompt
         const fallbackGreeting = currentLanguage === "es"
           ? "Gracias por llamar a Glō. ¿En qué puedo ayudarte hoy?"
           : "Thanks for calling Glō. How can I help you today?";
@@ -188,7 +177,7 @@ export const attachMediaWebSocketServer = (server) => {
         response: {
           modalities: ["audio", "text"],
           instructions: greetingInstruction,
-          max_output_tokens: 150,
+          max_output_tokens: 250, // ✅ FIX #2: Increased from 150 to 250
         },
       });
 
@@ -205,17 +194,9 @@ export const attachMediaWebSocketServer = (server) => {
     const commitAndCreateResponse = () => {
       if (!greetingComplete) return;
       if (aiResponseInProgress) return;
-
-      const isFirstTurnAfterGreeting =
-        greetingComplete && !hasCommittedUserAudioForTurn;
-
-      if (
-        framesSinceLastCommit < MIN_COMMIT_FRAMES &&
-        !isFirstTurnAfterGreeting
-      )
-        return;
-
       if (!lastUserTranscript) return;
+
+      console.log("📤 Committing audio and creating response...");
 
       sendToAI({ type: "input_audio_buffer.commit" });
 
@@ -240,32 +221,37 @@ export const attachMediaWebSocketServer = (server) => {
         response: {
           modalities: ["audio", "text"],
           instructions,
-          max_output_tokens: 120,
+          max_output_tokens: 150,
         },
       });
+
+      console.log(`🗣️ Response requested (${currentLanguage}): "${lastUserTranscript}"`);
 
       aiResponseInProgress = true;
       lastUserTranscript = "";
     };
 
     let respondTimer = null;
-    const scheduleRespond = () => {
+    const scheduleRespond = (immediate = false) => {
       pendingUserTurn = true;
       if (respondTimer) clearTimeout(respondTimer);
+
+      // ✅ FIX #3: Faster response timer (150ms instead of 250ms)
+      const delay = immediate ? 50 : 150;
 
       respondTimer = setTimeout(() => {
         respondTimer = null;
         if (!pendingUserTurn) return;
         pendingUserTurn = false;
         commitAndCreateResponse();
-      }, 250);
+      }, delay);
     };
 
     // ----------------------------
-    // Initialize AI Session (called once from "start" event)
+    // Create AI Session (with strict guard)
     // ----------------------------
     const initAISession = () => {
-      // ✅ FIX #3: Strict guard - only create session once
+      // ✅ FIX #1: Strict guard - prevent ANY duplicate session creation
       if (aiSessionCreated) {
         console.log("⚠️ AI session already created, skipping duplicate");
         return;
@@ -289,7 +275,7 @@ export const attachMediaWebSocketServer = (server) => {
               `Do not invent dates or times.\n` +
               `When given a specific phrase to speak, say it EXACTLY with no changes.\n`,
             temperature: 0.2,
-            max_response_output_tokens: 250,
+            max_response_output_tokens: 300,
             turn_detection: null, // VAD disabled during greeting
             input_audio_transcription: {
               model: "whisper-1",
@@ -308,12 +294,8 @@ export const attachMediaWebSocketServer = (server) => {
 
         if (evt.type === "session.updated") {
           console.log("📋 OpenAI session updated");
-          
-          // Only set sessionUpdated and try greeting on FIRST session.updated
-          if (!sessionUpdated) {
-            sessionUpdated = true;
-            trySendGreeting();
-          }
+          sessionUpdated = true;
+          trySendGreeting();
         }
 
         if (
@@ -323,13 +305,20 @@ export const attachMediaWebSocketServer = (server) => {
           const transcript = (evt.transcript || "").trim();
           if (transcript) {
             lastUserTranscript = transcript;
+            previousLanguage = currentLanguage;
             currentLanguage = detectLanguage(transcript);
-            console.log("📝 TRANSCRIPT:", transcript);
+            console.log("📝 TRANSCRIPT:", transcript, `(${currentLanguage})`);
+
+            // ✅ FIX #3: If language changed, respond immediately
+            if (previousLanguage !== currentLanguage) {
+              console.log(`🌐 Language switch detected: ${previousLanguage} → ${currentLanguage}`);
+              scheduleRespond(true); // Immediate response
+            }
           }
         }
 
         if (evt.type === "input_audio_buffer.speech_stopped") {
-          scheduleRespond();
+          scheduleRespond(false);
         }
 
         if (evt.type === "response.done") {
@@ -337,15 +326,15 @@ export const attachMediaWebSocketServer = (server) => {
             greetingComplete = true;
             console.log("✅ Greeting complete - enabling VAD and audio forwarding");
 
-            // Enable VAD after greeting completes
+            // ✅ FIX #4: Better VAD settings
             sendToAI({
               type: "session.update",
               session: {
                 turn_detection: {
                   type: "server_vad",
-                  threshold: 0.5,
+                  threshold: 0.4, // ✅ Lowered from 0.5 for better detection
                   prefix_padding_ms: 300,
-                  silence_duration_ms: 500,
+                  silence_duration_ms: 700, // ✅ Increased from 500 for more time
                 },
               },
             });
@@ -359,7 +348,6 @@ export const attachMediaWebSocketServer = (server) => {
           evt.type === "response.audio.delta" ||
           evt.type === "response.output_audio.delta"
         ) {
-          // Stop silence when AI audio starts
           stopSilence();
 
           if (twilioWs.readyState === twilioWs.OPEN && streamSid) {
@@ -409,22 +397,21 @@ export const attachMediaWebSocketServer = (server) => {
         // Start silence injection immediately
         startSilence();
 
-        // ✅ FIX #3: Create AI session here (only once)
+        // Create AI session (with guard against duplicates)
         initAISession();
 
-        // Queue greeting to be sent after session.updated
+        // Queue greeting (will send after session.updated)
         queueGreeting();
       }
 
       if (msg.event === "media") {
+        // ✅ FIX #1: Block audio forwarding until greeting is complete
+        if (!greetingComplete) {
+          return; // Don't forward caller audio during greeting
+        }
+
         const payloadB64 = msg.media?.payload;
         if (!payloadB64) return;
-
-        // ✅ FIX #1: DO NOT forward audio to OpenAI until greeting is complete
-        if (!greetingComplete) {
-          // Silently drop audio during greeting to prevent interference
-          return;
-        }
 
         if (canSendAI()) {
           sendToAI({
