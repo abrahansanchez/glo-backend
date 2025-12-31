@@ -6,7 +6,9 @@ const WS_PATH = "/ws/media";
 const TWILIO_FRAME_MS = 20;
 const MIN_COMMIT_MS = 100;
 const MIN_COMMIT_FRAMES = Math.ceil(MIN_COMMIT_MS / TWILIO_FRAME_MS); // 5
-const SILENCE_FRAME_SIZE = 160; // 🔇 20ms of μ-law audio @ 8kHz
+
+// Silence injection constants
+const SILENCE_FRAME_SIZE = 160; // 20ms of μ-law audio at 8kHz
 
 export const attachMediaWebSocketServer = (server) => {
   console.log("🔰 attachMediaWebSocketServer() called");
@@ -70,39 +72,42 @@ export const attachMediaWebSocketServer = (server) => {
 
     let currentLanguage = "en"; // en | es
 
-    // 🔇 Silence injection state
+    // Silence injection state
     let silenceInterval = null;
     let sendingSilence = false;
 
     // ----------------------------
-    // 🔇 Silence Injection Functions
+    // Silence Injection
     // ----------------------------
     const startSilence = () => {
       if (sendingSilence) return;
       sendingSilence = true;
       console.log("🔇 Starting silence injection...");
 
+      // 160 bytes of 0xFF = μ-law silence
+      const silenceBuffer = Buffer.alloc(SILENCE_FRAME_SIZE, 0xff);
+      const silenceB64 = silenceBuffer.toString("base64");
+
       silenceInterval = setInterval(() => {
-        if (twilioWs.readyState !== twilioWs.OPEN) return;
-
-        // μ-law silence = 0xFF bytes
-        const silenceFrame = Buffer.alloc(SILENCE_FRAME_SIZE, 0xff).toString("base64");
-
-        twilioWs.send(
-          JSON.stringify({
-            event: "media",
-            streamSid,
-            media: { payload: silenceFrame },
-          })
-        );
-      }, TWILIO_FRAME_MS);
+        if (twilioWs.readyState === twilioWs.OPEN && streamSid) {
+          twilioWs.send(
+            JSON.stringify({
+              event: "media",
+              streamSid,
+              media: { payload: silenceB64 },
+            })
+          );
+        }
+      }, TWILIO_FRAME_MS); // every 20ms
     };
 
     const stopSilence = () => {
       if (!sendingSilence) return;
-      clearInterval(silenceInterval);
-      silenceInterval = null;
       sendingSilence = false;
+      if (silenceInterval) {
+        clearInterval(silenceInterval);
+        silenceInterval = null;
+      }
       console.log("🔇 Silence injection stopped (AI audio started)");
     };
 
@@ -150,7 +155,7 @@ export const attachMediaWebSocketServer = (server) => {
         response: {
           modalities: ["audio", "text"],
           instructions: greetingText,
-          max_output_tokens: 60,
+          max_output_tokens: 100, // ✅ FIX #2: Increased from 60 to 100
         },
       });
 
@@ -227,7 +232,7 @@ export const attachMediaWebSocketServer = (server) => {
     // OpenAI events
     // ----------------------------
     ai.on("open", () => {
-      console.log("🤖 OpenAI session READY");
+      console.log("🤖 OpenAI Realtime Connected");
       aiReady = true;
     });
 
@@ -265,17 +270,30 @@ export const attachMediaWebSocketServer = (server) => {
         if (greetingSent && !greetingComplete) {
           greetingComplete = true;
           console.log("✅ Greeting complete");
+
+          // ✅ FIX #3: Enable VAD after greeting completes
+          sendToAI({
+            type: "session.update",
+            session: {
+              turn_detection: {
+                type: "server_vad",
+                threshold: 0.5,
+                prefix_padding_ms: 300,
+                silence_duration_ms: 500,
+              },
+            },
+          });
+          console.log("🎙️ VAD enabled for conversation");
         }
         aiResponseInProgress = false;
         hasCommittedUserAudioForTurn = false;
       }
 
-      // 🔊 AI Audio - stop silence and forward to Twilio
       if (
         evt.type === "response.audio.delta" ||
         evt.type === "response.output_audio.delta"
       ) {
-        // 🔇 CRITICAL: Stop silence on FIRST audio delta
+        // Stop silence when AI audio starts
         stopSilence();
 
         if (twilioWs.readyState === twilioWs.OPEN) {
@@ -310,9 +328,10 @@ export const attachMediaWebSocketServer = (server) => {
 
         console.log("📡 Stream started - streamSid:", streamSid);
 
-        // 🔇 START SILENCE IMMEDIATELY to keep stream alive
+        // Start silence injection immediately
         startSilence();
 
+        // ✅ FIX #1: Disable VAD initially to prevent greeting interruption
         sendToAI({
           type: "session.update",
           session: {
@@ -322,6 +341,7 @@ export const attachMediaWebSocketServer = (server) => {
               `Do not invent dates or times.\n`,
             temperature: 0.3,
             max_response_output_tokens: 250,
+            turn_detection: null, // ✅ VAD disabled during greeting
           },
         });
 
@@ -344,9 +364,8 @@ export const attachMediaWebSocketServer = (server) => {
 
     twilioWs.on("close", () => {
       console.log("📴 Twilio WebSocket closed");
-      // 🔇 Cleanup silence on close
-      stopSilence();
       if (respondTimer) clearTimeout(respondTimer);
+      stopSilence(); // Cleanup silence interval
       if (ai.readyState === ai.OPEN) ai.close();
     });
 
