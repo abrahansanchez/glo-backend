@@ -6,6 +6,7 @@ const WS_PATH = "/ws/media";
 const TWILIO_FRAME_MS = 20;
 const MIN_COMMIT_MS = 100;
 const MIN_COMMIT_FRAMES = Math.ceil(MIN_COMMIT_MS / TWILIO_FRAME_MS); // 5
+const SILENCE_FRAME_SIZE = 160; // 🔇 20ms of μ-law audio @ 8kHz
 
 export const attachMediaWebSocketServer = (server) => {
   console.log("🔰 attachMediaWebSocketServer() called");
@@ -62,12 +63,48 @@ export const attachMediaWebSocketServer = (server) => {
 
     let greetingQueued = false;
     let greetingSent = false;
-    let greetingComplete = false; // ✅ FIX
+    let greetingComplete = false;
 
     let lastUserTranscript = "";
     let silencePromptSent = false;
 
     let currentLanguage = "en"; // en | es
+
+    // 🔇 Silence injection state
+    let silenceInterval = null;
+    let sendingSilence = false;
+
+    // ----------------------------
+    // 🔇 Silence Injection Functions
+    // ----------------------------
+    const startSilence = () => {
+      if (sendingSilence) return;
+      sendingSilence = true;
+      console.log("🔇 Starting silence injection...");
+
+      silenceInterval = setInterval(() => {
+        if (twilioWs.readyState !== twilioWs.OPEN) return;
+
+        // μ-law silence = 0xFF bytes
+        const silenceFrame = Buffer.alloc(SILENCE_FRAME_SIZE, 0xff).toString("base64");
+
+        twilioWs.send(
+          JSON.stringify({
+            event: "media",
+            streamSid,
+            media: { payload: silenceFrame },
+          })
+        );
+      }, TWILIO_FRAME_MS);
+    };
+
+    const stopSilence = () => {
+      if (!sendingSilence) return;
+      clearInterval(silenceInterval);
+      silenceInterval = null;
+      sendingSilence = false;
+      console.log("🔇 Silence injection stopped (AI audio started)");
+    };
 
     // ----------------------------
     // Helpers
@@ -89,7 +126,7 @@ export const attachMediaWebSocketServer = (server) => {
     };
 
     // ----------------------------
-    // Greeting (FIXED)
+    // Greeting
     // ----------------------------
     const queueGreeting = () => {
       greetingQueued = true;
@@ -120,11 +157,12 @@ export const attachMediaWebSocketServer = (server) => {
       if (ok) {
         greetingSent = true;
         aiResponseInProgress = true;
+        console.log("🎤 Greeting sent to OpenAI");
       }
     };
 
     // ----------------------------
-    // Response creation (FIXED)
+    // Response creation
     // ----------------------------
     const commitAndCreateResponse = () => {
       if (!greetingComplete) return;
@@ -232,10 +270,14 @@ export const attachMediaWebSocketServer = (server) => {
         hasCommittedUserAudioForTurn = false;
       }
 
+      // 🔊 AI Audio - stop silence and forward to Twilio
       if (
         evt.type === "response.audio.delta" ||
         evt.type === "response.output_audio.delta"
       ) {
+        // 🔇 CRITICAL: Stop silence on FIRST audio delta
+        stopSilence();
+
         if (twilioWs.readyState === twilioWs.OPEN) {
           twilioWs.send(
             JSON.stringify({
@@ -265,6 +307,11 @@ export const attachMediaWebSocketServer = (server) => {
 
         const custom = msg.start?.customParameters || {};
         barberId = custom.barberId || null;
+
+        console.log("📡 Stream started - streamSid:", streamSid);
+
+        // 🔇 START SILENCE IMMEDIATELY to keep stream alive
+        startSilence();
 
         sendToAI({
           type: "session.update",
@@ -296,6 +343,9 @@ export const attachMediaWebSocketServer = (server) => {
     });
 
     twilioWs.on("close", () => {
+      console.log("📴 Twilio WebSocket closed");
+      // 🔇 Cleanup silence on close
+      stopSilence();
       if (respondTimer) clearTimeout(respondTimer);
       if (ai.readyState === ai.OPEN) ai.close();
     });

@@ -1,4 +1,5 @@
 // controllers/callController.js
+
 import twilio from "twilio";
 import Barber from "../models/Barber.js";
 
@@ -24,7 +25,6 @@ export const handleIncomingCall = async (req, res) => {
 
     console.log("💈 Matched Barber:", barber.name, barber._id.toString());
 
-    // Later we’ll enforce barber language here (4.95.6).
     const initialPrompt =
       `You are Glō, the AI receptionist for ${barber.name}.\n` +
       `When you answer:\n` +
@@ -41,6 +41,7 @@ export const handleIncomingCall = async (req, res) => {
 
     const response = new VoiceResponse();
 
+    // ✅ NO <Say> — single-voice AI flow with silence injection
     const connect = response.connect();
     const stream = connect.stream({
       url: wsUrl,
