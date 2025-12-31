@@ -10,7 +10,7 @@ const MIN_COMMIT_FRAMES = Math.ceil(MIN_COMMIT_MS / TWILIO_FRAME_MS); // 5
 // Silence injection constants
 const SILENCE_FRAME_SIZE = 160; // 20ms of μ-law audio at 8kHz
 
-// ✅ FIX: Helper to extract the exact greeting phrase from initialPrompt
+// ✅ Helper to extract the exact greeting phrase from initialPrompt
 const extractGreetingPhrase = (prompt) => {
   if (!prompt) return null;
   // Look for the greeting in quotes after "Say:"
@@ -56,10 +56,9 @@ export const attachMediaWebSocketServer = (server) => {
     console.log("🔗 TWILIO MEDIA WEBSOCKET CONNECTED");
     console.log("═══════════════════════════════════════════════════");
 
-    // ✅ FIX #4: Guard to prevent duplicate AI sessions
-    let aiSessionCreated = false;
-
+    // ✅ FIX #3: Declare ai as null, create session only once in "start" event
     let ai = null;
+    let aiSessionCreated = false;
 
     // ----------------------------
     // Per-call state
@@ -70,7 +69,7 @@ export const attachMediaWebSocketServer = (server) => {
     let streamSid = null;
     let callSid = null;
     let barberId = null;
-    let initialPrompt = null; // ✅ FIX #1: Store initialPrompt
+    let initialPrompt = null;
 
     let framesSinceLastCommit = 0;
     let mediaFrameCount = 0;
@@ -91,6 +90,7 @@ export const attachMediaWebSocketServer = (server) => {
     // Silence injection state
     let silenceInterval = null;
     let sendingSilence = false;
+    let silenceStopped = false; // ✅ FIX #4: Track if silence was already stopped
 
     // ----------------------------
     // Silence Injection
@@ -98,6 +98,7 @@ export const attachMediaWebSocketServer = (server) => {
     const startSilence = () => {
       if (sendingSilence) return;
       sendingSilence = true;
+      silenceStopped = false;
       console.log("🔇 Starting silence injection...");
 
       // 160 bytes of 0xFF = μ-law silence
@@ -118,8 +119,13 @@ export const attachMediaWebSocketServer = (server) => {
     };
 
     const stopSilence = () => {
+      // ✅ FIX #4: Prevent duplicate stop logs
+      if (silenceStopped) return;
       if (!sendingSilence) return;
+      
+      silenceStopped = true;
       sendingSilence = false;
+      
       if (silenceInterval) {
         clearInterval(silenceInterval);
         silenceInterval = null;
@@ -151,16 +157,16 @@ export const attachMediaWebSocketServer = (server) => {
     // ----------------------------
     const queueGreeting = () => {
       greetingQueued = true;
-      // No timer — greeting fires ONLY after session.updated
     };
 
     const trySendGreeting = () => {
       if (!sessionUpdated) return;
       if (!greetingQueued || greetingSent) return;
+      if (greetingComplete) return; // ✅ FIX #2: Don't re-send after completion
       if (!canSendAI()) return;
       if (aiResponseInProgress) return;
 
-      // ✅ FIX #2: Extract EXACT greeting from initialPrompt
+      // Extract EXACT greeting from initialPrompt
       const exactGreeting = extractGreetingPhrase(initialPrompt);
       
       let greetingInstruction;
@@ -182,7 +188,7 @@ export const attachMediaWebSocketServer = (server) => {
         response: {
           modalities: ["audio", "text"],
           instructions: greetingInstruction,
-          max_output_tokens: 150, // ✅ Increased for full greeting
+          max_output_tokens: 150,
         },
       });
 
@@ -256,21 +262,40 @@ export const attachMediaWebSocketServer = (server) => {
     };
 
     // ----------------------------
-    // Create AI Session (with guard)
+    // Initialize AI Session (called once from "start" event)
     // ----------------------------
     const initAISession = () => {
-      // ✅ FIX #4: Prevent duplicate sessions
+      // ✅ FIX #3: Strict guard - only create session once
       if (aiSessionCreated) {
         console.log("⚠️ AI session already created, skipping duplicate");
         return;
       }
       aiSessionCreated = true;
+      console.log("🔄 Creating OpenAI session...");
 
       ai = createOpenAISession();
 
       ai.on("open", () => {
         console.log("🤖 OpenAI Realtime Connected");
         aiReady = true;
+
+        // Send initial session config immediately after connection
+        sendToAI({
+          type: "session.update",
+          session: {
+            instructions:
+              `You are Glō, an AI phone receptionist.\n` +
+              `Follow booking rules strictly.\n` +
+              `Do not invent dates or times.\n` +
+              `When given a specific phrase to speak, say it EXACTLY with no changes.\n`,
+            temperature: 0.2,
+            max_response_output_tokens: 250,
+            turn_detection: null, // VAD disabled during greeting
+            input_audio_transcription: {
+              model: "whisper-1",
+            },
+          },
+        });
       });
 
       ai.on("message", (raw) => {
@@ -283,8 +308,12 @@ export const attachMediaWebSocketServer = (server) => {
 
         if (evt.type === "session.updated") {
           console.log("📋 OpenAI session updated");
-          sessionUpdated = true;
-          trySendGreeting();
+          
+          // Only set sessionUpdated and try greeting on FIRST session.updated
+          if (!sessionUpdated) {
+            sessionUpdated = true;
+            trySendGreeting();
+          }
         }
 
         if (
@@ -306,9 +335,9 @@ export const attachMediaWebSocketServer = (server) => {
         if (evt.type === "response.done") {
           if (greetingSent && !greetingComplete) {
             greetingComplete = true;
-            console.log("✅ Greeting complete");
+            console.log("✅ Greeting complete - enabling VAD and audio forwarding");
 
-            // ✅ FIX #3: Enable VAD after greeting completes
+            // Enable VAD after greeting completes
             sendToAI({
               type: "session.update",
               session: {
@@ -333,7 +362,7 @@ export const attachMediaWebSocketServer = (server) => {
           // Stop silence when AI audio starts
           stopSilence();
 
-          if (twilioWs.readyState === twilioWs.OPEN) {
+          if (twilioWs.readyState === twilioWs.OPEN && streamSid) {
             twilioWs.send(
               JSON.stringify({
                 event: "media",
@@ -371,7 +400,7 @@ export const attachMediaWebSocketServer = (server) => {
 
         const custom = msg.start?.customParameters || {};
         barberId = custom.barberId || null;
-        initialPrompt = custom.initialPrompt || null; // ✅ FIX #1: Read initialPrompt
+        initialPrompt = custom.initialPrompt || null;
 
         console.log("📡 Stream started - streamSid:", streamSid);
         console.log("💈 Barber ID:", barberId);
@@ -380,33 +409,22 @@ export const attachMediaWebSocketServer = (server) => {
         // Start silence injection immediately
         startSilence();
 
-        // Create AI session (with guard against duplicates)
+        // ✅ FIX #3: Create AI session here (only once)
         initAISession();
 
-        // ✅ FIX #1: Disable VAD initially to prevent greeting interruption
-        sendToAI({
-          type: "session.update",
-          session: {
-            instructions:
-              `You are Glō, an AI phone receptionist.\n` +
-              `Follow booking rules strictly.\n` +
-              `Do not invent dates or times.\n` +
-              `When given a specific phrase to speak, say it EXACTLY with no changes.\n`,
-            temperature: 0.2, // Lower temperature for more consistency
-            max_response_output_tokens: 250,
-            turn_detection: null, // ✅ VAD disabled during greeting
-            input_audio_transcription: {
-              model: "whisper-1",
-            },
-          },
-        });
-
+        // Queue greeting to be sent after session.updated
         queueGreeting();
       }
 
       if (msg.event === "media") {
         const payloadB64 = msg.media?.payload;
         if (!payloadB64) return;
+
+        // ✅ FIX #1: DO NOT forward audio to OpenAI until greeting is complete
+        if (!greetingComplete) {
+          // Silently drop audio during greeting to prevent interference
+          return;
+        }
 
         if (canSendAI()) {
           sendToAI({
@@ -421,7 +439,7 @@ export const attachMediaWebSocketServer = (server) => {
     twilioWs.on("close", () => {
       console.log("📴 Twilio WebSocket closed");
       if (respondTimer) clearTimeout(respondTimer);
-      stopSilence(); // Cleanup silence interval
+      stopSilence();
       if (ai && ai.readyState === ai.OPEN) ai.close();
     });
 
