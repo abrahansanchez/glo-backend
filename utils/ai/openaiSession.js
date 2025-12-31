@@ -1,4 +1,5 @@
 // utils/ai/openaiSession.js
+
 import WebSocket from "ws";
 import { SYSTEM_PERSONALITY } from "./aiPersonality.js";
 
@@ -42,21 +43,18 @@ export function createOpenAISession() {
           turn_detection: {
             type: "server_vad",
             create_response: false,
-
-            // These values are safe defaults for phone calls.
-            // If you still get delayed turns, reduce silence_duration_ms slightly.
             silence_duration_ms: 450,
             prefix_padding_ms: 300,
           },
 
           voice: "alloy",
-
-          // 🔥 must be >= 0.6 based on your logs
           temperature: 0.7,
-
           max_response_output_tokens: 250,
 
+          // ✅ FIX: Enforce English-only at session level
           instructions:
+            `LANGUAGE RULE: You MUST respond ONLY in English. ` +
+            `Do NOT switch to Spanish or any other language unless the caller explicitly speaks Spanish first.\n\n` +
             `You are a phone receptionist. Be brief. Ask one question at a time.\n\n` +
             `${SYSTEM_PERSONALITY}`,
         },

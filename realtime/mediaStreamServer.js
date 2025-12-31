@@ -62,6 +62,7 @@ export const attachMediaWebSocketServer = (server) => {
 
     let greetingQueued = false;
     let greetingSent = false;
+    let greetingComplete = false; // ✅ NEW
 
     let lastUserTranscript = "";
     let silencePromptSent = false;
@@ -83,7 +84,6 @@ export const attachMediaWebSocketServer = (server) => {
     };
 
     const detectLanguage = (text) => {
-      // Spanish markers
       if (/[áéíóúñ¿¡]/i.test(text)) return "es";
 
       const spanishWords = [
@@ -104,11 +104,10 @@ export const attachMediaWebSocketServer = (server) => {
       return "en";
     };
 
+    // ✅ FIX 1: remove timer race
     const queueGreeting = () => {
       greetingQueued = true;
-      setTimeout(() => {
-        trySendGreeting();
-      }, 200);
+      // greeting is triggered ONLY by session.updated
     };
 
     const trySendGreeting = () => {
@@ -138,7 +137,13 @@ export const attachMediaWebSocketServer = (server) => {
       }
     };
 
+    // ----------------------------
+    // Response creation
+    // ----------------------------
     const commitAndCreateResponse = () => {
+      // ✅ FIX 3: block until greeting finished
+      if (!greetingComplete) return;
+
       if (aiResponseInProgress) return;
       if (framesSinceLastCommit < MIN_COMMIT_FRAMES) return;
       if (!lastUserTranscript) return;
@@ -218,7 +223,6 @@ export const attachMediaWebSocketServer = (server) => {
         if (transcript) {
           lastUserTranscript = transcript;
 
-          // 🌐 auto detect language per turn
           const detected = detectLanguage(transcript);
           if (detected !== currentLanguage) {
             console.log("🌐 Language switched to:", detected);
@@ -238,6 +242,12 @@ export const attachMediaWebSocketServer = (server) => {
       }
 
       if (evt.type === "response.done") {
+        // ✅ FIX 2: mark greeting complete
+        if (greetingSent && !greetingComplete) {
+          greetingComplete = true;
+          console.log("✅ Greeting complete");
+        }
+
         aiResponseInProgress = false;
         hasCommittedUserAudioForTurn = false;
       }
