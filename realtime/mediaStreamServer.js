@@ -10,6 +10,18 @@ const MIN_COMMIT_FRAMES = Math.ceil(MIN_COMMIT_MS / TWILIO_FRAME_MS); // 5
 // Silence injection constants
 const SILENCE_FRAME_SIZE = 160; // 20ms of μ-law audio at 8kHz
 
+// ✅ FIX: Helper to extract the exact greeting phrase from initialPrompt
+const extractGreetingPhrase = (prompt) => {
+  if (!prompt) return null;
+  // Look for the greeting in quotes after "Say:"
+  const match = prompt.match(/Say:\s*"([^"]+)"/i);
+  if (match) return match[1];
+  // Fallback: look for "Thanks for calling" pattern
+  const thanksMatch = prompt.match(/(Thanks for calling[^.]+\.[^?]+\?)/i);
+  if (thanksMatch) return thanksMatch[1];
+  return null;
+};
+
 export const attachMediaWebSocketServer = (server) => {
   console.log("🔰 attachMediaWebSocketServer() called");
 
@@ -44,7 +56,10 @@ export const attachMediaWebSocketServer = (server) => {
     console.log("🔗 TWILIO MEDIA WEBSOCKET CONNECTED");
     console.log("═══════════════════════════════════════════════════");
 
-    const ai = createOpenAISession();
+    // ✅ FIX #4: Guard to prevent duplicate AI sessions
+    let aiSessionCreated = false;
+
+    let ai = null;
 
     // ----------------------------
     // Per-call state
@@ -55,6 +70,7 @@ export const attachMediaWebSocketServer = (server) => {
     let streamSid = null;
     let callSid = null;
     let barberId = null;
+    let initialPrompt = null; // ✅ FIX #1: Store initialPrompt
 
     let framesSinceLastCommit = 0;
     let mediaFrameCount = 0;
@@ -114,7 +130,7 @@ export const attachMediaWebSocketServer = (server) => {
     // ----------------------------
     // Helpers
     // ----------------------------
-    const canSendAI = () => aiReady && ai.readyState === ai.OPEN;
+    const canSendAI = () => aiReady && ai && ai.readyState === ai.OPEN;
 
     const sendToAI = (obj) => {
       if (!canSendAI()) return false;
@@ -140,22 +156,33 @@ export const attachMediaWebSocketServer = (server) => {
 
     const trySendGreeting = () => {
       if (!sessionUpdated) return;
-      if (!barberId) return;
       if (!greetingQueued || greetingSent) return;
       if (!canSendAI()) return;
       if (aiResponseInProgress) return;
 
-      const greetingText =
-        currentLanguage === "es"
-          ? `Gracias por llamar a Glō. Soy la recepcionista virtual de ${barberId}. ¿En qué puedo ayudarte hoy?`
-          : `Thanks for calling Glō. This is the AI receptionist for ${barberId}. How can I help you today?`;
+      // ✅ FIX #2: Extract EXACT greeting from initialPrompt
+      const exactGreeting = extractGreetingPhrase(initialPrompt);
+      
+      let greetingInstruction;
+      if (exactGreeting) {
+        // Force verbatim speech - no improvisation allowed
+        greetingInstruction = `You MUST speak this EXACTLY, word for word, with no changes, additions, or omissions: "${exactGreeting}"`;
+        console.log("📜 Using exact greeting from TwiML:", exactGreeting);
+      } else {
+        // Fallback if no initialPrompt
+        const fallbackGreeting = currentLanguage === "es"
+          ? "Gracias por llamar a Glō. ¿En qué puedo ayudarte hoy?"
+          : "Thanks for calling Glō. How can I help you today?";
+        greetingInstruction = `You MUST speak this EXACTLY, word for word: "${fallbackGreeting}"`;
+        console.log("📜 Using fallback greeting (no initialPrompt found)");
+      }
 
       const ok = sendToAI({
         type: "response.create",
         response: {
           modalities: ["audio", "text"],
-          instructions: greetingText,
-          max_output_tokens: 100, // ✅ FIX #2: Increased from 60 to 100
+          instructions: greetingInstruction,
+          max_output_tokens: 150, // ✅ Increased for full greeting
         },
       });
 
@@ -229,84 +256,103 @@ export const attachMediaWebSocketServer = (server) => {
     };
 
     // ----------------------------
-    // OpenAI events
+    // Create AI Session (with guard)
     // ----------------------------
-    ai.on("open", () => {
-      console.log("🤖 OpenAI Realtime Connected");
-      aiReady = true;
-    });
-
-    ai.on("message", (raw) => {
-      let evt;
-      try {
-        evt = JSON.parse(Buffer.from(raw).toString("utf8"));
-      } catch {
+    const initAISession = () => {
+      // ✅ FIX #4: Prevent duplicate sessions
+      if (aiSessionCreated) {
+        console.log("⚠️ AI session already created, skipping duplicate");
         return;
       }
+      aiSessionCreated = true;
 
-      if (evt.type === "session.updated") {
-        console.log("📋 OpenAI session updated");
-        sessionUpdated = true;
-        trySendGreeting();
-      }
+      ai = createOpenAISession();
 
-      if (
-        evt.type === "conversation.item.input_audio_transcription.completed" ||
-        evt.type === "input_audio_transcription.completed"
-      ) {
-        const transcript = (evt.transcript || "").trim();
-        if (transcript) {
-          lastUserTranscript = transcript;
-          currentLanguage = detectLanguage(transcript);
-          console.log("📝 TRANSCRIPT:", transcript);
+      ai.on("open", () => {
+        console.log("🤖 OpenAI Realtime Connected");
+        aiReady = true;
+      });
+
+      ai.on("message", (raw) => {
+        let evt;
+        try {
+          evt = JSON.parse(Buffer.from(raw).toString("utf8"));
+        } catch {
+          return;
         }
-      }
 
-      if (evt.type === "input_audio_buffer.speech_stopped") {
-        scheduleRespond();
-      }
+        if (evt.type === "session.updated") {
+          console.log("📋 OpenAI session updated");
+          sessionUpdated = true;
+          trySendGreeting();
+        }
 
-      if (evt.type === "response.done") {
-        if (greetingSent && !greetingComplete) {
-          greetingComplete = true;
-          console.log("✅ Greeting complete");
+        if (
+          evt.type === "conversation.item.input_audio_transcription.completed" ||
+          evt.type === "input_audio_transcription.completed"
+        ) {
+          const transcript = (evt.transcript || "").trim();
+          if (transcript) {
+            lastUserTranscript = transcript;
+            currentLanguage = detectLanguage(transcript);
+            console.log("📝 TRANSCRIPT:", transcript);
+          }
+        }
 
-          // ✅ FIX #3: Enable VAD after greeting completes
-          sendToAI({
-            type: "session.update",
-            session: {
-              turn_detection: {
-                type: "server_vad",
-                threshold: 0.5,
-                prefix_padding_ms: 300,
-                silence_duration_ms: 500,
+        if (evt.type === "input_audio_buffer.speech_stopped") {
+          scheduleRespond();
+        }
+
+        if (evt.type === "response.done") {
+          if (greetingSent && !greetingComplete) {
+            greetingComplete = true;
+            console.log("✅ Greeting complete");
+
+            // ✅ FIX #3: Enable VAD after greeting completes
+            sendToAI({
+              type: "session.update",
+              session: {
+                turn_detection: {
+                  type: "server_vad",
+                  threshold: 0.5,
+                  prefix_padding_ms: 300,
+                  silence_duration_ms: 500,
+                },
               },
-            },
-          });
-          console.log("🎙️ VAD enabled for conversation");
+            });
+            console.log("🎙️ VAD enabled for conversation");
+          }
+          aiResponseInProgress = false;
+          hasCommittedUserAudioForTurn = false;
         }
-        aiResponseInProgress = false;
-        hasCommittedUserAudioForTurn = false;
-      }
 
-      if (
-        evt.type === "response.audio.delta" ||
-        evt.type === "response.output_audio.delta"
-      ) {
-        // Stop silence when AI audio starts
-        stopSilence();
+        if (
+          evt.type === "response.audio.delta" ||
+          evt.type === "response.output_audio.delta"
+        ) {
+          // Stop silence when AI audio starts
+          stopSilence();
 
-        if (twilioWs.readyState === twilioWs.OPEN) {
-          twilioWs.send(
-            JSON.stringify({
-              event: "media",
-              streamSid,
-              media: { payload: evt.delta },
-            })
-          );
+          if (twilioWs.readyState === twilioWs.OPEN) {
+            twilioWs.send(
+              JSON.stringify({
+                event: "media",
+                streamSid,
+                media: { payload: evt.delta },
+              })
+            );
+          }
         }
-      }
-    });
+      });
+
+      ai.on("error", (err) => {
+        console.error("❌ OpenAI WS Error:", err.message);
+      });
+
+      ai.on("close", () => {
+        console.log("📴 OpenAI WebSocket closed");
+      });
+    };
 
     // ----------------------------
     // Twilio → OpenAI
@@ -325,11 +371,17 @@ export const attachMediaWebSocketServer = (server) => {
 
         const custom = msg.start?.customParameters || {};
         barberId = custom.barberId || null;
+        initialPrompt = custom.initialPrompt || null; // ✅ FIX #1: Read initialPrompt
 
         console.log("📡 Stream started - streamSid:", streamSid);
+        console.log("💈 Barber ID:", barberId);
+        console.log("📜 Initial Prompt received:", initialPrompt ? "YES" : "NO");
 
         // Start silence injection immediately
         startSilence();
+
+        // Create AI session (with guard against duplicates)
+        initAISession();
 
         // ✅ FIX #1: Disable VAD initially to prevent greeting interruption
         sendToAI({
@@ -338,10 +390,14 @@ export const attachMediaWebSocketServer = (server) => {
             instructions:
               `You are Glō, an AI phone receptionist.\n` +
               `Follow booking rules strictly.\n` +
-              `Do not invent dates or times.\n`,
-            temperature: 0.3,
+              `Do not invent dates or times.\n` +
+              `When given a specific phrase to speak, say it EXACTLY with no changes.\n`,
+            temperature: 0.2, // Lower temperature for more consistency
             max_response_output_tokens: 250,
             turn_detection: null, // ✅ VAD disabled during greeting
+            input_audio_transcription: {
+              model: "whisper-1",
+            },
           },
         });
 
@@ -366,7 +422,7 @@ export const attachMediaWebSocketServer = (server) => {
       console.log("📴 Twilio WebSocket closed");
       if (respondTimer) clearTimeout(respondTimer);
       stopSilence(); // Cleanup silence interval
-      if (ai.readyState === ai.OPEN) ai.close();
+      if (ai && ai.readyState === ai.OPEN) ai.close();
     });
 
     twilioWs.on("error", (err) => {
