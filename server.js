@@ -1,12 +1,12 @@
 // server.js
+// ⚠️ dotenv MUST load before ANY other imports (ESM requirement)
+import "dotenv/config";
+
 import express from "express";
 import http from "http";
-import dotenv from "dotenv";
 import cors from "cors";
 import path from "path";
 import { fileURLToPath } from "url";
-
-dotenv.config();
 
 // ---------------------------------------------------------
 // DATABASE
@@ -25,6 +25,9 @@ import { attachMediaWebSocketServer } from "./realtime/mediaStreamServer.js";
 
 // Twilio inbound call webhook → RETURNS TWIML
 import voiceWebhook from "./routes/voiceWebhook.js";
+
+// 🔔 STRIPE WEBHOOK (RAW BODY REQUIRED)
+import stripeWebhookRoutes from "./routes/stripeWebhookRoutes.js";
 
 // Twilio stream-status route
 import callStreamStatusRoutes from "./routes/callStreamRoutes.js";
@@ -51,6 +54,9 @@ import availabilityRoutes from "./routes/availabilityRoutes.js";
 import appointmentRoutes from "./routes/appointmentRoutes.js";
 import analyticsRoutes from "./routes/analyticsRoutes.js";
 
+// Billing
+import billingRoutes from "./routes/billingRoutes.js";
+
 // Voicemail CRUD
 import voiceRoutes from "./routes/voiceRoutes.js";
 
@@ -60,11 +66,25 @@ import voiceRoutes from "./routes/voiceRoutes.js";
 const app = express();
 const server = http.createServer(app);
 
-// JSON + FORM parsing
+// ---------------------------------------------------------
+// ⚠️ STRIPE WEBHOOK RAW BODY (MUST BE BEFORE express.json)
+// ---------------------------------------------------------
+app.use(
+  "/api/stripe/webhook",
+  express.raw({ type: "application/json" })
+);
+
+// Mount Stripe webhook router
+app.use("/api/stripe", stripeWebhookRoutes);
+// ---------------------------------------------------------
+// JSON + FORM parsing (AFTER Stripe raw body)
+// ---------------------------------------------------------
 app.use(express.json({ limit: "5mb" }));
 app.use(express.urlencoded({ extended: false }));
 
+// ---------------------------------------------------------
 // CORS
+// ---------------------------------------------------------
 app.use(cors());
 
 // ---------------------------------------------------------
@@ -82,7 +102,7 @@ app.get("/", (req, res) => {
 });
 
 // ---------------------------------------------------------
-// ROUTES (ORDER MATTERS — DO NOT CHANGE ORDER)
+// ROUTES (ORDER MATTERS — DO NOT CHANGE)
 // ---------------------------------------------------------
 
 // 1️⃣ Twilio incoming phone call → TwiML
@@ -93,6 +113,9 @@ app.use("/api/calls", callStreamStatusRoutes);
 
 // 3️⃣ Auth
 app.use("/api/auth", authRoutes);
+
+// 💳 Billing / Stripe Checkout
+app.use("/api/billing", billingRoutes);
 
 // 4️⃣ Phone number lifecycle
 app.use("/api/number", numberRoutes);

@@ -1,60 +1,86 @@
 import mongoose from "mongoose";
 
-const BarberSchema = new mongoose.Schema({
-  name: {
-    type: String,
-    required: true,
-  },
-  email: {
-    type: String,
-    required: true,
-    unique: true,
-  },
-  phone: {
-    type: String,
-    required: true,
-  },
-  password: {
-    type: String,
-    required: true,
-  },
-  twilioNumber: {
-    type: String,
-    default: null,
-  },
-  twilioSid: {
-    type: String,
-    default: null,
-  },
-  aiMode: {
-    type: Boolean,
-    default: true,
-  },
-  voiceModel: {
-    provider: { type: String, default: "ElevenLabs" },
-    voiceId: { type: String, default: null },
-  },
-  createdAt: {
-    type: Date,
-    default: Date.now,
-  },
-  voiceId: {
-  type: String,
-  default: null
-},
+const BarberSchema = new mongoose.Schema(
+  {
+    name: {
+      type: String,
+      required: true,
+    },
 
-voiceSampleUrl: {
-  type: String,
-  default: null
-},
+    email: {
+      type: String,
+      required: true,
+      unique: true,
+    },
 
-  availability: {
+    phone: {
+      type: String,
+      required: true,
+    },
+
+    password: {
+      type: String,
+      required: true,
+    },
+
+    twilioNumber: {
+      type: String,
+      default: null,
+    },
+
+    twilioSid: {
+      type: String,
+      default: null,
+    },
+
+    aiMode: {
+      type: Boolean,
+      default: true,
+    },
+
+    voiceModel: {
+      provider: { type: String, default: "ElevenLabs" },
+      voiceId: { type: String, default: null },
+    },
+
+    // (kept for backward compatibility)
+    voiceId: {
+      type: String,
+      default: null,
+    },
+
+    voiceSampleUrl: {
+      type: String,
+      default: null,
+    },
+
+    // ============================
+    // 🔐 STRIPE SUBSCRIPTION FIELDS
+    // ============================
+    stripeCustomerId: {
+      type: String,
+      default: null,
+    },
+
+    stripeSubscriptionId: {
+      type: String,
+      default: null,
+    },
+
+    subscriptionStatus: {
+      type: String,
+      enum: ["active", "past_due", "canceled", "incomplete", "trialing"],
+      default: "incomplete",
+    },
+    // ============================
+
+    availability: {
       timezone: {
         type: String,
-        default: "America/New_York", // you can change default later per barber
+        default: "America/New_York",
       },
+
       businessHours: {
-        // Simple open/close + isClosed per day (24h format "HH:MM")
         mon: {
           open: { type: String, default: "09:00" },
           close: { type: String, default: "18:00" },
@@ -91,14 +117,17 @@ voiceSampleUrl: {
           isClosed: { type: Boolean, default: true },
         },
       },
+
       defaultServiceDurationMinutes: {
         type: Number,
-        default: 30, // default length for an appointment
+        default: 30,
       },
+
       bufferMinutes: {
         type: Number,
-        default: 0, // extra gap between appointments
+        default: 0,
       },
+
       blackoutDates: [
         {
           date: { type: Date, required: true },
