@@ -3,10 +3,11 @@ import Subscription from "../models/Subscription.js";
 
 /**
  * Ensures the authenticated barber has a valid subscription
- * Handles edge cases:
- * - trialing
- * - past_due (with grace period)
- * - incomplete / canceled (blocked)
+ * Handles:
+ * - active → allowed
+ * - trialing → allowed
+ * - past_due → allowed ONLY within grace period
+ * - canceled / incomplete / missing → blocked
  */
 export const requireActiveSubscription = async (req, res, next) => {
   try {
@@ -14,7 +15,7 @@ export const requireActiveSubscription = async (req, res, next) => {
 
     if (!barberId) {
       return res.status(401).json({
-        error: "UNAUTHORIZED",
+        code: "UNAUTHORIZED",
         message: "Authentication required",
       });
     }
@@ -23,7 +24,7 @@ export const requireActiveSubscription = async (req, res, next) => {
 
     if (!barber) {
       return res.status(404).json({
-        error: "BARBER_NOT_FOUND",
+        code: "BARBER_NOT_FOUND",
         message: "Barber account not found",
       });
     }
@@ -32,10 +33,11 @@ export const requireActiveSubscription = async (req, res, next) => {
       barber: barber._id,
     }).sort({ createdAt: -1 });
 
+    // ❌ No subscription at all
     if (!subscription) {
       return res.status(403).json({
-        error: "SUBSCRIPTION_REQUIRED",
-        message: "No subscription found",
+        code: "SUBSCRIPTION_REQUIRED",
+        message: "No active subscription found",
       });
     }
 
@@ -46,29 +48,27 @@ export const requireActiveSubscription = async (req, res, next) => {
       return next();
     }
 
-    // ⚠️ TEMPORARY ACCESS (PAST DUE)
+    // ⚠️ PAST DUE — allow only if within grace period
     if (status === "past_due") {
       if (gracePeriodEndsAt && new Date() < gracePeriodEndsAt) {
         return next();
       }
 
       return res.status(403).json({
-        error: "SUBSCRIPTION_PAST_DUE",
+        code: "SUBSCRIPTION_PAST_DUE",
         message: "Payment overdue. Please update billing.",
-        subscriptionStatus: status,
       });
     }
 
-    // ❌ BLOCKED STATES
+    // ❌ ALL OTHER STATES (canceled, incomplete, etc.)
     return res.status(403).json({
-      error: "SUBSCRIPTION_REQUIRED",
+      code: "SUBSCRIPTION_REQUIRED",
       message: "Active subscription required to access this feature",
-      subscriptionStatus: status,
     });
   } catch (err) {
     console.error("❌ Subscription middleware error:", err);
     return res.status(500).json({
-      error: "SUBSCRIPTION_CHECK_FAILED",
+      code: "SUBSCRIPTION_CHECK_FAILED",
       message: "Failed to verify subscription status",
     });
   }
