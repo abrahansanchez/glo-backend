@@ -36,6 +36,8 @@ import callStreamStatusRoutes from "./routes/callStreamRoutes.js";
 import authRoutes from "./routes/authRoutes.js";
 import profileRoutes from "./routes/profileRoutes.js";
 import adminRoutes from "./routes/adminRoutes.js";
+import voiceTokenRoutes from "./routes/voiceTokenRoutes.js";
+import debugRoutes from "./routes/debugRoutes.js";
 
 // Phone number lifecycle
 import numberRoutes from "./routes/numberRoutes.js";
@@ -149,6 +151,15 @@ app.use("/api/analytics", analyticsRoutes);
 // 1️⃣3️⃣ Voicemail API
 app.use("/api/voicemail", voiceRoutes);
 
+app.use("/api/voice", voiceTokenRoutes);
+
+// Debug routes (controlled by explicit env flag)
+const enableDebug = process.env.ENABLE_DEBUG_ROUTES === "true";
+if (enableDebug) {
+  app.use("/api/debug", debugRoutes);
+}
+
+
 // ---------------------------------------------------------
 // ATTACH TWILIO MEDIA STREAM WEBSOCKET SERVER
 // ---------------------------------------------------------
@@ -163,3 +174,4 @@ server.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Glō Backend running on port ${PORT}`);
   console.log(`🎧 Media Stream WS active at /ws/media`);
 });
+
