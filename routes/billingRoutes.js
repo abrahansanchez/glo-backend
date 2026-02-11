@@ -66,22 +66,51 @@ router.get("/status", protect, async (req, res) => {
  * ======================================================
  */
 router.post("/portal", protect, async (req, res) => {
-  try {
-    const barber = await Barber.findById(req.user.id);
+  const barberId = req.user?._id || req.user?.id || req.userId;
 
-    if (!barber || !barber.stripeCustomerId) {
-      return res.status(400).json({ error: "No Stripe customer found" });
+  try {
+    const barber = await Barber.findById(barberId);
+
+    console.log("[billing/portal]", {
+      barberId: barberId ? String(barberId) : null,
+      stripeCustomerId: barber?.stripeCustomerId || null,
+      stripeSubscriptionId: barber?.stripeSubscriptionId || null,
+      stripeKeyPresent: Boolean(process.env.STRIPE_SECRET_KEY),
+      returnUrl:
+        process.env.BILLING_PORTAL_RETURN_URL ||
+        process.env.FRONTEND_URL ||
+        null,
+    });
+
+    if (!barber) {
+      return res.status(404).json({
+        code: "BARBER_NOT_FOUND",
+        message: "Barber not found",
+      });
+    }
+
+    if (!barber.stripeCustomerId) {
+      return res.status(400).json({
+        code: "NO_STRIPE_CUSTOMER",
+        message: "No Stripe customer on file",
+      });
     }
 
     const session = await stripe.billingPortal.sessions.create({
       customer: barber.stripeCustomerId,
-      return_url: process.env.FRONTEND_URL,
+      return_url:
+        process.env.BILLING_PORTAL_RETURN_URL ||
+        process.env.FRONTEND_URL ||
+        "https://example.com", // last-resort fallback to avoid Stripe error
     });
 
     return res.json({ url: session.url });
   } catch (err) {
-    console.error("❌ Stripe portal error:", err);
-    return res.status(500).json({ error: "Failed to create portal session" });
+    console.error("❌ Stripe portal error:", err?.stack || err);
+    return res.status(500).json({
+      code: "BILLING_PORTAL_FAILED",
+      message: "Failed to create billing portal session",
+    });
   }
 });
 

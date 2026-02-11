@@ -4,14 +4,21 @@ import Subscription from "../models/Subscription.js";
 /**
  * Ensures the authenticated barber has a valid subscription
  * Handles:
- * - active → allowed
- * - trialing → allowed
- * - past_due → allowed ONLY within grace period
- * - canceled / incomplete / missing → blocked
+ * - active -> allowed
+ * - trialing -> allowed
+ * - past_due -> allowed ONLY within grace period
+ * - incomplete -> blocked with INCOMPLETE
+ * - canceled / missing -> blocked with SUBSCRIPTION_REQUIRED
  */
 export const requireActiveSubscription = async (req, res, next) => {
   try {
-    const barberId = req.user?.id;
+    const barberId =
+      req.barber?._id ||
+      req.user?._id ||
+      req.user?.id ||
+      req.userId;
+
+    console.log("[subscription] barberId resolved:", String(barberId));
 
     if (!barberId) {
       return res.status(401).json({
@@ -20,7 +27,11 @@ export const requireActiveSubscription = async (req, res, next) => {
       });
     }
 
-    const barber = await Barber.findById(barberId);
+    const barber =
+      req.barber ||
+      (await Barber.findById(barberId));
+
+    console.log("[subscription] barber found:", String(barber._id), barber.email);
 
     if (!barber) {
       return res.status(404).json({
@@ -33,34 +44,67 @@ export const requireActiveSubscription = async (req, res, next) => {
       barber: barber._id,
     }).sort({ createdAt: -1 });
 
-    // ❌ No subscription at all
+    console.log("[subscription] subscription lookup result:", subscription ? subscription.status : "none");
+
     if (!subscription) {
+      if (process.env.NODE_ENV === "development") {
+        console.log(
+          "[subscription] blocked",
+          String(barber._id),
+          "none"
+        );
+      }
       return res.status(403).json({
         code: "SUBSCRIPTION_REQUIRED",
-        message: "No active subscription found",
+        message: "Active subscription required to access this feature",
       });
     }
 
     const { status, gracePeriodEndsAt } = subscription;
 
-    // ✅ FULL ACCESS
     if (status === "active" || status === "trialing") {
       return next();
     }
 
-    // ⚠️ PAST DUE — allow only if within grace period
     if (status === "past_due") {
       if (gracePeriodEndsAt && new Date() < gracePeriodEndsAt) {
         return next();
       }
 
+      if (process.env.NODE_ENV === "development") {
+        console.log(
+          "[subscription] blocked",
+          String(barber._id),
+          status
+        );
+      }
       return res.status(403).json({
         code: "SUBSCRIPTION_PAST_DUE",
         message: "Payment overdue. Please update billing.",
       });
     }
 
-    // ❌ ALL OTHER STATES (canceled, incomplete, etc.)
+    if (status === "incomplete") {
+      if (process.env.NODE_ENV === "development") {
+        console.log(
+          "[subscription] blocked",
+          String(barber._id),
+          status
+        );
+      }
+      return res.status(403).json({
+        code: "INCOMPLETE",
+        message: "Subscription setup incomplete. Please finish checkout.",
+      });
+    }
+
+    if (process.env.NODE_ENV === "development") {
+      console.log(
+        "[subscription] blocked",
+        String(barber._id),
+        status
+      );
+    }
     return res.status(403).json({
       code: "SUBSCRIPTION_REQUIRED",
       message: "Active subscription required to access this feature",
