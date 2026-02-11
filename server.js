@@ -38,6 +38,7 @@ import profileRoutes from "./routes/profileRoutes.js";
 import adminRoutes from "./routes/adminRoutes.js";
 import voiceTokenRoutes from "./routes/voiceTokenRoutes.js";
 import debugRoutes from "./routes/debugRoutes.js";
+import qaRoutes from "./routes/qaRoutes.js";
 
 // Phone number lifecycle
 import numberRoutes from "./routes/numberRoutes.js";
@@ -157,6 +158,11 @@ app.use("/api/voice", voiceTokenRoutes);
 const enableDebug = process.env.ENABLE_DEBUG_ROUTES === "true";
 if (enableDebug) {
   app.use("/api/debug", debugRoutes);
+}
+
+const enableQaRoutes = process.env.ENABLE_QA_ROUTES === "true";
+if (enableQaRoutes) {
+  app.use("/api/qa", qaRoutes);
 }
 
 
