@@ -37,6 +37,7 @@ import authRoutes from "./routes/authRoutes.js";
 import profileRoutes from "./routes/profileRoutes.js";
 import adminRoutes from "./routes/adminRoutes.js";
 import voiceTokenRoutes from "./routes/voiceTokenRoutes.js";
+import twilioClientVoiceRoutes from "./routes/twilioClientVoiceRoutes.js";
 import debugRoutes from "./routes/debugRoutes.js";
 import qaRoutes from "./routes/qaRoutes.js";
 
@@ -152,6 +153,7 @@ app.use("/api/analytics", analyticsRoutes);
 // 1️⃣3️⃣ Voicemail API
 app.use("/api/voicemail", voiceRoutes);
 
+app.use("/api/voice", twilioClientVoiceRoutes);
 app.use("/api/voice", voiceTokenRoutes);
 
 // Debug routes (controlled by explicit env flag)
