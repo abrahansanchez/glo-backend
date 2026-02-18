@@ -28,6 +28,11 @@ const BarberSchema = new mongoose.Schema(
       default: null,
     },
 
+    assignedTwilioNumber: {
+      type: String,
+      default: null,
+    },
+
     twilioSid: {
       type: String,
       default: null,

@@ -22,6 +22,7 @@ export const assignPhoneNumber = async (barberId) => {
       if (!barber) throw new Error("Barber not found");
 
       barber.twilioNumber = mockNumber;
+      barber.assignedTwilioNumber = mockNumber;
       barber.twilioSid = mockSid;
       await barber.save();
 
@@ -60,6 +61,7 @@ export const assignPhoneNumber = async (barberId) => {
     if (!barber) throw new Error("Barber not found");
 
     barber.twilioNumber = purchase.phoneNumber;
+    barber.assignedTwilioNumber = purchase.phoneNumber;
     barber.twilioSid = purchase.sid;
     await barber.save();
 
