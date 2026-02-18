@@ -5,7 +5,7 @@ const router = express.Router();
 const VoiceResponse = twilio.twiml.VoiceResponse;
 
 router.post("/outgoing", (req, res) => {
-  // IMPORTANT: log full payload so we see what Twilio is actually sending
+  console.log("[TwilioClientOutgoing] HIT");
   console.log("[TwilioClientOutgoing] headers:", {
     "content-type": req.headers["content-type"],
     "user-agent": req.headers["user-agent"],
@@ -27,8 +27,10 @@ router.post("/outgoing", (req, res) => {
 
   if (!to) {
     twiml.say("Missing destination phone number.");
+    const twimlString = twiml.toString();
+    console.log("[TwilioClientOutgoing] twiml:", twimlString);
     res.type("text/xml");
-    return res.send(twiml.toString());
+    return res.send(twimlString);
   }
 
   const callerId = process.env.TWILIO_PHONE_NUMBER; // you set this to +18132952433
@@ -39,8 +41,10 @@ router.post("/outgoing", (req, res) => {
   const dial = callerId ? twiml.dial({ callerId }) : twiml.dial();
   dial.number(to);
 
+  const twimlString = twiml.toString();
+  console.log("[TwilioClientOutgoing] twiml:", twimlString);
   res.type("text/xml");
-  return res.send(twiml.toString());
+  return res.send(twimlString);
 });
 
 export default router;

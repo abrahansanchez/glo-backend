@@ -5,6 +5,34 @@ const router = express.Router();
 
 router.get("/ping", (req, res) => res.json({ ok: true }));
 
+const maskLast = (value, visibleCount) => {
+  if (!value || typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  if (trimmed.length <= visibleCount) return trimmed;
+  return `${"*".repeat(trimmed.length - visibleCount)}${trimmed.slice(-visibleCount)}`;
+};
+
+router.get("/twilio-client-health", (req, res) => {
+  const twimlAppSid = process.env.TWILIO_TWIML_APP_SID || "";
+  const twilioPhoneNumber = process.env.TWILIO_PHONE_NUMBER || "";
+
+  const hasTwimlAppSid = Boolean(twimlAppSid);
+  const hasTwilioPhoneNumber = Boolean(twilioPhoneNumber);
+
+  return res.status(200).json({
+    ok: true,
+    hasTwimlAppSid,
+    hasTwilioPhoneNumber,
+    twilioPhoneNumberMasked: maskLast(twilioPhoneNumber, 4),
+    twimlAppSidMasked: maskLast(twimlAppSid, 6),
+    voiceGrantPreview: {
+      outgoingApplicationSidMasked: maskLast(twimlAppSid, 6),
+      incomingAllow: true,
+    },
+  });
+});
+
 router.post("/call-me", async (req, res) => {
   try {
     const accountSid = process.env.TWILIO_ACCOUNT_SID;
