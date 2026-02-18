@@ -12,7 +12,6 @@ router.post("/outgoing", (req, res) => {
   });
   console.log("[TwilioClientOutgoing] body:", req.body);
 
-  // Try multiple possible fields
   const to =
     req.body?.To ||
     req.body?.to ||
@@ -27,19 +26,15 @@ router.post("/outgoing", (req, res) => {
 
   if (!to) {
     twiml.say("Missing destination phone number.");
-    const twimlString = twiml.toString();
-    console.log("[TwilioClientOutgoing] twiml:", twimlString);
-    res.type("text/xml");
-    return res.send(twimlString);
-  }
+  } else {
+    const callerId = process.env.TWILIO_PHONE_NUMBER;
+    if (!callerId) {
+      console.warn("[TwilioClientOutgoing] TWILIO_PHONE_NUMBER missing");
+    }
 
-  const callerId = process.env.TWILIO_PHONE_NUMBER; // you set this to +18132952433
-  if (!callerId) {
-    console.warn("[TwilioClientOutgoing] TWILIO_PHONE_NUMBER missing");
+    const dial = callerId ? twiml.dial({ callerId }) : twiml.dial();
+    dial.number(to);
   }
-
-  const dial = callerId ? twiml.dial({ callerId }) : twiml.dial();
-  dial.number(to);
 
   const twimlString = twiml.toString();
   console.log("[TwilioClientOutgoing] twiml:", twimlString);
