@@ -16,7 +16,6 @@ export const releasePhoneNumber = async (barberId) => {
     if (!barber.twilioSid) throw new Error("No Twilio SID found for this barber");
 
     if (process.env.USE_TWILIO_MOCK === "true") {
-      // MOCK MODE
       console.log(`Mock release for ${barber.twilioNumber}`);
       barber.twilioNumber = null;
       barber.assignedTwilioNumber = null;
@@ -25,7 +24,6 @@ export const releasePhoneNumber = async (barberId) => {
       return { released: true, mode: "mock" };
     }
 
-    // REAL TWILIO MODE
     await client.incomingPhoneNumbers(barber.twilioSid).remove();
 
     barber.twilioNumber = null;
