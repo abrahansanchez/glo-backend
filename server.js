@@ -112,6 +112,7 @@ app.get("/", (req, res) => {
 
 // 1️⃣ Twilio incoming phone call → TwiML
 app.use("/voice", voiceWebhook);
+app.use("/api/voice", voiceWebhook);
 
 // 2️⃣ Twilio audio stream status callback
 app.use("/api/calls", callStreamStatusRoutes);
