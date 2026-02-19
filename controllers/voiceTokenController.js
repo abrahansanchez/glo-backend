@@ -2,28 +2,28 @@ import twilio from "twilio";
 
 export const getVoiceToken = async (req, res) => {
   try {
-    const {
-      TWILIO_ACCOUNT_SID,
-      TWILIO_API_KEY,
-      TWILIO_API_SECRET,
-      TWILIO_TWIML_APP_SID,
-    } = process.env;
+    const { TWILIO_ACCOUNT_SID } = process.env;
+    const TWILIO_API_KEY_SID =
+      process.env.TWILIO_API_KEY_SID || process.env.TWILIO_API_KEY;
+    const TWILIO_API_KEY_SECRET =
+      process.env.TWILIO_API_KEY_SECRET || process.env.TWILIO_API_SECRET;
 
-    // Fail fast if misconfigured
+    const { TWILIO_TWIML_APP_SID, TWILIO_PUSH_CREDENTIAL_SID } = process.env;
+
     if (
       !TWILIO_ACCOUNT_SID ||
-      !TWILIO_API_KEY ||
-      !TWILIO_API_SECRET ||
-      !TWILIO_TWIML_APP_SID
+      !TWILIO_API_KEY_SID ||
+      !TWILIO_API_KEY_SECRET ||
+      !TWILIO_TWIML_APP_SID ||
+      !TWILIO_PUSH_CREDENTIAL_SID
     ) {
       return res.status(500).json({
         error: "VOICE_TOKEN_CONFIG_MISSING",
         message:
-          "Missing one or more Twilio Voice env vars (ACCOUNT_SID, API_KEY, API_SECRET, TWIML_APP_SID).",
+          "Missing Twilio env vars: TWILIO_ACCOUNT_SID, TWILIO_API_KEY_SID/TWILIO_API_KEY, TWILIO_API_KEY_SECRET/TWILIO_API_SECRET, TWILIO_TWIML_APP_SID, TWILIO_PUSH_CREDENTIAL_SID",
       });
     }
 
-    // Identity must come from JWT (barber)
     const barberId = req.user?.id || req.user?._id;
     if (!barberId) {
       return res.status(401).json({
@@ -37,13 +37,15 @@ export const getVoiceToken = async (req, res) => {
 
     const voiceGrant = new VoiceGrant({
       outgoingApplicationSid: TWILIO_TWIML_APP_SID,
+      pushCredentialSid: TWILIO_PUSH_CREDENTIAL_SID,
       incomingAllow: true,
+      // sandbox: true, // enable only for APNs sandbox testing
     });
 
     const token = new AccessToken(
       TWILIO_ACCOUNT_SID,
-      TWILIO_API_KEY,
-      TWILIO_API_SECRET,
+      TWILIO_API_KEY_SID,
+      TWILIO_API_KEY_SECRET,
       { identity: String(barberId) }
     );
 
@@ -54,7 +56,7 @@ export const getVoiceToken = async (req, res) => {
       identity: String(barberId),
     });
   } catch (err) {
-    console.error("❌ Voice token error:", err);
+    console.error("Voice token error:", err);
     return res.status(500).json({
       error: "VOICE_TOKEN_ERROR",
       message: err.message || "Failed to generate voice token.",
