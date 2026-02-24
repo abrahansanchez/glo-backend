@@ -63,8 +63,10 @@ router.post("/test", protect, async (req, res) => {
 
     const barber = await Barber.findById(barberId).select("expoPushToken");
     const token = barber?.expoPushToken || null;
+    console.log(`[PUSH_TEST] barberId=${String(barberId)} tokenPresent=${Boolean(token)}`);
+
     if (!token) {
-      return res.status(400).json({ code: "NO_EXPO_PUSH_TOKEN" });
+      return res.status(400).json({ ok: false, code: "NO_EXPO_PUSH_TOKEN" });
     }
 
     const result = await sendExpoPush(
@@ -79,11 +81,7 @@ router.post("/test", protect, async (req, res) => {
       setLastExpoPushId(barberId, maybeId);
     }
 
-    return res.status(200).json({
-      ok: true,
-      sent: Boolean(result?.ok),
-      result,
-    });
+    return res.status(200).json({ ok: true, sent: Boolean(result?.ok), result });
   } catch (error) {
     console.error("[PUSH_TEST] error:", error?.message || error);
     return res.status(500).json({
