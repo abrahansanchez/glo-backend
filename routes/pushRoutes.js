@@ -81,7 +81,7 @@ router.post("/test", protect, async (req, res) => {
       setLastExpoPushId(barberId, maybeId);
     }
 
-    return res.status(200).json({ ok: true, sent: Boolean(result?.ok), result });
+    return res.status(200).json({ ok: true });
   } catch (error) {
     console.error("[PUSH_TEST] error:", error?.message || error);
     return res.status(500).json({
