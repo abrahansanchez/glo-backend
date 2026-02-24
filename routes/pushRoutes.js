@@ -48,11 +48,7 @@ router.post("/register", protect, async (req, res) => {
 
 router.post("/test", protect, async (req, res) => {
   try {
-    if (process.env.NODE_ENV === "production") {
-      return res.status(404).json({ error: "NOT_FOUND" });
-    }
-
-    const barberId = req.user?._id || req.user?.id;
+    const barberId = req.user?.barberId || req.user?._id || req.user?.id;
     if (!barberId) {
       return res.status(401).json({ error: "UNAUTHORIZED" });
     }
@@ -60,17 +56,21 @@ router.post("/test", protect, async (req, res) => {
     const barber = await Barber.findById(barberId).select("expoPushToken");
     const token = barber?.expoPushToken || null;
     if (!token) {
-      return res.status(200).json({ ok: true, skipped: true, reason: "NO_TOKEN" });
+      return res.status(400).json({ code: "NO_EXPO_PUSH_TOKEN" });
     }
 
     const result = await sendExpoPush(
       token,
-      "Push test",
-      "Test notification from Glo backend",
+      "Gl\u014D Test Notification",
+      "Push notifications are working.",
       { type: "TEST_PUSH" }
     );
 
-    return res.status(200).json({ ok: true, result });
+    return res.status(200).json({
+      ok: true,
+      sent: Boolean(result?.ok),
+      result,
+    });
   } catch (error) {
     console.error("[PUSH_TEST] error:", error?.message || error);
     return res.status(500).json({
