@@ -81,7 +81,7 @@ router.post("/test", protect, async (req, res) => {
       setLastExpoPushId(barberId, maybeId);
     }
 
-    return res.status(200).json({ ok: true });
+    return res.status(200).json({ ok: true, ticketId: maybeId || null });
   } catch (error) {
     console.error("[PUSH_TEST] error:", error?.message || error);
     return res.status(500).json({
@@ -103,6 +103,7 @@ router.post("/receipts", protect, async (req, res) => {
 
     const result = await getExpoPushReceipts(ids);
     if (!result?.ok && result?.status) {
+      console.log("[PUSH_RECEIPTS] Expo response:", result.response);
       return res.status(result.status).json(result.response || { ok: false });
     }
     if (!result?.ok) {
@@ -112,6 +113,7 @@ router.post("/receipts", protect, async (req, res) => {
       });
     }
 
+    console.log("[PUSH_RECEIPTS] Expo response:", result.response);
     return res.status(200).json(result.response);
   } catch (error) {
     console.error("[PUSH_RECEIPTS] error:", error?.message || error);
