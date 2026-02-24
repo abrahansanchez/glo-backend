@@ -143,17 +143,45 @@ export const handleDialFallback = async (req, res) => {
     const barberId = barber._id.toString();
     clearActiveCall(barberId);
 
-    if (dialStatus === "no-answer" && barber.expoPushToken) {
-      void sendExpoPush(
-        barber.expoPushToken,
-        "Missed call",
-        `You missed a call from ${from || "unknown number"}`,
-        {
-          type: "MISSED_CALL",
-          callSid,
-          from: from || "",
-        }
-      );
+    if (dialStatus === "no-answer") {
+      if (!barber.expoPushToken) {
+        console.log(`[PUSH_MISSED_CALL] skipped/no-token barberId=${barberId}`);
+      } else {
+        void (async () => {
+          try {
+            const pushPromise = sendExpoPush(
+              barber.expoPushToken,
+              "Missed call",
+              `Missed call from ${from || "unknown number"}. AI handled it.`,
+              {
+                type: "MISSED_CALL",
+                callSid,
+                from: from || "",
+                to: to || "",
+                barberId,
+              }
+            );
+
+            const timeoutPromise = new Promise((resolve) =>
+              setTimeout(() => resolve({ ok: false, timeout: true }), 1500)
+            );
+
+            const result = await Promise.race([pushPromise, timeoutPromise]);
+            if (result?.ok) {
+              console.log(`[PUSH_MISSED_CALL] sent barberId=${barberId} callSid=${callSid}`);
+            } else if (result?.timeout) {
+              console.log(`[PUSH_MISSED_CALL] sent barberId=${barberId} callSid=${callSid} (timed)`);
+            } else {
+              console.log(`[PUSH_MISSED_CALL] error barberId=${barberId} callSid=${callSid}`);
+            }
+          } catch (err) {
+            console.error(
+              `[PUSH_MISSED_CALL] error barberId=${barberId} callSid=${callSid}`,
+              err?.message || err
+            );
+          }
+        })();
+      }
     }
 
     const twimlOutput = getAiStreamTwimlString({
