@@ -1,5 +1,11 @@
 import twilio from "twilio";
 import Barber from "../models/Barber.js";
+import {
+  clearActiveCall,
+  clearActiveCallBySid,
+  getActiveCall,
+  setActiveCall,
+} from "../utils/voice/activeCallStore.js";
 
 const VoiceResponse = twilio.twiml.VoiceResponse;
 
@@ -38,6 +44,11 @@ const buildAiStreamTwiml = ({ req, barberId, initialPrompt }) => {
   return response;
 };
 
+const getAiStreamTwimlString = ({ req, barberId, barberName }) => {
+  const initialPrompt = buildInitialPrompt(barberName);
+  return buildAiStreamTwiml({ req, barberId, initialPrompt }).toString();
+};
+
 export const handleIncomingCall = async (req, res) => {
   try {
     console.log("[INCOMING] Incoming Twilio Call (RAW):", req.body);
@@ -57,8 +68,19 @@ export const handleIncomingCall = async (req, res) => {
     }
 
     const barberId = barber._id.toString();
+    const callSid = req.body.CallSid || "";
+    const from = req.body.From || "";
+    const to = req.body.To || req.body.Called || "";
     const ringTimeoutSeconds = Number(process.env.RING_TIMEOUT_SECONDS || 12);
     const fallbackUrl = `${getBaseHttpsUrl(req)}/api/voice/dial-fallback`;
+
+    setActiveCall({
+      barberId,
+      callSid,
+      from,
+      to,
+      createdAt: Date.now(),
+    });
 
     console.log("[INCOMING] matched barberId:", barberId);
     console.log("[INCOMING] dialing client identity:", barberId);
@@ -97,6 +119,7 @@ export const handleDialFallback = async (req, res) => {
     console.log("[DIAL_FALLBACK] DialCallStatus:", dialStatusRaw);
     console.log("[DIAL_FALLBACK] CallSid:", callSid);
     console.log("[DIAL_FALLBACK] To/From:", { to, from });
+    clearActiveCallBySid(callSid);
 
     const twiml = new VoiceResponse();
     if (dialStatus === "completed") {
@@ -117,9 +140,13 @@ export const handleDialFallback = async (req, res) => {
     }
 
     const barberId = barber._id.toString();
-    const initialPrompt = buildInitialPrompt(barber.name);
-    const aiTwiml = buildAiStreamTwiml({ req, barberId, initialPrompt });
-    const twimlOutput = aiTwiml.toString();
+    clearActiveCall(barberId);
+
+    const twimlOutput = getAiStreamTwimlString({
+      req,
+      barberId,
+      barberName: barber.name,
+    });
 
     console.log("[DIAL_FALLBACK] falling back to AI stream");
     console.log("[DIAL_FALLBACK] TwiML:\n", twimlOutput);
@@ -133,3 +160,68 @@ export const handleDialFallback = async (req, res) => {
     return res.type("text/xml").send(fallback.toString());
   }
 };
+
+export const handleAiTakeover = async (req, res) => {
+  try {
+    const barberId = req.user?.id || req.user?._id?.toString();
+    if (!barberId) {
+      return res.status(401).json({ error: "UNAUTHORIZED" });
+    }
+
+    const activeCall = getActiveCall(barberId);
+    if (!activeCall) {
+      return res.status(404).json({ error: "NO_ACTIVE_CALL" });
+    }
+
+    const barber = await Barber.findById(barberId).select("name");
+    if (!barber) {
+      return res.status(404).json({ error: "BARBER_NOT_FOUND" });
+    }
+
+    const twiml = getAiStreamTwimlString({
+      req,
+      barberId: String(barberId),
+      barberName: barber.name,
+    });
+
+    const accountSid = process.env.TWILIO_ACCOUNT_SID;
+    const authToken = process.env.TWILIO_AUTH_TOKEN;
+
+    if (!accountSid || !authToken) {
+      return res.status(500).json({
+        error: "TWILIO_CONFIG_MISSING",
+        message: "Missing Twilio env vars: TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN",
+      });
+    }
+
+    const client = twilio(accountSid, authToken);
+    await client.calls(activeCall.callSid).update({ twiml });
+
+    clearActiveCall(String(barberId));
+    console.log(
+      `[AI_TAKEOVER] barberId=${String(barberId)} callSid=${activeCall.callSid} redirected-to-ai`
+    );
+
+    return res.status(200).json({
+      success: true,
+      callSid: activeCall.callSid,
+      redirectedTo: "ai",
+    });
+  } catch (error) {
+    console.error("[AI_TAKEOVER] error:", error);
+    return res.status(500).json({
+      error: "AI_TAKEOVER_FAILED",
+      message: error.message || "Failed to redirect call to AI.",
+    });
+  }
+};
+
+/*
+Manual Test Plan (AI Takeover)
+1. Place an inbound call to the Twilio number mapped to a barber.
+2. Keep the mobile app open while the call is still ringing the client identity.
+3. Trigger POST /api/voice/ai-takeover as that authenticated barber ("Let AI Handle").
+4. Confirm AI media stream starts immediately (no waiting for Dial timeout).
+5. Confirm server log includes:
+   [AI_TAKEOVER] barberId=... callSid=... redirected-to-ai
+*/
