@@ -1,5 +1,6 @@
 export const isExpoPushToken = (token) =>
-  typeof token === "string" && token.includes("ExponentPushToken[");
+  typeof token === "string" &&
+  (token.includes("ExponentPushToken[") || token.includes("ExpoPushToken["));
 
 export const sendExpoPush = async (toToken, title, body, data = {}) => {
   if (!isExpoPushToken(toToken)) {

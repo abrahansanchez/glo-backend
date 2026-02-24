@@ -8,7 +8,16 @@ const router = express.Router();
 router.post("/register", protect, async (req, res) => {
   try {
     const barberId = req.user?._id || req.user?.id;
-    const expoPushToken = req.body?.expoPushToken;
+    const body = req.body || {};
+    const expoPushToken = body.expoPushToken || body.token;
+    const bodyKeys = Object.keys(body);
+    const tokenPreview =
+      typeof expoPushToken === "string"
+        ? `${expoPushToken.slice(0, 12)}... (len=${expoPushToken.length})`
+        : "none";
+
+    console.log("[PUSH_REGISTER] body keys:", bodyKeys);
+    console.log("[PUSH_REGISTER] token preview:", tokenPreview);
 
     if (!barberId) {
       return res.status(401).json({ error: "UNAUTHORIZED" });
@@ -17,7 +26,8 @@ router.post("/register", protect, async (req, res) => {
     if (!isExpoPushToken(expoPushToken)) {
       return res.status(400).json({
         error: "INVALID_EXPO_PUSH_TOKEN",
-        message: "expoPushToken must contain ExponentPushToken[",
+        message:
+          "expoPushToken/token must be a valid Expo token (ExponentPushToken[...] or ExpoPushToken[...])",
       });
     }
 
