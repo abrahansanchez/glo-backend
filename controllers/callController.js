@@ -6,6 +6,7 @@ import {
   getActiveCall,
   setActiveCall,
 } from "../utils/voice/activeCallStore.js";
+import { sendExpoPush } from "../utils/push/expoPush.js";
 
 const VoiceResponse = twilio.twiml.VoiceResponse;
 
@@ -141,6 +142,19 @@ export const handleDialFallback = async (req, res) => {
 
     const barberId = barber._id.toString();
     clearActiveCall(barberId);
+
+    if (dialStatus === "no-answer" && barber.expoPushToken) {
+      void sendExpoPush(
+        barber.expoPushToken,
+        "Missed call",
+        `You missed a call from ${from || "unknown number"}`,
+        {
+          type: "MISSED_CALL",
+          callSid,
+          from: from || "",
+        }
+      );
+    }
 
     const twimlOutput = getAiStreamTwimlString({
       req,

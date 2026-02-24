@@ -1,4 +1,6 @@
 import mongoose from "mongoose";
+import Barber from "./Barber.js";
+import { sendExpoPush } from "../utils/push/expoPush.js";
 
 const voicemailSchema = new mongoose.Schema(
   {
@@ -42,6 +44,27 @@ const voicemailSchema = new mongoose.Schema(
     timestamps: true,
   }
 );
+
+voicemailSchema.post("save", function postVoicemailSave(doc) {
+  const statusNow = String(doc.status || "").toLowerCase();
+  const shouldNotify = this.isNew || (this.isModified("status") && statusNow === "new");
+  if (!shouldNotify) return;
+
+  void (async () => {
+    try {
+      const barber = await Barber.findById(doc.barberId).select("expoPushToken");
+      const token = barber?.expoPushToken || null;
+      if (!token) return;
+
+      await sendExpoPush(token, "New voicemail", "New voicemail received", {
+        type: "NEW_VOICEMAIL",
+        voicemailId: String(doc._id),
+      });
+    } catch (error) {
+      console.error("[VOICEMAIL_PUSH] error:", error?.message || error);
+    }
+  })();
+});
 
 const Voicemail = mongoose.model("Voicemail", voicemailSchema);
 

@@ -38,6 +38,16 @@ const BarberSchema = new mongoose.Schema(
       default: null,
     },
 
+    expoPushToken: {
+      type: String,
+      default: null,
+    },
+
+    expoPushUpdatedAt: {
+      type: Date,
+      default: null,
+    },
+
     aiMode: {
       type: Boolean,
       default: true,

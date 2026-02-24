@@ -38,6 +38,7 @@ import profileRoutes from "./routes/profileRoutes.js";
 import adminRoutes from "./routes/adminRoutes.js";
 import voiceTokenRoutes from "./routes/voiceTokenRoutes.js";
 import twilioClientVoiceRoutes from "./routes/twilioClientVoiceRoutes.js";
+import pushRoutes from "./routes/pushRoutes.js";
 import debugRoutes from "./routes/debugRoutes.js";
 import debugCallRoutes from "./routes/debugCallRoutes.js";
 import qaRoutes from "./routes/qaRoutes.js";
@@ -157,6 +158,7 @@ app.use("/api/voicemail", voiceRoutes);
 
 app.use("/api/voice", twilioClientVoiceRoutes);
 app.use("/api/voice", voiceTokenRoutes);
+app.use("/api/push", pushRoutes);
 console.log("[ROUTES] mounting debug call-me");
 app.use("/api/debug", debugCallRoutes);
 
