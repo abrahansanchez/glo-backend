@@ -77,6 +77,24 @@ export const attachMediaWebSocketServer = (server) => {
     const userTranscriptLines = [];
     let transcriptFinalized = false;
 
+    async function setTranscriptIntentOutcome({ intent, outcome }) {
+      if (!barberId || !callSid) return;
+
+      try {
+        await CallTranscript.findOneAndUpdate(
+          { barberId: String(barberId), callSid: String(callSid) },
+          { $set: { intent, outcome } },
+          { upsert: true }
+        );
+
+        console.log(
+          `[INTENT_OUTCOME_SET] callSid=${callSid} barberId=${barberId} intent=${intent} outcome=${outcome}`
+        );
+      } catch (e) {
+        console.error("[INTENT_OUTCOME_SET] error:", e?.message || e);
+      }
+    }
+
     let framesSinceLastCommit = 0;
 
     let aiResponseInProgress = false;
@@ -290,7 +308,7 @@ export const attachMediaWebSocketServer = (server) => {
         });
       });
 
-      ai.on("message", (raw) => {
+      ai.on("message", async (raw) => {
         let evt;
         try {
           evt = JSON.parse(Buffer.from(raw).toString("utf8"));
@@ -308,13 +326,24 @@ export const attachMediaWebSocketServer = (server) => {
           evt.type === "conversation.item.input_audio_transcription.completed" ||
           evt.type === "input_audio_transcription.completed"
         ) {
-          const transcript = (evt.transcript || "").trim();
-          if (transcript) {
-            lastUserTranscript = transcript;
-            userTranscriptLines.push(transcript);
+          const transcriptText = (evt.transcript || "").trim();
+          if (transcriptText) {
+            lastUserTranscript = transcriptText;
+            userTranscriptLines.push(transcriptText);
             previousLanguage = currentLanguage;
-            currentLanguage = detectLanguage(transcript);
-            console.log("📝 TRANSCRIPT:", transcript, `(${currentLanguage})`);
+            currentLanguage = detectLanguage(transcriptText);
+            console.log("📝 TRANSCRIPT:", transcriptText, `(${currentLanguage})`);
+
+            const text = String(transcriptText || "").toLowerCase();
+            if (
+              text.includes("book") ||
+              text.includes("appointment") ||
+              text.includes("schedule") ||
+              text.includes("reserve") ||
+              text.includes("thursday")
+            ) {
+              await setTranscriptIntentOutcome({ intent: "BOOKING", outcome: "NO_ACTION" });
+            }
 
             // ✅ FIX #3: If language changed, respond immediately
             if (previousLanguage !== currentLanguage) {
