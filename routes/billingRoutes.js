@@ -4,6 +4,7 @@ import { stripe } from "../utils/stripe.js";
 
 import Barber from "../models/Barber.js";
 import Subscription from "../models/Subscription.js";
+import CallTranscript from "../models/CallTranscript.js";
 
 import { createCheckoutSession } from "../controllers/billingController.js";
 
@@ -19,6 +20,82 @@ router.post(
   protect,
   createCheckoutSession
 );
+
+router.get("/plans", protect, async (_req, res) => {
+  const plans = [
+    {
+      key: "core",
+      label: "Core",
+      priceId: process.env.STRIPE_PRICE_ID || "",
+      available: Boolean(process.env.STRIPE_PRICE_ID),
+    },
+    {
+      key: "pro",
+      label: "Pro",
+      priceId: process.env.STRIPE_PRICE_ID_PRO || "",
+      available: Boolean(process.env.STRIPE_PRICE_ID_PRO),
+    },
+    {
+      key: "starter",
+      label: "Starter",
+      priceId: process.env.STRIPE_PRICE_ID_STARTER || "",
+      available: Boolean(process.env.STRIPE_PRICE_ID_STARTER),
+    },
+  ];
+
+  return res.json({
+    plans: plans.filter((p) => p.available),
+    fallbackPlan: "core",
+  });
+});
+
+router.get("/usage-summary", protect, async (req, res) => {
+  try {
+    const barberId = req.user?._id || req.user?.id;
+    const now = new Date();
+    const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+    const rangeStart = req.query?.from ? new Date(String(req.query.from)) : monthStart;
+    const rangeEnd = req.query?.to ? new Date(String(req.query.to)) : now;
+
+    const usageFilter = {
+      barberId,
+      createdAt: { $gte: rangeStart, $lte: rangeEnd },
+      outcome: { $ne: "HUMAN_ANSWERED" },
+    };
+
+    const transcripts = await CallTranscript.find(usageFilter).select("durationSeconds").lean();
+    const aiHandledCalls = transcripts.length;
+    const totalDurationSeconds = transcripts.reduce(
+      (sum, t) => sum + Number(t.durationSeconds || 0),
+      0
+    );
+    const totalMinutes = Number((totalDurationSeconds / 60).toFixed(2));
+    const perMinuteRate = Number(process.env.AI_USAGE_PRICE_PER_MINUTE || 0);
+    const estimatedUsageCharge = Number((totalMinutes * perMinuteRate).toFixed(2));
+
+    return res.json({
+      range: {
+        from: rangeStart.toISOString(),
+        to: rangeEnd.toISOString(),
+      },
+      usage: {
+        aiHandledCalls,
+        totalDurationSeconds,
+        totalMinutes,
+      },
+      pricing: {
+        perMinuteRate,
+        estimatedUsageCharge,
+        currency: "usd",
+      },
+      note:
+        "Estimate only. Stripe metered invoicing is not yet wired in this endpoint.",
+    });
+  } catch (err) {
+    console.error("usage-summary error:", err?.message || err);
+    return res.status(500).json({ error: "Failed to load usage summary" });
+  }
+});
 
 /**
  * ======================================================

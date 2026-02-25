@@ -33,13 +33,19 @@ export const createCheckoutSession = async (req, res) => {
       await barber.save();
     }
 
-    // ----------------------------------
-    // Price ID (monthly $47.97)
-    // ----------------------------------
-    const PRICE_ID = process.env.STRIPE_PRICE_ID;
+    const requestedPlan = String(req.body?.plan || "core").toLowerCase();
+    const planPriceMap = {
+      core: process.env.STRIPE_PRICE_ID || "",
+      pro: process.env.STRIPE_PRICE_ID_PRO || "",
+      starter: process.env.STRIPE_PRICE_ID_STARTER || "",
+    };
 
-    if (!PRICE_ID) {
-      throw new Error("STRIPE_PRICE_ID missing");
+    const fallbackPriceId = process.env.STRIPE_PRICE_ID || "";
+    const selectedPriceId = planPriceMap[requestedPlan] || fallbackPriceId;
+    const selectedPlan = planPriceMap[requestedPlan] ? requestedPlan : "core";
+
+    if (!selectedPriceId) {
+      throw new Error("Missing Stripe price configuration");
     }
 
     // ----------------------------------
@@ -53,7 +59,7 @@ export const createCheckoutSession = async (req, res) => {
 
       line_items: [
         {
-          price: PRICE_ID,
+          price: selectedPriceId,
           quantity: 1,
         },
       ],
@@ -65,11 +71,12 @@ export const createCheckoutSession = async (req, res) => {
       subscription_data: {
         metadata: {
           barberId: barber._id.toString(),
+          plan: selectedPlan,
         },
       },
     });
 
-    return res.json({ checkoutUrl: session.url });
+    return res.json({ checkoutUrl: session.url, plan: selectedPlan });
   } catch (error) {
     console.error("❌ Stripe checkout error:", error);
     return res.status(500).json({ error: "Unable to start checkout" });

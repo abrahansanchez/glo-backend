@@ -2,6 +2,36 @@
 import { stripe } from "../utils/stripe.js";
 import Barber from "../models/Barber.js";
 import Subscription from "../models/Subscription.js";
+import { sendExpoPush } from "../utils/push/expoPush.js";
+
+const ISSUE_STATUSES = new Set(["past_due", "incomplete", "canceled"]);
+
+const pushSubscriptionIssue = async ({ barber, status, stripeSubscriptionId }) => {
+  const token = barber?.expoPushToken || null;
+  if (!token) {
+    console.log(
+      `[PUSH_SUBSCRIPTION] skipped/no-token barberId=${String(barber?._id || "")} status=${status}`
+    );
+    return;
+  }
+
+  const cleanStatus = String(status || "").toLowerCase();
+  const title = cleanStatus === "canceled" ? "Subscription canceled" : "Payment issue";
+  const body =
+    cleanStatus === "canceled"
+      ? "Your subscription was canceled. Re-subscribe to keep AI features active."
+      : "Payment issue detected. Tap to fix billing and keep AI features active.";
+
+  await sendExpoPush(token, title, body, {
+    type: "SUBSCRIPTION_ISSUE",
+    status: cleanStatus,
+    barberId: String(barber._id || ""),
+    stripeSubscriptionId: String(stripeSubscriptionId || ""),
+  });
+  console.log(
+    `[PUSH_SUBSCRIPTION] sent barberId=${String(barber._id || "")} status=${cleanStatus}`
+  );
+};
 
 /**
  * Stripe Webhook Handler
@@ -13,12 +43,12 @@ export default async function stripeWebhookHandler(req, res) {
   const sig = req.headers["stripe-signature"];
 
   if (!sig) {
-    console.error("❌ Missing Stripe signature header");
+    console.error("Missing Stripe signature header");
     return res.status(400).send("Missing Stripe signature");
   }
 
   if (!process.env.STRIPE_WEBHOOK_SECRET) {
-    console.error("❌ STRIPE_WEBHOOK_SECRET missing in env");
+    console.error("STRIPE_WEBHOOK_SECRET missing in env");
     return res.status(500).send("Server misconfigured");
   }
 
@@ -31,17 +61,14 @@ export default async function stripeWebhookHandler(req, res) {
       process.env.STRIPE_WEBHOOK_SECRET
     );
   } catch (err) {
-    console.error("❌ Stripe signature verification failed:", err.message);
+    console.error("Stripe signature verification failed:", err.message);
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
-  console.log("✅ Stripe Webhook received:", event.type);
+  console.log("Stripe Webhook received:", event.type);
 
   try {
     switch (event.type) {
-      // ===============================
-      // PHASE 6.3 — SAVE SUBSCRIPTION
-      // ===============================
       case "checkout.session.completed": {
         const session = event.data.object;
 
@@ -50,13 +77,13 @@ export default async function stripeWebhookHandler(req, res) {
         const stripeSubscriptionId = session.subscription;
 
         if (!barberId || !stripeSubscriptionId) {
-          console.warn("⚠️ Missing barberId or subscriptionId");
+          console.warn("Missing barberId or subscriptionId");
           break;
         }
 
         const barber = await Barber.findById(barberId);
         if (!barber) {
-          console.error("❌ Barber not found:", barberId);
+          console.error("Barber not found:", barberId);
           break;
         }
 
@@ -78,13 +105,10 @@ export default async function stripeWebhookHandler(req, res) {
         barber.subscriptionStatus = "active";
         await barber.save();
 
-        console.log("✅ Subscription activated for barber:", barber.email);
+        console.log("Subscription activated for barber:", barber.email);
         break;
       }
 
-      // ===============================
-      // PHASE 6.4 — CANCELLATION LOGIC
-      // ===============================
       case "customer.subscription.deleted": {
         const sub = event.data.object;
 
@@ -105,19 +129,84 @@ export default async function stripeWebhookHandler(req, res) {
         if (barber) {
           barber.subscriptionStatus = "canceled";
           await barber.save();
+          await pushSubscriptionIssue({
+            barber,
+            status: "canceled",
+            stripeSubscriptionId: sub.id,
+          });
         }
 
-        console.log("❌ Subscription canceled:", sub.id);
+        console.log("Subscription canceled:", sub.id);
+        break;
+      }
+
+      case "customer.subscription.updated": {
+        const sub = event.data.object;
+        const nextStatus = String(sub.status || "").toLowerCase();
+
+        const subscriptionDoc = await Subscription.findOne({
+          stripeSubscriptionId: sub.id,
+        });
+        if (subscriptionDoc) {
+          subscriptionDoc.status = nextStatus;
+          if (nextStatus === "canceled" && !subscriptionDoc.canceledAt) {
+            subscriptionDoc.canceledAt = new Date();
+          }
+          await subscriptionDoc.save();
+        }
+
+        const barber = await Barber.findOne({
+          stripeSubscriptionId: sub.id,
+        });
+        if (barber) {
+          barber.subscriptionStatus = nextStatus;
+          await barber.save();
+          if (ISSUE_STATUSES.has(nextStatus)) {
+            await pushSubscriptionIssue({
+              barber,
+              status: nextStatus,
+              stripeSubscriptionId: sub.id,
+            });
+          }
+        }
+
+        console.log("Subscription updated:", sub.id, nextStatus);
+        break;
+      }
+
+      case "invoice.payment_failed": {
+        const invoice = event.data.object;
+        const stripeSubscriptionId = invoice.subscription;
+        if (!stripeSubscriptionId) break;
+
+        const subscriptionDoc = await Subscription.findOne({ stripeSubscriptionId });
+        if (subscriptionDoc) {
+          subscriptionDoc.status = "past_due";
+          await subscriptionDoc.save();
+        }
+
+        const barber = await Barber.findOne({ stripeSubscriptionId });
+        if (barber) {
+          barber.subscriptionStatus = "past_due";
+          await barber.save();
+          await pushSubscriptionIssue({
+            barber,
+            status: "past_due",
+            stripeSubscriptionId,
+          });
+        }
+
+        console.log("Invoice payment failed:", stripeSubscriptionId);
         break;
       }
 
       default:
-        console.log("ℹ️ Unhandled event:", event.type);
+        console.log("Unhandled event:", event.type);
     }
 
     return res.json({ received: true });
   } catch (err) {
-    console.error("❌ Webhook handler error:", err);
+    console.error("Webhook handler error:", err);
     return res.status(500).json({ error: "Webhook handler failed" });
   }
 }
