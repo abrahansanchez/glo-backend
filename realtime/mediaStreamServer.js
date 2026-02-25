@@ -342,7 +342,7 @@ export const attachMediaWebSocketServer = (server) => {
               text.includes("reserve") ||
               text.includes("thursday")
             ) {
-              await setTranscriptIntentOutcome({ intent: "BOOKING", outcome: "NO_ACTION" });
+              await setTranscriptIntentOutcome({ intent: "BOOK", outcome: "NO_ACTION" });
             }
 
             // ✅ FIX #3: If language changed, respond immediately
