@@ -52,16 +52,30 @@ voicemailSchema.post("save", function postVoicemailSave(doc) {
 
   void (async () => {
     try {
+      const barberId = String(doc.barberId || "");
+      const voicemailId = String(doc._id || "");
+      const from = String(doc.callerNumber || "").trim();
       const barber = await Barber.findById(doc.barberId).select("expoPushToken");
       const token = barber?.expoPushToken || null;
-      if (!token) return;
+      if (!token) {
+        console.log(`[PUSH_VOICEMAIL] skipped/no-token barberId=${barberId}`);
+        return;
+      }
 
-      await sendExpoPush(token, "New voicemail", "New voicemail received", {
-        type: "NEW_VOICEMAIL",
-        voicemailId: String(doc._id),
-      });
+      await sendExpoPush(
+        token,
+        "New voicemail",
+        `New voicemail from ${from || "unknown number"}. Tap to listen.`,
+        {
+          type: "NEW_VOICEMAIL",
+          voicemailId,
+          from: from || "",
+          barberId,
+        }
+      );
+      console.log(`[PUSH_VOICEMAIL] sent barberId=${barberId} voicemailId=${voicemailId}`);
     } catch (error) {
-      console.error("[VOICEMAIL_PUSH] error:", error?.message || error);
+      console.error("[PUSH_VOICEMAIL] error:", error?.message || error);
     }
   })();
 });
