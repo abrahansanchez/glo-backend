@@ -14,6 +14,10 @@ const CallTranscriptSchema = new mongoose.Schema(
       type: String,
       required: true,
     },
+    toNumber: {
+      type: String,
+      default: "",
+    },
     callSid: {
       type: String,
       index: true,

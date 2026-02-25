@@ -72,6 +72,7 @@ export const attachMediaWebSocketServer = (server) => {
     let barberId = null;
     let initialPrompt = null;
     let callerNumber = "";
+    let toNumber = "";
     let callStartedAt = new Date();
     const userTranscriptLines = [];
     let transcriptFinalized = false;
@@ -397,6 +398,7 @@ export const attachMediaWebSocketServer = (server) => {
         barberId = custom.barberId || null;
         initialPrompt = custom.initialPrompt || null;
         callerNumber = custom.from || msg.start?.from || "";
+        toNumber = custom.to || msg.start?.to || msg.start?.called || "";
 
         console.log("📡 Stream started - streamSid:", streamSid);
         console.log("💈 Barber ID:", barberId);
@@ -445,8 +447,6 @@ export const attachMediaWebSocketServer = (server) => {
           if (!barberId) return;
 
           const callEndedAt = new Date();
-          const outcome = "NO_ACTION";
-          const intent = "UNKNOWN";
           const safeCallSid = callSid ? String(callSid) : "";
           const safeBarberId = String(barberId);
           const durationSeconds = Math.max(
@@ -467,16 +467,38 @@ export const attachMediaWebSocketServer = (server) => {
               barberId: safeBarberId,
               callSid: safeCallSid,
               callerNumber: callerNumber || "unknown number",
+              toNumber: toNumber || "",
             });
           }
+
+          const hasValue = (value) =>
+            value !== null && value !== undefined && String(value).trim().length > 0;
+          const outcome = hasValue(transcriptDoc.outcome) ? transcriptDoc.outcome : "NO_ACTION";
+          const intent = hasValue(transcriptDoc.intent) ? transcriptDoc.intent : "UNKNOWN";
+          const transcriptLines =
+            userTranscriptLines.length > 0
+              ? userTranscriptLines
+              : Array.isArray(transcriptDoc.transcript)
+                ? transcriptDoc.transcript
+                : [];
+          const summary = transcriptLines.length
+            ? transcriptLines.slice(0, 2).join(" ").slice(0, 120)
+            : "Tap to view summary";
 
           transcriptDoc.callStartedAt = transcriptDoc.callStartedAt || callStartedAt;
           transcriptDoc.callEndedAt = callEndedAt;
           transcriptDoc.durationSeconds = durationSeconds;
           transcriptDoc.outcome = outcome;
           transcriptDoc.intent = intent;
-          if (userTranscriptLines.length > 0) {
-            transcriptDoc.transcript = userTranscriptLines;
+          transcriptDoc.summary = summary;
+          if (callerNumber) {
+            transcriptDoc.callerNumber = callerNumber;
+          }
+          if (toNumber) {
+            transcriptDoc.toNumber = toNumber;
+          }
+          if (transcriptLines.length > 0) {
+            transcriptDoc.transcript = transcriptLines;
           }
 
           await transcriptDoc.save();
@@ -484,10 +506,11 @@ export const attachMediaWebSocketServer = (server) => {
           console.log("[TRANSCRIPT_FINALIZED]", {
             callSid: safeCallSid,
             barberId: safeBarberId,
-            transcriptId: String(transcriptDoc._id),
-            callEndedAt,
+            callerNumber: transcriptDoc.callerNumber,
+            toNumber: transcriptDoc.toNumber || "",
             outcome,
             intent,
+            summaryPresent: Boolean(summary),
           });
         } catch (error) {
           console.error("[TRANSCRIPT_FINALIZED] error:", error?.message || error);
