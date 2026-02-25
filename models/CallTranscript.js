@@ -80,6 +80,10 @@ const CallTranscriptSchema = new mongoose.Schema(
     callEndedAt: {
       type: Date,
     },
+    pushNotifiedAt: {
+      type: Date,
+      default: null,
+    },
 
     // ✅ NEW FIELDS
     preferredTimes: {
@@ -94,21 +98,20 @@ const CallTranscriptSchema = new mongoose.Schema(
 );
 
 CallTranscriptSchema.post("save", function postCallTranscriptSave(doc) {
-  const hasCallEnded = Boolean(doc.callEndedAt);
-  const isAiHandledOutcome = String(doc.outcome || "").toUpperCase() !== "HUMAN_ANSWERED";
-  const shouldNotify =
-    hasCallEnded &&
-    isAiHandledOutcome &&
-    (this.isNew || this.isModified("callEndedAt"));
-
-  if (!shouldNotify) return;
-
   void (async () => {
     try {
       const barberId = String(doc.barberId || "");
       const transcriptId = String(doc._id || "");
       const callSid = String(doc.callSid || "");
       const intent = String(doc.intent || "").trim();
+      console.log(`[PUSH_AI_SUMMARY] hook fired transcriptId=${transcriptId} barberId=${barberId}`);
+
+      if (!doc.callEndedAt) return;
+      if (String(doc.outcome || "").toUpperCase() === "HUMAN_ANSWERED") return;
+      if (doc.pushNotifiedAt) {
+        console.log(`[PUSH_AI_SUMMARY] skipped/already-notified transcriptId=${transcriptId}`);
+        return;
+      }
 
       const barber = await Barber.findById(doc.barberId).select("expoPushToken");
       const token = barber?.expoPushToken || null;
@@ -126,6 +129,10 @@ CallTranscriptSchema.post("save", function postCallTranscriptSave(doc) {
         intent: intent || "",
         barberId,
       });
+      await doc.constructor.updateOne(
+        { _id: doc._id, pushNotifiedAt: null },
+        { $set: { pushNotifiedAt: new Date() } }
+      );
 
       console.log(`[PUSH_AI_SUMMARY] sent barberId=${barberId} transcriptId=${transcriptId}`);
     } catch (error) {
