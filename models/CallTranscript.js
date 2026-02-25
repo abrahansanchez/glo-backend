@@ -1,4 +1,6 @@
 import mongoose from "mongoose";
+import Barber from "./Barber.js";
+import { sendExpoPush } from "../utils/push/expoPush.js";
 
 const CallTranscriptSchema = new mongoose.Schema(
   {
@@ -86,5 +88,46 @@ const CallTranscriptSchema = new mongoose.Schema(
   },
   { timestamps: true }
 );
+
+CallTranscriptSchema.post("save", function postCallTranscriptSave(doc) {
+  const hasCallEnded = Boolean(doc.callEndedAt);
+  const isAiHandledOutcome = String(doc.outcome || "").toUpperCase() !== "HUMAN_ANSWERED";
+  const shouldNotify =
+    hasCallEnded &&
+    isAiHandledOutcome &&
+    (this.isNew || this.isModified("callEndedAt"));
+
+  if (!shouldNotify) return;
+
+  void (async () => {
+    try {
+      const barberId = String(doc.barberId || "");
+      const transcriptId = String(doc._id || "");
+      const callSid = String(doc.callSid || "");
+      const intent = String(doc.intent || "").trim();
+
+      const barber = await Barber.findById(doc.barberId).select("expoPushToken");
+      const token = barber?.expoPushToken || null;
+      if (!token) {
+        console.log(`[PUSH_AI_SUMMARY] skipped/no-token barberId=${barberId}`);
+        return;
+      }
+
+      const body = intent && intent !== "UNKNOWN" ? `Intent: ${intent}` : "Tap to view summary";
+
+      await sendExpoPush(token, "AI handled a call", body, {
+        type: "AI_CALL_SUMMARY",
+        transcriptId,
+        callSid,
+        intent: intent || "",
+        barberId,
+      });
+
+      console.log(`[PUSH_AI_SUMMARY] sent barberId=${barberId} transcriptId=${transcriptId}`);
+    } catch (error) {
+      console.error("[PUSH_AI_SUMMARY] error:", error?.message || error);
+    }
+  })();
+});
 
 export default mongoose.model("CallTranscript", CallTranscriptSchema);
