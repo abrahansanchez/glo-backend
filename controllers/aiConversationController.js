@@ -12,9 +12,24 @@ import { parseNaturalDateTime } from "../utils/ai/dateParser.js";
 import { validateRequest } from "../utils/ai/bookingValidator.js";
 import { getNextAvailableSlot } from "../utils/booking/availabilityEngine.js";
 import { createAppointment } from "../utils/booking/createAppointment.js";
+import CallTranscript from "../models/CallTranscript.js";
 
 // Voice synthesis (for HTTP TTS responses)
 import { synthesizeSpeech } from "../utils/voice/elevenLabsTTS.js";
+
+async function updateTranscriptIntentOutcome({ barberId, callSid, intent, outcome }) {
+  if (!barberId || !callSid) return;
+
+  await CallTranscript.findOneAndUpdate(
+    { barberId: String(barberId), callSid: String(callSid) },
+    { $set: { intent, outcome } },
+    { upsert: true, new: true }
+  );
+
+  console.log(
+    `[INTENT_OUTCOME_SET] callSid=${callSid} barberId=${barberId} intent=${intent} outcome=${outcome}`
+  );
+}
 
 /**
  * 4.95.4 — Booking confirmation enforcement (PROPER)
@@ -68,6 +83,12 @@ function ttsLine(lang, en, es) {
 export const handleAIConversation = async (req, res) => {
   try {
     const { message, phone, barberId } = req.body;
+    const callSid =
+      req.body?.CallSid ||
+      req.body?.callSid ||
+      req.query?.CallSid ||
+      req.query?.callSid ||
+      "";
 
     if (!message || !phone || !barberId) {
       return res.status(400).json({
@@ -200,6 +221,17 @@ export const handleAIConversation = async (req, res) => {
         );
 
         if (result?.ok) {
+          try {
+            await updateTranscriptIntentOutcome({
+              barberId,
+              callSid,
+              intent: "BOOKING",
+              outcome: "BOOKED",
+            });
+          } catch (e) {
+            console.error("[INTENT_OUTCOME_SET] booking success update failed:", e?.message || e);
+          }
+
           await updateClientMemory(phone, barberId, {
             lastIntent: "BOOK",
             lastAppointment: state.pendingSlot,
@@ -218,6 +250,17 @@ export const handleAIConversation = async (req, res) => {
         }
 
         // Booking failed (DB, conflict, etc.)
+        try {
+          await updateTranscriptIntentOutcome({
+            barberId,
+            callSid,
+            intent: "BOOKING",
+            outcome: "FAILED",
+          });
+        } catch (e) {
+          console.error("[INTENT_OUTCOME_SET] booking fail update failed:", e?.message || e);
+        }
+
         await resetState(phone, barberId);
         return sendTTS(
           res,
