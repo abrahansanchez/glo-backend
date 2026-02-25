@@ -68,7 +68,7 @@ export const attachMediaWebSocketServer = (server) => {
     let sessionUpdated = false;
 
     let streamSid = null;
-    let callSid = null;
+    let callSid = "";
     let barberId = null;
     let initialPrompt = null;
     let callerNumber = "";
@@ -391,14 +391,19 @@ export const attachMediaWebSocketServer = (server) => {
 
       if (msg.event === "start") {
         streamSid = msg.start?.streamSid || null;
-        callSid = msg.start?.callSid || null;
+        callSid = msg.start?.callSid || callSid || "";
         callStartedAt = new Date();
 
         const custom = msg.start?.customParameters || {};
-        barberId = custom.barberId || null;
-        initialPrompt = custom.initialPrompt || null;
-        callerNumber = custom.from || msg.start?.from || "";
-        toNumber = custom.to || msg.start?.to || msg.start?.called || "";
+        barberId = custom.barberId || barberId || null;
+        initialPrompt = custom.initialPrompt || initialPrompt || null;
+        callerNumber = custom.from || msg.start?.from || callerNumber || "";
+        toNumber = custom.to || msg.start?.to || toNumber || "";
+        callSid = custom.callSid || msg.start?.callSid || callSid || "";
+
+        console.log(
+          `[STREAM_META_WS] callSid=${callSid} from=${callerNumber} to=${toNumber} barberId=${barberId}`
+        );
 
         console.log("📡 Stream started - streamSid:", streamSid);
         console.log("💈 Barber ID:", barberId);
@@ -465,8 +470,8 @@ export const attachMediaWebSocketServer = (server) => {
           if (!transcriptDoc) {
             transcriptDoc = new CallTranscript({
               barberId: safeBarberId,
-              callSid: safeCallSid,
-              callerNumber: callerNumber || "unknown number",
+              callSid: callSid || "",
+              callerNumber: callerNumber || "",
               toNumber: toNumber || "",
             });
           }
@@ -488,19 +493,19 @@ export const attachMediaWebSocketServer = (server) => {
           transcriptDoc.callStartedAt = transcriptDoc.callStartedAt || callStartedAt;
           transcriptDoc.callEndedAt = callEndedAt;
           transcriptDoc.durationSeconds = durationSeconds;
+          transcriptDoc.callSid = callSid || "";
+          transcriptDoc.callerNumber = callerNumber || "";
+          transcriptDoc.toNumber = toNumber || "";
           transcriptDoc.outcome = outcome;
           transcriptDoc.intent = intent;
           transcriptDoc.summary = summary;
-          if (callerNumber) {
-            transcriptDoc.callerNumber = callerNumber;
-          }
-          if (toNumber) {
-            transcriptDoc.toNumber = toNumber;
-          }
           if (transcriptLines.length > 0) {
             transcriptDoc.transcript = transcriptLines;
           }
 
+          console.log(
+            `[TRANSCRIPT_META_SAVE] callSid=${callSid || ""} from=${callerNumber || ""} to=${toNumber || ""} barberId=${barberId}`
+          );
           await transcriptDoc.save();
 
           console.log("[TRANSCRIPT_FINALIZED]", {

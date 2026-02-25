@@ -41,6 +41,9 @@ const buildAiStreamTwiml = ({ req, barberId, initialPrompt }) => {
 
   stream.parameter({ name: "barberId", value: String(barberId) });
   stream.parameter({ name: "initialPrompt", value: initialPrompt });
+  stream.parameter({ name: "from", value: req.body.From || "" });
+  stream.parameter({ name: "to", value: req.body.To || "" });
+  stream.parameter({ name: "callSid", value: req.body.CallSid || "" });
 
   return response;
 };
@@ -190,6 +193,9 @@ export const handleDialFallback = async (req, res) => {
       barberName: barber.name,
     });
 
+    console.log(
+      `[STREAM_META_TWIML] callSid=${req.body.CallSid || ""} from=${req.body.From || ""} to=${req.body.To || ""} barberId=${barberId}`
+    );
     console.log("[DIAL_FALLBACK] falling back to AI stream");
     console.log("[DIAL_FALLBACK] TwiML:\n", twimlOutput);
 
