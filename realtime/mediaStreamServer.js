@@ -25,6 +25,7 @@ const extractGreetingPhrase = (prompt) => {
 };
 
 const detectLanguageMode = (text) => {
+  if (/[áéíóúñ¿¡]/i.test(text)) return "es";
   const t = String(text || "").toLowerCase();
 
   const es = [
@@ -43,6 +44,18 @@ const detectLanguageMode = (text) => {
   if (hasEs) return "es";
   if (hasEn) return "en";
   return "auto";
+};
+
+const isYes = (text) => {
+  const t = String(text || "").toLowerCase();
+  return (
+    t === "yes" ||
+    t === "si" ||
+    t === "sí" ||
+    t.includes(" yes") ||
+    t.includes("sí") ||
+    t.includes("confirm")
+  );
 };
 
 export const attachMediaWebSocketServer = (server) => {
@@ -81,6 +94,7 @@ export const attachMediaWebSocketServer = (server) => {
 
     // ✅ FIX #1: Session guard - MUST be checked before ANY session creation
     let aiSessionCreated = false;
+    let aiSessionStarted = false;
     let ai = null;
 
     // ----------------------------
@@ -165,17 +179,20 @@ export const attachMediaWebSocketServer = (server) => {
     let greetingSent = false;
     let greetingComplete = false;
 
-    let lastUserTranscript = "";
-    let respondTimer = null;
-    let lastRespondedTranscript = "";
-    let isResponding = false;
-    let pendingRespond = false;
     let responseInFlightId = null;
     let assistantSpeaking = false;
     let lastUserSpokeAt = 0;
     let assistantResponseText = "";
     let currentLanguage = "en";
     let previousLanguage = "en";
+    const bookingState = {
+      intent: "OTHER",
+      name: "",
+      service: "",
+      dateTimeText: "",
+      askedConfirm: false,
+      confirmed: false,
+    };
 
     // Silence injection state
     let silenceInterval = null;
@@ -320,29 +337,30 @@ export const attachMediaWebSocketServer = (server) => {
 
     // ----------------------------
     // Response creation
-    // ----------------------------
-    const commitAndCreateResponse = async () => {
+    const nextBookingQuestion = () => {
+      if (!bookingState.name) return "Ask for their name.";
+      if (!bookingState.service) {
+        return "Ask what service they want (haircut, beard, haircut+beard).";
+      }
+      if (!bookingState.dateTimeText) return "Ask the date and time they want.";
+      if (!bookingState.askedConfirm) {
+        return "Repeat back Name + Service + Date/Time and ask: 'Should I confirm that?'";
+      }
+      return "If they confirmed, acknowledge and say the barber will see it and follow up if needed.";
+    };
+
+    const requestAssistantResponse = async ({ immediate = false, reason = "unknown" } = {}) => {
       if (!greetingComplete) return;
       if (aiResponseInProgress) return;
-      if (!lastUserTranscript) return;
+      if (!canSendAI()) return;
 
-      console.log("📤 Committing audio and creating response...");
+      const forcedNext = nextBookingQuestion();
+      const bookingOverlay =
+        bookingState.intent === "BOOK"
+          ? `\n\nBOOKING STATE:\n- name: ${bookingState.name || "(missing)"}\n- service: ${bookingState.service || "(missing)"}\n- datetime: ${bookingState.dateTimeText || "(missing)"}\n- askedConfirm: ${bookingState.askedConfirm}\n- confirmed: ${bookingState.confirmed}\n\nNEXT ACTION (MANDATORY): ${forcedNext}\nAsk ONLY one question.`
+          : "";
 
-      sendToAI({ type: "input_audio_buffer.commit" });
-
-      framesSinceLastCommit = 0;
-      hasCommittedUserAudioForTurn = true;
-
-      const instructions =
-        `LANGUAGE: ${languageInstructionFor(currentLanguage)}\n\n` +
-        `VOICE STYLE:\n` +
-        `- Be brief and natural.\n` +
-        `- Ask ONE question.\n\n` +
-        `BOOKING RULES:\n` +
-        `- Never invent dates or times.\n` +
-        `- Require BOTH date and time.\n` +
-        `- Repeat back EXACTLY and confirm YES.\n\n` +
-        `Caller said: "${lastUserTranscript}"`;
+      const instructions = `${baseInstructions}\n\n${languageInstructionFor(currentLanguage)}${bookingOverlay}`;
 
       sendToAI({
         type: "response.create",
@@ -353,55 +371,23 @@ export const attachMediaWebSocketServer = (server) => {
         },
       });
 
-      console.log(`🗣️ Response requested (${currentLanguage}): "${lastUserTranscript}"`);
-      const responseText = `Responding to caller: ${lastUserTranscript}`;
-      await appendMessage({ role: "assistant", text: responseText, lang: currentLanguage });
-
+      console.log(
+        `[RESPONSE_REQUESTED] reason=${reason} immediate=${String(immediate)} lang=${currentLanguage}`
+      );
       aiResponseInProgress = true;
-    };
-
-    const scheduleRespond = (immediate = false) => {
-      if (respondTimer) clearTimeout(respondTimer);
-
-      const delayMs = immediate ? 0 : 250;
-
-      respondTimer = setTimeout(async () => {
-        try {
-          if (!ai || ai.readyState !== ai.OPEN) return;
-          if (!lastUserTranscript) return;
-
-          if (lastUserTranscript === lastRespondedTranscript && !pendingRespond) return;
-
-          if (isResponding) {
-            pendingRespond = true;
-            return;
-          }
-
-          isResponding = true;
-          pendingRespond = false;
-          lastRespondedTranscript = lastUserTranscript;
-          await commitAndCreateResponse();
-        } catch (e) {
-          console.error("[scheduleRespond] error:", e?.message || e);
-        } finally {
-          isResponding = false;
-          if (pendingRespond) {
-            pendingRespond = false;
-            scheduleRespond(true);
-          }
-        }
-      }, delayMs);
+      assistantResponseText = "";
     };
 
     // ----------------------------
     // Create AI Session (with strict guard)
     // ----------------------------
-    const initAISession = () => {
+    const ensureAISession = () => {
       // ✅ FIX #1: Strict guard - prevent ANY duplicate session creation
-      if (aiSessionCreated) {
+      if (aiSessionStarted || aiSessionCreated) {
         console.log("⚠️ AI session already created, skipping duplicate");
         return;
       }
+      aiSessionStarted = true;
       aiSessionCreated = true;
       console.log("🔄 Creating OpenAI session...");
 
@@ -465,7 +451,6 @@ export const attachMediaWebSocketServer = (server) => {
             previousLanguage = currentLanguage;
             const detected = detectLanguageMode(transcriptText);
             if (detected !== "auto") currentLanguage = detected;
-            else currentLanguage = barberPreferredLang;
             console.log("TRANSCRIPT:", transcriptText, `(${currentLanguage})`);
 
             const text = String(transcriptText || "").toLowerCase();
@@ -475,12 +460,29 @@ export const attachMediaWebSocketServer = (server) => {
               text.includes("schedule") ||
               text.includes("reserve")
             ) {
+              bookingState.intent = "BOOK";
               await setTranscriptIntentOutcome({ intent: "BOOK", outcome: "NO_ACTION" });
+            } else if (
+              text.includes("cancel") ||
+              text.includes("cancellation")
+            ) {
+              bookingState.intent = "CANCEL";
+            } else if (text.includes("reschedule")) {
+              bookingState.intent = "RESCHEDULE";
+            } else if (
+              text.includes("price") ||
+              text.includes("hours") ||
+              text.includes("open")
+            ) {
+              bookingState.intent = "INQUIRE";
             }
 
             const lower = transcriptText.toLowerCase();
             if (!lower.includes("unknown")) {
               if (lower.includes("my name is") || lower.startsWith("i'm ") || lower.startsWith("i am ")) {
+                bookingState.name = transcriptText;
+                bookingState.askedConfirm = false;
+                bookingState.confirmed = false;
                 await updateTranscriptFields({ clientName: transcriptText });
               }
             }
@@ -491,6 +493,9 @@ export const attachMediaWebSocketServer = (server) => {
               lower.includes("lineup") ||
               lower.includes("beard")
             ) {
+              bookingState.service = transcriptText;
+              bookingState.askedConfirm = false;
+              bookingState.confirmed = false;
               await updateTranscriptFields({ serviceRequested: transcriptText });
             }
 
@@ -499,11 +504,16 @@ export const attachMediaWebSocketServer = (server) => {
               lower.includes("thursday") || lower.includes("friday") || lower.includes("saturday") || lower.includes("sunday") ||
               lower.includes("am") || lower.includes("pm")
             ) {
+              bookingState.dateTimeText = transcriptText;
+              bookingState.askedConfirm = false;
+              bookingState.confirmed = false;
               await updateTranscriptFields({ requestedDateTimeText: transcriptText });
             }
 
-            if (lower === "yes" || lower.includes("yes")) {
+            if (bookingState.intent === "BOOK" && bookingState.askedConfirm && isYes(transcriptText)) {
+              bookingState.confirmed = true;
               await updateTranscriptFields({ confirmed: true });
+              await setTranscriptIntentOutcome({ intent: "BOOK", outcome: "BOOKED" });
             }
 
             if (previousLanguage !== currentLanguage) {
@@ -511,7 +521,6 @@ export const attachMediaWebSocketServer = (server) => {
               await applyLanguageToSession(currentLanguage);
             }
 
-            lastUserTranscript = transcriptText;
             lastUserSpokeAt = Date.now();
 
             if (assistantSpeaking && responseInFlightId) {
@@ -522,12 +531,20 @@ export const attachMediaWebSocketServer = (server) => {
               assistantSpeaking = false;
               responseInFlightId = null;
             }
-
-            scheduleRespond(false);
           }
         }
         if (evt.type === "input_audio_buffer.speech_stopped") {
-          scheduleRespond(false);
+          if (!greetingComplete) return;
+          if (aiResponseInProgress) return;
+
+          lastUserSpokeAt = Date.now();
+          if (!hasCommittedUserAudioForTurn) {
+            hasCommittedUserAudioForTurn = true;
+            sendToAI({ type: "input_audio_buffer.commit" });
+            framesSinceLastCommit = 0;
+            await requestAssistantResponse({ immediate: true, reason: "speech_stopped" });
+          }
+          return;
         }
 
         if (evt.type === "response.done") {
@@ -552,6 +569,14 @@ export const attachMediaWebSocketServer = (server) => {
           assistantSpeaking = false;
           responseInFlightId = null;
           if (assistantResponseText && assistantResponseText.trim()) {
+            const responseLower = assistantResponseText.toLowerCase();
+            if (
+              responseLower.includes("should i confirm that") ||
+              responseLower.includes("debo confirmar") ||
+              responseLower.includes("quieres que lo confirme")
+            ) {
+              bookingState.askedConfirm = true;
+            }
             assistantTranscriptLines.push(assistantResponseText.trim());
             await appendMessage({
               role: "assistant",
@@ -588,6 +613,7 @@ export const attachMediaWebSocketServer = (server) => {
       });
 
       ai.on("close", () => {
+        aiSessionStarted = false;
         console.log("📴 OpenAI WebSocket closed");
       });
     };
@@ -635,7 +661,7 @@ export const attachMediaWebSocketServer = (server) => {
         startSilence();
 
         // Create AI session (with guard against duplicates)
-        initAISession();
+        ensureAISession();
 
         // Queue greeting (will send after session.updated)
         queueGreeting();
@@ -662,9 +688,9 @@ export const attachMediaWebSocketServer = (server) => {
 
     twilioWs.on("close", () => {
       console.log("📴 Twilio WebSocket closed");
-      if (respondTimer) clearTimeout(respondTimer);
       stopSilence();
       if (ai && ai.readyState === ai.OPEN) ai.close();
+      aiSessionStarted = false;
 
       if (transcriptFinalized) return;
       transcriptFinalized = true;
@@ -755,6 +781,8 @@ export const attachMediaWebSocketServer = (server) => {
 
   console.log(`🎧 Media WebSocket Ready → ${WS_PATH}`);
 };
+
+
 
 
 
