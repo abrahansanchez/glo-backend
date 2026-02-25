@@ -95,7 +95,44 @@ const CallTranscriptSchema = new mongoose.Schema(
     },
 
     clientName: {
-      type: String, // caller’s name if known
+      type: String, // caller's name if known
+      default: "",
+    },
+    serviceRequested: {
+      type: String,
+      default: "",
+    },
+    requestedDateTimeText: {
+      type: String,
+      default: "",
+    },
+    confirmed: {
+      type: Boolean,
+      default: false,
+    },
+    messages: {
+      type: [
+        {
+          role: {
+            type: String,
+            enum: ["caller", "assistant", "system"],
+            required: true,
+          },
+          text: {
+            type: String,
+            required: true,
+          },
+          lang: {
+            type: String,
+            default: "",
+          },
+          at: {
+            type: Date,
+            default: Date.now,
+          },
+        },
+      ],
+      default: [],
     },
   },
   { timestamps: true }

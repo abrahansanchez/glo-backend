@@ -1,6 +1,7 @@
 import { WebSocketServer } from "ws";
 import { createOpenAISession } from "../utils/ai/openaiSession.js";
 import CallTranscript from "../models/CallTranscript.js";
+import Barber from "../models/Barber.js";
 
 const WS_PATH = "/ws/media";
 
@@ -21,6 +22,27 @@ const extractGreetingPhrase = (prompt) => {
   const thanksMatch = prompt.match(/(Thanks for calling[^.]+\.[^?]+\?)/i);
   if (thanksMatch) return thanksMatch[1];
   return null;
+};
+
+const detectLanguageMode = (text) => {
+  const t = String(text || "").toLowerCase();
+
+  const es = [
+    "hola", "buenas", "gracias", "por favor", "quiero", "necesito", "cita", "precio", "cuanto",
+    "barbero", "mañana", "hoy", "jueves", "viernes", "sabado", "domingo", "recortar", "barba",
+  ];
+  const en = [
+    "hello", "thanks", "please", "i want", "i need", "appointment", "book", "schedule", "price", "how much",
+    "thursday", "friday", "saturday", "sunday", "haircut", "beard",
+  ];
+
+  const hasEs = es.some((w) => t.includes(w));
+  const hasEn = en.some((w) => t.includes(w));
+
+  if (hasEs && hasEn) return "spanglish";
+  if (hasEs) return "es";
+  if (hasEn) return "en";
+  return "auto";
 };
 
 export const attachMediaWebSocketServer = (server) => {
@@ -73,8 +95,10 @@ export const attachMediaWebSocketServer = (server) => {
     let initialPrompt = null;
     let callerNumber = "";
     let toNumber = "";
+    let barberPreferredLang = "en";
     let callStartedAt = new Date();
     const userTranscriptLines = [];
+    const assistantTranscriptLines = [];
     let transcriptFinalized = false;
 
     async function setTranscriptIntentOutcome({ intent, outcome }) {
@@ -95,10 +119,46 @@ export const attachMediaWebSocketServer = (server) => {
       }
     }
 
+    async function updateTranscriptFields(fields) {
+      if (!barberId || !callSid) return;
+      try {
+        await CallTranscript.findOneAndUpdate(
+          { barberId: String(barberId), callSid: String(callSid) },
+          { $set: fields },
+          { upsert: true }
+        );
+        console.log(
+          `[TRANSCRIPT_FIELDS_SET] callSid=${callSid} barberId=${barberId} fields=${Object.keys(fields).join(",")}`
+        );
+      } catch (e) {
+        console.error("[TRANSCRIPT_FIELDS_SET] error:", e?.message || e);
+      }
+    }
+
+    async function appendMessage({ role, text, lang }) {
+      if (!barberId || !callSid || !text) return;
+      try {
+        await CallTranscript.findOneAndUpdate(
+          { barberId: String(barberId), callSid: String(callSid) },
+          {
+            $push: {
+              messages: {
+                role,
+                text: String(text).slice(0, 2000),
+                lang: lang || "",
+              },
+            },
+          },
+          { upsert: true }
+        );
+      } catch (e) {
+        console.error("[APPEND_MESSAGE] error:", e?.message || e);
+      }
+    }
+
     let framesSinceLastCommit = 0;
 
     let aiResponseInProgress = false;
-    let pendingUserTurn = false;
     let hasCommittedUserAudioForTurn = false;
 
     let greetingQueued = false;
@@ -106,8 +166,16 @@ export const attachMediaWebSocketServer = (server) => {
     let greetingComplete = false;
 
     let lastUserTranscript = "";
-    let currentLanguage = "en"; // en | es
-    let previousLanguage = "en"; // Track language changes
+    let respondTimer = null;
+    let lastRespondedTranscript = "";
+    let isResponding = false;
+    let pendingRespond = false;
+    let responseInFlightId = null;
+    let assistantSpeaking = false;
+    let lastUserSpokeAt = 0;
+    let assistantResponseText = "";
+    let currentLanguage = "en";
+    let previousLanguage = "en";
 
     // Silence injection state
     let silenceInterval = null;
@@ -160,12 +228,50 @@ export const attachMediaWebSocketServer = (server) => {
       return true;
     };
 
-    const detectLanguage = (text) => {
-      if (/[áéíóúñ¿¡]/i.test(text)) return "es";
-      const spanishWords = ["hola", "cita", "mañana", "precio", "gracias", "quiero", "para", "una"];
-      const lower = text.toLowerCase();
-      if (spanishWords.some((w) => lower.includes(w))) return "es";
-      return "en";
+    const baseInstructions =
+      `You are Glō, an AI phone receptionist.\n` +
+      `Follow booking rules strictly.\n` +
+      `Do not invent dates or times.\n` +
+      `When given a specific phrase to speak, say it EXACTLY with no changes.\n\n` +
+      `BOOKING FLOW (REQUIRED):\n` +
+      `1) Collect missing: name, service, date, time.\n` +
+      `2) Ask ONE question at a time.\n` +
+      `3) After you have all details, repeat back Name + Service + Date + Time, then ask "Should I confirm that?".\n` +
+      `4) Only after caller says YES, mark confirmed.\n` +
+      `5) If caller switches languages, match instantly.\n\n` +
+      `SERVICE OPTIONS:\n` +
+      `- haircut\n` +
+      `- beard\n` +
+      `- haircut + beard\n` +
+      `- other (ask what they want)\n\n` +
+      `STYLE:\n` +
+      `- 1-2 short sentences max per turn.\n` +
+      `- No long speeches.\n` +
+      `- No awkward pauses.\n`;
+
+    const languageInstructionFor = (mode) => {
+      const target = mode === "auto" ? barberPreferredLang : mode;
+      if (target === "es") return "Respond in Spanish. Keep it clear and natural.";
+      if (target === "spanglish") {
+        return "Respond in clear Spanglish (mix Spanish/English naturally). Keep it easy to understand.";
+      }
+      return "Respond in English. Keep it clear and natural.";
+    };
+
+    const applyLanguageToSession = async (mode) => {
+      const target = mode === "auto" ? barberPreferredLang : mode;
+      const instruction = languageInstructionFor(target);
+      try {
+        sendToAI({
+          type: "session.update",
+          session: {
+            instructions: `${baseInstructions}\n\n${instruction}`,
+          },
+        });
+        console.log(`[LANG_APPLIED] mode=${target}`);
+      } catch (e) {
+        console.error("[LANG_APPLIED] error:", e?.message || e);
+      }
     };
 
     // ----------------------------
@@ -215,7 +321,7 @@ export const attachMediaWebSocketServer = (server) => {
     // ----------------------------
     // Response creation
     // ----------------------------
-    const commitAndCreateResponse = () => {
+    const commitAndCreateResponse = async () => {
       if (!greetingComplete) return;
       if (aiResponseInProgress) return;
       if (!lastUserTranscript) return;
@@ -228,9 +334,7 @@ export const attachMediaWebSocketServer = (server) => {
       hasCommittedUserAudioForTurn = true;
 
       const instructions =
-        `LANGUAGE: Respond ONLY in ${
-          currentLanguage === "es" ? "Spanish" : "English"
-        }.\n\n` +
+        `LANGUAGE: ${languageInstructionFor(currentLanguage)}\n\n` +
         `VOICE STYLE:\n` +
         `- Be brief and natural.\n` +
         `- Ask ONE question.\n\n` +
@@ -245,30 +349,48 @@ export const attachMediaWebSocketServer = (server) => {
         response: {
           modalities: ["audio", "text"],
           instructions,
-          max_output_tokens: 150,
+          max_output_tokens: 220,
         },
       });
 
       console.log(`🗣️ Response requested (${currentLanguage}): "${lastUserTranscript}"`);
+      const responseText = `Responding to caller: ${lastUserTranscript}`;
+      await appendMessage({ role: "assistant", text: responseText, lang: currentLanguage });
 
       aiResponseInProgress = true;
-      lastUserTranscript = "";
     };
 
-    let respondTimer = null;
     const scheduleRespond = (immediate = false) => {
-      pendingUserTurn = true;
       if (respondTimer) clearTimeout(respondTimer);
 
-      // ✅ FIX #3: Faster response timer (150ms instead of 250ms)
-      const delay = immediate ? 50 : 150;
+      const delayMs = immediate ? 0 : 250;
 
-      respondTimer = setTimeout(() => {
-        respondTimer = null;
-        if (!pendingUserTurn) return;
-        pendingUserTurn = false;
-        commitAndCreateResponse();
-      }, delay);
+      respondTimer = setTimeout(async () => {
+        try {
+          if (!ai || ai.readyState !== ai.OPEN) return;
+          if (!lastUserTranscript) return;
+
+          if (lastUserTranscript === lastRespondedTranscript && !pendingRespond) return;
+
+          if (isResponding) {
+            pendingRespond = true;
+            return;
+          }
+
+          isResponding = true;
+          pendingRespond = false;
+          lastRespondedTranscript = lastUserTranscript;
+          await commitAndCreateResponse();
+        } catch (e) {
+          console.error("[scheduleRespond] error:", e?.message || e);
+        } finally {
+          isResponding = false;
+          if (pendingRespond) {
+            pendingRespond = false;
+            scheduleRespond(true);
+          }
+        }
+      }, delayMs);
     };
 
     // ----------------------------
@@ -293,11 +415,7 @@ export const attachMediaWebSocketServer = (server) => {
         sendToAI({
           type: "session.update",
           session: {
-            instructions:
-              `You are Glō, an AI phone receptionist.\n` +
-              `Follow booking rules strictly.\n` +
-              `Do not invent dates or times.\n` +
-              `When given a specific phrase to speak, say it EXACTLY with no changes.\n`,
+            instructions: `${baseInstructions}\n\n${languageInstructionFor(currentLanguage)}`, 
             temperature: 0.2,
             max_response_output_tokens: 300,
             turn_detection: null, // VAD disabled during greeting
@@ -322,37 +440,92 @@ export const attachMediaWebSocketServer = (server) => {
           trySendGreeting();
         }
 
+        if (evt.response?.id) {
+          responseInFlightId = evt.response.id;
+        } else if (evt.response_id) {
+          responseInFlightId = evt.response_id;
+        }
+
+        if (
+          evt.type === "response.audio_transcript.delta" ||
+          evt.type === "response.output_text.delta"
+        ) {
+          const deltaText = String(evt.delta || "");
+          if (deltaText) assistantResponseText += deltaText;
+        }
         if (
           evt.type === "conversation.item.input_audio_transcription.completed" ||
           evt.type === "input_audio_transcription.completed"
         ) {
           const transcriptText = (evt.transcript || "").trim();
           if (transcriptText) {
-            lastUserTranscript = transcriptText;
             userTranscriptLines.push(transcriptText);
+            await appendMessage({ role: "caller", text: transcriptText, lang: currentLanguage });
+
             previousLanguage = currentLanguage;
-            currentLanguage = detectLanguage(transcriptText);
-            console.log("📝 TRANSCRIPT:", transcriptText, `(${currentLanguage})`);
+            const detected = detectLanguageMode(transcriptText);
+            if (detected !== "auto") currentLanguage = detected;
+            else currentLanguage = barberPreferredLang;
+            console.log("TRANSCRIPT:", transcriptText, `(${currentLanguage})`);
 
             const text = String(transcriptText || "").toLowerCase();
             if (
               text.includes("book") ||
               text.includes("appointment") ||
               text.includes("schedule") ||
-              text.includes("reserve") ||
-              text.includes("thursday")
+              text.includes("reserve")
             ) {
               await setTranscriptIntentOutcome({ intent: "BOOK", outcome: "NO_ACTION" });
             }
 
-            // ✅ FIX #3: If language changed, respond immediately
-            if (previousLanguage !== currentLanguage) {
-              console.log(`🌐 Language switch detected: ${previousLanguage} → ${currentLanguage}`);
-              scheduleRespond(true); // Immediate response
+            const lower = transcriptText.toLowerCase();
+            if (!lower.includes("unknown")) {
+              if (lower.includes("my name is") || lower.startsWith("i'm ") || lower.startsWith("i am ")) {
+                await updateTranscriptFields({ clientName: transcriptText });
+              }
             }
+
+            if (
+              lower.includes("haircut") ||
+              lower.includes("fade") ||
+              lower.includes("lineup") ||
+              lower.includes("beard")
+            ) {
+              await updateTranscriptFields({ serviceRequested: transcriptText });
+            }
+
+            if (
+              lower.includes("monday") || lower.includes("tuesday") || lower.includes("wednesday") ||
+              lower.includes("thursday") || lower.includes("friday") || lower.includes("saturday") || lower.includes("sunday") ||
+              lower.includes("am") || lower.includes("pm")
+            ) {
+              await updateTranscriptFields({ requestedDateTimeText: transcriptText });
+            }
+
+            if (lower === "yes" || lower.includes("yes")) {
+              await updateTranscriptFields({ confirmed: true });
+            }
+
+            if (previousLanguage !== currentLanguage) {
+              console.log(`[LANG_SWITCH] ${previousLanguage} -> ${currentLanguage}`);
+              await applyLanguageToSession(currentLanguage);
+            }
+
+            lastUserTranscript = transcriptText;
+            lastUserSpokeAt = Date.now();
+
+            if (assistantSpeaking && responseInFlightId) {
+              try {
+                ai.send(JSON.stringify({ type: "response.cancel" }));
+                console.log("[BARGE_IN] user interrupted assistant -> response.cancel");
+              } catch {}
+              assistantSpeaking = false;
+              responseInFlightId = null;
+            }
+
+            scheduleRespond(false);
           }
         }
-
         if (evt.type === "input_audio_buffer.speech_stopped") {
           scheduleRespond(false);
         }
@@ -376,6 +549,17 @@ export const attachMediaWebSocketServer = (server) => {
             });
             console.log("🎙️ VAD enabled for conversation");
           }
+          assistantSpeaking = false;
+          responseInFlightId = null;
+          if (assistantResponseText && assistantResponseText.trim()) {
+            assistantTranscriptLines.push(assistantResponseText.trim());
+            await appendMessage({
+              role: "assistant",
+              text: assistantResponseText.trim(),
+              lang: currentLanguage,
+            });
+          }
+          assistantResponseText = "";
           aiResponseInProgress = false;
           hasCommittedUserAudioForTurn = false;
         }
@@ -385,6 +569,7 @@ export const attachMediaWebSocketServer = (server) => {
           evt.type === "response.output_audio.delta"
         ) {
           stopSilence();
+          assistantSpeaking = true;
 
           if (twilioWs.readyState === twilioWs.OPEN && streamSid) {
             twilioWs.send(
@@ -410,7 +595,7 @@ export const attachMediaWebSocketServer = (server) => {
     // ----------------------------
     // Twilio → OpenAI
     // ----------------------------
-    twilioWs.on("message", (msgData) => {
+    twilioWs.on("message", async (msgData) => {
       let msg;
       try {
         msg = JSON.parse(Buffer.from(msgData).toString("utf8"));
@@ -433,6 +618,14 @@ export const attachMediaWebSocketServer = (server) => {
         console.log(
           `[STREAM_META_WS] callSid=${callSid} from=${callerNumber} to=${toNumber} barberId=${barberId}`
         );
+        try {
+          const barber = await Barber.findById(barberId).select("preferredLanguage");
+          barberPreferredLang = barber?.preferredLanguage || "en";
+        } catch (e) {
+          barberPreferredLang = "en";
+        }
+        currentLanguage = barberPreferredLang;
+        console.log(`[LANG_PREF] barberId=${barberId} preferred=${barberPreferredLang}`);
 
         console.log("📡 Stream started - streamSid:", streamSid);
         console.log("💈 Barber ID:", barberId);
@@ -531,6 +724,9 @@ export const attachMediaWebSocketServer = (server) => {
           if (transcriptLines.length > 0) {
             transcriptDoc.transcript = transcriptLines;
           }
+          if (assistantTranscriptLines.length > 0) {
+            transcriptDoc.aiResponses = assistantTranscriptLines;
+          }
 
           console.log(
             `[TRANSCRIPT_META_SAVE] callSid=${callSid || ""} from=${callerNumber || ""} to=${toNumber || ""} barberId=${barberId}`
@@ -559,3 +755,13 @@ export const attachMediaWebSocketServer = (server) => {
 
   console.log(`🎧 Media WebSocket Ready → ${WS_PATH}`);
 };
+
+
+
+
+
+
+
+
+
+
