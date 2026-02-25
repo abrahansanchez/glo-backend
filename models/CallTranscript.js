@@ -14,6 +14,10 @@ const CallTranscriptSchema = new mongoose.Schema(
       type: String,
       required: true,
     },
+    callSid: {
+      type: String,
+      index: true,
+    },
 
     transcript: {
       type: [String], // user speech
@@ -130,4 +134,7 @@ CallTranscriptSchema.post("save", function postCallTranscriptSave(doc) {
   })();
 });
 
-export default mongoose.model("CallTranscript", CallTranscriptSchema);
+const CallTranscript =
+  mongoose.models.CallTranscript || mongoose.model("CallTranscript", CallTranscriptSchema);
+
+export default CallTranscript;

@@ -1,5 +1,6 @@
 import { WebSocketServer } from "ws";
 import { createOpenAISession } from "../utils/ai/openaiSession.js";
+import CallTranscript from "../models/CallTranscript.js";
 
 const WS_PATH = "/ws/media";
 
@@ -70,6 +71,10 @@ export const attachMediaWebSocketServer = (server) => {
     let callSid = null;
     let barberId = null;
     let initialPrompt = null;
+    let callerNumber = "";
+    let callStartedAt = new Date();
+    const userTranscriptLines = [];
+    let transcriptFinalized = false;
 
     let framesSinceLastCommit = 0;
 
@@ -305,6 +310,7 @@ export const attachMediaWebSocketServer = (server) => {
           const transcript = (evt.transcript || "").trim();
           if (transcript) {
             lastUserTranscript = transcript;
+            userTranscriptLines.push(transcript);
             previousLanguage = currentLanguage;
             currentLanguage = detectLanguage(transcript);
             console.log("📝 TRANSCRIPT:", transcript, `(${currentLanguage})`);
@@ -385,10 +391,12 @@ export const attachMediaWebSocketServer = (server) => {
       if (msg.event === "start") {
         streamSid = msg.start?.streamSid || null;
         callSid = msg.start?.callSid || null;
+        callStartedAt = new Date();
 
         const custom = msg.start?.customParameters || {};
         barberId = custom.barberId || null;
         initialPrompt = custom.initialPrompt || null;
+        callerNumber = custom.from || msg.start?.from || "";
 
         console.log("📡 Stream started - streamSid:", streamSid);
         console.log("💈 Barber ID:", barberId);
@@ -428,6 +436,63 @@ export const attachMediaWebSocketServer = (server) => {
       if (respondTimer) clearTimeout(respondTimer);
       stopSilence();
       if (ai && ai.readyState === ai.OPEN) ai.close();
+
+      if (transcriptFinalized) return;
+      transcriptFinalized = true;
+
+      void (async () => {
+        try {
+          if (!barberId) return;
+
+          const callEndedAt = new Date();
+          const outcome = "NO_ACTION";
+          const intent = "UNKNOWN";
+          const safeCallSid = callSid ? String(callSid) : "";
+          const safeBarberId = String(barberId);
+          const durationSeconds = Math.max(
+            0,
+            Math.round((callEndedAt.getTime() - callStartedAt.getTime()) / 1000)
+          );
+
+          let transcriptDoc = null;
+          if (safeCallSid) {
+            transcriptDoc = await CallTranscript.findOne({
+              callSid: safeCallSid,
+              barberId: safeBarberId,
+            });
+          }
+
+          if (!transcriptDoc) {
+            transcriptDoc = new CallTranscript({
+              barberId: safeBarberId,
+              callSid: safeCallSid,
+              callerNumber: callerNumber || "unknown number",
+            });
+          }
+
+          transcriptDoc.callStartedAt = transcriptDoc.callStartedAt || callStartedAt;
+          transcriptDoc.callEndedAt = callEndedAt;
+          transcriptDoc.durationSeconds = durationSeconds;
+          transcriptDoc.outcome = outcome;
+          transcriptDoc.intent = intent;
+          if (userTranscriptLines.length > 0) {
+            transcriptDoc.transcript = userTranscriptLines;
+          }
+
+          await transcriptDoc.save();
+
+          console.log("[TRANSCRIPT_FINALIZED]", {
+            callSid: safeCallSid,
+            barberId: safeBarberId,
+            transcriptId: String(transcriptDoc._id),
+            callEndedAt,
+            outcome,
+            intent,
+          });
+        } catch (error) {
+          console.error("[TRANSCRIPT_FINALIZED] error:", error?.message || error);
+        }
+      })();
     });
 
     twilioWs.on("error", (err) => {
