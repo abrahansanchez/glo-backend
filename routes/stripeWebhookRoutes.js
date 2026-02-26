@@ -5,6 +5,11 @@ import Subscription from "../models/Subscription.js";
 import { sendExpoPush } from "../utils/push/expoPush.js";
 
 const ISSUE_STATUSES = new Set(["past_due", "incomplete", "canceled"]);
+const logWebhook = ({ type, barberId, subscriptionId }) => {
+  console.log(
+    `[STRIPE_WEBHOOK] type=${String(type || "")} barberId=${String(barberId || "")} subscriptionId=${String(subscriptionId || "")}`
+  );
+};
 
 const pushSubscriptionIssue = async ({ barber, status, stripeSubscriptionId }) => {
   const token = barber?.expoPushToken || null;
@@ -51,6 +56,10 @@ export default async function stripeWebhookHandler(req, res) {
     console.error("STRIPE_WEBHOOK_SECRET missing in env");
     return res.status(500).send("Server misconfigured");
   }
+  if (!String(process.env.STRIPE_WEBHOOK_SECRET).startsWith("whsec_")) {
+    console.error("STRIPE_WEBHOOK_SECRET invalid format (expected whsec_...)");
+    return res.status(500).send("Server misconfigured");
+  }
 
   let event;
 
@@ -69,6 +78,49 @@ export default async function stripeWebhookHandler(req, res) {
 
   try {
     switch (event.type) {
+      case "customer.subscription.created": {
+        const sub = event.data.object;
+        const nextStatus = String(sub.status || "trialing").toLowerCase();
+        let barberId = sub.metadata?.barberId || "";
+
+        let subscriptionDoc = await Subscription.findOne({
+          stripeSubscriptionId: sub.id,
+        });
+
+        if (!subscriptionDoc && barberId) {
+          subscriptionDoc = await Subscription.create({
+            barber: barberId,
+            stripeCustomerId: sub.customer,
+            stripeSubscriptionId: sub.id,
+            status: nextStatus,
+            priceId: sub.items?.data?.[0]?.price?.id || process.env.STRIPE_PRICE_ID || null,
+            currency: sub.currency || "usd",
+            startedAt: new Date(),
+          });
+        } else if (subscriptionDoc) {
+          subscriptionDoc.status = nextStatus;
+          await subscriptionDoc.save();
+          barberId = barberId || String(subscriptionDoc.barber || "");
+        }
+
+        if (barberId) {
+          const barber = await Barber.findById(barberId);
+          if (barber) {
+            barber.stripeCustomerId = sub.customer || barber.stripeCustomerId;
+            barber.stripeSubscriptionId = sub.id;
+            barber.subscriptionStatus = nextStatus;
+            await barber.save();
+          }
+        }
+
+        logWebhook({
+          type: event.type,
+          barberId,
+          subscriptionId: sub.id,
+        });
+        break;
+      }
+
       case "checkout.session.completed": {
         const session = event.data.object;
 
@@ -105,6 +157,11 @@ export default async function stripeWebhookHandler(req, res) {
         barber.subscriptionStatus = "active";
         await barber.save();
 
+        logWebhook({
+          type: event.type,
+          barberId,
+          subscriptionId: stripeSubscriptionId,
+        });
         console.log("Subscription activated for barber:", barber.email);
         break;
       }
@@ -136,6 +193,11 @@ export default async function stripeWebhookHandler(req, res) {
           });
         }
 
+        logWebhook({
+          type: event.type,
+          barberId: barber?._id,
+          subscriptionId: sub.id,
+        });
         console.log("Subscription canceled:", sub.id);
         break;
       }
@@ -170,7 +232,37 @@ export default async function stripeWebhookHandler(req, res) {
           }
         }
 
+        logWebhook({
+          type: event.type,
+          barberId: barber?._id || subscriptionDoc?.barber,
+          subscriptionId: sub.id,
+        });
         console.log("Subscription updated:", sub.id, nextStatus);
+        break;
+      }
+
+      case "invoice.payment_succeeded": {
+        const invoice = event.data.object;
+        const stripeSubscriptionId = invoice.subscription;
+        if (!stripeSubscriptionId) break;
+
+        const subscriptionDoc = await Subscription.findOne({ stripeSubscriptionId });
+        if (subscriptionDoc) {
+          subscriptionDoc.status = "active";
+          await subscriptionDoc.save();
+        }
+
+        const barber = await Barber.findOne({ stripeSubscriptionId });
+        if (barber) {
+          barber.subscriptionStatus = "active";
+          await barber.save();
+        }
+
+        logWebhook({
+          type: event.type,
+          barberId: barber?._id || subscriptionDoc?.barber,
+          subscriptionId: stripeSubscriptionId,
+        });
         break;
       }
 
@@ -196,6 +288,11 @@ export default async function stripeWebhookHandler(req, res) {
           });
         }
 
+        logWebhook({
+          type: event.type,
+          barberId: barber?._id || subscriptionDoc?.barber,
+          subscriptionId: stripeSubscriptionId,
+        });
         console.log("Invoice payment failed:", stripeSubscriptionId);
         break;
       }

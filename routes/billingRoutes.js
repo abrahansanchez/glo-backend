@@ -13,6 +13,7 @@ const router = express.Router();
 
 const TRIAL_SCOPE = "billing.trial.start";
 const DEFAULT_TRIAL_DAYS = Number(process.env.TRIAL_DAYS || 14);
+const isStripeSecretKeyValid = (key) => /^sk_(test|live)_[A-Za-z0-9]+/.test(String(key || "").trim());
 
 const ensureStripeCustomer = async (barber) => {
   if (barber.stripeCustomerId) return barber.stripeCustomerId;
@@ -287,6 +288,13 @@ router.post("/portal", protect, async (req, res) => {
   const barberId = req.user?._id || req.user?.id || req.userId;
 
   try {
+    if (!isStripeSecretKeyValid(process.env.STRIPE_SECRET_KEY)) {
+      return res.status(500).json({
+        code: "STRIPE_CONFIG_INVALID",
+        message: "Stripe not configured",
+      });
+    }
+
     const barber = await Barber.findById(barberId);
     const returnUrl = process.env.BILLING_PORTAL_RETURN_URL || process.env.APP_BASE_URL;
 
@@ -311,6 +319,7 @@ router.post("/portal", protect, async (req, res) => {
         message: "Missing BILLING_PORTAL_RETURN_URL or APP_BASE_URL",
       });
     }
+
     try {
       const parsed = new URL(returnUrl);
       if (!/^https?:$/i.test(parsed.protocol)) throw new Error("Invalid protocol");
@@ -330,7 +339,19 @@ router.post("/portal", protect, async (req, res) => {
 
     return res.json({ url: session.url });
   } catch (err) {
-    console.error("❌ Stripe portal error:", err?.stack || err);
+    const errMsg = String(err?.message || "");
+    const stripeAuthError =
+      err?.type === "StripeAuthenticationError" ||
+      errMsg.includes("Invalid API Key provided");
+    if (stripeAuthError) {
+      console.error("[billing/portal] Stripe config invalid:", errMsg);
+      return res.status(500).json({
+        code: "STRIPE_CONFIG_INVALID",
+        message: "Stripe not configured",
+      });
+    }
+
+    console.error("[billing/portal] error:", err?.stack || err);
     return res.status(500).json({
       code: "BILLING_PORTAL_FAILED",
       message: "Failed to create billing portal session",

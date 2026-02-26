@@ -1,10 +1,13 @@
 import express from "express";
 import twilio from "twilio";
+import { getAppBaseUrl } from "../utils/config.js";
 
 const router = express.Router();
 
 router.post("/voice", (req, res) => {
   const twiml = new twilio.twiml.VoiceResponse();
+  const baseHttps = getAppBaseUrl();
+  const baseWss = baseHttps.replace(/^https:\/\//, "wss://");
 
   // Give Twilio time to set up the stream
   twiml.pause({ length: 1 });
@@ -12,9 +15,9 @@ router.post("/voice", (req, res) => {
   const connect = twiml.connect();
 
   connect.stream({
-    url: `wss://${process.env.APP_BASE_URL}/ws/media`,   // MUST be wss://
+    url: `${baseWss}/ws/media`,   // MUST be wss://
     track: "inbound",                                   // VALID per Twilio docs
-    statusCallback: `https://${process.env.APP_BASE_URL}/api/calls/stream-status`,
+    statusCallback: `${baseHttps}/api/calls/stream-status`,
     statusCallbackMethod: "POST"
   });
 

@@ -1,6 +1,7 @@
 import dotenv from "dotenv";
 import twilio from "twilio";
 import Barber from "../models/Barber.js";
+import { getAppBaseUrl } from "./config.js";
 
 dotenv.config();
 
@@ -30,13 +31,9 @@ export const assignPhoneNumber = async (barberId) => {
       return { number: mockNumber, sid: mockSid };
     }
 
-    const rawBaseUrl = String(process.env.APP_BASE_URL || "").trim();
-    let parsedBaseUrl;
+    let baseOrigin;
     try {
-      parsedBaseUrl = new URL(rawBaseUrl);
-      if (!/^https?:$/i.test(parsedBaseUrl.protocol)) {
-        throw new Error("APP_BASE_URL must use http/https");
-      }
+      baseOrigin = getAppBaseUrl();
     } catch {
       console.error("[CONFIG] APP_BASE_URL missing");
       const configError = new Error("APP_BASE_URL missing or invalid");
@@ -44,7 +41,6 @@ export const assignPhoneNumber = async (barberId) => {
       configError.status = 500;
       throw configError;
     }
-    const baseOrigin = parsedBaseUrl.origin;
 
     //  2. Only initialize Twilio client if NOT mock
     console.log("🔗 Connecting to real Twilio API...");

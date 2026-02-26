@@ -7,6 +7,7 @@ import http from "http";
 import cors from "cors";
 import path from "path";
 import { fileURLToPath } from "url";
+import { getAppBaseUrl } from "./utils/config.js";
 
 // ---------------------------------------------------------
 // DATABASE
@@ -189,9 +190,16 @@ attachMediaWebSocketServer(server);
 // SERVER START
 // ---------------------------------------------------------
 const PORT = process.env.PORT || 5000;
+let validatedAppBaseUrl;
+try {
+  validatedAppBaseUrl = getAppBaseUrl();
+} catch (err) {
+  console.error(`[CONFIG] APP_BASE_URL invalid: ${err?.message || "unknown error"}`);
+  process.exit(1);
+}
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`[CONFIG] APP_BASE_URL=${process.env.APP_BASE_URL || "undefined"}`);
+  console.log(`[CONFIG] APP_BASE_URL=${validatedAppBaseUrl}`);
   console.log(`🚀 Glō Backend running on port ${PORT}`);
   console.log(`🎧 Media Stream WS active at /ws/media`);
 });
