@@ -12,7 +12,13 @@ export async function isSlotAvailable({ barber, date, time }) {
 
   const conflict = await Appointment.findOne({
     barberId: barber._id,
-    date: { $gte: start, $lt: end },
+    $or: [
+      { startAt: { $gte: start, $lt: end } },
+      {
+        startAt: { $exists: false },
+        date: { $gte: start, $lt: end },
+      },
+    ],
     status: "confirmed",
   });
 

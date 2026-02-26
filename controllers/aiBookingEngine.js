@@ -25,10 +25,12 @@ export async function bookAppointment({ barberId, phone, name, date, time }) {
     barberId,
     clientPhone: phone,
     clientName: name,
+    startAt: new Date(`${date} ${time}`),
+    endAt: new Date(new Date(`${date} ${time}`).getTime() + 60 * 60 * 1000),
     date: new Date(`${date} ${time}`),
     time,
     status: "confirmed",
-    source: "AI",
+    source: "ai",
   });
 
   return {
@@ -48,7 +50,13 @@ export async function rescheduleAppointment({ barberId, phone, oldDate, newDate,
   const current = await Appointment.findOne({
     barberId,
     clientPhone: phone,
-    date: { $gte: new Date(oldDate), $lt: new Date(oldDate + "T23:59:59Z") },
+    $or: [
+      { startAt: { $gte: new Date(oldDate), $lt: new Date(oldDate + "T23:59:59Z") } },
+      {
+        startAt: { $exists: false },
+        date: { $gte: new Date(oldDate), $lt: new Date(oldDate + "T23:59:59Z") },
+      },
+    ],
     status: "confirmed",
   });
 
@@ -66,7 +74,9 @@ export async function rescheduleAppointment({ barberId, phone, oldDate, newDate,
     return { unavailable: true, alternatives };
   }
 
-  current.date = new Date(`${newDate} ${newTime}`);
+  current.startAt = new Date(`${newDate} ${newTime}`);
+  current.endAt = new Date(current.startAt.getTime() + 60 * 60 * 1000);
+  current.date = current.startAt;
   current.time = newTime;
   await current.save();
 

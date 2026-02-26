@@ -2,6 +2,7 @@ import express from "express";
 import {
   getUpcomingAppointments,
   getPastAppointments,
+  getAppointmentsRange,
   createAppointment,
   updateAppointment,
   deleteAppointment,
@@ -19,6 +20,7 @@ router.use(protect, requireActiveSubscription);
 
 router.get("/upcoming", getUpcomingAppointments);
 router.get("/past", getPastAppointments);
+router.get("/range", getAppointmentsRange);
 router.post("/", createAppointment);
 router.put("/:id", updateAppointment);
 router.delete("/:id", deleteAppointment);

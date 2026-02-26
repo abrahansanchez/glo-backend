@@ -52,7 +52,11 @@ export async function getNextAvailableSlot(barber, desiredDateTime, service) {
   const conflict = await Appointment.findOne({
     barberId: barber._id,
     $or: [
-      { date: { $gte: start.toDate(), $lt: end.toDate() } }
+      { startAt: { $gte: start.toDate(), $lt: end.toDate() } },
+      {
+        startAt: { $exists: false },
+        date: { $gte: start.toDate(), $lt: end.toDate() },
+      },
     ],
   });
 

@@ -19,6 +19,16 @@ function getDateRange(rangeParam) {
   return { startDate, endDate, now };
 }
 
+const isAiSource = (source) => {
+  const normalized = String(source || "").trim().toLowerCase();
+  return normalized === "ai" || normalized === "ai voice";
+};
+
+const isManualSource = (source) => {
+  const normalized = String(source || "").trim().toLowerCase();
+  return normalized === "manual" || normalized === "mobile";
+};
+
 export const getAnalyticsOverview = async (req, res) => {
   try {
     const barberId = req.user._id;
@@ -92,12 +102,8 @@ export const getAnalyticsOverview = async (req, res) => {
     const appointmentsInRange = await Appointment.find(apptFilter).lean();
 
     const totalAppointmentsInRange = appointmentsInRange.length;
-    const aiBookingsInRange = appointmentsInRange.filter(
-      (a) => a.source === "AI Voice"
-    ).length;
-    const manualBookingsInRange = appointmentsInRange.filter(
-      (a) => a.source === "Manual"
-    ).length;
+    const aiBookingsInRange = appointmentsInRange.filter((a) => isAiSource(a.source)).length;
+    const manualBookingsInRange = appointmentsInRange.filter((a) => isManualSource(a.source)).length;
 
     /* --------------------------------------------------
      * 3) CLIENT ANALYTICS
@@ -203,12 +209,12 @@ export const getAnalyticsOverview = async (req, res) => {
           total: { $sum: 1 },
           ai: {
             $sum: {
-              $cond: [{ $eq: ["$source", "AI Voice"] }, 1, 0],
+              $cond: [{ $in: [{ $toLower: "$source" }, ["ai", "ai voice"]] }, 1, 0],
             },
           },
           manual: {
             $sum: {
-              $cond: [{ $eq: ["$source", "Manual"] }, 1, 0],
+              $cond: [{ $in: [{ $toLower: "$source" }, ["manual", "mobile"]] }, 1, 0],
             },
           },
         },

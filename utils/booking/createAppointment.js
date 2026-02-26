@@ -16,8 +16,12 @@ export const createAppointment = async (
       barberId,
       clientName,
       clientPhone,
-      date: dateTimeISO,
+      startAt: new Date(dateTimeISO),
+      endAt: new Date(new Date(dateTimeISO).getTime() + 60 * 60 * 1000),
+      date: new Date(dateTimeISO),
       service: serviceName,
+      status: "confirmed",
+      source: "ai",
     });
 
     return { ok: true, appointment: appt };
