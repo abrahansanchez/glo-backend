@@ -191,7 +191,9 @@ attachMediaWebSocketServer(server);
 const PORT = process.env.PORT || 5000;
 
 server.listen(PORT, "0.0.0.0", () => {
+  console.log(`[CONFIG] APP_BASE_URL=${process.env.APP_BASE_URL || "undefined"}`);
   console.log(`🚀 Glō Backend running on port ${PORT}`);
   console.log(`🎧 Media Stream WS active at /ws/media`);
 });
+
 

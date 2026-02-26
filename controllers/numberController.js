@@ -9,6 +9,12 @@ export const assignNumberController = async (req, res) => {
     res.status(200).json({ message: "Number assigned", number });
   } catch (error) {
     console.error("Assign Controller Error:", error);
+    if (error?.code === "BASE_URL_MISSING") {
+      return res.status(500).json({
+        code: "BASE_URL_MISSING",
+        message: "APP_BASE_URL missing or invalid",
+      });
+    }
     res.status(500).json({ message: "Failed to assign number" });
   }
 };

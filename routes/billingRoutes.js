@@ -14,6 +14,20 @@ const router = express.Router();
 const TRIAL_SCOPE = "billing.trial.start";
 const DEFAULT_TRIAL_DAYS = Number(process.env.TRIAL_DAYS || 14);
 
+const ensureStripeCustomer = async (barber) => {
+  if (barber.stripeCustomerId) return barber.stripeCustomerId;
+
+  const customer = await stripe.customers.create({
+    email: barber.email,
+    name: barber.name,
+    metadata: { barberId: String(barber._id) },
+  });
+
+  barber.stripeCustomerId = customer.id;
+  await barber.save();
+  return customer.id;
+};
+
 /**
  * ======================================================
  * START STRIPE CHECKOUT (EXISTING – DO NOT BREAK)
@@ -64,6 +78,7 @@ router.post("/trial/start", protect, async (req, res) => {
         message: "Barber not found",
       });
     }
+    await ensureStripeCustomer(barber);
 
     const latestSub = await Subscription.findOne({ barber: barberId }).sort({ createdAt: -1 });
     if (latestSub && ["trialing", "active"].includes(String(latestSub.status || "").toLowerCase())) {
@@ -94,18 +109,17 @@ router.post("/trial/start", protect, async (req, res) => {
     const now = new Date();
     const trialEndsAt = new Date(now.getTime() + DEFAULT_TRIAL_DAYS * 24 * 60 * 60 * 1000);
     const syntheticSubscriptionId = `trial_${String(barberId)}_${now.getTime()}`;
-    const syntheticCustomerId = barber.stripeCustomerId || `trial_customer_${String(barberId)}`;
+    const stripeCustomerId = await ensureStripeCustomer(barber);
 
     const trialSub = await Subscription.create({
       barber: barberId,
-      stripeCustomerId: syntheticCustomerId,
+      stripeCustomerId,
       stripeSubscriptionId: syntheticSubscriptionId,
       status: "trialing",
       startedAt: now,
       gracePeriodEndsAt: trialEndsAt,
     });
 
-    barber.stripeCustomerId = syntheticCustomerId;
     barber.subscriptionStatus = "trialing";
     barber.onboarding = barber.onboarding || {};
     const stepMap = barber.onboarding.stepMap instanceof Map
@@ -274,16 +288,14 @@ router.post("/portal", protect, async (req, res) => {
 
   try {
     const barber = await Barber.findById(barberId);
+    const returnUrl = process.env.BILLING_PORTAL_RETURN_URL || process.env.APP_BASE_URL;
 
     console.log("[billing/portal]", {
       barberId: barberId ? String(barberId) : null,
       stripeCustomerId: barber?.stripeCustomerId || null,
       stripeSubscriptionId: barber?.stripeSubscriptionId || null,
       stripeKeyPresent: Boolean(process.env.STRIPE_SECRET_KEY),
-      returnUrl:
-        process.env.BILLING_PORTAL_RETURN_URL ||
-        process.env.FRONTEND_URL ||
-        null,
+      returnUrl: returnUrl || null,
     });
 
     if (!barber) {
@@ -293,19 +305,27 @@ router.post("/portal", protect, async (req, res) => {
       });
     }
 
-    if (!barber.stripeCustomerId) {
-      return res.status(400).json({
-        code: "NO_STRIPE_CUSTOMER",
-        message: "No Stripe customer on file",
+    if (!returnUrl) {
+      return res.status(500).json({
+        code: "CONFIG_MISSING_RETURN_URL",
+        message: "Missing BILLING_PORTAL_RETURN_URL or APP_BASE_URL",
+      });
+    }
+    try {
+      const parsed = new URL(returnUrl);
+      if (!/^https?:$/i.test(parsed.protocol)) throw new Error("Invalid protocol");
+    } catch {
+      return res.status(500).json({
+        code: "CONFIG_MISSING_RETURN_URL",
+        message: "BILLING_PORTAL_RETURN_URL/APP_BASE_URL must be a valid absolute URL",
       });
     }
 
+    const customerId = await ensureStripeCustomer(barber);
+
     const session = await stripe.billingPortal.sessions.create({
-      customer: barber.stripeCustomerId,
-      return_url:
-        process.env.BILLING_PORTAL_RETURN_URL ||
-        process.env.FRONTEND_URL ||
-        "https://example.com", // last-resort fallback to avoid Stripe error
+      customer: customerId,
+      return_url: returnUrl,
     });
 
     return res.json({ url: session.url });

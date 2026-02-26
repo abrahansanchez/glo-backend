@@ -30,6 +30,22 @@ export const assignPhoneNumber = async (barberId) => {
       return { number: mockNumber, sid: mockSid };
     }
 
+    const rawBaseUrl = String(process.env.APP_BASE_URL || "").trim();
+    let parsedBaseUrl;
+    try {
+      parsedBaseUrl = new URL(rawBaseUrl);
+      if (!/^https?:$/i.test(parsedBaseUrl.protocol)) {
+        throw new Error("APP_BASE_URL must use http/https");
+      }
+    } catch {
+      console.error("[CONFIG] APP_BASE_URL missing");
+      const configError = new Error("APP_BASE_URL missing or invalid");
+      configError.code = "BASE_URL_MISSING";
+      configError.status = 500;
+      throw configError;
+    }
+    const baseOrigin = parsedBaseUrl.origin;
+
     //  2. Only initialize Twilio client if NOT mock
     console.log("🔗 Connecting to real Twilio API...");
     const client = twilio(
@@ -52,8 +68,8 @@ export const assignPhoneNumber = async (barberId) => {
     // 4. Purchase number
     const purchase = await client.incomingPhoneNumbers.create({
       phoneNumber: numberToBuy,
-      voiceUrl: `${process.env.BASE_URL}/api/calls/incoming`,
-      smsUrl: `${process.env.BASE_URL}/api/sms/incoming`,
+      voiceUrl: `${baseOrigin}/api/voice/incoming`,
+      smsUrl: `${baseOrigin}/api/sms/inbound`,
     });
 
     // 5. Save to barber record
