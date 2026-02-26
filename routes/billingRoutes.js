@@ -67,11 +67,17 @@ router.post("/trial/start", protect, async (req, res) => {
 
     const latestSub = await Subscription.findOne({ barber: barberId }).sort({ createdAt: -1 });
     if (latestSub && ["trialing", "active"].includes(String(latestSub.status || "").toLowerCase())) {
+      const startedAt = latestSub.startedAt ? new Date(latestSub.startedAt) : new Date();
+      const computedTrialEndsAt = new Date(
+        startedAt.getTime() + DEFAULT_TRIAL_DAYS * 24 * 60 * 60 * 1000
+      );
+      const trialEndsAt = latestSub.gracePeriodEndsAt || computedTrialEndsAt;
+
       const existingPayload = {
         ok: true,
         status: latestSub.status,
-        trialStartedAt: latestSub.startedAt || null,
-        trialEndsAt: latestSub.gracePeriodEndsAt || null,
+        trialStartedAt: latestSub.startedAt || startedAt,
+        trialEndsAt,
       };
 
       await IdempotencyKey.create({
