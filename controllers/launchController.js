@@ -1,5 +1,6 @@
 import Barber from "../models/Barber.js";
 import Subscription from "../models/Subscription.js";
+import PortingOrder from "../models/PortingOrder.js";
 
 const REQUIRED_ONBOARDING_STEPS = [
   "welcome",
@@ -24,6 +25,9 @@ export const getLaunchChecklist = async (req, res) => {
     const latestSubscription = await Subscription.findOne({ barber: barberId })
       .sort({ createdAt: -1 })
       .lean();
+    const latestPortOrder = await PortingOrder.findOne({ barberId })
+      .sort({ createdAt: -1 })
+      .lean();
 
     const stepMap =
       barber.onboarding?.stepMap instanceof Map
@@ -34,7 +38,12 @@ export const getLaunchChecklist = async (req, res) => {
     const numberStrategySelected = Boolean(barber.phoneNumberStrategy);
     const trialStarted = ["trialing", "active"].includes(String(latestSubscription?.status || "").toLowerCase());
     const portingRequired = barber.phoneNumberStrategy === "port_existing";
-    const portingStatus = barber.porting?.status || "draft";
+    const portingStatus = latestPortOrder?.status || barber.porting?.status || "draft";
+    const portingSubmitted = Boolean(latestPortOrder?.twilioPortingSid);
+    const docs = Array.isArray(latestPortOrder?.docs) ? latestPortOrder.docs : [];
+    const hasLoa = docs.some((d) => d?.type === "loa");
+    const hasBill = docs.some((d) => d?.type === "bill");
+    const portingDocsComplete = hasLoa && hasBill;
     const portingReady = !portingRequired || ["approved", "completed"].includes(portingStatus);
     const phoneReady = Boolean(barber.twilioNumber) || portingReady;
 
@@ -42,8 +51,18 @@ export const getLaunchChecklist = async (req, res) => {
     if (!onboardingComplete) blockers.push("ONBOARDING_INCOMPLETE");
     if (!numberStrategySelected) blockers.push("NUMBER_STRATEGY_MISSING");
     if (!trialStarted) blockers.push("TRIAL_NOT_STARTED");
+    if (portingRequired && !portingSubmitted) blockers.push("PORTING_IN_PROGRESS");
+    if (portingRequired && !portingDocsComplete) blockers.push("PORTING_DOCS_MISSING");
+    if (portingRequired && portingStatus === "rejected") blockers.push("PORTING_REJECTED");
+    if (
+      portingRequired &&
+      ["submitted", "carrier_review", "approved"].includes(String(portingStatus || "").toLowerCase())
+    ) {
+      blockers.push("PORTING_IN_PROGRESS");
+    }
     if (!phoneReady) blockers.push("PHONE_NOT_READY");
-    if (portingRequired && !portingReady) blockers.push(`PORTING_${String(portingStatus).toUpperCase()}`);
+
+    const uniqueBlockers = [...new Set(blockers)];
 
     return res.json({
       readiness: {
@@ -52,11 +71,13 @@ export const getLaunchChecklist = async (req, res) => {
         trialStarted,
         portingRequired,
         portingStatus,
+        portingSubmitted,
+        portingDocsComplete,
         portingReady,
         phoneReady,
       },
-      blockers,
-      launchReady: blockers.length === 0,
+      blockers: uniqueBlockers,
+      launchReady: uniqueBlockers.length === 0,
     });
   } catch (err) {
     console.error("getLaunchChecklist error:", err);
