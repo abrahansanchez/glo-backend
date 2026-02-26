@@ -5,10 +5,14 @@ import { stripe } from "../utils/stripe.js";
 import Barber from "../models/Barber.js";
 import Subscription from "../models/Subscription.js";
 import CallTranscript from "../models/CallTranscript.js";
+import IdempotencyKey from "../models/IdempotencyKey.js";
 
 import { createCheckoutSession } from "../controllers/billingController.js";
 
 const router = express.Router();
+
+const TRIAL_SCOPE = "billing.trial.start";
+const DEFAULT_TRIAL_DAYS = Number(process.env.TRIAL_DAYS || 14);
 
 /**
  * ======================================================
@@ -20,6 +24,123 @@ router.post(
   protect,
   createCheckoutSession
 );
+
+router.post("/trial/start", protect, async (req, res) => {
+  try {
+    const barberId = req.user?._id || req.user?.id;
+    if (!barberId) {
+      return res.status(401).json({
+        code: "UNAUTHORIZED",
+        message: "Authentication required",
+      });
+    }
+
+    const idempotencyKey =
+      String(req.headers["idempotency-key"] || req.body?.idempotencyKey || "").trim();
+    if (!idempotencyKey) {
+      return res.status(400).json({
+        code: "IDEMPOTENCY_KEY_REQUIRED",
+        message: "Provide idempotency key via header 'Idempotency-Key' or body.idempotencyKey",
+      });
+    }
+
+    const existingReplay = await IdempotencyKey.findOne({
+      barberId,
+      scope: TRIAL_SCOPE,
+      key: idempotencyKey,
+    }).lean();
+
+    if (existingReplay) {
+      return res.status(existingReplay.statusCode || 200).json({
+        ...(existingReplay.responseBody || {}),
+        idempotentReplay: true,
+      });
+    }
+
+    const barber = await Barber.findById(barberId);
+    if (!barber) {
+      return res.status(404).json({
+        code: "BARBER_NOT_FOUND",
+        message: "Barber not found",
+      });
+    }
+
+    const latestSub = await Subscription.findOne({ barber: barberId }).sort({ createdAt: -1 });
+    if (latestSub && ["trialing", "active"].includes(String(latestSub.status || "").toLowerCase())) {
+      const existingPayload = {
+        ok: true,
+        status: latestSub.status,
+        trialStartedAt: latestSub.startedAt || null,
+        trialEndsAt: latestSub.gracePeriodEndsAt || null,
+      };
+
+      await IdempotencyKey.create({
+        barberId,
+        scope: TRIAL_SCOPE,
+        key: idempotencyKey,
+        statusCode: 200,
+        responseBody: existingPayload,
+      });
+
+      return res.json(existingPayload);
+    }
+
+    const now = new Date();
+    const trialEndsAt = new Date(now.getTime() + DEFAULT_TRIAL_DAYS * 24 * 60 * 60 * 1000);
+    const syntheticSubscriptionId = `trial_${String(barberId)}_${now.getTime()}`;
+    const syntheticCustomerId = barber.stripeCustomerId || `trial_customer_${String(barberId)}`;
+
+    const trialSub = await Subscription.create({
+      barber: barberId,
+      stripeCustomerId: syntheticCustomerId,
+      stripeSubscriptionId: syntheticSubscriptionId,
+      status: "trialing",
+      startedAt: now,
+      gracePeriodEndsAt: trialEndsAt,
+    });
+
+    barber.stripeCustomerId = syntheticCustomerId;
+    barber.subscriptionStatus = "trialing";
+    barber.onboarding = barber.onboarding || {};
+    const stepMap = barber.onboarding.stepMap instanceof Map
+      ? Object.fromEntries(barber.onboarding.stepMap.entries())
+      : (barber.onboarding.stepMap || {});
+    stepMap.trial_start = true;
+    barber.onboarding.stepMap = stepMap;
+    barber.onboarding.lastStep = "trial_start";
+    barber.onboarding.updatedAt = now;
+    await barber.save();
+
+    const payload = {
+      ok: true,
+      status: "trialing",
+      trialStartedAt: trialSub.startedAt,
+      trialEndsAt,
+      subscriptionId: trialSub._id,
+      idempotentReplay: false,
+    };
+
+    await IdempotencyKey.create({
+      barberId,
+      scope: TRIAL_SCOPE,
+      key: idempotencyKey,
+      statusCode: 200,
+      responseBody: payload,
+    });
+
+    console.log(
+      `[TRIAL_STARTED] barberId=${String(barberId)} trialDays=${DEFAULT_TRIAL_DAYS} trialEndsAt=${trialEndsAt.toISOString()}`
+    );
+
+    return res.status(200).json(payload);
+  } catch (err) {
+    console.error("billing trial/start error:", err?.message || err);
+    return res.status(500).json({
+      code: "TRIAL_START_FAILED",
+      message: "Failed to start trial",
+    });
+  }
+});
 
 router.get("/plans", protect, async (_req, res) => {
   const plans = [

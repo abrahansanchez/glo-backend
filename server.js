@@ -59,6 +59,9 @@ import dashboardRoutes from "./routes/dashboardRoutes.js";
 import availabilityRoutes from "./routes/availabilityRoutes.js";
 import appointmentRoutes from "./routes/appointmentRoutes.js";
 import analyticsRoutes from "./routes/analyticsRoutes.js";
+import onboardingRoutes from "./routes/onboardingRoutes.js";
+import phoneRoutes from "./routes/phoneRoutes.js";
+import launchRoutes from "./routes/launchRoutes.js";
 
 // Billing
 import billingRoutes from "./routes/billingRoutes.js";
@@ -152,6 +155,9 @@ app.use("/api/appointments", appointmentRoutes);
 
 // 1️⃣2️⃣ Analytics
 app.use("/api/analytics", analyticsRoutes);
+app.use("/api/onboarding", onboardingRoutes);
+app.use("/api/phone", phoneRoutes);
+app.use("/api/launch", launchRoutes);
 
 // 1️⃣3️⃣ Voicemail API
 app.use("/api/voicemail", voiceRoutes);

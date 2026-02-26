@@ -155,6 +155,56 @@ const BarberSchema = new mongoose.Schema(
         },
       ],
     },
+
+    onboarding: {
+      stepMap: {
+        type: Map,
+        of: Boolean,
+        default: {},
+      },
+      lastStep: {
+        type: String,
+        default: "welcome",
+      },
+      completedAt: {
+        type: Date,
+        default: null,
+      },
+      updatedAt: {
+        type: Date,
+        default: null,
+      },
+    },
+
+    phoneNumberStrategy: {
+      type: String,
+      enum: ["new_number", "port_existing"],
+      default: null,
+    },
+
+    porting: {
+      status: {
+        type: String,
+        enum: ["draft", "submitted", "carrier_review", "approved", "completed", "rejected"],
+        default: "draft",
+      },
+      submittedAt: {
+        type: Date,
+        default: null,
+      },
+      updatedAt: {
+        type: Date,
+        default: null,
+      },
+      rejectionReason: {
+        type: String,
+        default: "",
+      },
+      details: {
+        type: mongoose.Schema.Types.Mixed,
+        default: {},
+      },
+    },
   },
   {
     timestamps: true,
