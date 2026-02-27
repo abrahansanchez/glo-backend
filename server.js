@@ -81,6 +81,12 @@ const server = http.createServer(app);
 cloudinary.config({
   secure: true,
 });
+const cloudinaryConfig = cloudinary.config();
+console.log("[CLOUDINARY DEBUG]", {
+  cloud: cloudinaryConfig.cloud_name,
+  keyLast4: cloudinaryConfig.api_key ? cloudinaryConfig.api_key.slice(-4) : null,
+  hasSecret: !!cloudinaryConfig.api_secret,
+});
 
 // ---------------------------------------------------------
 // ⚠️ STRIPE WEBHOOK RAW BODY (MUST BE BEFORE express.json)
