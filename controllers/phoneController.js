@@ -26,12 +26,49 @@ const requirePortingEnabled = (res) => {
 
 const sanitize = (v) => String(v || "").trim();
 
-const validateStartPayload = (body) => {
+const normalizeServiceAddress = (value) => {
+  if (!value) return null;
+  let input = value;
+  if (typeof input === "string") {
+    const trimmed = input.trim();
+    if (!trimmed || trimmed === "[object Object]") return null;
+    try {
+      input = JSON.parse(trimmed);
+    } catch {
+      return null;
+    }
+  }
+  if (typeof input !== "object" || Array.isArray(input)) return null;
+  return {
+    line1: sanitize(input.line1),
+    line2: sanitize(input.line2),
+    city: sanitize(input.city),
+    state: sanitize(input.state),
+    postalCode: sanitize(input.postalCode),
+    country: sanitize(input.country || "US"),
+  };
+};
+
+const validateServiceAddress = (address) => {
+  const errors = [];
+  if (!address || typeof address !== "object" || Array.isArray(address)) {
+    errors.push("serviceAddress must be an object");
+    return errors;
+  }
+  if (!sanitize(address.line1)) errors.push("serviceAddress.line1 required");
+  if (!sanitize(address.city)) errors.push("serviceAddress.city required");
+  if (!sanitize(address.state)) errors.push("serviceAddress.state required");
+  if (!sanitize(address.postalCode)) errors.push("serviceAddress.postalCode required");
+  if (!sanitize(address.country)) errors.push("serviceAddress.country required");
+  return errors;
+};
+
+const validateStartPayload = (body, normalizedAddress) => {
   const errors = [];
   if (!E164_REGEX.test(sanitize(body.phoneNumber))) errors.push("phoneNumber must be valid E.164");
   if (!sanitize(body.businessName)) errors.push("businessName required");
   if (!sanitize(body.authorizedName)) errors.push("authorizedName required");
-  if (!sanitize(body.serviceAddress)) errors.push("serviceAddress required");
+  errors.push(...validateServiceAddress(normalizedAddress));
   if (!sanitize(body.carrierName)) errors.push("carrierName required");
   if (!sanitize(body.accountNumber)) errors.push("accountNumber required");
   return errors;
@@ -51,7 +88,7 @@ const hasRequiredPortingFields = (order) =>
     sanitize(order?.phoneNumber) &&
       sanitize(order?.businessName) &&
       sanitize(order?.authorizedName) &&
-      sanitize(order?.serviceAddress) &&
+      validateServiceAddress(order?.serviceAddress).length === 0 &&
       sanitize(order?.carrierName) &&
       sanitize(order?.accountNumber)
   );
@@ -120,7 +157,8 @@ export const startPorting = async (req, res) => {
       return res.status(401).json({ code: "UNAUTHORIZED", message: "Authentication required" });
     }
 
-    const errors = validateStartPayload(req.body || {});
+    const normalizedAddress = normalizeServiceAddress(req.body?.serviceAddress);
+    const errors = validateStartPayload(req.body || {}, normalizedAddress);
     if (errors.length > 0) {
       return res.status(400).json({
         code: "PORTING_VALIDATION_FAILED",
@@ -140,7 +178,7 @@ export const startPorting = async (req, res) => {
       country: "US",
       businessName: sanitize(req.body.businessName),
       authorizedName: sanitize(req.body.authorizedName),
-      serviceAddress: sanitize(req.body.serviceAddress),
+      serviceAddress: normalizedAddress,
       carrierName: sanitize(req.body.carrierName),
       accountNumber: sanitize(req.body.accountNumber),
       pin: sanitize(req.body.pin),
@@ -247,12 +285,38 @@ export const submitPorting = async (req, res) => {
       return res.status(404).json({ code: "PORTING_ORDER_NOT_FOUND", message: "Porting order not found" });
     }
 
-    const errors = validateStartPayload(order.toObject());
+    // Legacy fix path: allow updating address object during submit attempt.
+    if (typeof req.body?.serviceAddress !== "undefined") {
+      const patchedAddress = normalizeServiceAddress(req.body.serviceAddress);
+      if (!patchedAddress) {
+        return res.status(400).json({
+          code: "PORTING_VALIDATION_FAILED",
+          message: "serviceAddress must be an object",
+          errors: ["serviceAddress must be an object"],
+        });
+      }
+      order.serviceAddress = patchedAddress;
+      order.history.push(buildHistoryEntry(order.status, "serviceAddress updated before submit"));
+      await order.save();
+    }
+
+    const errors = validateStartPayload(order.toObject(), order.serviceAddress);
     if (errors.length > 0) {
       return res.status(400).json({
         code: "PORTING_VALIDATION_FAILED",
         message: "Invalid porting payload",
         errors,
+      });
+    }
+
+    if (validateServiceAddress(order.serviceAddress).length > 0) {
+      return res.status(400).json({
+        code: "PORTING_VALIDATION_FAILED",
+        message: "serviceAddress must be an object",
+        errors: [
+          "serviceAddress must be an object with line1, city, state, postalCode, country",
+          "Recreate this order or resubmit with serviceAddress object in request body",
+        ],
       });
     }
 
@@ -284,6 +348,7 @@ export const submitPorting = async (req, res) => {
         carrierName: order.carrierName,
         accountNumber: order.accountNumber,
         pin: order.pin || undefined,
+        serviceAddress: order.serviceAddress,
       },
       documents: docs,
     });
@@ -549,19 +614,24 @@ export const resubmitPorting = async (req, res) => {
       });
     }
 
+    const normalizedAddress =
+      typeof req.body?.serviceAddress !== "undefined"
+        ? normalizeServiceAddress(req.body.serviceAddress)
+        : normalizeServiceAddress(current.serviceAddress);
+
     const merged = {
       phoneNumber: sanitize(req.body?.phoneNumber || current.phoneNumber),
       country: "US",
       businessName: sanitize(req.body?.businessName || current.businessName),
       authorizedName: sanitize(req.body?.authorizedName || current.authorizedName),
-      serviceAddress: sanitize(req.body?.serviceAddress || current.serviceAddress),
+      serviceAddress: normalizedAddress,
       carrierName: sanitize(req.body?.carrierName || current.carrierName),
       accountNumber: sanitize(req.body?.accountNumber || current.accountNumber),
       pin: sanitize(req.body?.pin || current.pin),
       requestedFocDate: req.body?.requestedFocDate || current.requestedFocDate || null,
     };
 
-    const errors = validateStartPayload(merged);
+    const errors = validateStartPayload(merged, merged.serviceAddress);
     if (errors.length > 0) {
       return res.status(400).json({
         code: "PORTING_VALIDATION_FAILED",

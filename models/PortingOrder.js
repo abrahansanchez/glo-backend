@@ -39,6 +39,18 @@ const PortingHistorySchema = new mongoose.Schema(
   { _id: false }
 );
 
+const ServiceAddressSchema = new mongoose.Schema(
+  {
+    line1: { type: String, required: true },
+    line2: { type: String, default: "" },
+    city: { type: String, required: true },
+    state: { type: String, required: true },
+    postalCode: { type: String, required: true },
+    country: { type: String, required: true, default: "US" },
+  },
+  { _id: false }
+);
+
 const PortingOrderSchema = new mongoose.Schema(
   {
     barberId: {
@@ -59,7 +71,7 @@ const PortingOrderSchema = new mongoose.Schema(
     },
     businessName: { type: String, required: true },
     authorizedName: { type: String, required: true },
-    serviceAddress: { type: String, required: true },
+    serviceAddress: { type: ServiceAddressSchema, required: true },
     carrierName: { type: String, required: true },
     accountNumber: { type: String, required: true },
     pin: { type: String, default: "" },

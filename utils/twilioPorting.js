@@ -44,7 +44,28 @@ export const normalizeTwilioPortStatus = (rawStatus) => {
 
 export const createPortOrder = async (payload) => {
   const client = twilioClient();
+  const { accountSid } = getTwilioCredentials();
   const body = {
+    accountSid,
+    phoneNumber: payload.phoneNumber,
+    country: payload.country || "US",
+    businessName: payload.businessName,
+    authorizedName: payload.authorizedName,
+    serviceAddress: payload.serviceAddress,
+    carrierName: payload.carrierName,
+    accountNumber: payload.accountNumber,
+    pin: payload.pin || undefined,
+    requestedFocDate: payload.requestedFocDate || undefined,
+    statusCallbackUrl: process.env.TWILIO_PORTING_STATUS_WEBHOOK_URL || undefined,
+    losingCarrierInformation: payload.losingCarrierInformation || undefined,
+    documents: Array.isArray(payload.documents)
+      ? payload.documents
+          .filter((d) => d && d.docType && d.url)
+          .map((d) => ({
+            docType: String(d.docType).toLowerCase(),
+            url: String(d.url),
+          }))
+      : undefined,
     PhoneNumber: payload.phoneNumber,
     Country: payload.country || "US",
     BusinessName: payload.businessName,
