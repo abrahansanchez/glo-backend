@@ -175,10 +175,19 @@ export const startPorting = async (req, res) => {
       status: order.status,
     });
   } catch (err) {
-    console.error("startPorting error:", err?.message || err);
-    return res.status(500).json({
+    const status = err?.status || err?.response?.status;
+    const data = err?.response?.data || err?.data;
+    console.error("[PORTING_START_FAILED]", {
+      message: err?.message,
+      status,
+      data,
+      stack: err?.stack,
+    });
+
+    return res.status(400).json({
       code: "PORTING_START_FAILED",
       message: "Failed to start porting request",
+      debug: process.env.NODE_ENV === "production" ? undefined : { status, data },
     });
   }
 };
