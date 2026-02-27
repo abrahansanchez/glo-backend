@@ -5,7 +5,6 @@ import {
   createPortOrder,
   fetchPortOrder,
   normalizeTwilioPortStatus,
-  uploadPortDoc,
 } from "../utils/twilioPorting.js";
 import { uploadPortingDocToStorage } from "../utils/portingStorage.js";
 import { getAppBaseUrl } from "../utils/config.js";
@@ -43,6 +42,28 @@ const buildHistoryEntry = (status, note = "") => ({
   status,
   note,
 });
+
+const getDocType = (doc) => String(doc?.docType || doc?.type || "").trim().toLowerCase();
+const getDocUrl = (doc) => String(doc?.url || doc?.storageUrl || "").trim();
+
+const hasRequiredPortingFields = (order) =>
+  Boolean(
+    sanitize(order?.phoneNumber) &&
+      sanitize(order?.businessName) &&
+      sanitize(order?.authorizedName) &&
+      sanitize(order?.serviceAddress) &&
+      sanitize(order?.carrierName) &&
+      sanitize(order?.accountNumber)
+  );
+
+const hasRequiredDocs = (docs = []) => {
+  const hasLoa = docs.some((d) => getDocType(d) === "loa" && getDocUrl(d));
+  const hasBill = docs.some((d) => getDocType(d) === "bill" && getDocUrl(d));
+  return hasLoa && hasBill;
+};
+
+const isReadyToSubmit = (order) =>
+  hasRequiredPortingFields(order) && hasRequiredDocs(order?.docs || []);
 
 export const selectNumberStrategy = async (req, res) => {
   try {
@@ -140,39 +161,56 @@ export const startPorting = async (req, res) => {
       });
     }
 
-    const order = await PortingOrder.create({
-      ...payload,
+    let order = await PortingOrder.findOne({
+      barberId,
       status: "draft",
-      statusRaw: "draft",
-      history: [buildHistoryEntry("draft", "Draft created")],
-    });
+      twilioPortingSid: { $exists: false },
+    }).sort({ createdAt: -1 });
 
-    const twilioResult = await createPortOrder(payload);
-    order.twilioPortingSid = twilioResult.sid;
-    order.status = twilioResult.status;
-    order.statusRaw = String(twilioResult.statusRaw || "");
-    order.history.push(buildHistoryEntry(order.status, "Submitted to Twilio"));
+    if (!order) {
+      order = new PortingOrder({
+        ...payload,
+        status: "draft",
+        statusRaw: "draft",
+        history: [buildHistoryEntry("draft", "Draft created")],
+      });
+    } else {
+      order.phoneNumber = payload.phoneNumber;
+      order.country = payload.country;
+      order.businessName = payload.businessName;
+      order.authorizedName = payload.authorizedName;
+      order.serviceAddress = payload.serviceAddress;
+      order.carrierName = payload.carrierName;
+      order.accountNumber = payload.accountNumber;
+      order.pin = payload.pin;
+      order.requestedFocDate = payload.requestedFocDate;
+      order.status = "draft";
+      order.statusRaw = "draft";
+      order.rejectionReason = "";
+      order.history.push(buildHistoryEntry("draft", "Draft updated"));
+    }
     await order.save();
 
     barber.phoneNumberStrategy = "port_existing";
     barber.porting = {
       ...(barber.porting?.toObject?.() || barber.porting || {}),
-      status: order.status,
-      submittedAt: barber.porting?.submittedAt || new Date(),
+      status: "draft",
+      submittedAt: barber.porting?.submittedAt || null,
       updatedAt: new Date(),
       rejectionReason: "",
       details: {
         ...(barber.porting?.details || {}),
-        twilioPortingSid: order.twilioPortingSid,
+        twilioPortingSid: order.twilioPortingSid || undefined,
       },
     };
     await barber.save();
 
-    return res.status(201).json({
+    console.log(`[PORTING_START_LOCAL] barberId=${String(barberId)} orderId=${String(order._id)} status=draft`);
+
+    return res.status(200).json({
       ok: true,
-      portingOrderId: order._id,
-      twilioPortingSid: order.twilioPortingSid,
-      status: order.status,
+      orderId: order._id,
+      status: "draft",
     });
   } catch (err) {
     const status = err?.status || err?.response?.status;
@@ -187,6 +225,113 @@ export const startPorting = async (req, res) => {
     return res.status(400).json({
       code: "PORTING_START_FAILED",
       message: "Failed to start porting request",
+      debug: process.env.NODE_ENV === "production" ? undefined : { status, data },
+    });
+  }
+};
+
+export const submitPorting = async (req, res) => {
+  try {
+    if (!requirePortingEnabled(res)) return;
+
+    const barberId = req.user?._id;
+    if (!barberId) {
+      return res.status(401).json({ code: "UNAUTHORIZED", message: "Authentication required" });
+    }
+
+    const order = await PortingOrder.findOne({
+      _id: req.params.id,
+      barberId,
+    });
+    if (!order) {
+      return res.status(404).json({ code: "PORTING_ORDER_NOT_FOUND", message: "Porting order not found" });
+    }
+
+    const errors = validateStartPayload(order.toObject());
+    if (errors.length > 0) {
+      return res.status(400).json({
+        code: "PORTING_VALIDATION_FAILED",
+        message: "Invalid porting payload",
+        errors,
+      });
+    }
+
+    if (!hasRequiredDocs(order.docs || [])) {
+      return res.status(400).json({
+        code: "PORTING_DOCS_MISSING",
+        message: "LOA and bill documents are required before submit",
+      });
+    }
+
+    const docs = (order.docs || [])
+      .map((d) => ({
+        docType: getDocType(d),
+        url: getDocUrl(d),
+      }))
+      .filter((d) => d.docType && d.url);
+
+    const twilioResult = await createPortOrder({
+      phoneNumber: order.phoneNumber,
+      country: order.country || "US",
+      businessName: order.businessName,
+      authorizedName: order.authorizedName,
+      serviceAddress: order.serviceAddress,
+      carrierName: order.carrierName,
+      accountNumber: order.accountNumber,
+      pin: order.pin,
+      requestedFocDate: order.requestedFocDate,
+      losingCarrierInformation: {
+        carrierName: order.carrierName,
+        accountNumber: order.accountNumber,
+        pin: order.pin || undefined,
+      },
+      documents: docs,
+    });
+
+    if (!twilioResult?.sid) {
+      return res.status(502).json({
+        code: "PORTING_SUBMIT_FAILED",
+        message: "Twilio did not return a porting SID",
+      });
+    }
+
+    order.twilioPortingSid = twilioResult.sid;
+    order.status = "submitted";
+    order.statusRaw = String(twilioResult.statusRaw || "submitted");
+    order.rejectionReason = "";
+    order.history.push(buildHistoryEntry("submitted", "Submitted to Twilio"));
+    await order.save();
+
+    await Barber.findByIdAndUpdate(barberId, {
+      $set: {
+        phoneNumberStrategy: "port_existing",
+        "porting.status": "submitted",
+        "porting.submittedAt": new Date(),
+        "porting.updatedAt": new Date(),
+        "porting.rejectionReason": "",
+        "porting.details.twilioPortingSid": order.twilioPortingSid,
+      },
+    });
+
+    console.log(
+      `[PORTING_SUBMIT] orderId=${String(order._id)} twilioSid=${String(order.twilioPortingSid)} status=submitted`
+    );
+
+    return res.json({
+      ok: true,
+      order,
+    });
+  } catch (err) {
+    const status = err?.status || err?.response?.status;
+    const data = err?.response?.data || err?.data;
+    console.error("submitPorting error:", {
+      message: err?.message,
+      status,
+      data,
+    });
+    return res.status(400).json({
+      code: "PORTING_SUBMIT_FAILED",
+      message: "Failed to submit porting request",
       debug: process.env.NODE_ENV === "production" ? undefined : { status, data },
     });
   }
@@ -229,35 +374,20 @@ export const uploadPortingDoc = async (req, res) => {
       contentType: req.file.mimetype,
     });
 
-    let twilioDocSid = null;
-    try {
-      const twilioDoc = await uploadPortDoc({
-        portSid: order.twilioPortingSid,
-        docType,
-        fileBuffer: req.file.buffer,
-        filename: req.file.originalname || `${docType}-${Date.now()}.pdf`,
-        contentType: req.file.mimetype,
-      });
-      twilioDocSid = twilioDoc.sid || null;
-    } catch (err) {
-      console.error("uploadPortingDoc twilio error:", err?.message || err);
-      return res.status(502).json({
-        code: "PORT_DOC_UPLOAD_FAILED",
-        message: "Failed to upload document to Twilio",
-      });
-    }
-
     const nextDoc = {
+      docType,
+      url: storage.storageUrl,
       type: docType,
       storageUrl: storage.storageUrl,
-      twilioDocSid,
       uploadedAt: new Date(),
     };
 
-    order.docs = (order.docs || []).filter((d) => d.type !== docType);
+    order.docs = (order.docs || []).filter((d) => getDocType(d) !== docType);
     order.docs.push(nextDoc);
     order.history.push(buildHistoryEntry(order.status, `Document uploaded: ${docType}`));
     await order.save();
+
+    console.log(`[PORTING_DOC_UPLOADED] orderId=${String(order._id)} type=${docType} url=${storage.storageUrl}`);
 
     return res.json({
       ok: true,
@@ -289,11 +419,13 @@ export const getPortingStatus = async (req, res) => {
         status: "draft",
         states: PORTING_STATES,
         docs: [],
+        readyToSubmit: false,
       });
     }
 
+    const hasTwilioSid = Boolean(order.twilioPortingSid);
     const shouldRefresh = String(req.query?.refresh || "false").toLowerCase() === "true";
-    if (shouldRefresh && order.twilioPortingSid) {
+    if (shouldRefresh && hasTwilioSid) {
       try {
         const remote = await fetchPortOrder(order.twilioPortingSid);
         order.statusRaw = String(remote.statusRaw || "");
@@ -307,11 +439,12 @@ export const getPortingStatus = async (req, res) => {
 
     return res.json({
       ok: true,
-      status: order.status,
+      status: hasTwilioSid ? order.status : "draft",
       statusRaw: order.statusRaw,
       rejectionReason: order.rejectionReason || "",
       twilioPortingSid: order.twilioPortingSid || null,
       docs: order.docs || [],
+      readyToSubmit: isReadyToSubmit(order),
       updatedAt: order.updatedAt,
       createdAt: order.createdAt,
       states: PORTING_STATES,

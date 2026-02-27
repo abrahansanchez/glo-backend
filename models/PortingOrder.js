@@ -2,6 +2,13 @@ import mongoose from "mongoose";
 
 const PortingDocSchema = new mongoose.Schema(
   {
+    docType: {
+      type: String,
+      enum: ["loa", "bill"],
+    },
+    url: {
+      type: String,
+    },
     type: {
       type: String,
       enum: ["loa", "bill"],

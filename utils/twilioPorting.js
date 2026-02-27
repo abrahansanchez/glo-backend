@@ -55,6 +55,15 @@ export const createPortOrder = async (payload) => {
     Pin: payload.pin || undefined,
     RequestedFocDate: payload.requestedFocDate || undefined,
     StatusCallbackUrl: process.env.TWILIO_PORTING_STATUS_WEBHOOK_URL || undefined,
+    LosingCarrierInformation: payload.losingCarrierInformation || undefined,
+    Documents: Array.isArray(payload.documents)
+      ? payload.documents
+          .filter((d) => d && d.docType && d.url)
+          .map((d) => ({
+            Type: String(d.docType).toUpperCase(),
+            Url: String(d.url),
+          }))
+      : undefined,
   };
 
   const { data } = await client.post(`${portingBase()}/PortIn`, body);
