@@ -60,10 +60,7 @@ const PortingOrderSchema = new mongoose.Schema(
 
     twilioPortingSid: {
       type: String,
-      default: null,
-      unique: true,
-      sparse: true,
-      index: true,
+      default: undefined,
     },
     status: {
       type: String,
@@ -92,6 +89,16 @@ const PortingOrderSchema = new mongoose.Schema(
 );
 
 PortingOrderSchema.index({ barberId: 1, status: 1 });
+// Unique only when twilioPortingSid exists (prevents duplicate-null failures)
+PortingOrderSchema.index(
+  { twilioPortingSid: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { twilioPortingSid: { $type: "string" } },
+  }
+);
+
+console.log("[PORTING] twilioPortingSid index uses partialFilterExpression (string-only)");
 
 const PortingOrder =
   mongoose.models.PortingOrder || mongoose.model("PortingOrder", PortingOrderSchema);
