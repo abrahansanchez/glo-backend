@@ -7,6 +7,7 @@ import http from "http";
 import cors from "cors";
 import path from "path";
 import { fileURLToPath } from "url";
+import { v2 as cloudinary } from "cloudinary";
 import { getAppBaseUrl } from "./utils/config.js";
 
 // ---------------------------------------------------------
@@ -75,6 +76,11 @@ import voiceRoutes from "./routes/voiceRoutes.js";
 // ---------------------------------------------------------
 const app = express();
 const server = http.createServer(app);
+
+// Cloudinary SDK reads CLOUDINARY_URL from env automatically.
+cloudinary.config({
+  secure: true,
+});
 
 // ---------------------------------------------------------
 // ⚠️ STRIPE WEBHOOK RAW BODY (MUST BE BEFORE express.json)
