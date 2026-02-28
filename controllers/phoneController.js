@@ -5,6 +5,7 @@ import {
   createPortOrder,
   fetchPortOrder,
   normalizeTwilioPortStatus,
+  uploadPortDocByUrl,
 } from "../utils/twilioPorting.js";
 import { uploadPortingDocToStorage } from "../utils/portingStorage.js";
 import { getAppBaseUrl } from "../utils/config.js";
@@ -98,6 +99,10 @@ const hasRequiredDocs = (docs = []) => {
   const hasBill = docs.some((d) => getDocType(d) === "bill" && getDocUrl(d));
   return hasLoa && hasBill;
 };
+
+const hasTwilioDocSids = (docs = []) =>
+  docs.some((d) => getDocType(d) === "loa" && sanitize(d?.twilioDocSid)) &&
+  docs.some((d) => getDocType(d) === "bill" && sanitize(d?.twilioDocSid));
 
 const isReadyToSubmit = (order) =>
   hasRequiredPortingFields(order) && hasRequiredDocs(order?.docs || []);
@@ -331,8 +336,33 @@ export const submitPorting = async (req, res) => {
       .map((d) => ({
         docType: getDocType(d),
         url: getDocUrl(d),
+        twilioDocSid: sanitize(d?.twilioDocSid) || undefined,
       }))
       .filter((d) => d.docType && d.url);
+
+    // Register docs with Twilio if missing SID so submit can reference Twilio document IDs.
+    for (const doc of docs) {
+      if (doc.twilioDocSid) continue;
+      const twilioDoc = await uploadPortDocByUrl({
+        portSid: order.twilioPortingSid || undefined,
+        docType: doc.docType,
+        url: doc.url,
+      });
+      doc.twilioDocSid = twilioDoc?.sid || undefined;
+      const existing = (order.docs || []).find((d) => getDocType(d) === doc.docType);
+      if (existing && doc.twilioDocSid) {
+        existing.twilioDocSid = doc.twilioDocSid;
+      }
+      console.log(`[PORTING_DOC_REGISTERED_TWILIO] orderId=${String(order._id)} type=${doc.docType} hasSid=${Boolean(doc.twilioDocSid)}`);
+    }
+    await order.save();
+
+    if (!hasTwilioDocSids(order.docs || [])) {
+      return res.status(400).json({
+        code: "PORTING_DOCS_TWILIO_MISSING",
+        message: "Documents must be registered with Twilio before submit",
+      });
+    }
 
     const twilioResult = await createPortOrder({
       phoneNumber: order.phoneNumber,
@@ -350,7 +380,11 @@ export const submitPorting = async (req, res) => {
         pin: order.pin || undefined,
         serviceAddress: order.serviceAddress,
       },
-      documents: docs,
+      documents: docs.map((d) => ({
+        docType: d.docType,
+        url: d.url,
+        twilioDocSid: d.twilioDocSid,
+      })),
     });
 
     if (!twilioResult?.sid) {

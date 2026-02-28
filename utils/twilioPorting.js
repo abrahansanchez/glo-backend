@@ -45,6 +45,26 @@ export const normalizeTwilioPortStatus = (rawStatus) => {
 export const createPortOrder = async (payload) => {
   const client = twilioClient();
   const { accountSid } = getTwilioCredentials();
+  const normalizedDocuments = Array.isArray(payload.documents)
+    ? payload.documents
+        .filter((d) => d && (d.docType || d.type) && (d.url || d.documentUrl || d.sid || d.twilioDocSid))
+        .map((d) => {
+          const type = String(d.docType || d.type).toLowerCase();
+          const sid = d.twilioDocSid || d.sid || d.documentSid || undefined;
+          const url = d.url || d.documentUrl || undefined;
+          return {
+            type,
+            sid,
+            documentSid: sid,
+            url,
+            Type: type.toUpperCase(),
+            Sid: sid,
+            DocumentSid: sid,
+            Url: url,
+          };
+        })
+    : undefined;
+
   const body = {
     accountSid,
     phoneNumber: payload.phoneNumber,
@@ -58,14 +78,7 @@ export const createPortOrder = async (payload) => {
     requestedFocDate: payload.requestedFocDate || undefined,
     statusCallbackUrl: process.env.TWILIO_PORTING_STATUS_WEBHOOK_URL || undefined,
     losingCarrierInformation: payload.losingCarrierInformation || undefined,
-    documents: Array.isArray(payload.documents)
-      ? payload.documents
-          .filter((d) => d && d.docType && d.url)
-          .map((d) => ({
-            docType: String(d.docType).toLowerCase(),
-            url: String(d.url),
-          }))
-      : undefined,
+    documents: normalizedDocuments,
     PhoneNumber: payload.phoneNumber,
     Country: payload.country || "US",
     BusinessName: payload.businessName,
@@ -77,21 +90,29 @@ export const createPortOrder = async (payload) => {
     RequestedFocDate: payload.requestedFocDate || undefined,
     StatusCallbackUrl: process.env.TWILIO_PORTING_STATUS_WEBHOOK_URL || undefined,
     LosingCarrierInformation: payload.losingCarrierInformation || undefined,
-    Documents: Array.isArray(payload.documents)
-      ? payload.documents
-          .filter((d) => d && d.docType && d.url)
-          .map((d) => ({
-            Type: String(d.docType).toUpperCase(),
-            Url: String(d.url),
-          }))
-      : undefined,
+    Documents: normalizedDocuments,
   };
-
-  const { data } = await client.post(`${portingBase()}/PortIn`, body);
-  const sid = data?.sid || data?.Sid || data?.id || null;
-  const statusRaw = data?.status || data?.Status || "submitted";
-  const status = normalizeTwilioPortStatus(statusRaw);
-  return { sid, status, statusRaw, raw: data };
+  console.log("[TWILIO_PORTING_REQUEST]", {
+    keys: Object.keys(body),
+    hasAccountSid: Boolean(body.accountSid),
+    hasLosingCarrierInformation: Boolean(body.losingCarrierInformation),
+    hasServiceAddress: Boolean(body.serviceAddress),
+    documentsCount: Array.isArray(normalizedDocuments) ? normalizedDocuments.length : 0,
+  });
+  try {
+    const { data } = await client.post(`${portingBase()}/PortIn`, body);
+    const sid = data?.sid || data?.Sid || data?.id || null;
+    const statusRaw = data?.status || data?.Status || "submitted";
+    const status = normalizeTwilioPortStatus(statusRaw);
+    return { sid, status, statusRaw, raw: data };
+  } catch (err) {
+    console.error("[TWILIO_PORTING_RESPONSE_ERROR]", {
+      status: err?.response?.status || err?.status,
+      data: err?.response?.data || err?.data || null,
+      message: err?.message || "Unknown Twilio porting error",
+    });
+    throw err;
+  }
 };
 
 export const uploadPortDoc = async ({
@@ -105,7 +126,9 @@ export const uploadPortDoc = async ({
 
   const form = new FormData();
   form.append("FriendlyName", `${docType}-${Date.now()}`);
-  form.append("PortInSid", String(portSid));
+  if (portSid) {
+    form.append("PortInSid", String(portSid));
+  }
   form.append("Type", String(docType).toUpperCase());
   form.append("File", new Blob([fileBuffer], { type: contentType || "application/octet-stream" }), filename);
 
@@ -117,6 +140,26 @@ export const uploadPortDoc = async ({
     sid: data?.sid || data?.Sid || data?.id || null,
     raw: data,
   };
+};
+
+export const uploadPortDocByUrl = async ({ portSid, docType, url }) => {
+  const response = await fetch(url);
+  if (!response.ok) {
+    const err = new Error("Failed to download document URL for Twilio upload");
+    err.code = "PORT_DOC_DOWNLOAD_FAILED";
+    throw err;
+  }
+  const contentType = response.headers.get("content-type") || "application/octet-stream";
+  const arrayBuffer = await response.arrayBuffer();
+  const fileBuffer = Buffer.from(arrayBuffer);
+  const safeName = `${String(docType).toLowerCase()}-${Date.now()}`;
+  return uploadPortDoc({
+    portSid,
+    docType,
+    fileBuffer,
+    filename: safeName,
+    contentType,
+  });
 };
 
 export const fetchPortOrder = async (portSid) => {
