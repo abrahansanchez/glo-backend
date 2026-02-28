@@ -12,6 +12,7 @@ import { getAppBaseUrl } from "../utils/config.js";
 
 const PORTING_STATES = ["draft", "submitted", "carrier_review", "approved", "completed", "rejected"];
 const E164_REGEX = /^\+[1-9]\d{7,14}$/;
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 const isPortingEnabled = () =>
   String(process.env.FEATURE_TWILIO_PORTING || "false").toLowerCase() === "true";
@@ -75,6 +76,22 @@ const validateStartPayload = (body, normalizedAddress) => {
   return errors;
 };
 
+const collectSubmitMissingFields = (order) => {
+  const missing = [];
+  if (!sanitize(order?.accountTelephoneNumber || order?.phoneNumber)) {
+    missing.push("accountTelephoneNumber");
+  }
+  const email = sanitize(order?.authorizedRepresentativeEmail);
+  if (!email || !EMAIL_REGEX.test(email)) {
+    missing.push("authorizedRepresentativeEmail");
+  }
+  const addressErrors = validateServiceAddress(order?.serviceAddress);
+  if (addressErrors.length > 0) {
+    missing.push("serviceAddress");
+  }
+  return missing;
+};
+
 const buildHistoryEntry = (status, note = "") => ({
   at: new Date(),
   status,
@@ -89,6 +106,8 @@ const hasRequiredPortingFields = (order) =>
     sanitize(order?.phoneNumber) &&
       sanitize(order?.businessName) &&
       sanitize(order?.authorizedName) &&
+      sanitize(order?.accountTelephoneNumber || order?.phoneNumber) &&
+      EMAIL_REGEX.test(sanitize(order?.authorizedRepresentativeEmail || "")) &&
       validateServiceAddress(order?.serviceAddress).length === 0 &&
       sanitize(order?.carrierName) &&
       sanitize(order?.accountNumber)
@@ -101,8 +120,8 @@ const hasRequiredDocs = (docs = []) => {
 };
 
 const hasTwilioDocSids = (docs = []) =>
-  docs.some((d) => getDocType(d) === "loa" && sanitize(d?.twilioDocSid)) &&
-  docs.some((d) => getDocType(d) === "bill" && sanitize(d?.twilioDocSid));
+  docs.some((d) => getDocType(d) === "loa" && sanitize(d?.twilioDocSid).startsWith("RD")) &&
+  docs.some((d) => getDocType(d) === "bill" && sanitize(d?.twilioDocSid).startsWith("RD"));
 
 const isReadyToSubmit = (order) =>
   hasRequiredPortingFields(order) && hasRequiredDocs(order?.docs || []);
@@ -182,10 +201,13 @@ export const startPorting = async (req, res) => {
       phoneNumber: sanitize(req.body.phoneNumber),
       country: "US",
       businessName: sanitize(req.body.businessName),
+      customerType: sanitize(req.body.customerType || "Business"),
       authorizedName: sanitize(req.body.authorizedName),
+      authorizedRepresentativeEmail: sanitize(req.body.authorizedRepresentativeEmail || barber.email),
       serviceAddress: normalizedAddress,
       carrierName: sanitize(req.body.carrierName),
       accountNumber: sanitize(req.body.accountNumber),
+      accountTelephoneNumber: sanitize(req.body.accountTelephoneNumber || req.body.phoneNumber),
       pin: sanitize(req.body.pin),
       requestedFocDate: req.body.requestedFocDate || null,
     };
@@ -221,10 +243,13 @@ export const startPorting = async (req, res) => {
       order.phoneNumber = payload.phoneNumber;
       order.country = payload.country;
       order.businessName = payload.businessName;
+      order.customerType = payload.customerType;
       order.authorizedName = payload.authorizedName;
+      order.authorizedRepresentativeEmail = payload.authorizedRepresentativeEmail;
       order.serviceAddress = payload.serviceAddress;
       order.carrierName = payload.carrierName;
       order.accountNumber = payload.accountNumber;
+      order.accountTelephoneNumber = payload.accountTelephoneNumber;
       order.pin = payload.pin;
       order.requestedFocDate = payload.requestedFocDate;
       order.status = "draft";
@@ -304,6 +329,16 @@ export const submitPorting = async (req, res) => {
       order.history.push(buildHistoryEntry(order.status, "serviceAddress updated before submit"));
       await order.save();
     }
+    if (typeof req.body?.authorizedRepresentativeEmail !== "undefined") {
+      order.authorizedRepresentativeEmail = sanitize(req.body.authorizedRepresentativeEmail);
+    }
+    if (typeof req.body?.accountTelephoneNumber !== "undefined") {
+      order.accountTelephoneNumber = sanitize(req.body.accountTelephoneNumber);
+    }
+    if (typeof req.body?.customerType !== "undefined") {
+      order.customerType = sanitize(req.body.customerType || "Business");
+    }
+    await order.save();
 
     const errors = validateStartPayload(order.toObject(), order.serviceAddress);
     if (errors.length > 0) {
@@ -325,10 +360,20 @@ export const submitPorting = async (req, res) => {
       });
     }
 
+    const missing = collectSubmitMissingFields(order);
+    if (missing.length > 0) {
+      return res.status(400).json({
+        code: "PORTING_SUBMIT_INVALID_ORDER",
+        message: "Order missing fields required by Twilio Port-In Request",
+        missingFields: missing,
+      });
+    }
+
     if (!hasRequiredDocs(order.docs || [])) {
       return res.status(400).json({
-        code: "PORTING_DOCS_MISSING",
-        message: "LOA and bill documents are required before submit",
+        code: "PORTING_SUBMIT_INVALID_ORDER",
+        message: "Order missing fields required by Twilio Port-In Request",
+        missingFields: ["documents.loa", "documents.utility_bill"],
       });
     }
 
@@ -359,8 +404,19 @@ export const submitPorting = async (req, res) => {
 
     if (!hasTwilioDocSids(order.docs || [])) {
       return res.status(400).json({
-        code: "PORTING_DOCS_TWILIO_MISSING",
-        message: "Documents must be registered with Twilio before submit",
+        code: "PORTING_SUBMIT_INVALID_ORDER",
+        message: "Order missing fields required by Twilio Port-In Request",
+        missingFields: ["documents.twilioDocSid(RD...)"],
+      });
+    }
+    const hasUtilityBill = (order.docs || []).some(
+      (d) => getDocType(d) === "bill" && sanitize(d?.twilioDocSid).startsWith("RD")
+    );
+    if (!hasUtilityBill) {
+      return res.status(400).json({
+        code: "PORTING_SUBMIT_INVALID_ORDER",
+        message: "At least one Utility Bill document SID (RD...) is required",
+        missingFields: ["documents.utility_bill"],
       });
     }
 
@@ -368,21 +424,26 @@ export const submitPorting = async (req, res) => {
       phoneNumber: order.phoneNumber,
       country: order.country || "US",
       businessName: order.businessName,
+      customerType: order.customerType || "Business",
       authorizedName: order.authorizedName,
+      authorizedRepresentativeEmail: order.authorizedRepresentativeEmail,
       serviceAddress: order.serviceAddress,
       carrierName: order.carrierName,
       accountNumber: order.accountNumber,
+      accountTelephoneNumber: order.accountTelephoneNumber || order.phoneNumber,
       pin: order.pin,
       requestedFocDate: order.requestedFocDate,
       losingCarrierInformation: {
-        carrierName: order.carrierName,
+        customerType: order.customerType || "Business",
+        customerName: order.businessName,
         accountNumber: order.accountNumber,
-        pin: order.pin || undefined,
-        serviceAddress: order.serviceAddress,
+        accountTelephoneNumber: order.accountTelephoneNumber || order.phoneNumber,
+        authorizedRepresentative: order.authorizedName,
+        authorizedRepresentativeEmail: order.authorizedRepresentativeEmail,
+        address: order.serviceAddress,
       },
       documents: docs.map((d) => ({
         docType: d.docType,
-        url: d.url,
         twilioDocSid: d.twilioDocSid,
       })),
     });
@@ -427,6 +488,7 @@ export const submitPorting = async (req, res) => {
       message: err?.message,
       status,
       data,
+      twilioMessage: err?.response?.data?.message || err?.response?.data?.error?.message || null,
     });
     return res.status(400).json({
       code: "PORTING_SUBMIT_FAILED",
@@ -657,10 +719,17 @@ export const resubmitPorting = async (req, res) => {
       phoneNumber: sanitize(req.body?.phoneNumber || current.phoneNumber),
       country: "US",
       businessName: sanitize(req.body?.businessName || current.businessName),
+      customerType: sanitize(req.body?.customerType || current.customerType || "Business"),
       authorizedName: sanitize(req.body?.authorizedName || current.authorizedName),
+      authorizedRepresentativeEmail: sanitize(
+        req.body?.authorizedRepresentativeEmail || current.authorizedRepresentativeEmail
+      ),
       serviceAddress: normalizedAddress,
       carrierName: sanitize(req.body?.carrierName || current.carrierName),
       accountNumber: sanitize(req.body?.accountNumber || current.accountNumber),
+      accountTelephoneNumber: sanitize(
+        req.body?.accountTelephoneNumber || current.accountTelephoneNumber || current.phoneNumber
+      ),
       pin: sanitize(req.body?.pin || current.pin),
       requestedFocDate: req.body?.requestedFocDate || current.requestedFocDate || null,
     };
@@ -678,10 +747,13 @@ export const resubmitPorting = async (req, res) => {
 
     current.phoneNumber = merged.phoneNumber;
     current.businessName = merged.businessName;
+    current.customerType = merged.customerType;
     current.authorizedName = merged.authorizedName;
+    current.authorizedRepresentativeEmail = merged.authorizedRepresentativeEmail;
     current.serviceAddress = merged.serviceAddress;
     current.carrierName = merged.carrierName;
     current.accountNumber = merged.accountNumber;
+    current.accountTelephoneNumber = merged.accountTelephoneNumber;
     current.pin = merged.pin;
     current.requestedFocDate = merged.requestedFocDate;
     current.twilioPortingSid = twilioResult.sid;

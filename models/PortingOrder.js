@@ -70,10 +70,13 @@ const PortingOrderSchema = new mongoose.Schema(
       enum: ["US"],
     },
     businessName: { type: String, required: true },
+    customerType: { type: String, default: "Business" },
     authorizedName: { type: String, required: true },
+    authorizedRepresentativeEmail: { type: String, default: "" },
     serviceAddress: { type: ServiceAddressSchema, required: true },
     carrierName: { type: String, required: true },
     accountNumber: { type: String, required: true },
+    accountTelephoneNumber: { type: String, default: "" },
     pin: { type: String, default: "" },
     requestedFocDate: { type: Date, default: null },
 

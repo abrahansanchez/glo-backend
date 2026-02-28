@@ -45,62 +45,53 @@ export const normalizeTwilioPortStatus = (rawStatus) => {
 export const createPortOrder = async (payload) => {
   const client = twilioClient();
   const { accountSid } = getTwilioCredentials();
-  const normalizedDocuments = Array.isArray(payload.documents)
+  const documentSids = Array.isArray(payload.documents)
     ? payload.documents
-        .filter((d) => d && (d.docType || d.type) && (d.url || d.documentUrl || d.sid || d.twilioDocSid))
-        .map((d) => {
-          const type = String(d.docType || d.type).toLowerCase();
-          const sid = d.twilioDocSid || d.sid || d.documentSid || undefined;
-          const url = d.url || d.documentUrl || undefined;
-          return {
-            type,
-            sid,
-            documentSid: sid,
-            url,
-            Type: type.toUpperCase(),
-            Sid: sid,
-            DocumentSid: sid,
-            Url: url,
-          };
-        })
+        .map((d) => String(d?.twilioDocSid || d?.sid || d?.documentSid || "").trim())
+        .filter(Boolean)
     : undefined;
 
+  const serviceAddress = payload.serviceAddress || {};
+  const losingCarrierInformation = {
+    customer_type: String(payload.customerType || "Business"),
+    customer_name: String(payload.businessName || ""),
+    account_number: String(payload.accountNumber || ""),
+    account_telephone_number: String(payload.accountTelephoneNumber || payload.phoneNumber || ""),
+    authorized_representative: String(payload.authorizedName || ""),
+    authorized_representative_email: String(payload.authorizedRepresentativeEmail || ""),
+    address: {
+      street: String(serviceAddress.line1 || ""),
+      city: String(serviceAddress.city || ""),
+      state: String(serviceAddress.state || ""),
+      zip: String(serviceAddress.postalCode || ""),
+      country: String(serviceAddress.country || "US"),
+    },
+  };
+
   const body = {
-    accountSid,
-    phoneNumber: payload.phoneNumber,
-    country: payload.country || "US",
-    businessName: payload.businessName,
-    authorizedName: payload.authorizedName,
-    serviceAddress: payload.serviceAddress,
-    carrierName: payload.carrierName,
-    accountNumber: payload.accountNumber,
-    pin: payload.pin || undefined,
-    requestedFocDate: payload.requestedFocDate || undefined,
-    statusCallbackUrl: process.env.TWILIO_PORTING_STATUS_WEBHOOK_URL || undefined,
-    losingCarrierInformation: payload.losingCarrierInformation || undefined,
-    documents: normalizedDocuments,
-    PhoneNumber: payload.phoneNumber,
-    Country: payload.country || "US",
-    BusinessName: payload.businessName,
-    AuthorizedName: payload.authorizedName,
-    ServiceAddress: payload.serviceAddress,
-    CarrierName: payload.carrierName,
-    AccountNumber: payload.accountNumber,
-    Pin: payload.pin || undefined,
-    RequestedFocDate: payload.requestedFocDate || undefined,
-    StatusCallbackUrl: process.env.TWILIO_PORTING_STATUS_WEBHOOK_URL || undefined,
-    LosingCarrierInformation: payload.losingCarrierInformation || undefined,
-    Documents: normalizedDocuments,
+    account_sid: accountSid,
+    losing_carrier_information: losingCarrierInformation,
+    phone_numbers: [
+      {
+        phone_number: String(payload.phoneNumber || ""),
+        pin: payload.pin ? String(payload.pin) : null,
+      },
+    ],
+    documents: documentSids,
   };
   console.log("[TWILIO_PORTING_REQUEST]", {
     keys: Object.keys(body),
-    hasAccountSid: Boolean(body.accountSid),
-    hasLosingCarrierInformation: Boolean(body.losingCarrierInformation),
-    hasServiceAddress: Boolean(body.serviceAddress),
-    documentsCount: Array.isArray(normalizedDocuments) ? normalizedDocuments.length : 0,
+    hasAccountSid: Boolean(body.account_sid),
+    hasLosingCarrierInformation: Boolean(body.losing_carrier_information),
+    documentsCount: Array.isArray(documentSids) ? documentSids.length : 0,
+    allDocumentSidsAreRD: Array.isArray(documentSids)
+      ? documentSids.every((sid) => String(sid).startsWith("RD"))
+      : false,
   });
   try {
-    const { data } = await client.post(`${portingBase()}/PortIn`, body);
+    const { data } = await client.post(`${portingBase()}/PortIn`, body, {
+      headers: { "Content-Type": "application/json" },
+    });
     const sid = data?.sid || data?.Sid || data?.id || null;
     const statusRaw = data?.status || data?.Status || "submitted";
     const status = normalizeTwilioPortStatus(statusRaw);
@@ -109,6 +100,7 @@ export const createPortOrder = async (payload) => {
     console.error("[TWILIO_PORTING_RESPONSE_ERROR]", {
       status: err?.response?.status || err?.status,
       data: err?.response?.data || err?.data || null,
+      twilioMessage: err?.response?.data?.message || err?.response?.data?.error?.message || null,
       message: err?.message || "Unknown Twilio porting error",
     });
     throw err;
@@ -123,13 +115,18 @@ export const uploadPortDoc = async ({
   contentType,
 }) => {
   const client = twilioClient();
+  const twilioTypeByDocType = {
+    loa: "LETTER_OF_AUTHORIZATION",
+    bill: "UTILITY_BILL",
+  };
+  const mappedType = twilioTypeByDocType[String(docType || "").toLowerCase()] || String(docType).toUpperCase();
 
   const form = new FormData();
   form.append("FriendlyName", `${docType}-${Date.now()}`);
   if (portSid) {
     form.append("PortInSid", String(portSid));
   }
-  form.append("Type", String(docType).toUpperCase());
+  form.append("Type", mappedType);
   form.append("File", new Blob([fileBuffer], { type: contentType || "application/octet-stream" }), filename);
 
   const { data } = await client.post(`${numbersUploadBase()}/Documents`, form, {
