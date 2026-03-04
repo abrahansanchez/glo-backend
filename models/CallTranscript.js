@@ -138,6 +138,8 @@ const CallTranscriptSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
+CallTranscriptSchema.index({ barberId: 1, createdAt: -1 });
+
 CallTranscriptSchema.post("save", function postCallTranscriptSave(doc) {
   void (async () => {
     try {
