@@ -98,13 +98,28 @@ export const createPortOrder = async (payload) => {
       : false,
   });
   try {
-    const { data } = await client.post(url, body, {
+    const resp = await client.post(url, body, {
       headers: { "Content-Type": "application/json" },
     });
-    const sid = data?.sid || data?.Sid || data?.id || null;
-    const statusRaw = data?.status || data?.Status || "submitted";
+    console.log("[TWILIO_PORTIN_RESPONSE_STATUS]", resp.status);
+    console.log("[TWILIO_PORTIN_RESPONSE_DATA]", JSON.stringify(resp.data, null, 2));
+
+    const portInSid =
+      resp.data?.sid ||
+      resp.data?.port_in_sid ||
+      resp.data?.portInSid ||
+      resp.data?.port_in?.sid ||
+      resp.data?.result?.sid ||
+      null;
+
+    if (!portInSid) {
+      console.log("[TWILIO_PORTIN_RESPONSE_KEYS]", Object.keys(resp.data || {}));
+      throw new Error("Twilio did not return a port-in SID (unknown response shape)");
+    }
+
+    const statusRaw = resp.data?.status || resp.data?.Status || "submitted";
     const status = normalizeTwilioPortStatus(statusRaw);
-    return { sid, status, statusRaw, raw: data };
+    return { sid: portInSid, status, statusRaw, raw: resp.data };
   } catch (err) {
     console.error("[TWILIO_PORTING_RESPONSE_ERROR]", {
       status: err?.response?.status || err?.status,
