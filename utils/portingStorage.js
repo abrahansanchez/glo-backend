@@ -1,35 +1,40 @@
 import { v2 as cloudinary } from "cloudinary";
 
-const uploadToCloudinary = (fileBuffer) =>
+const uploadToCloudinary = ({ fileBuffer, contentType, docType }) =>
   new Promise((resolve, reject) => {
     const folder = String(process.env.CLOUDINARY_PORTING_FOLDER || "glo/porting");
+    const resourceType = String(contentType || "").toLowerCase() === "application/pdf" ? "raw" : "image";
     const stream = cloudinary.uploader.upload_stream(
-      { resource_type: "auto", folder },
+      { resource_type: resourceType, folder },
       (error, result) => {
-        if (error) {
-          console.error("Cloudinary upload error:", error);
-          const err = new Error("Cloudinary upload failed");
-          err.code = "PORTING_STORAGE_UPLOAD_FAILED";
-          return reject(err);
-        }
+        if (error) return reject(error);
+        console.log(
+          `[CLOUDINARY_UPLOAD_OK] docType=${String(docType || "unknown")} resourceType=${String(
+            result?.resource_type || ""
+          )} url=${String(result?.secure_url || "")}`
+        );
         return resolve(result);
       }
     );
     stream.end(fileBuffer);
   });
 
-export const uploadPortingDocToStorage = async ({ fileBuffer, filename, contentType }) => {
+export const uploadPortingDocToStorage = async ({ fileBuffer, filename, contentType, docType }) => {
   const provider = String(process.env.PORTING_DOCS_STORAGE || "cloudinary").trim().toLowerCase();
 
   if (provider === "cloudinary") {
-    const result = await uploadToCloudinary(fileBuffer);
-    const storageUrl = result?.secure_url || result?.url || null;
+    const result = await uploadToCloudinary({ fileBuffer, contentType, docType });
+    const storageUrl = result?.secure_url || null;
     if (!storageUrl) {
       const err = new Error("Cloudinary upload failed");
       err.code = "PORTING_STORAGE_UPLOAD_FAILED";
       throw err;
     }
-    return { provider, storageUrl };
+    return {
+      provider,
+      storageUrl,
+      cloudinaryResourceType: result?.resource_type || null,
+    };
   }
 
   if (provider === "s3") {

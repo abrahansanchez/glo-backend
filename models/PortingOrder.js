@@ -18,6 +18,10 @@ const PortingDocSchema = new mongoose.Schema(
       type: String,
       required: true,
     },
+    cloudinaryResourceType: {
+      type: String,
+      default: null,
+    },
     twilioDocSid: {
       type: String,
       default: null,

@@ -533,6 +533,7 @@ export const uploadPortingDoc = async (req, res) => {
       fileBuffer: req.file.buffer,
       filename: req.file.originalname || `${docType}-${Date.now()}.pdf`,
       contentType: req.file.mimetype,
+      docType,
     });
 
     const nextDoc = {
@@ -540,6 +541,7 @@ export const uploadPortingDoc = async (req, res) => {
       url: storage.storageUrl,
       type: docType,
       storageUrl: storage.storageUrl,
+      cloudinaryResourceType: storage.cloudinaryResourceType || undefined,
       uploadedAt: new Date(),
     };
 
