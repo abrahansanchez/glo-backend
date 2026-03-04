@@ -113,6 +113,7 @@ export const uploadPortDoc = async ({
   fileBuffer,
   filename,
   contentType,
+  url,
 }) => {
   const client = twilioClient();
   const twilioTypeByDocType = {
@@ -126,9 +127,14 @@ export const uploadPortDoc = async ({
   if (portSid) {
     form.append("PortInSid", String(portSid));
   }
-  form.append("Type", mappedType);
+  form.append("type", mappedType);
   form.append("File", new Blob([fileBuffer], { type: contentType || "application/octet-stream" }), filename);
 
+  console.log(
+    `[TWILIO_DOC_UPLOAD] docType=${String(docType || "")} mappedType=${String(mappedType || "")} url=${String(
+      url || ""
+    )}`
+  );
   const { data } = await client.post(`${numbersUploadBase()}/Documents`, form, {
     headers: {},
   });
@@ -156,6 +162,7 @@ export const uploadPortDocByUrl = async ({ portSid, docType, url }) => {
     fileBuffer,
     filename: safeName,
     contentType,
+    url,
   });
 };
 
