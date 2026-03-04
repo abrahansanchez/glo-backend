@@ -448,24 +448,33 @@ export const submitPorting = async (req, res) => {
       })),
     });
 
-    if (!twilioResult?.sid) {
+    const portSid = twilioResult?.portSid || twilioResult?.sid || null;
+    if (!portSid) {
       return res.status(502).json({
         code: "PORTING_SUBMIT_FAILED",
         message: "Twilio did not return a porting SID",
       });
     }
 
-    order.twilioPortingSid = twilioResult.sid;
-    order.status = "submitted";
-    order.statusRaw = String(twilioResult.statusRaw || "submitted");
+    const statusRaw = String(
+      twilioResult?.statusRaw ||
+      twilioResult?.raw?.port_in_request_status ||
+      twilioResult?.raw?.status ||
+      "submitted"
+    );
+    const normalizedStatus = normalizeTwilioPortStatus(statusRaw);
+
+    order.twilioPortingSid = portSid;
+    order.status = normalizedStatus;
+    order.statusRaw = statusRaw;
     order.rejectionReason = "";
-    order.history.push(buildHistoryEntry("submitted", "Submitted to Twilio"));
+    order.history.push(buildHistoryEntry(normalizedStatus, `Submitted to Twilio: ${portSid}`));
     await order.save();
 
     await Barber.findByIdAndUpdate(barberId, {
       $set: {
         phoneNumberStrategy: "port_existing",
-        "porting.status": "submitted",
+        "porting.status": normalizedStatus,
         "porting.submittedAt": new Date(),
         "porting.updatedAt": new Date(),
         "porting.rejectionReason": "",
@@ -474,7 +483,10 @@ export const submitPorting = async (req, res) => {
     });
 
     console.log(
-      `[PORTING_SUBMIT] orderId=${String(order._id)} twilioSid=${String(order.twilioPortingSid)} status=submitted`
+      `[PORTING_SUBMITTED] orderId=${String(order._id)} twilioPortingSid=${String(order.twilioPortingSid)} statusRaw=${statusRaw}`
+    );
+    console.log(
+      `[PORTING_SUBMIT] orderId=${String(order._id)} twilioSid=${String(order.twilioPortingSid)} status=${normalizedStatus}`
     );
 
     return res.json({

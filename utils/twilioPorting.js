@@ -33,7 +33,7 @@ export const normalizeTwilioPortStatus = (rawStatus) => {
   if (!raw) return "draft";
   if (["draft"].includes(raw)) return "draft";
   if (["submitted", "pending", "requested", "new", "created"].includes(raw)) return "submitted";
-  if (["in_review", "review", "carrier_review", "pending_carrier", "pending_vendor"].includes(raw)) {
+  if (["in_review", "in review", "review", "carrier_review", "pending_carrier", "pending_vendor"].includes(raw)) {
     return "carrier_review";
   }
   if (["approved", "foc_scheduled", "scheduled"].includes(raw)) return "approved";
@@ -103,23 +103,21 @@ export const createPortOrder = async (payload) => {
     });
     console.log("[TWILIO_PORTIN_RESPONSE_STATUS]", resp.status);
     console.log("[TWILIO_PORTIN_RESPONSE_DATA]", JSON.stringify(resp.data, null, 2));
+    if (![200, 201, 202].includes(Number(resp.status))) {
+      throw new Error(`Twilio PortIn create failed with unexpected status ${String(resp.status)}`);
+    }
 
-    const portInSid =
-      resp.data?.sid ||
-      resp.data?.port_in_sid ||
-      resp.data?.portInSid ||
-      resp.data?.port_in?.sid ||
-      resp.data?.result?.sid ||
-      null;
+    const data = resp.data || {};
+    const portInSid = data.port_in_request_sid || null;
 
     if (!portInSid) {
       console.log("[TWILIO_PORTIN_RESPONSE_KEYS]", Object.keys(resp.data || {}));
       throw new Error("Twilio did not return a port-in SID (unknown response shape)");
     }
 
-    const statusRaw = resp.data?.status || resp.data?.Status || "submitted";
+    const statusRaw = data.port_in_request_status || data.status || data.Status || "submitted";
     const status = normalizeTwilioPortStatus(statusRaw);
-    return { sid: portInSid, status, statusRaw, raw: resp.data };
+    return { portSid: portInSid, sid: portInSid, status, statusRaw, url: data.url || null, raw: data };
   } catch (err) {
     console.error("[TWILIO_PORTING_RESPONSE_ERROR]", {
       status: err?.response?.status || err?.status,
