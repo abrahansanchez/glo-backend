@@ -117,8 +117,8 @@ export const uploadPortDoc = async ({
 }) => {
   const client = twilioClient();
   const twilioTypeByDocType = {
-    loa: "LETTER_OF_AUTHORIZATION",
-    bill: "UTILITY_BILL",
+    loa: "letter_of_authorization",
+    bill: "utility_bill",
   };
   const mappedType = twilioTypeByDocType[String(docType || "").toLowerCase()] || String(docType).toUpperCase();
 
@@ -128,6 +128,7 @@ export const uploadPortDoc = async ({
     form.append("PortInSid", String(portSid));
   }
   form.append("type", mappedType);
+  console.log("[TWILIO_DOC_UPLOAD_FORM]", { type: mappedType });
   form.append("File", new Blob([fileBuffer], { type: contentType || "application/octet-stream" }), filename);
 
   console.log(
