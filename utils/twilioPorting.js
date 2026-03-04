@@ -79,6 +79,11 @@ export const createPortOrder = async (payload) => {
     ],
     documents: documentSids,
   };
+  const safe = JSON.parse(JSON.stringify(payload));
+  if (safe?.account_sid) safe.account_sid = "***";
+  const url = `${portingBase()}/PortIn`;
+  console.log("[TWILIO_PORTIN_PAYLOAD]", safe);
+  console.log("[TWILIO_PORTIN_URL]", url);
   console.log("[TWILIO_PORTING_REQUEST]", {
     keys: Object.keys(body),
     hasAccountSid: Boolean(body.account_sid),
@@ -89,7 +94,7 @@ export const createPortOrder = async (payload) => {
       : false,
   });
   try {
-    const { data } = await client.post(`${portingBase()}/PortIn`, body, {
+    const { data } = await client.post(url, body, {
       headers: { "Content-Type": "application/json" },
     });
     const sid = data?.sid || data?.Sid || data?.id || null;
