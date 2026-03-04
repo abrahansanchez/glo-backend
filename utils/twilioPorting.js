@@ -117,17 +117,22 @@ export const uploadPortDoc = async ({
 }) => {
   const client = twilioClient();
   const twilioTypeByDocType = {
-    loa: "letter_of_authorization",
     bill: "utility_bill",
   };
-  const mappedType = twilioTypeByDocType[String(docType || "").toLowerCase()] || String(docType).toUpperCase();
+  const normalizedDocType = String(docType || "").toLowerCase();
+  const mappedType = twilioTypeByDocType[normalizedDocType];
+  if (!mappedType) {
+    const err = new Error(`Unsupported document type for Twilio upload: ${normalizedDocType}`);
+    err.code = "PORT_DOC_TYPE_UNSUPPORTED";
+    throw err;
+  }
 
   const form = new FormData();
-  form.append("FriendlyName", `${docType}-${Date.now()}`);
+  form.append("friendly_name", "Porting utility bill");
   if (portSid) {
     form.append("PortInSid", String(portSid));
   }
-  form.append("type", mappedType);
+  form.append("document_type", mappedType);
   console.log("[TWILIO_DOC_UPLOAD_FORM]", { type: mappedType });
   form.append("File", new Blob([fileBuffer], { type: contentType || "application/octet-stream" }), filename);
 
@@ -147,6 +152,18 @@ export const uploadPortDoc = async ({
 };
 
 export const uploadPortDocByUrl = async ({ portSid, docType, url }) => {
+  const normalizedDocType = String(docType || "").toLowerCase();
+  if (normalizedDocType === "loa") {
+    console.log("[TWILIO_DOC_UPLOAD_SKIP] docType=loa reason=twilio_generates_electronic_loa");
+    return { sid: null, skipped: true, raw: null };
+  }
+
+  if (normalizedDocType !== "bill") {
+    const err = new Error(`Unsupported document type for Twilio upload: ${normalizedDocType}`);
+    err.code = "PORT_DOC_TYPE_UNSUPPORTED";
+    throw err;
+  }
+
   const response = await fetch(url);
   if (!response.ok) {
     const err = new Error("Failed to download document URL for Twilio upload");
@@ -159,7 +176,7 @@ export const uploadPortDocByUrl = async ({ portSid, docType, url }) => {
   const safeName = `${String(docType).toLowerCase()}-${Date.now()}`;
   return uploadPortDoc({
     portSid,
-    docType,
+    docType: normalizedDocType,
     fileBuffer,
     filename: safeName,
     contentType,
