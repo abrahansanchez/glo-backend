@@ -52,15 +52,18 @@ export const createPortOrder = async (payload) => {
     : undefined;
 
   const serviceAddress = payload.serviceAddress || {};
+  const normalizedCustomerType = String(payload.customerType || "").trim().toLowerCase();
   const losingCarrierInformation = {
-    customer_type: String(payload.customerType || "Business"),
+    customer_type: normalizedCustomerType === "business" ? "Business" : "Individual",
     customer_name: String(payload.businessName || ""),
     account_number: String(payload.accountNumber || ""),
     account_telephone_number: String(payload.accountTelephoneNumber || payload.phoneNumber || ""),
     authorized_representative: String(payload.authorizedName || ""),
     authorized_representative_email: String(payload.authorizedRepresentativeEmail || ""),
+    address_sid: null,
     address: {
       street: String(serviceAddress.line1 || ""),
+      street_2: String(serviceAddress.line2 || ""),
       city: String(serviceAddress.city || ""),
       state: String(serviceAddress.state || ""),
       zip: String(serviceAddress.postalCode || ""),
@@ -84,6 +87,7 @@ export const createPortOrder = async (payload) => {
   const url = `${portingBase()}/PortIn`;
   console.log("[TWILIO_PORTIN_PAYLOAD]", safe);
   console.log("[TWILIO_PORTIN_URL]", url);
+  console.log("[TWILIO_PORTIN_FINAL_JSON]", JSON.stringify(body, null, 2));
   console.log("[TWILIO_PORTING_REQUEST]", {
     keys: Object.keys(body),
     hasAccountSid: Boolean(body.account_sid),
@@ -122,6 +126,7 @@ export const uploadPortDoc = async ({
 }) => {
   const client = twilioClient();
   const twilioTypeByDocType = {
+    loa: "letter_of_authorization",
     bill: "utility_bill",
   };
   const normalizedDocType = String(docType || "").toLowerCase();
@@ -158,12 +163,7 @@ export const uploadPortDoc = async ({
 
 export const uploadPortDocByUrl = async ({ portSid, docType, url }) => {
   const normalizedDocType = String(docType || "").toLowerCase();
-  if (normalizedDocType === "loa") {
-    console.log("[TWILIO_DOC_UPLOAD_SKIP] docType=loa reason=twilio_generates_electronic_loa");
-    return { sid: null, skipped: true, raw: null };
-  }
-
-  if (normalizedDocType !== "bill") {
+  if (!["loa", "bill"].includes(normalizedDocType)) {
     const err = new Error(`Unsupported document type for Twilio upload: ${normalizedDocType}`);
     err.code = "PORT_DOC_TYPE_UNSUPPORTED";
     throw err;

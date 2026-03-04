@@ -114,11 +114,13 @@ const hasRequiredPortingFields = (order) =>
   );
 
 const hasRequiredDocs = (docs = []) => {
+  const hasLoa = docs.some((d) => getDocType(d) === "loa" && getDocUrl(d));
   const hasBill = docs.some((d) => getDocType(d) === "bill" && getDocUrl(d));
-  return hasBill;
+  return hasLoa && hasBill;
 };
 
 const hasTwilioDocSids = (docs = []) =>
+  docs.some((d) => getDocType(d) === "loa" && sanitize(d?.twilioDocSid).startsWith("RD")) &&
   docs.some((d) => getDocType(d) === "bill" && sanitize(d?.twilioDocSid).startsWith("RD"));
 
 const isReadyToSubmit = (order) =>
@@ -371,7 +373,7 @@ export const submitPorting = async (req, res) => {
       return res.status(400).json({
         code: "PORTING_SUBMIT_INVALID_ORDER",
         message: "Order missing fields required by Twilio Port-In Request",
-        missingFields: ["documents.utility_bill"],
+        missingFields: ["documents.loa", "documents.utility_bill"],
       });
     }
 
