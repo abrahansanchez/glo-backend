@@ -1,6 +1,7 @@
 import twilio from "twilio";
 import Barber from "../models/Barber.js";
 import PortingOrder from "../models/PortingOrder.js";
+import IdempotencyKey from "../models/IdempotencyKey.js";
 import {
   createPortOrder,
   fetchPortOrder,
@@ -12,7 +13,11 @@ import { getAppBaseUrl } from "../utils/config.js";
 
 const PORTING_STATES = ["draft", "submitted", "carrier_review", "approved", "completed", "rejected"];
 const E164_REGEX = /^\+[1-9]\d{7,14}$/;
+const BASIC_PHONE_REGEX = /^\+?[0-9][0-9\s\-().]{6,20}$/;
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const ZIP_REGEX = /^\d{5}(-?\d{4})?$/;
+const DEV_PLACEHOLDER = "DEV_PLACEHOLDER";
+const PORTING_START_SCOPE = "phone.porting.start";
 
 const isPortingEnabled = () =>
   String(process.env.FEATURE_TWILIO_PORTING || "false").toLowerCase() === "true";
@@ -27,6 +32,53 @@ const requirePortingEnabled = (res) => {
 };
 
 const sanitize = (v) => String(v || "").trim();
+const isDevLike = () => String(process.env.NODE_ENV || "").trim().toLowerCase() !== "production";
+const normalizeZip = (v) => sanitize(v).replace(/\s+/g, "");
+const getHeader = (req, name) => (typeof req.get === "function" ? sanitize(req.get(name)) : "");
+
+const getIdempotencyKey = (req) =>
+  sanitize(
+    getHeader(req, "Idempotency-Key") ||
+      getHeader(req, "idempotency-key") ||
+      req.headers?.["idempotency-key"] ||
+      req.body?.idempotencyKey
+  );
+
+const makeFieldError = (field, message) => ({ field, message });
+
+const normalizeStartInput = (body = {}, barber = null) => {
+  const normalizedAddress = normalizeServiceAddress(body?.serviceAddress);
+  const billingZip = normalizeZip(body?.billingZip);
+  const line1 = sanitize(body?.billingAddressLine1 || body?.addressLine1);
+  const city = sanitize(body?.billingCity || body?.city);
+  const state = sanitize(body?.billingState || body?.state);
+
+  const fallbackAddress = {
+    line1: line1 || (isDevLike() ? DEV_PLACEHOLDER : ""),
+    line2: sanitize(body?.billingAddressLine2 || body?.addressLine2),
+    city: city || (isDevLike() ? DEV_PLACEHOLDER : ""),
+    state: state || (isDevLike() ? "NA" : ""),
+    postalCode: billingZip || "",
+    country: sanitize(body?.billingCountry || body?.country || "US"),
+  };
+
+  return {
+    phoneNumber: sanitize(body.phoneNumber),
+    country: "US",
+    businessName: sanitize(body.businessName || body.contactName || barber?.shopName || barber?.name),
+    customerType: sanitize(body.customerType || "Business"),
+    authorizedName: sanitize(body.authorizedName || body.contactName),
+    authorizedRepresentativeEmail: sanitize(
+      body.authorizedRepresentativeEmail || body.contactEmail || barber?.email
+    ),
+    serviceAddress: normalizedAddress || fallbackAddress,
+    carrierName: sanitize(body.carrierName || body.carrier),
+    accountNumber: sanitize(body.accountNumber),
+    accountTelephoneNumber: sanitize(body.accountTelephoneNumber || body.phoneNumber),
+    pin: sanitize(body.pin),
+    requestedFocDate: body.requestedFocDate || null,
+  };
+};
 
 const normalizeServiceAddress = (value) => {
   if (!value) return null;
@@ -51,28 +103,78 @@ const normalizeServiceAddress = (value) => {
   };
 };
 
-const validateServiceAddress = (address) => {
+const validateServiceAddress = (address, opts = {}) => {
+  const devBypass = Boolean(opts.devBypass);
   const errors = [];
   if (!address || typeof address !== "object" || Array.isArray(address)) {
-    errors.push("serviceAddress must be an object");
+    errors.push(makeFieldError("serviceAddress", "serviceAddress must be an object"));
     return errors;
   }
-  if (!sanitize(address.line1)) errors.push("serviceAddress.line1 required");
-  if (!sanitize(address.city)) errors.push("serviceAddress.city required");
-  if (!sanitize(address.state)) errors.push("serviceAddress.state required");
-  if (!sanitize(address.postalCode)) errors.push("serviceAddress.postalCode required");
-  if (!sanitize(address.country)) errors.push("serviceAddress.country required");
+
+  const line1 = sanitize(address.line1);
+  const city = sanitize(address.city);
+  const state = sanitize(address.state);
+  const postalCode = normalizeZip(address.postalCode);
+  const country = sanitize(address.country);
+
+  if (!line1 && !devBypass) errors.push(makeFieldError("serviceAddress.line1", "Line 1 is required"));
+  if (!city && !devBypass) errors.push(makeFieldError("serviceAddress.city", "City is required"));
+  if (!state && !devBypass) errors.push(makeFieldError("serviceAddress.state", "State is required"));
+  if (!postalCode) {
+    errors.push(makeFieldError("serviceAddress.postalCode", "Postal code is required"));
+  } else if (!devBypass && !ZIP_REGEX.test(postalCode)) {
+    errors.push(
+      makeFieldError("serviceAddress.postalCode", "Postal code must be 5 digits or ZIP+4")
+    );
+  }
+  if (!country) errors.push(makeFieldError("serviceAddress.country", "Country is required"));
   return errors;
 };
 
-const validateStartPayload = (body, normalizedAddress) => {
+const validateStartPayload = (body, normalizedAddress, opts = {}) => {
+  const devBypass = Boolean(opts.devBypass);
   const errors = [];
-  if (!E164_REGEX.test(sanitize(body.phoneNumber))) errors.push("phoneNumber must be valid E.164");
-  if (!sanitize(body.businessName)) errors.push("businessName required");
-  if (!sanitize(body.authorizedName)) errors.push("authorizedName required");
-  errors.push(...validateServiceAddress(normalizedAddress));
-  if (!sanitize(body.carrierName)) errors.push("carrierName required");
-  if (!sanitize(body.accountNumber)) errors.push("accountNumber required");
+
+  const phoneNumber = sanitize(body.phoneNumber);
+  const businessName = sanitize(body.businessName);
+  const authorizedName = sanitize(body.authorizedName);
+  const carrierName = sanitize(body.carrierName);
+  const accountNumber = sanitize(body.accountNumber);
+  const email = sanitize(body.authorizedRepresentativeEmail);
+
+  if (!phoneNumber) {
+    errors.push(makeFieldError("phoneNumber", "phoneNumber is required"));
+  } else if (devBypass ? !BASIC_PHONE_REGEX.test(phoneNumber) : !E164_REGEX.test(phoneNumber)) {
+    errors.push(
+      makeFieldError(
+        "phoneNumber",
+        devBypass
+          ? "phoneNumber format is invalid"
+          : "phoneNumber must be E.164 format (example: +14155550123)"
+      )
+    );
+  }
+
+  if (!businessName) errors.push(makeFieldError("businessName", "businessName is required"));
+  if (!authorizedName) errors.push(makeFieldError("authorizedName", "authorizedName is required"));
+
+  if (!email) {
+    errors.push(makeFieldError("authorizedRepresentativeEmail", "authorizedRepresentativeEmail is required"));
+  } else if (!EMAIL_REGEX.test(email)) {
+    errors.push(
+      makeFieldError("authorizedRepresentativeEmail", "authorizedRepresentativeEmail must be a valid email")
+    );
+  }
+
+  errors.push(...validateServiceAddress(normalizedAddress, { devBypass }));
+
+  if (!carrierName && !devBypass) {
+    errors.push(makeFieldError("carrierName", "carrierName is required"));
+  }
+  if (!accountNumber && !devBypass) {
+    errors.push(makeFieldError("accountNumber", "accountNumber is required"));
+  }
+
   return errors;
 };
 
@@ -181,14 +283,16 @@ export const startPorting = async (req, res) => {
       return res.status(401).json({ code: "UNAUTHORIZED", message: "Authentication required" });
     }
 
-    const normalizedAddress = normalizeServiceAddress(req.body?.serviceAddress);
-    const errors = validateStartPayload(req.body || {}, normalizedAddress);
-    if (errors.length > 0) {
-      return res.status(400).json({
-        code: "PORTING_VALIDATION_FAILED",
-        message: "Invalid porting payload",
-        errors,
-      });
+    const idempotencyKey = getIdempotencyKey(req);
+    if (idempotencyKey) {
+      const existingKey = await IdempotencyKey.findOne({
+        barberId,
+        scope: PORTING_START_SCOPE,
+        key: idempotencyKey,
+      }).lean();
+      if (existingKey) {
+        return res.status(existingKey.statusCode || 200).json(existingKey.responseBody || { ok: true });
+      }
     }
 
     const barber = await Barber.findById(barberId);
@@ -196,20 +300,21 @@ export const startPorting = async (req, res) => {
       return res.status(404).json({ code: "BARBER_NOT_FOUND", message: "Barber not found" });
     }
 
+    const normalizedInput = normalizeStartInput(req.body || {}, barber);
+    const errors = validateStartPayload(normalizedInput, normalizedInput.serviceAddress, {
+      devBypass: isDevLike(),
+    });
+    if (errors.length > 0) {
+      return res.status(400).json({
+        code: "PORTING_VALIDATION_FAILED",
+        message: "Porting validation failed",
+        errors,
+      });
+    }
+
     const payload = {
       barberId,
-      phoneNumber: sanitize(req.body.phoneNumber),
-      country: "US",
-      businessName: sanitize(req.body.businessName),
-      customerType: sanitize(req.body.customerType || "Business"),
-      authorizedName: sanitize(req.body.authorizedName),
-      authorizedRepresentativeEmail: sanitize(req.body.authorizedRepresentativeEmail || barber.email),
-      serviceAddress: normalizedAddress,
-      carrierName: sanitize(req.body.carrierName),
-      accountNumber: sanitize(req.body.accountNumber),
-      accountTelephoneNumber: sanitize(req.body.accountTelephoneNumber || req.body.phoneNumber),
-      pin: sanitize(req.body.pin),
-      requestedFocDate: req.body.requestedFocDate || null,
+      ...normalizedInput,
     };
 
     const existingActiveOrder = await PortingOrder.findOne({
@@ -217,13 +322,26 @@ export const startPorting = async (req, res) => {
       status: { $in: ["submitted", "carrier_review", "approved"] },
     }).sort({ createdAt: -1 });
     if (existingActiveOrder) {
-      return res.status(200).json({
+      const existingResponse = {
         ok: true,
         idempotent: true,
         portingOrderId: existingActiveOrder._id,
         twilioPortingSid: existingActiveOrder.twilioPortingSid,
         status: existingActiveOrder.status,
-      });
+      };
+      if (idempotencyKey) {
+        await IdempotencyKey.updateOne(
+          { barberId, scope: PORTING_START_SCOPE, key: idempotencyKey },
+          {
+            $setOnInsert: {
+              statusCode: 200,
+              responseBody: existingResponse,
+            },
+          },
+          { upsert: true }
+        );
+      }
+      return res.status(200).json(existingResponse);
     }
 
     let order = await PortingOrder.findOne({
@@ -275,11 +393,26 @@ export const startPorting = async (req, res) => {
 
     console.log(`[PORTING_START_LOCAL] barberId=${String(barberId)} orderId=${String(order._id)} status=draft`);
 
-    return res.status(200).json({
+    const successResponse = {
       ok: true,
       orderId: order._id,
       status: "draft",
-    });
+    };
+
+    if (idempotencyKey) {
+      await IdempotencyKey.updateOne(
+        { barberId, scope: PORTING_START_SCOPE, key: idempotencyKey },
+        {
+          $setOnInsert: {
+            statusCode: 200,
+            responseBody: successResponse,
+          },
+        },
+        { upsert: true }
+      );
+    }
+
+    return res.status(200).json(successResponse);
   } catch (err) {
     const status = err?.status || err?.response?.status;
     const data = err?.response?.data || err?.data;
