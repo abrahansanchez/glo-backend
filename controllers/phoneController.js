@@ -178,6 +178,67 @@ const validateStartPayload = (body, normalizedAddress, opts = {}) => {
   return errors;
 };
 
+const validateDraftServiceAddress = (address) => {
+  const errors = [];
+  if (!address || typeof address !== "object" || Array.isArray(address)) {
+    errors.push(makeFieldError("serviceAddress", "serviceAddress must be an object"));
+    return errors;
+  }
+
+  const postalCode = normalizeZip(address.postalCode);
+  const country = sanitize(address.country || "US");
+
+  if (!postalCode) {
+    errors.push(makeFieldError("serviceAddress.postalCode", "Postal code is required"));
+  }
+  if (!country) {
+    errors.push(makeFieldError("serviceAddress.country", "Country is required"));
+  }
+
+  return errors;
+};
+
+const validateStartDraftPayload = (body, normalizedAddress) => {
+  const errors = [];
+
+  const phoneNumber = sanitize(body.phoneNumber);
+  const authorizedName = sanitize(body.authorizedName);
+  const carrierName = sanitize(body.carrierName);
+  const accountNumber = sanitize(body.accountNumber);
+  const email = sanitize(body.authorizedRepresentativeEmail);
+
+  if (!phoneNumber) {
+    errors.push(makeFieldError("phoneNumber", "phoneNumber is required"));
+  } else if (!E164_REGEX.test(phoneNumber)) {
+    errors.push(
+      makeFieldError("phoneNumber", "phoneNumber must be E.164 format (example: +14155550123)")
+    );
+  }
+
+  if (!authorizedName) {
+    errors.push(makeFieldError("authorizedName", "authorizedName is required"));
+  }
+
+  if (!email) {
+    errors.push(makeFieldError("authorizedRepresentativeEmail", "authorizedRepresentativeEmail is required"));
+  } else if (!EMAIL_REGEX.test(email)) {
+    errors.push(
+      makeFieldError("authorizedRepresentativeEmail", "authorizedRepresentativeEmail must be a valid email")
+    );
+  }
+
+  if (!carrierName) {
+    errors.push(makeFieldError("carrierName", "carrierName is required"));
+  }
+  if (!accountNumber) {
+    errors.push(makeFieldError("accountNumber", "accountNumber is required"));
+  }
+
+  errors.push(...validateDraftServiceAddress(normalizedAddress));
+
+  return errors;
+};
+
 const collectSubmitMissingFields = (order) => {
   const missing = [];
   if (!sanitize(order?.accountTelephoneNumber || order?.phoneNumber)) {
@@ -301,9 +362,7 @@ export const startPorting = async (req, res) => {
     }
 
     const normalizedInput = normalizeStartInput(req.body || {}, barber);
-    const errors = validateStartPayload(normalizedInput, normalizedInput.serviceAddress, {
-      devBypass: isDevLike(),
-    });
+    const errors = validateStartDraftPayload(normalizedInput, normalizedInput.serviceAddress);
     if (errors.length > 0) {
       return res.status(400).json({
         code: "PORTING_VALIDATION_FAILED",
@@ -375,7 +434,7 @@ export const startPorting = async (req, res) => {
       order.rejectionReason = "";
       order.history.push(buildHistoryEntry("draft", "Draft updated"));
     }
-    await order.save();
+    await order.save({ validateBeforeSave: false });
 
     barber.phoneNumberStrategy = "port_existing";
     barber.porting = {
