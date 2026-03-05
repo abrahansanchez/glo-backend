@@ -4,6 +4,7 @@ import Appointment from "../models/Appointment.js";
 import CallTranscript from "../models/CallTranscript.js";
 import Voicemail from "../models/Voicemail.js";
 import Client from "../models/Client.js";
+import AnalyticsEvent from "../models/AnalyticsEvent.js";
 
 /**
  * Helper: compute date range based on ?range=
@@ -269,5 +270,277 @@ export const getAnalyticsOverview = async (req, res) => {
   } catch (err) {
     console.error("getAnalyticsOverview error:", err);
     res.status(500).json({ message: "Failed to load analytics" });
+  }
+};
+
+const ALLOWED_RANGE_DAYS = new Set([7, 14, 30]);
+const AI_OUTCOMES = [
+  "BOOKED",
+  "CANCELED",
+  "RESCHEDULED",
+  "INQUIRED",
+  "NO_ACTION",
+  "FAILED",
+];
+
+function parseRangeDays(value) {
+  const parsed = Number.parseInt(String(value || "7"), 10);
+  return ALLOWED_RANGE_DAYS.has(parsed) ? parsed : 7;
+}
+
+function safeRate(numerator, denominator) {
+  if (!denominator) return 0;
+  return numerator / denominator;
+}
+
+function toIsoString(value) {
+  return value instanceof Date && !Number.isNaN(value.getTime())
+    ? value.toISOString()
+    : null;
+}
+
+export const recordAnalyticsEvent = async (req, res) => {
+  const barberId = req.user?._id;
+
+  if (!barberId) {
+    return res.status(401).json({ message: "Not authorized" });
+  }
+
+  const payload = req.body && typeof req.body === "object" ? req.body : {};
+  const { eventName, timestamp, sessionId, step, platform, appVersion } = payload;
+
+  if (!eventName || !timestamp) {
+    return res.status(400).json({ message: "eventName and timestamp are required" });
+  }
+
+  const parsedTs = new Date(timestamp);
+  if (Number.isNaN(parsedTs.getTime())) {
+    return res.status(400).json({ message: "Invalid timestamp" });
+  }
+
+  const {
+    barberId: _ignoredBarberId,
+    eventName: _ignoredEventName,
+    timestamp: _ignoredTimestamp,
+    sessionId: _ignoredSessionId,
+    step: _ignoredStep,
+    platform: _ignoredPlatform,
+    appVersion: _ignoredAppVersion,
+    ...props
+  } = payload;
+
+  const dedupeKey = `${String(barberId)}:${sessionId || "nosess"}:${eventName}:${timestamp}`;
+
+  try {
+    await AnalyticsEvent.create({
+      barberId,
+      sessionId: sessionId || "",
+      eventName,
+      step: step || "",
+      platform: platform || "",
+      appVersion: appVersion || "",
+      ts: parsedTs,
+      props,
+      source: "mobile",
+      dedupeKey,
+    });
+    return res.status(200).json({ ok: true });
+  } catch (error) {
+    // Duplicate insert for same dedupe key should be treated as success.
+    if (error?.code === 11000) {
+      return res.status(200).json({ ok: true });
+    }
+
+    console.error("recordAnalyticsEvent warning:", error?.message || error);
+    return res.status(200).json({ ok: true });
+  }
+};
+
+async function getUniqueBarbersByEvent(eventName, startDate, endDate, extraMatch = {}) {
+  const rows = await AnalyticsEvent.aggregate([
+    {
+      $match: {
+        eventName,
+        ts: { $gte: startDate, $lte: endDate },
+        ...extraMatch,
+      },
+    },
+    { $group: { _id: "$barberId" } },
+  ]);
+
+  return new Set(rows.map((row) => String(row._id)));
+}
+
+export const getAnalyticsKpis = async (req, res) => {
+  const rangeDays = parseRangeDays(req.query.rangeDays);
+  const endDate = new Date();
+  const startDate = new Date(endDate.getTime() - rangeDays * 24 * 60 * 60 * 1000);
+
+  try {
+    const onboardingStartedByViewed = await getUniqueBarbersByEvent(
+      "onboarding_step_viewed",
+      startDate,
+      endDate,
+      { step: { $in: ["welcome", "account"] } }
+    );
+
+    const onboardingStartedByCompleted = await getUniqueBarbersByEvent(
+      "onboarding_step_completed",
+      startDate,
+      endDate,
+      { step: { $in: ["welcome", "account"] } }
+    );
+
+    const onboardingStartedSet = new Set([
+      ...onboardingStartedByViewed,
+      ...onboardingStartedByCompleted,
+    ]);
+
+    const onboardingCompletedSet = await getUniqueBarbersByEvent(
+      "onboarding_completed",
+      startDate,
+      endDate
+    );
+
+    const trialStartedSet = await getUniqueBarbersByEvent(
+      "trial_started",
+      startDate,
+      endDate
+    );
+    const trialFailedSet = await getUniqueBarbersByEvent(
+      "trial_start_failed",
+      startDate,
+      endDate
+    );
+
+    const portingStartedSet = await getUniqueBarbersByEvent(
+      "porting_started",
+      startDate,
+      endDate
+    );
+    const portingSubmittedSet = await getUniqueBarbersByEvent(
+      "porting_submitted",
+      startDate,
+      endDate
+    );
+    const portingRejectedSet = await getUniqueBarbersByEvent(
+      "porting_status_updated",
+      startDate,
+      endDate,
+      { "props.status": { $in: ["rejected", "REJECTED"] } }
+    );
+
+    const onboardingCompletionRate = safeRate(
+      onboardingCompletedSet.size,
+      onboardingStartedSet.size
+    );
+    const trialStartRate = safeRate(trialStartedSet.size, onboardingCompletedSet.size);
+    const portingSubmissionRate = safeRate(
+      portingSubmittedSet.size,
+      portingStartedSet.size
+    );
+
+    const cohortRows = await AnalyticsEvent.aggregate([
+      {
+        $match: {
+          eventName: "onboarding_completed",
+          ts: { $gte: startDate, $lte: endDate },
+        },
+      },
+      { $sort: { ts: 1 } },
+      {
+        $group: {
+          _id: "$barberId",
+          completedAt: { $first: "$ts" },
+        },
+      },
+    ]);
+
+    let retainedCount = 0;
+    let handledFirst72hCount = 0;
+
+    for (const row of cohortRows) {
+      const barberId = row._id;
+      const completedAt = row.completedAt;
+      if (!completedAt) continue;
+
+      const day7Start = new Date(completedAt.getTime() + 7 * 24 * 60 * 60 * 1000);
+      const day8Start = new Date(completedAt.getTime() + 8 * 24 * 60 * 60 * 1000);
+
+      const retained = await AnalyticsEvent.exists({
+        barberId,
+        ts: { $gte: day7Start, $lt: day8Start },
+      });
+
+      if (retained) retainedCount += 1;
+
+      const first72hEnd = new Date(completedAt.getTime() + 72 * 60 * 60 * 1000);
+      const aiCalls = await CallTranscript.countDocuments({
+        barberId,
+        createdAt: { $gte: completedAt, $lte: first72hEnd },
+        $or: [{ aiHandled: true }, { outcome: { $in: AI_OUTCOMES } }],
+      });
+      handledFirst72hCount += aiCalls;
+    }
+
+    const cohortCount = cohortRows.length;
+    const d7RetentionRate = safeRate(retainedCount, cohortCount);
+
+    return res.status(200).json({
+      rangeDays,
+      startDate: toIsoString(startDate),
+      endDate: toIsoString(endDate),
+      onboarding: {
+        completionRate: onboardingCompletionRate,
+        startedCount: onboardingStartedSet.size,
+        completedCount: onboardingCompletedSet.size,
+      },
+      trial: {
+        startRate: trialStartRate,
+        startedCount: trialStartedSet.size,
+        failedCount: trialFailedSet.size,
+      },
+      porting: {
+        submissionRate: portingSubmissionRate,
+        startedCount: portingStartedSet.size,
+        submittedCount: portingSubmittedSet.size,
+        rejectedCount: portingRejectedSet.size,
+      },
+      retention: {
+        d7RetentionRate,
+      },
+      calls: {
+        handledFirst72hCount,
+      },
+    });
+  } catch (error) {
+    console.error("getAnalyticsKpis error:", error?.message || error);
+    return res.status(200).json({
+      rangeDays,
+      startDate: toIsoString(startDate),
+      endDate: toIsoString(endDate),
+      onboarding: {
+        completionRate: 0,
+        startedCount: 0,
+        completedCount: 0,
+      },
+      trial: {
+        startRate: 0,
+        startedCount: 0,
+        failedCount: 0,
+      },
+      porting: {
+        submissionRate: 0,
+        startedCount: 0,
+        submittedCount: 0,
+        rejectedCount: 0,
+      },
+      retention: {
+        d7RetentionRate: 0,
+      },
+      calls: {
+        handledFirst72hCount: 0,
+      },
+    });
   }
 };
