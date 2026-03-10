@@ -377,17 +377,43 @@ export const getForwardingStatus = async (req, res) => {
   }
 };
 
-export const triggerForwardingTest = async (req, res) => {
+export const triggerForwardingTest = async (req, res, next) => {
   try {
-    const barberId = req.user?._id;
+    console.log("Forwarding test body:", req.body);
+    console.log("Forwarding test query:", req.query);
+
+    const barberId = req.user?.id || req.user?._id;
     if (!barberId) {
-      return res.status(401).json({ code: "UNAUTHORIZED", message: "Authentication required" });
+      return res.status(401).json({
+        code: "UNAUTHORIZED",
+        message: "User not authenticated",
+      });
     }
 
-    const result = await startForwardingTest(barberId);
-    return res.status(200).json(result);
+    const forwardFromNumber =
+      req.body?.forwardFromNumber ||
+      req.query?.forwardFromNumber;
+
+    if (!forwardFromNumber) {
+      return res.status(400).json({
+        code: "INVALID_FORWARDING_PHONE",
+        message: "forwardFromNumber is required",
+        field: "forwardFromNumber",
+      });
+    }
+
+    const result = await startForwardingTest({
+      barberId,
+      forwardFromNumber,
+    });
+
+    return res.json({
+      ok: true,
+      ...result,
+    });
   } catch (err) {
     console.error("triggerForwardingTest error:", err);
+    if (typeof next === "function") return next(err);
     if (err?.code === "BARBER_NOT_FOUND") {
       return res.status(404).json({ code: err.code, message: err.message });
     }

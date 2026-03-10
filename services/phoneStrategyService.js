@@ -165,13 +165,17 @@ export const assignStrategy = async (barberId, strategy, options = {}) => {
   throw error;
 };
 
-export const startForwardingTest = async (barberId) => {
+export const startForwardingTest = async ({ barberId, forwardFromNumber }) => {
   const barber = await ensureBarber(barberId);
   await expireForwardingVerificationIfNeeded(barber);
 
-  const forwardFromNumber = validatePhoneOrThrow("forwardFromNumber", barber.forwardFromNumber, {
-    required: true,
-  });
+  const normalizedForwardFromNumber = validatePhoneOrThrow(
+    "forwardFromNumber",
+    forwardFromNumber || barber.forwardFromNumber,
+    {
+      required: true,
+    }
+  );
   const forwardToNumber = validatePhoneOrThrow("forwardToNumber", barber.forwardToNumber, {
     required: true,
   });
@@ -186,6 +190,7 @@ export const startForwardingTest = async (barberId) => {
   );
 
   barber.forwardingStatus = "activation_started";
+  barber.forwardFromNumber = normalizedForwardFromNumber;
   barber.verificationSessionId = verificationSessionId;
   barber.verificationWindowExpiresAt = expiresAt;
   await barber.save();
@@ -193,7 +198,7 @@ export const startForwardingTest = async (barberId) => {
   const client = getTwilioClient();
   try {
     await client.calls.create({
-      to: forwardFromNumber,
+      to: normalizedForwardFromNumber,
       from: testFromNumber,
       twiml:
         "<Response><Say>This is a Glo forwarding verification test call. If your forwarding is active, no action is needed.</Say></Response>",
