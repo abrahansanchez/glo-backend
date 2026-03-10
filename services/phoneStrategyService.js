@@ -176,9 +176,11 @@ export const startForwardingTest = async ({ barberId, forwardFromNumber }) => {
       required: true,
     }
   );
-  const forwardToNumber = validatePhoneOrThrow("forwardToNumber", barber.forwardToNumber, {
-    required: true,
-  });
+  const forwardToNumber = validatePhoneOrThrow(
+    "forwardToNumber",
+    barber.forwardToNumber || process.env.GLO_ROUTING_NUMBER,
+    { required: true }
+  );
 
   const now = new Date();
   const expiresAt = new Date(now.getTime() + FORWARDING_TEST_WINDOW_MS);
@@ -191,6 +193,7 @@ export const startForwardingTest = async ({ barberId, forwardFromNumber }) => {
 
   barber.forwardingStatus = "activation_started";
   barber.forwardFromNumber = normalizedForwardFromNumber;
+  barber.forwardToNumber = forwardToNumber;
   barber.verificationSessionId = verificationSessionId;
   barber.verificationWindowExpiresAt = expiresAt;
   await barber.save();
