@@ -229,7 +229,11 @@ export const getStrategyStatus = async (barberId) => {
   return serializeForwardingState(barber);
 };
 
-export const maybeVerifyForwardingCall = async ({ barber, toNumber, webhookBody = {} }) => {
+export const maybeVerifyForwardingCall = async ({ to, from, callSid }) => {
+  const normalizedTo = sanitize(to);
+  if (!normalizedTo) return false;
+
+  const barber = await Barber.findOne({ forwardToNumber: normalizedTo });
   if (!barber) return false;
   if (barber.phoneNumberStrategy !== "forward_existing") return false;
 
@@ -239,12 +243,19 @@ export const maybeVerifyForwardingCall = async ({ barber, toNumber, webhookBody 
   const expiresAt = barber.verificationWindowExpiresAt
     ? new Date(barber.verificationWindowExpiresAt)
     : null;
-  const normalizedTo = sanitize(toNumber);
+  const normalizedFrom = sanitize(from);
+  const expectedFrom = sanitize(process.env.TWILIO_TEST_NUMBER);
 
   if (!activeSessionId || !expiresAt || expiresAt.getTime() <= Date.now()) {
     return false;
   }
+  if (barber.forwardingStatus !== "verification_pending") {
+    return false;
+  }
   if (!normalizedTo || normalizedTo !== sanitize(barber.forwardToNumber)) {
+    return false;
+  }
+  if (expectedFrom && normalizedFrom !== expectedFrom) {
     return false;
   }
 
@@ -254,9 +265,8 @@ export const maybeVerifyForwardingCall = async ({ barber, toNumber, webhookBody 
   barber.verificationWindowExpiresAt = null;
   await barber.save();
 
-  const forwardedFrom = sanitize(webhookBody.ForwardedFrom || webhookBody.forwardedFrom);
   console.log(
-    `[FORWARDING_VERIFIED] barberId=${String(barber._id)} to=${normalizedTo} forwardedFrom=${forwardedFrom || "unknown"}`
+    `[FORWARDING_VERIFIED] barberId=${String(barber._id)} callSid=${sanitize(callSid)} to=${normalizedTo} from=${normalizedFrom || "unknown"}`
   );
 
   return true;

@@ -58,6 +58,18 @@ export const handleIncomingCall = async (req, res) => {
   try {
     console.log("[INCOMING] Incoming Twilio Call (RAW):", req.body);
 
+    const verificationResult = await maybeVerifyForwardingCall({
+      to: req.body.To || req.body.Called || "",
+      from: req.body.From || "",
+      callSid: req.body.CallSid || "",
+    });
+
+    if (verificationResult === true) {
+      const twiml = new VoiceResponse();
+      twiml.hangup();
+      return res.type("text/xml").send(twiml.toString());
+    }
+
     const called = req.body.Called || req.body.To;
     const cleanNumber = called ? called.trim() : null;
 
@@ -71,12 +83,6 @@ export const handleIncomingCall = async (req, res) => {
       twiml.say("Sorry, this number is not assigned.");
       return res.type("text/xml").send(twiml.toString());
     }
-
-    await maybeVerifyForwardingCall({
-      barber,
-      toNumber: cleanNumber,
-      webhookBody: req.body,
-    });
 
     const barberId = barber._id.toString();
     const callSid = req.body.CallSid || "";
