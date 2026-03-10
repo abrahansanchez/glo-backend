@@ -178,7 +178,50 @@ const BarberSchema = new mongoose.Schema(
 
     phoneNumberStrategy: {
       type: String,
-      enum: ["new_number", "port_existing"],
+      enum: ["new_number", "port_existing", "forward_existing"],
+      default: null,
+    },
+
+    forwardFromNumber: {
+      type: String,
+      default: null,
+    },
+
+    forwardToNumber: {
+      type: String,
+      default: null,
+    },
+
+    forwardingCarrier: {
+      type: String,
+      default: "",
+    },
+
+    forwardingStatus: {
+      type: String,
+      enum: [
+        "not_started",
+        "routing_ready",
+        "activation_started",
+        "verification_pending",
+        "verified",
+        "activation_failed",
+      ],
+      default: "not_started",
+    },
+
+    forwardingVerifiedAt: {
+      type: Date,
+      default: null,
+    },
+
+    verificationSessionId: {
+      type: String,
+      default: null,
+    },
+
+    verificationWindowExpiresAt: {
+      type: Date,
       default: null,
     },
 
@@ -210,6 +253,8 @@ const BarberSchema = new mongoose.Schema(
     timestamps: true,
   }
 );
+
+BarberSchema.index({ forwardToNumber: 1 });
 
 const Barber = mongoose.model("Barber", BarberSchema);
 export default Barber;

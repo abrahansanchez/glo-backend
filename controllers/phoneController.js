@@ -10,6 +10,11 @@ import {
 } from "../utils/twilioPorting.js";
 import { uploadPortingDocToStorage } from "../utils/portingStorage.js";
 import { getAppBaseUrl } from "../utils/config.js";
+import {
+  assignStrategy,
+  getStrategyStatus,
+  startForwardingTest,
+} from "../services/phoneStrategyService.js";
 
 const PORTING_STATES = ["draft", "submitted", "carrier_review", "approved", "completed", "rejected"];
 const E164_REGEX = /^\+[1-9]\d{7,14}$/;
@@ -297,19 +302,18 @@ export const selectNumberStrategy = async (req, res) => {
     }
 
     const strategy = String(req.body?.strategy || "").trim().toLowerCase();
-    if (!["new_number", "port_existing"].includes(strategy)) {
+    if (!["new_number", "port_existing", "forward_existing"].includes(strategy)) {
       return res.status(400).json({
         code: "INVALID_STRATEGY",
-        message: "strategy must be 'new_number' or 'port_existing'",
+        message: "strategy must be 'new_number', 'port_existing', or 'forward_existing'",
       });
     }
 
-    const barber = await Barber.findById(barberId);
-    if (!barber) {
-      return res.status(404).json({ code: "BARBER_NOT_FOUND", message: "Barber not found" });
-    }
+    const barber = await assignStrategy(barberId, strategy, {
+      forwardFromNumber: req.body?.forwardFromNumber,
+      forwardingCarrier: req.body?.forwardingCarrier,
+    });
 
-    barber.phoneNumberStrategy = strategy;
     barber.onboarding = barber.onboarding || {};
     const stepMap = barber.onboarding.stepMap instanceof Map
       ? Object.fromEntries(barber.onboarding.stepMap.entries())
@@ -328,9 +332,81 @@ export const selectNumberStrategy = async (req, res) => {
     });
   } catch (err) {
     console.error("selectNumberStrategy error:", err);
+    if (err?.code === "BARBER_NOT_FOUND") {
+      return res.status(404).json({ code: err.code, message: err.message });
+    }
+    if (err?.code === "INVALID_STRATEGY" || err?.code === "INVALID_FORWARDING_PHONE") {
+      return res.status(err.status || 400).json({
+        code: err.code,
+        message: err.message,
+        field: err.field || undefined,
+      });
+    }
     return res.status(500).json({
       code: "NUMBER_STRATEGY_FAILED",
       message: "Failed to save number strategy",
+    });
+  }
+};
+
+export const getForwardingStatus = async (req, res) => {
+  try {
+    const barberId = req.user?._id;
+    if (!barberId) {
+      return res.status(401).json({ code: "UNAUTHORIZED", message: "Authentication required" });
+    }
+
+    const status = await getStrategyStatus(barberId);
+    return res.json({
+      forwardFromNumber: status.forwardFromNumber,
+      forwardToNumber: status.forwardToNumber,
+      forwardingCarrier: status.forwardingCarrier,
+      forwardingStatus: status.forwardingStatus,
+      forwardingVerifiedAt: status.forwardingVerifiedAt,
+      verificationWindowExpiresAt: status.verificationWindowExpiresAt,
+    });
+  } catch (err) {
+    console.error("getForwardingStatus error:", err);
+    if (err?.code === "BARBER_NOT_FOUND") {
+      return res.status(404).json({ code: err.code, message: err.message });
+    }
+    return res.status(500).json({
+      code: "FORWARDING_STATUS_FAILED",
+      message: "Failed to load forwarding status",
+    });
+  }
+};
+
+export const triggerForwardingTest = async (req, res) => {
+  try {
+    const barberId = req.user?._id;
+    if (!barberId) {
+      return res.status(401).json({ code: "UNAUTHORIZED", message: "Authentication required" });
+    }
+
+    const result = await startForwardingTest(barberId);
+    return res.status(200).json(result);
+  } catch (err) {
+    console.error("triggerForwardingTest error:", err);
+    if (err?.code === "BARBER_NOT_FOUND") {
+      return res.status(404).json({ code: err.code, message: err.message });
+    }
+    if (err?.code === "INVALID_FORWARDING_PHONE" && err?.field === "TWILIO_TEST_NUMBER") {
+      return res.status(500).json({ code: err.code, message: err.message });
+    }
+    if (err?.code === "INVALID_FORWARDING_PHONE") {
+      return res.status(400).json({
+        code: err.code,
+        message: err.message,
+        field: err.field || undefined,
+      });
+    }
+    if (err?.code === "TWILIO_CONFIG_MISSING") {
+      return res.status(500).json({ code: err.code, message: err.message });
+    }
+    return res.status(500).json({
+      code: "FORWARDING_TEST_FAILED",
+      message: "Failed to start forwarding verification",
     });
   }
 };

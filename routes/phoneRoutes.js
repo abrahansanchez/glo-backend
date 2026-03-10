@@ -3,6 +3,8 @@ import { protect } from "../middleware/authMiddleware.js";
 import upload from "../middleware/uploadMiddleware.js";
 import {
   selectNumberStrategy,
+  getForwardingStatus,
+  triggerForwardingTest,
   startPorting,
   submitPorting,
   uploadPortingDoc,
@@ -18,6 +20,8 @@ router.post("/porting/webhook", portingWebhook);
 
 router.use(protect);
 router.post("/number-strategy", selectNumberStrategy);
+router.get("/forwarding/status", getForwardingStatus);
+router.post("/forwarding/test", triggerForwardingTest);
 router.post("/porting/start", startPorting);
 router.post("/porting/:id/submit", submitPorting);
 router.post("/porting/:id/docs", upload.single("file"), uploadPortingDoc);

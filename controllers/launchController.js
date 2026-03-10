@@ -38,6 +38,7 @@ export const getLaunchChecklist = async (req, res) => {
     const numberStrategySelected = Boolean(barber.phoneNumberStrategy);
     const trialStarted = ["trialing", "active"].includes(String(latestSubscription?.status || "").toLowerCase());
     const portingRequired = barber.phoneNumberStrategy === "port_existing";
+    const forwardingRequired = barber.phoneNumberStrategy === "forward_existing";
     const portingStatus = latestPortOrder?.status || barber.porting?.status || "draft";
     const portingSubmitted = Boolean(latestPortOrder?.twilioPortingSid);
     const docs = Array.isArray(latestPortOrder?.docs) ? latestPortOrder.docs : [];
@@ -45,7 +46,10 @@ export const getLaunchChecklist = async (req, res) => {
     const hasBill = docs.some((d) => d?.type === "bill");
     const portingDocsComplete = hasLoa && hasBill;
     const portingReady = !portingRequired || ["approved", "completed"].includes(portingStatus);
-    const phoneReady = Boolean(barber.twilioNumber) || portingReady;
+    const forwardingReady = !forwardingRequired || barber.forwardingStatus === "verified";
+    const phoneReady = forwardingRequired
+      ? forwardingReady
+      : (Boolean(barber.twilioNumber) || portingReady);
 
     const blockers = [];
     if (!onboardingComplete) blockers.push("ONBOARDING_INCOMPLETE");
@@ -60,6 +64,7 @@ export const getLaunchChecklist = async (req, res) => {
     ) {
       blockers.push("PORTING_IN_PROGRESS");
     }
+    if (forwardingRequired && !forwardingReady) blockers.push("FORWARDING_NOT_VERIFIED");
     if (!phoneReady) blockers.push("PHONE_NOT_READY");
 
     const uniqueBlockers = [...new Set(blockers)];
@@ -70,6 +75,9 @@ export const getLaunchChecklist = async (req, res) => {
         numberStrategySelected,
         trialStarted,
         portingRequired,
+        forwardingRequired,
+        forwardingStatus: barber.forwardingStatus || "not_started",
+        forwardingReady,
         portingStatus,
         portingSubmitted,
         portingDocsComplete,

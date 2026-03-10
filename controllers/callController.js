@@ -7,6 +7,7 @@ import {
   setActiveCall,
 } from "../utils/voice/activeCallStore.js";
 import { sendExpoPush } from "../utils/push/expoPush.js";
+import { maybeVerifyForwardingCall } from "../services/phoneStrategyService.js";
 
 const VoiceResponse = twilio.twiml.VoiceResponse;
 
@@ -70,6 +71,12 @@ export const handleIncomingCall = async (req, res) => {
       twiml.say("Sorry, this number is not assigned.");
       return res.type("text/xml").send(twiml.toString());
     }
+
+    await maybeVerifyForwardingCall({
+      barber,
+      toNumber: cleanNumber,
+      webhookBody: req.body,
+    });
 
     const barberId = barber._id.toString();
     const callSid = req.body.CallSid || "";
