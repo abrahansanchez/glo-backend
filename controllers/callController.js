@@ -7,7 +7,10 @@ import {
   setActiveCall,
 } from "../utils/voice/activeCallStore.js";
 import { sendExpoPush } from "../utils/push/expoPush.js";
-import { maybeVerifyForwardingCall } from "../services/phoneStrategyService.js";
+import {
+  isForwardingVerificationSessionActive,
+  maybeVerifyForwardingCall,
+} from "../services/phoneStrategyService.js";
 
 const VoiceResponse = twilio.twiml.VoiceResponse;
 
@@ -65,6 +68,16 @@ export const handleIncomingCall = async (req, res) => {
     });
 
     if (verificationResult === true) {
+      const twiml = new VoiceResponse();
+      twiml.hangup();
+      return res.type("text/xml").send(twiml.toString());
+    }
+
+    const verificationSessionActive = await isForwardingVerificationSessionActive({
+      to: req.body.To || req.body.Called || "",
+    });
+
+    if (verificationSessionActive === true) {
       const twiml = new VoiceResponse();
       twiml.hangup();
       return res.type("text/xml").send(twiml.toString());

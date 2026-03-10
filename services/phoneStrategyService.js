@@ -237,6 +237,26 @@ export const getStrategyStatus = async (barberId) => {
   return serializeForwardingState(barber);
 };
 
+export const isForwardingVerificationSessionActive = async ({ to }) => {
+  const normalizedTo = sanitize(to);
+  if (!normalizedTo) return false;
+
+  const barber = await Barber.findOne({ forwardToNumber: normalizedTo });
+  if (!barber) return false;
+  if (barber.phoneNumberStrategy !== "forward_existing") return false;
+
+  await expireForwardingVerificationIfNeeded(barber);
+
+  const expiresAt = barber.verificationWindowExpiresAt
+    ? new Date(barber.verificationWindowExpiresAt)
+    : null;
+
+  if (barber.forwardingStatus !== "verification_pending") return false;
+  if (!expiresAt || expiresAt.getTime() <= Date.now()) return false;
+
+  return true;
+};
+
 export const maybeVerifyForwardingCall = async ({ to, from, callSid }) => {
   const normalizedTo = sanitize(to);
   if (!normalizedTo) return false;
