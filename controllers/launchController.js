@@ -35,10 +35,11 @@ export const getLaunchChecklist = async (req, res) => {
         : (barber.onboarding?.stepMap || {});
 
     const onboardingComplete = REQUIRED_ONBOARDING_STEPS.every((s) => Boolean(stepMap[s]));
-    const numberStrategySelected = Boolean(barber.phoneNumberStrategy);
+    const activeNumberStrategy = barber.numberStrategy || barber.phoneNumberStrategy;
+    const numberStrategySelected = Boolean(activeNumberStrategy);
     const trialStarted = ["trialing", "active"].includes(String(latestSubscription?.status || "").toLowerCase());
-    const portingRequired = barber.phoneNumberStrategy === "port_existing";
-    const forwardingRequired = barber.phoneNumberStrategy === "forward_existing";
+    const portingRequired = activeNumberStrategy === "port_existing";
+    const forwardingRequired = activeNumberStrategy === "forward_existing";
     const portingStatus = latestPortOrder?.status || barber.porting?.status || "draft";
     const portingSubmitted = Boolean(latestPortOrder?.twilioPortingSid);
     const docs = Array.isArray(latestPortOrder?.docs) ? latestPortOrder.docs : [];

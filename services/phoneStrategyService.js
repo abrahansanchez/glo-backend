@@ -18,7 +18,7 @@ const E164_REGEX = /^\+[1-9]\d{7,14}$/;
 const sanitize = (value) => String(value || "").trim();
 
 const serializeForwardingState = (barber) => ({
-  strategy: barber.phoneNumberStrategy || null,
+  strategy: barber.numberStrategy || barber.phoneNumberStrategy || null,
   forwardFromNumber: barber.forwardFromNumber || null,
   forwardToNumber: barber.forwardToNumber || null,
   forwardingCarrier: barber.forwardingCarrier || "",
@@ -108,12 +108,14 @@ const ensureRoutingNumber = async (barber) => {
 
 export const handleNewNumber = async (barber) => {
   barber.phoneNumberStrategy = "new_number";
+  barber.numberStrategy = "new_number";
   await barber.save();
   return barber;
 };
 
 export const handlePortExisting = async (barber) => {
   barber.phoneNumberStrategy = "port_existing";
+  barber.numberStrategy = "port_existing";
   await barber.save();
   return barber;
 };
@@ -129,6 +131,7 @@ export const handleForwardExisting = async (barber, options = {}) => {
   const forwardingCarrier = sanitize(options.forwardingCarrier || current.forwardingCarrier);
 
   current.phoneNumberStrategy = "forward_existing";
+  current.numberStrategy = "forward_existing";
   current.forwardFromNumber = forwardFromNumber || null;
   current.forwardToNumber = current.twilioNumber || current.assignedTwilioNumber || null;
   current.forwardingCarrier = forwardingCarrier;
@@ -243,7 +246,7 @@ export const isForwardingVerificationSessionActive = async ({ to }) => {
 
   const barber = await Barber.findOne({ forwardToNumber: normalizedTo });
   if (!barber) return false;
-  if (barber.phoneNumberStrategy !== "forward_existing") return false;
+  if ((barber.numberStrategy || barber.phoneNumberStrategy) !== "forward_existing") return false;
 
   await expireForwardingVerificationIfNeeded(barber);
 
@@ -263,7 +266,7 @@ export const maybeVerifyForwardingCall = async ({ to, from, callSid }) => {
 
   const barber = await Barber.findOne({ forwardToNumber: normalizedTo });
   if (!barber) return false;
-  if (barber.phoneNumberStrategy !== "forward_existing") return false;
+  if ((barber.numberStrategy || barber.phoneNumberStrategy) !== "forward_existing") return false;
 
   await expireForwardingVerificationIfNeeded(barber);
 

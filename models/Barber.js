@@ -182,6 +182,12 @@ const BarberSchema = new mongoose.Schema(
       default: null,
     },
 
+    numberStrategy: {
+      type: String,
+      enum: ["new_number", "port_existing", "forward_existing"],
+      default: null,
+    },
+
     forwardFromNumber: {
       type: String,
       default: null,
@@ -189,6 +195,16 @@ const BarberSchema = new mongoose.Schema(
 
     forwardToNumber: {
       type: String,
+      default: null,
+    },
+
+    forwardingEnabled: {
+      type: Boolean,
+      default: false,
+    },
+
+    forwardingLastToggledAt: {
+      type: Date,
       default: null,
     },
 

@@ -63,6 +63,7 @@ import appointmentRoutes from "./routes/appointmentRoutes.js";
 import analyticsRoutes from "./routes/analyticsRoutes.js";
 import onboardingRoutes from "./routes/onboardingRoutes.js";
 import phoneRoutes from "./routes/phoneRoutes.js";
+import forwardingRoutes from "./routes/forwardingRoutes.js";
 import launchRoutes from "./routes/launchRoutes.js";
 
 // Billing
@@ -170,6 +171,7 @@ app.use("/api/appointments", appointmentRoutes);
 app.use("/api/analytics", analyticsRoutes);
 app.use("/api/onboarding", onboardingRoutes);
 app.use("/api/phone", phoneRoutes);
+app.use("/api/forwarding", forwardingRoutes);
 app.use("/api/launch", launchRoutes);
 
 // 1️⃣3️⃣ Voicemail API

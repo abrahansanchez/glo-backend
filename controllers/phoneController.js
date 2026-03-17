@@ -539,6 +539,7 @@ export const startPorting = async (req, res) => {
     await order.save({ validateBeforeSave: false });
 
     barber.phoneNumberStrategy = "port_existing";
+    barber.numberStrategy = "port_existing";
     barber.porting = {
       ...(barber.porting?.toObject?.() || barber.porting || {}),
       status: "draft",
@@ -768,6 +769,7 @@ export const submitPorting = async (req, res) => {
     await Barber.findByIdAndUpdate(barberId, {
       $set: {
         phoneNumberStrategy: "port_existing",
+        numberStrategy: "port_existing",
         "porting.status": normalizedStatus,
         "porting.submittedAt": new Date(),
         "porting.updatedAt": new Date(),
