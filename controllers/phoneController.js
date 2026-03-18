@@ -314,6 +314,9 @@ export const selectNumberStrategy = async (req, res) => {
       forwardingCarrier: req.body?.forwardingCarrier,
     });
 
+    barber.numberStrategy = strategy;
+    barber.phoneNumberStrategy = strategy;
+
     barber.onboarding = barber.onboarding || {};
     const stepMap = barber.onboarding.stepMap instanceof Map
       ? Object.fromEntries(barber.onboarding.stepMap.entries())

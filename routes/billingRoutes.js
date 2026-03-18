@@ -123,11 +123,12 @@ router.post("/trial/start", protect, async (req, res) => {
 
     barber.subscriptionStatus = "trialing";
     barber.onboarding = barber.onboarding || {};
-    const stepMap = barber.onboarding.stepMap instanceof Map
-      ? Object.fromEntries(barber.onboarding.stepMap.entries())
-      : (barber.onboarding.stepMap || {});
-    stepMap.trial_start = true;
-    barber.onboarding.stepMap = stepMap;
+    if (!(barber.onboarding.stepMap instanceof Map)) {
+      barber.onboarding.stepMap = new Map(
+        Object.entries(barber.onboarding.stepMap || {})
+      );
+    }
+    barber.onboarding.stepMap.set("trial_start", true);
     barber.onboarding.lastStep = "trial_start";
     barber.onboarding.updatedAt = now;
     await barber.save();

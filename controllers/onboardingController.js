@@ -1,4 +1,5 @@
 import Barber from "../models/Barber.js";
+import { getNextStep } from "../utils/onboarding/getNextStep.js";
 
 const ONBOARDING_STEPS = [
   "welcome",
@@ -30,22 +31,27 @@ export const getOnboardingStatus = async (req, res) => {
       return res.status(401).json({ code: "UNAUTHORIZED", message: "Authentication required" });
     }
 
-    const barber = await Barber.findById(barberId).select("onboarding preferredLanguage");
+    const barber = await Barber.findById(barberId).select(
+      "onboarding preferredLanguage subscriptionStatus numberStrategy forwardingStatus porting phoneNumberStrategy"
+    );
     if (!barber) {
       return res.status(404).json({ code: "BARBER_NOT_FOUND", message: "Barber not found" });
     }
 
     const stepMap = getStepMapObject(barber);
-    const nextStep = deriveNextStep(stepMap);
-    const isComplete = nextStep === "done";
+    const nextStep = getNextStep(barber);
+    const isComplete = nextStep === "complete";
 
     return res.json({
-      steps: ONBOARDING_STEPS,
       stepMap,
       nextStep,
+      isComplete,
       currentStep: barber.onboarding?.lastStep || nextStep,
       completedAt: barber.onboarding?.completedAt || null,
-      isComplete,
+      subscriptionStatus: barber.subscriptionStatus,
+      numberStrategy: barber.numberStrategy || barber.phoneNumberStrategy || null,
+      forwardingStatus: barber.forwardingStatus || "not_started",
+      portingStatus: barber.porting?.status || "draft",
       preferredLanguage: barber.preferredLanguage || "en",
     });
   } catch (err) {

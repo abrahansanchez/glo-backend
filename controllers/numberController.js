@@ -4,7 +4,10 @@ import { releasePhoneNumber } from "../utils/releasePhoneNumber.js";
 export const assignNumberController = async (req, res) => {
   try {
     console.log("✅ assignNumberController started");
-    const barberId = "6902417832ae83a10f987b36";//req.user._id; // from JWT middleware
+    const barberId = req.user?.id || req.user?._id;
+    if (!barberId) {
+      return res.status(401).json({ message: "Authentication required" });
+    }
     const number = await assignPhoneNumber(barberId);
     res.status(200).json({ message: "Number assigned", number });
   } catch (error) {
@@ -23,8 +26,10 @@ export const releaseNumberController = async (req, res) => {
   try {
     console.log("releaseNumberController started");
 
-    // Temporary hardcoded ID for testing (replace later with req.user._id)
-    const barberId = "6902417832ae83a10f987b36";
+    const barberId = req.user?.id || req.user?._id;
+    if (!barberId) {
+      return res.status(401).json({ message: "Authentication required" });
+    }
 
     const result = await releasePhoneNumber(barberId);
     res.status(200).json({ message: "Number released", result });

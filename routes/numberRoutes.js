@@ -4,6 +4,7 @@ import { assignNumberController } from "../controllers/numberController.js";
 import { releaseNumberController } from "../controllers/numberController.js";
 
 const router = express.Router();
+router.use(protect);
 
 // Secure route — only logged-in barber can call this
 router.post("/assign", assignNumberController);
