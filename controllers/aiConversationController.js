@@ -1,7 +1,7 @@
 // controllers/aiConversationController.js
 import axios from "axios";
+import Barber from "../models/Barber.js";
 
-import { detectLanguage } from "../utils/ai/languageDetector.js";
 import { normalizeAIText } from "../utils/ai/normalizeAIText.js";
 import { loadState, updateState, resetState } from "../utils/ai/convoState.js";
 
@@ -97,7 +97,8 @@ export const handleAIConversation = async (req, res) => {
       });
     }
 
-    const lang = detectLanguage(message);
+    const barber = await Barber.findById(barberId).select("preferredLanguage");
+    const lang = barber?.preferredLanguage || "en";
 
     // Load convo state (persisted)
     // We’ll store:

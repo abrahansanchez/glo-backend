@@ -5,6 +5,7 @@ const ONBOARDING_STEPS = [
   "account",
   "business_snapshot",
   "number_strategy",
+  "language",
   "trial_start",
 ];
 
@@ -29,7 +30,7 @@ export const getOnboardingStatus = async (req, res) => {
       return res.status(401).json({ code: "UNAUTHORIZED", message: "Authentication required" });
     }
 
-    const barber = await Barber.findById(barberId).select("onboarding");
+    const barber = await Barber.findById(barberId).select("onboarding preferredLanguage");
     if (!barber) {
       return res.status(404).json({ code: "BARBER_NOT_FOUND", message: "Barber not found" });
     }
@@ -45,6 +46,7 @@ export const getOnboardingStatus = async (req, res) => {
       currentStep: barber.onboarding?.lastStep || nextStep,
       completedAt: barber.onboarding?.completedAt || null,
       isComplete,
+      preferredLanguage: barber.preferredLanguage || "en",
     });
   } catch (err) {
     console.error("getOnboardingStatus error:", err);
@@ -61,6 +63,7 @@ export const postOnboardingStep = async (req, res) => {
 
     const step = String(req.body?.step || "").trim();
     const completed = req.body?.completed !== false;
+    const preferredLanguage = req.body?.data?.preferredLanguage;
     if (!ONBOARDING_STEPS.includes(step)) {
       return res.status(400).json({
         code: "INVALID_STEP",
@@ -68,9 +71,21 @@ export const postOnboardingStep = async (req, res) => {
       });
     }
 
-    const barber = await Barber.findById(barberId).select("onboarding");
+    const barber = await Barber.findById(barberId).select("onboarding preferredLanguage");
     if (!barber) {
       return res.status(404).json({ code: "BARBER_NOT_FOUND", message: "Barber not found" });
+    }
+
+    const previousPreferredLanguage = barber.preferredLanguage || "en";
+
+    if (step === "language") {
+      if (!["en", "es"].includes(preferredLanguage)) {
+        return res.status(400).json({
+          code: "INVALID_PREFERRED_LANGUAGE",
+          message: 'preferredLanguage must be one of: "en", "es"',
+        });
+      }
+      barber.preferredLanguage = preferredLanguage;
     }
 
     const stepMap = getStepMapObject(barber);
@@ -92,15 +107,19 @@ export const postOnboardingStep = async (req, res) => {
 
     await barber.save();
 
+    const languageChanged =
+      step === "language" && previousPreferredLanguage !== (barber.preferredLanguage || "en");
+
     return res.json({
       ok: true,
-      idempotent: previous === Boolean(completed),
+      idempotent: previous === Boolean(completed) && !languageChanged,
       step,
       completed: Boolean(completed),
       stepMap,
       nextStep,
       isComplete: nextStep === "done",
       completedAt: barber.onboarding.completedAt || null,
+      preferredLanguage: barber.preferredLanguage || "en",
     });
   } catch (err) {
     console.error("postOnboardingStep error:", err);

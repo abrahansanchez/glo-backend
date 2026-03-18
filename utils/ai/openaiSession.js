@@ -53,8 +53,7 @@ export function createOpenAISession() {
 
           // ✅ FIX: Enforce English-only at session level
           instructions:
-            `LANGUAGE RULE: You MUST respond ONLY in English. ` +
-            `Do NOT switch to Spanish or any other language unless the caller explicitly speaks Spanish first.\n\n` +
+            `LANGUAGE RULE: Follow the language provided by the latest session instructions.\n\n` +
             `You are a phone receptionist. Be brief. Ask one question at a time.\n\n` +
             `${SYSTEM_PERSONALITY}`,
         },

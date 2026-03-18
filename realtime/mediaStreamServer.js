@@ -58,6 +58,39 @@ const isYes = (text) => {
   );
 };
 
+const detectCallerLanguagePreference = (text, currentLanguage) => {
+  const t = String(text || "").toLowerCase();
+  if (!t.trim()) return null;
+
+  const spanishSignals = [
+    "hola", "buenas", "gracias", "por favor", "quiero", "necesito", "cita", "precio", "cuanto",
+    "barbero", "manana", "mañana", "hoy", "jueves", "viernes", "sabado", "sábado", "domingo",
+    "recortar", "barba", "pueden", "tienen", "disponibilidad", "si", "sí",
+  ];
+  const englishSignals = [
+    "hello", "hi", "thanks", "please", "i want", "i need", "appointment", "book", "schedule",
+    "price", "how much", "tomorrow", "today", "thursday", "friday", "saturday", "sunday",
+    "haircut", "beard", "availability", "do you", "can you", "yes",
+  ];
+
+  let spanishScore = /[áéíóúñ¿¡]/i.test(text) ? 2 : 0;
+  let englishScore = 0;
+
+  for (const signal of spanishSignals) {
+    if (t.includes(signal)) spanishScore += 1;
+  }
+  for (const signal of englishSignals) {
+    if (t.includes(signal)) englishScore += 1;
+  }
+
+  if (spanishScore === englishScore) return null;
+
+  const preferredLanguage = spanishScore > englishScore ? "es" : "en";
+  if (preferredLanguage === currentLanguage) return null;
+
+  return Math.abs(spanishScore - englishScore) >= 2 ? preferredLanguage : null;
+};
+
 export const attachMediaWebSocketServer = (server) => {
   console.log("🔰 attachMediaWebSocketServer() called");
 
@@ -184,7 +217,7 @@ export const attachMediaWebSocketServer = (server) => {
     let lastUserSpokeAt = 0;
     let assistantResponseText = "";
     let currentLanguage = "en";
-    let previousLanguage = "en";
+    let hasSwitchedLanguage = false;
     const bookingState = {
       intent: "OTHER",
       name: "",
@@ -255,7 +288,7 @@ export const attachMediaWebSocketServer = (server) => {
       `2) Ask ONE question at a time.\n` +
       `3) After you have all details, repeat back Name + Service + Date + Time, then ask "Should I confirm that?".\n` +
       `4) Only after caller says YES, mark confirmed.\n` +
-      `5) If caller switches languages, match instantly.\n\n` +
+      `5) Start in the barber's preferred language and follow the active language rules.\n\n` +
       `SERVICE OPTIONS:\n` +
       `- haircut\n` +
       `- beard\n` +
@@ -266,18 +299,23 @@ export const attachMediaWebSocketServer = (server) => {
       `- No long speeches.\n` +
       `- No awkward pauses.\n`;
 
-    const languageInstructionFor = (mode) => {
-      const target = mode === "auto" ? barberPreferredLang : mode;
-      if (target === "es") return "Respond in Spanish. Keep it clear and natural.";
-      if (target === "spanglish") {
-        return "Respond in clear Spanglish (mix Spanish/English naturally). Keep it easy to understand.";
-      }
-      return "Respond in English. Keep it clear and natural.";
+    const languageInstructionFor = () => {
+      const lang = currentLanguage || barberPreferredLang || "en";
+      return `
+PRIMARY LANGUAGE: ${lang === "es" ? "Spanish" : "English"}.
+
+RULES:
+- Start the call in the primary language.
+- Stay consistent and natural.
+- You may understand English, Spanish, or Spanglish from the caller.
+- If the caller clearly prefers another language, you may switch ONCE and continue in that language.
+- Do NOT switch back and forth repeatedly.
+- Keep the conversation smooth and professional.
+`.trim();
     };
 
-    const applyLanguageToSession = async (mode) => {
-      const target = mode === "auto" ? barberPreferredLang : mode;
-      const instruction = languageInstructionFor(target);
+    const applyLanguageToSession = async () => {
+      const instruction = languageInstructionFor();
       try {
         sendToAI({
           type: "session.update",
@@ -285,7 +323,7 @@ export const attachMediaWebSocketServer = (server) => {
             instructions: `${baseInstructions}\n\n${instruction}`,
           },
         });
-        console.log(`[LANG_APPLIED] mode=${target}`);
+        console.log(`[LANG_APPLIED] mode=${currentLanguage || barberPreferredLang || "en"}`);
       } catch (e) {
         console.error("[LANG_APPLIED] error:", e?.message || e);
       }
@@ -360,7 +398,7 @@ export const attachMediaWebSocketServer = (server) => {
           ? `\n\nBOOKING STATE:\n- name: ${bookingState.name || "(missing)"}\n- service: ${bookingState.service || "(missing)"}\n- datetime: ${bookingState.dateTimeText || "(missing)"}\n- askedConfirm: ${bookingState.askedConfirm}\n- confirmed: ${bookingState.confirmed}\n\nNEXT ACTION (MANDATORY): ${forcedNext}\nAsk ONLY one question.`
           : "";
 
-      const instructions = `${baseInstructions}\n\n${languageInstructionFor(currentLanguage)}${bookingOverlay}`;
+      const instructions = `${baseInstructions}\n\n${languageInstructionFor()}${bookingOverlay}`;
 
       sendToAI({
         type: "response.create",
@@ -401,7 +439,7 @@ export const attachMediaWebSocketServer = (server) => {
         sendToAI({
           type: "session.update",
           session: {
-            instructions: `${baseInstructions}\n\n${languageInstructionFor(currentLanguage)}`, 
+            instructions: `${baseInstructions}\n\n${languageInstructionFor()}`, 
             temperature: 0.2,
             max_response_output_tokens: 300,
             turn_detection: null, // VAD disabled during greeting
@@ -448,9 +486,14 @@ export const attachMediaWebSocketServer = (server) => {
             userTranscriptLines.push(transcriptText);
             await appendMessage({ role: "caller", text: transcriptText, lang: currentLanguage });
 
-            previousLanguage = currentLanguage;
-            const detected = detectLanguageMode(transcriptText);
-            if (detected !== "auto") currentLanguage = detected;
+            const nextLanguage =
+              !hasSwitchedLanguage ? detectCallerLanguagePreference(transcriptText, currentLanguage) : null;
+            if (nextLanguage) {
+              currentLanguage = nextLanguage;
+              hasSwitchedLanguage = true;
+              await applyLanguageToSession();
+            }
+
             console.log("TRANSCRIPT:", transcriptText, `(${currentLanguage})`);
 
             const text = String(transcriptText || "").toLowerCase();
@@ -514,11 +557,6 @@ export const attachMediaWebSocketServer = (server) => {
               bookingState.confirmed = true;
               await updateTranscriptFields({ confirmed: true });
               await setTranscriptIntentOutcome({ intent: "BOOK", outcome: "BOOKED" });
-            }
-
-            if (previousLanguage !== currentLanguage) {
-              console.log(`[LANG_SWITCH] ${previousLanguage} -> ${currentLanguage}`);
-              await applyLanguageToSession(currentLanguage);
             }
 
             lastUserSpokeAt = Date.now();
@@ -651,6 +689,7 @@ export const attachMediaWebSocketServer = (server) => {
           barberPreferredLang = "en";
         }
         currentLanguage = barberPreferredLang;
+        hasSwitchedLanguage = false;
         console.log(`[LANG_PREF] barberId=${barberId} preferred=${barberPreferredLang}`);
 
         console.log("📡 Stream started - streamSid:", streamSid);
