@@ -2,11 +2,16 @@ import Barber from "../models/Barber.js";
 
 const ONBOARDING_STEPS = [
   "welcome",
+  "language",
   "account",
   "business_snapshot",
   "number_strategy",
-  "language",
+  "forwarding_flow",
+  "forwarding_setup",
+  "forwarding_verification",
+  "porting_flow",
   "trial_start",
+  "go_live_checklist",
 ];
 
 const getStepMapObject = (barber) => {
@@ -16,11 +21,75 @@ const getStepMapObject = (barber) => {
   return raw;
 };
 
-const deriveNextStep = (stepMap) => {
-  for (const step of ONBOARDING_STEPS) {
-    if (!stepMap[step]) return step;
+const hasActiveSubscription = (barber) =>
+  barber?.subscriptionStatus === "trialing" || barber?.subscriptionStatus === "active";
+
+const hasAssignedNumber = (barber) =>
+  Boolean(barber?.twilioNumber || barber?.assignedTwilioNumber);
+
+const hasSubmittedPortingFlow = (barber) => {
+  const status = String(barber?.porting?.status || "").toLowerCase();
+  return (
+    Boolean(barber?.porting?.submittedAt) ||
+    ["submitted", "carrier_review", "approved", "completed", "rejected"].includes(status)
+  );
+};
+
+const getOnboardingFlowState = (barber) => {
+  const stepMap = getStepMapObject(barber);
+  const subscriptionActive = hasActiveSubscription(barber);
+  const numberStrategy = barber?.numberStrategy || barber?.phoneNumberStrategy || null;
+  const forwardingVerified = barber?.forwardingStatus === "verified";
+  const portingSubmitted = hasSubmittedPortingFlow(barber);
+  const numberAssigned = hasAssignedNumber(barber);
+
+  let nextStep = "go_live_checklist";
+
+  if (!stepMap.welcome) {
+    nextStep = "welcome";
+  } else if (!barber?.preferredLanguage) {
+    nextStep = "language";
+  } else if (!stepMap.account) {
+    nextStep = "account";
+  } else if (!stepMap.business_snapshot) {
+    nextStep = "business_snapshot";
+  } else if (!numberStrategy) {
+    nextStep = "number_strategy";
+  } else if (numberStrategy === "forward_existing") {
+    if (!stepMap.forwarding_flow) {
+      nextStep = "forwarding_flow";
+    } else if (!stepMap.forwarding_setup) {
+      nextStep = "forwarding_setup";
+    } else if (
+      stepMap.forwarding_verification &&
+      !forwardingVerified &&
+      !subscriptionActive
+    ) {
+      nextStep = "forwarding_verification";
+    } else if (!subscriptionActive) {
+      nextStep = "trial_start";
+    }
+  } else if (numberStrategy === "port_existing") {
+    if (!portingSubmitted) {
+      nextStep = "porting_flow";
+    } else if (!subscriptionActive) {
+      nextStep = "trial_start";
+    }
+  } else if (!subscriptionActive) {
+    nextStep = "trial_start";
   }
-  return "done";
+
+  const numberReady =
+    (numberStrategy === "new_number" && numberAssigned) ||
+    (numberStrategy === "forward_existing" &&
+      (forwardingVerified || (subscriptionActive && Boolean(stepMap.trial_start)))) ||
+    (numberStrategy === "port_existing" && portingSubmitted);
+
+  return {
+    stepMap,
+    nextStep,
+    isComplete: nextStep === "go_live_checklist" && subscriptionActive && numberReady,
+  };
 };
 
 export const getOnboardingStatus = async (req, res) => {
@@ -31,67 +100,24 @@ export const getOnboardingStatus = async (req, res) => {
     }
 
     const barber = await Barber.findById(barberId).select(
-      "onboarding preferredLanguage subscriptionStatus numberStrategy forwardingStatus porting phoneNumberStrategy"
+      "onboarding preferredLanguage subscriptionStatus numberStrategy forwardingStatus porting phoneNumberStrategy twilioNumber assignedTwilioNumber"
     );
     if (!barber) {
       return res.status(404).json({ code: "BARBER_NOT_FOUND", message: "Barber not found" });
     }
 
-    const stepMap = getStepMapObject(barber);
+    const { stepMap, nextStep, isComplete } = getOnboardingFlowState(barber);
     const preferredLanguage = barber.preferredLanguage || null;
     const subscriptionStatus = barber.subscriptionStatus || "incomplete";
-    const numberStrategy = barber.numberStrategy || null;
+    const numberStrategy = barber.numberStrategy || barber.phoneNumberStrategy || null;
     const forwardingStatus = barber.forwardingStatus || "not_started";
     const portingStatus = barber.porting?.status || "draft";
-    const isReady =
-      barber.subscriptionStatus === "trialing" ||
-      barber.subscriptionStatus === "active";
-    const numberReady =
-      barber.numberStrategy === "new_number" ||
-      (barber.numberStrategy === "forward_existing" &&
-        barber.forwardingStatus === "verified") ||
-      (barber.numberStrategy === "port_existing" &&
-        barber.porting?.status === "completed");
-
-    let status;
-
-    if (!barber.preferredLanguage) {
-      status = { nextStep: "language", isComplete: false };
-    } else if (!stepMap.account) {
-      status = { nextStep: "account", isComplete: false };
-    } else if (!stepMap.business_snapshot) {
-      status = { nextStep: "business_snapshot", isComplete: false };
-    } else if (
-      barber.subscriptionStatus !== "trialing" &&
-      barber.subscriptionStatus !== "active"
-    ) {
-      status = { nextStep: "trial_start", isComplete: false };
-    } else if (!barber.numberStrategy) {
-      status = { nextStep: "number_strategy", isComplete: false };
-    } else if (
-      barber.numberStrategy === "forward_existing" &&
-      barber.forwardingStatus !== "verified"
-    ) {
-      status = { nextStep: "forwarding_flow", isComplete: false };
-    } else if (
-      barber.numberStrategy === "port_existing" &&
-      barber.porting?.status !== "completed"
-    ) {
-      status = { nextStep: "porting_flow", isComplete: false };
-    }
-
-    if (!status) {
-      status = {
-        nextStep: "go_live_checklist",
-        isComplete: isReady && numberReady,
-      };
-    }
 
     return res.json({
       stepMap,
-      nextStep: status.nextStep,
-      isComplete: status.isComplete,
-      currentStep: status.nextStep,
+      nextStep,
+      isComplete,
+      currentStep: nextStep,
       completedAt: barber.onboarding?.completedAt || null,
       subscriptionStatus,
       numberStrategy,
@@ -122,7 +148,9 @@ export const postOnboardingStep = async (req, res) => {
       });
     }
 
-    const barber = await Barber.findById(barberId).select("onboarding preferredLanguage");
+    const barber = await Barber.findById(barberId).select(
+      "onboarding preferredLanguage subscriptionStatus numberStrategy phoneNumberStrategy forwardingStatus porting twilioNumber assignedTwilioNumber"
+    );
     if (!barber) {
       return res.status(404).json({ code: "BARBER_NOT_FOUND", message: "Barber not found" });
     }
@@ -148,11 +176,11 @@ export const postOnboardingStep = async (req, res) => {
     barber.onboarding.lastStep = step;
     barber.onboarding.updatedAt = new Date();
 
-    const nextStep = deriveNextStep(stepMap);
-    if (nextStep === "done" && !barber.onboarding.completedAt) {
+    const { nextStep, isComplete } = getOnboardingFlowState(barber);
+    if (isComplete && !barber.onboarding.completedAt) {
       barber.onboarding.completedAt = new Date();
     }
-    if (nextStep !== "done") {
+    if (!isComplete) {
       barber.onboarding.completedAt = null;
     }
 
@@ -168,7 +196,7 @@ export const postOnboardingStep = async (req, res) => {
       completed: Boolean(completed),
       stepMap,
       nextStep,
-      isComplete: nextStep === "done",
+      isComplete,
       completedAt: barber.onboarding.completedAt || null,
       preferredLanguage: barber.preferredLanguage || "en",
     });

@@ -5,8 +5,23 @@ const getStepMapObject = (barber) => {
   return raw;
 };
 
+const hasActiveSubscription = (barber) =>
+  barber?.subscriptionStatus === "trialing" || barber?.subscriptionStatus === "active";
+
+const hasSubmittedPortingFlow = (barber) => {
+  const status = String(barber?.porting?.status || "").toLowerCase();
+  return (
+    Boolean(barber?.porting?.submittedAt) ||
+    ["submitted", "carrier_review", "approved", "completed", "rejected"].includes(status)
+  );
+};
+
 export function getNextStep(barber) {
   const stepMap = getStepMapObject(barber);
+  const numberStrategy = barber?.numberStrategy || barber?.phoneNumberStrategy || null;
+  const subscriptionActive = hasActiveSubscription(barber);
+
+  if (!stepMap.welcome) return "welcome";
 
   if (!barber?.preferredLanguage) return "language";
 
@@ -14,26 +29,23 @@ export function getNextStep(barber) {
 
   if (!stepMap.business_snapshot) return "business_snapshot";
 
-  if (
-    barber?.subscriptionStatus !== "trialing" &&
-    barber?.subscriptionStatus !== "active"
-  ) {
-    return "trial_start";
-  }
+  if (!numberStrategy) return "number_strategy";
 
-  if (!barber?.numberStrategy) return "number_strategy";
-
-  if (barber.numberStrategy === "forward_existing") {
-    if (barber?.forwardingStatus !== "verified") {
-      return "forwarding_flow";
+  if (numberStrategy === "forward_existing") {
+    if (!stepMap.forwarding_flow) return "forwarding_flow";
+    if (!stepMap.forwarding_setup) return "forwarding_setup";
+    if (stepMap.forwarding_verification && barber?.forwardingStatus !== "verified" && !subscriptionActive) {
+      return "forwarding_verification";
     }
+    if (!subscriptionActive) return "trial_start";
   }
 
-  if (barber.numberStrategy === "port_existing") {
-    if (barber?.porting?.status !== "completed") {
-      return "porting_flow";
-    }
+  if (numberStrategy === "port_existing") {
+    if (!hasSubmittedPortingFlow(barber)) return "porting_flow";
+    if (!subscriptionActive) return "trial_start";
   }
 
-  return "complete";
+  if (!subscriptionActive) return "trial_start";
+
+  return "go_live_checklist";
 }
