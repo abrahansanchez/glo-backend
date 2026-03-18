@@ -1,5 +1,4 @@
 import Barber from "../models/Barber.js";
-import { getNextStep } from "../utils/onboarding/getNextStep.js";
 
 const ONBOARDING_STEPS = [
   "welcome",
@@ -39,20 +38,66 @@ export const getOnboardingStatus = async (req, res) => {
     }
 
     const stepMap = getStepMapObject(barber);
-    const nextStep = getNextStep(barber);
-    const isComplete = nextStep === "complete";
+    const preferredLanguage = barber.preferredLanguage || null;
+    const subscriptionStatus = barber.subscriptionStatus || "incomplete";
+    const numberStrategy = barber.numberStrategy || null;
+    const forwardingStatus = barber.forwardingStatus || "not_started";
+    const portingStatus = barber.porting?.status || "draft";
+    const isReady =
+      barber.subscriptionStatus === "trialing" ||
+      barber.subscriptionStatus === "active";
+    const numberReady =
+      barber.numberStrategy === "new_number" ||
+      (barber.numberStrategy === "forward_existing" &&
+        barber.forwardingStatus === "verified") ||
+      (barber.numberStrategy === "port_existing" &&
+        barber.porting?.status === "completed");
+
+    let status;
+
+    if (!barber.preferredLanguage) {
+      status = { nextStep: "language", isComplete: false };
+    } else if (!stepMap.account) {
+      status = { nextStep: "account", isComplete: false };
+    } else if (!stepMap.business_snapshot) {
+      status = { nextStep: "business_snapshot", isComplete: false };
+    } else if (
+      barber.subscriptionStatus !== "trialing" &&
+      barber.subscriptionStatus !== "active"
+    ) {
+      status = { nextStep: "trial_start", isComplete: false };
+    } else if (!barber.numberStrategy) {
+      status = { nextStep: "number_strategy", isComplete: false };
+    } else if (
+      barber.numberStrategy === "forward_existing" &&
+      barber.forwardingStatus !== "verified"
+    ) {
+      status = { nextStep: "forwarding_flow", isComplete: false };
+    } else if (
+      barber.numberStrategy === "port_existing" &&
+      barber.porting?.status !== "completed"
+    ) {
+      status = { nextStep: "porting_flow", isComplete: false };
+    }
+
+    if (!status) {
+      status = {
+        nextStep: "go_live_checklist",
+        isComplete: isReady && numberReady,
+      };
+    }
 
     return res.json({
       stepMap,
-      nextStep,
-      isComplete,
-      currentStep: barber.onboarding?.lastStep || nextStep,
+      nextStep: status.nextStep,
+      isComplete: status.isComplete,
+      currentStep: status.nextStep,
       completedAt: barber.onboarding?.completedAt || null,
-      subscriptionStatus: barber.subscriptionStatus,
-      numberStrategy: barber.numberStrategy || barber.phoneNumberStrategy || null,
-      forwardingStatus: barber.forwardingStatus || "not_started",
-      portingStatus: barber.porting?.status || "draft",
-      preferredLanguage: barber.preferredLanguage || "en",
+      subscriptionStatus,
+      numberStrategy,
+      forwardingStatus,
+      portingStatus,
+      preferredLanguage,
     });
   } catch (err) {
     console.error("getOnboardingStatus error:", err);
