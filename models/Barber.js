@@ -55,7 +55,7 @@ const BarberSchema = new mongoose.Schema(
     preferredLanguage: {
       type: String,
       enum: ["en", "es"],
-      default: "en",
+      default: null,
     },
 
     voiceModel: {

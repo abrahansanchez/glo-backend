@@ -29,6 +29,23 @@ const ensureStripeCustomer = async (barber) => {
   return customer.id;
 };
 
+const getCustomerWithDefaultPaymentMethod = async (customerId) => {
+  if (!customerId) return null;
+
+  const customer = await stripe.customers.retrieve(customerId, {
+    expand: ["invoice_settings.default_payment_method"],
+  });
+
+  if (customer.deleted) return null;
+  return customer;
+};
+
+const getDefaultPaymentMethodId = (customer) => {
+  const paymentMethod = customer?.invoice_settings?.default_payment_method;
+  if (!paymentMethod) return null;
+  return typeof paymentMethod === "string" ? paymentMethod : paymentMethod.id || null;
+};
+
 /**
  * ======================================================
  * START STRIPE CHECKOUT (EXISTING – DO NOT BREAK)
@@ -39,6 +56,47 @@ router.post(
   protect,
   createCheckoutSession
 );
+
+router.post("/setup-intent", protect, async (req, res) => {
+  try {
+    const barberId = req.user?._id || req.user?.id;
+    if (!barberId) {
+      return res.status(401).json({
+        code: "UNAUTHORIZED",
+        message: "Authentication required",
+      });
+    }
+
+    const barber = await Barber.findById(barberId);
+    if (!barber) {
+      return res.status(404).json({
+        code: "BARBER_NOT_FOUND",
+        message: "Barber not found",
+      });
+    }
+
+    const customerId = await ensureStripeCustomer(barber);
+    const setupIntent = await stripe.setupIntents.create({
+      customer: customerId,
+      usage: "off_session",
+      automatic_payment_methods: { enabled: true },
+      metadata: { barberId: String(barberId) },
+    });
+
+    return res.status(200).json({
+      ok: true,
+      clientSecret: setupIntent.client_secret,
+      customerId,
+      setupIntentId: setupIntent.id,
+    });
+  } catch (err) {
+    console.error("billing setup-intent error:", err?.message || err);
+    return res.status(500).json({
+      code: "SETUP_INTENT_FAILED",
+      message: "Failed to create setup intent",
+    });
+  }
+});
 
 router.post("/trial/start", protect, async (req, res) => {
   try {
@@ -80,6 +138,15 @@ router.post("/trial/start", protect, async (req, res) => {
       });
     }
     await ensureStripeCustomer(barber);
+
+    const customer = await getCustomerWithDefaultPaymentMethod(barber.stripeCustomerId);
+    const defaultPaymentMethodId = getDefaultPaymentMethodId(customer);
+    if (!defaultPaymentMethodId) {
+      return res.status(400).json({
+        code: "PAYMENT_METHOD_REQUIRED",
+        message: "Add and save a payment method before starting the trial",
+      });
+    }
 
     const latestSub = await Subscription.findOne({ barber: barberId }).sort({ createdAt: -1 });
     if (latestSub && ["trialing", "active"].includes(String(latestSub.status || "").toLowerCase())) {
