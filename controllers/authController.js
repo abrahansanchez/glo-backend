@@ -1,7 +1,6 @@
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import Barber from "../models/Barber.js";
-import { assignPhoneNumber } from "../utils/assignPhoneNumber.js";
 
 // REGISTER BARBER
 export const registerBarber = async (req, res) => {
@@ -26,14 +25,6 @@ export const registerBarber = async (req, res) => {
     });
 
     await barber.save();
-    
-    //Automatically assign Twilio number (mock or real)
-    try {
-      await assignPhoneNumber(barber._id);
-      console.log(`Assigned number to new barber: ${barber.email}`);
-    } catch (err) {
-      console.error("Failed to assign number at signup:", err.message);
-    }
 
     res.status(201).json({ message: "Barber registered successfully" });
   } catch (error) {

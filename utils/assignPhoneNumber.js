@@ -5,29 +5,45 @@ import { getAppBaseUrl } from "./config.js";
 
 dotenv.config();
 
+const normalizeTarget = (value) =>
+  String(value || "primary").trim().toLowerCase() === "interim" ? "interim" : "primary";
+
+const saveAssignedNumber = async ({ barberId, number, sid, target }) => {
+  const barber = await Barber.findById(barberId);
+  if (!barber) throw new Error("Barber not found");
+
+  if (target === "interim") {
+    barber.interimTwilioNumber = number;
+  } else {
+    barber.twilioNumber = number;
+    barber.assignedTwilioNumber = number;
+    barber.twilioSid = sid;
+  }
+  await barber.save();
+};
+
 /**
  * Assign a Twilio number automatically to a barber.
  */
-export const assignPhoneNumber = async (barberId) => {
-  console.log(" assignPhoneNumber started");
+export const assignPhoneNumber = async (barberId, options = {}) => {
+  const target = normalizeTarget(options?.target);
+  console.log(`[TWILIO_ASSIGN_ATTEMPT] barberId=${String(barberId)} target=${target}`);
 
   try {
-    //  1. Check if mock mode is enabled FIRST
     if (process.env.USE_TWILIO_MOCK === "true") {
-      console.log("⚙️ Using Mock Twilio Mode");
-
       const mockNumber = "+13105551234";
       const mockSid = "PNabc12345";
 
-      const barber = await Barber.findById(barberId);
-      if (!barber) throw new Error("Barber not found");
+      await saveAssignedNumber({
+        barberId,
+        number: mockNumber,
+        sid: mockSid,
+        target,
+      });
 
-      barber.twilioNumber = mockNumber;
-      barber.assignedTwilioNumber = mockNumber;
-      barber.twilioSid = mockSid;
-      await barber.save();
-
-      console.log(`✅ Mock number assigned: ${mockNumber} (${mockSid})`);
+      console.log(
+        `[TWILIO_ASSIGN_SUCCESS] barberId=${String(barberId)} target=${target} number=${mockNumber} sid=${mockSid}`
+      );
       return { number: mockNumber, sid: mockSid };
     }
 
@@ -35,21 +51,17 @@ export const assignPhoneNumber = async (barberId) => {
     try {
       baseOrigin = getAppBaseUrl();
     } catch {
-      console.error("[CONFIG] APP_BASE_URL missing");
       const configError = new Error("APP_BASE_URL missing or invalid");
       configError.code = "BASE_URL_MISSING";
       configError.status = 500;
       throw configError;
     }
 
-    //  2. Only initialize Twilio client if NOT mock
-    console.log("🔗 Connecting to real Twilio API...");
     const client = twilio(
       process.env.TWILIO_ACCOUNT_SID,
       process.env.TWILIO_AUTH_TOKEN
     );
 
-    // 3. Search for an available number
     const numbers = await client
       .availablePhoneNumbers(process.env.TWILIO_COUNTRY_CODE || "US")
       .local.list({
@@ -59,29 +71,27 @@ export const assignPhoneNumber = async (barberId) => {
 
     if (!numbers.length) throw new Error("No available Twilio numbers found.");
 
-    const numberToBuy = numbers[0].phoneNumber;
-
-    // 4. Purchase number
     const purchase = await client.incomingPhoneNumbers.create({
-      phoneNumber: numberToBuy,
+      phoneNumber: numbers[0].phoneNumber,
       voiceUrl: `${baseOrigin}/api/voice/incoming`,
       smsUrl: `${baseOrigin}/api/sms/inbound`,
     });
 
-    // 5. Save to barber record
-    const barber = await Barber.findById(barberId);
-    if (!barber) throw new Error("Barber not found");
+    await saveAssignedNumber({
+      barberId,
+      number: purchase.phoneNumber,
+      sid: purchase.sid,
+      target,
+    });
 
-    barber.twilioNumber = purchase.phoneNumber;
-    barber.assignedTwilioNumber = purchase.phoneNumber;
-    barber.twilioSid = purchase.sid;
-    await barber.save();
-
-    console.log(`Twilio number purchased: ${purchase.phoneNumber}`);
+    console.log(
+      `[TWILIO_ASSIGN_SUCCESS] barberId=${String(barberId)} target=${target} number=${purchase.phoneNumber} sid=${purchase.sid}`
+    );
     return { number: purchase.phoneNumber, sid: purchase.sid };
-
   } catch (error) {
-    console.error(" assignPhoneNumber error:", error.message);
+    console.error(
+      `[TWILIO_ASSIGN_FAILED] barberId=${String(barberId)} target=${target} reason=${String(error?.message || error)}`
+    );
     throw error;
   }
 };

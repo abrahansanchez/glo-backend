@@ -16,6 +16,8 @@ const FORWARDING_TEST_WINDOW_MS = 3 * 60 * 1000;
 const E164_REGEX = /^\+[1-9]\d{7,14}$/;
 
 const sanitize = (value) => String(value || "").trim();
+const hasConfirmedTrial = (barber) =>
+  barber?.subscriptionStatus === "trialing" || barber?.subscriptionStatus === "active";
 
 const serializeForwardingState = (barber) => ({
   strategy: barber.numberStrategy || barber.phoneNumberStrategy || null,
@@ -90,22 +92,6 @@ export const expireForwardingVerificationIfNeeded = async (barber) => {
   return barber;
 };
 
-const ensureRoutingNumber = async (barber) => {
-  if (barber.twilioNumber && barber.twilioSid) {
-    return barber;
-  }
-
-  await assignPhoneNumber(barber._id);
-  const refreshed = await Barber.findById(barber._id);
-  if (!refreshed) {
-    const error = new Error("Barber not found after routing assignment");
-    error.code = "BARBER_NOT_FOUND";
-    error.status = 404;
-    throw error;
-  }
-  return refreshed;
-};
-
 export const handleNewNumber = async (barber) => {
   barber.phoneNumberStrategy = "new_number";
   barber.numberStrategy = "new_number";
@@ -121,31 +107,52 @@ export const handlePortExisting = async (barber) => {
 };
 
 export const handleForwardExisting = async (barber, options = {}) => {
-  let current = await ensureRoutingNumber(barber);
+  barber.phoneNumberStrategy = "forward_existing";
+  barber.numberStrategy = "forward_existing";
+  await barber.save();
+  return barber;
+};
 
-  const forwardFromNumber = validatePhoneOrThrow(
-    "forwardFromNumber",
-    options.forwardFromNumber || current.forwardFromNumber,
-    { required: true }
-  );
-  const forwardingCarrier = sanitize(options.forwardingCarrier || current.forwardingCarrier);
+export const assignForwardingRoutingNumber = async (barberId) => {
+  const barber = await ensureBarber(barberId);
+  if (barber.twilioNumber && barber.twilioSid) {
+    return barber;
+  }
 
-  current.phoneNumberStrategy = "forward_existing";
-  current.numberStrategy = "forward_existing";
-  current.forwardFromNumber = forwardFromNumber || null;
-  current.forwardToNumber = current.twilioNumber || current.assignedTwilioNumber || null;
-  current.forwardingCarrier = forwardingCarrier;
-  current.forwardingStatus = "routing_ready";
-  current.forwardingVerifiedAt = null;
-  current.verificationSessionId = null;
-  current.verificationWindowExpiresAt = null;
-  await current.save();
+  console.log(`[TWILIO_FORWARDING_ASSIGN_ATTEMPT] barberId=${String(barberId)}`);
+  await assignPhoneNumber(barberId);
+  const refreshed = await ensureBarber(barberId);
+  refreshed.forwardToNumber = refreshed.twilioNumber || refreshed.assignedTwilioNumber || null;
+  if (refreshed.forwardToNumber && refreshed.forwardingStatus === "not_started") {
+    refreshed.forwardingStatus = "routing_ready";
+  }
+  await refreshed.save();
 
   console.log(
-    `[FORWARDING_ROUTING_READY] barberId=${String(current._id)} forwardToNumber=${String(current.forwardToNumber || "")}`
+    `[TWILIO_FORWARDING_ASSIGN_SUCCESS] barberId=${String(barberId)} forwardToNumber=${String(refreshed.forwardToNumber || "")}`
   );
+  return refreshed;
+};
 
-  return current;
+export const assignPortingInterimNumber = async (barberId) => {
+  const barber = await ensureBarber(barberId);
+  if (barber.interimTwilioNumber) {
+    return barber;
+  }
+  if (!hasConfirmedTrial(barber)) {
+    const error = new Error("Trial must be confirmed before assigning a porting interim number");
+    error.code = "TRIAL_REQUIRED";
+    error.status = 400;
+    throw error;
+  }
+
+  console.log(`[TWILIO_PORTING_ASSIGN_ATTEMPT] barberId=${String(barberId)}`);
+  await assignPhoneNumber(barberId, { target: "interim" });
+  const refreshed = await ensureBarber(barberId);
+  console.log(
+    `[TWILIO_PORTING_ASSIGN_SUCCESS] barberId=${String(barberId)} interimTwilioNumber=${String(refreshed.interimTwilioNumber || "")}`
+  );
+  return refreshed;
 };
 
 export const assignStrategy = async (barberId, strategy, options = {}) => {

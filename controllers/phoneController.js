@@ -12,6 +12,8 @@ import { uploadPortingDocToStorage } from "../utils/portingStorage.js";
 import { getAppBaseUrl } from "../utils/config.js";
 import {
   assignStrategy,
+  assignForwardingRoutingNumber,
+  assignPortingInterimNumber,
   getStrategyStatus,
   startForwardingTest,
 } from "../services/phoneStrategyService.js";
@@ -331,7 +333,7 @@ export const selectNumberStrategy = async (req, res) => {
 
     return res.json({
       ok: true,
-      strategy,
+      numberStrategy: barber.numberStrategy,
     });
   } catch (err) {
     console.error("selectNumberStrategy error:", err);
@@ -359,6 +361,18 @@ export const getForwardingStatus = async (req, res) => {
       return res.status(401).json({ code: "UNAUTHORIZED", message: "Authentication required" });
     }
 
+    let barber = await Barber.findById(barberId);
+    if (!barber) {
+      return res.status(404).json({ code: "BARBER_NOT_FOUND", message: "Barber not found" });
+    }
+
+    if (
+      (barber.numberStrategy || barber.phoneNumberStrategy) === "forward_existing" &&
+      !barber.twilioNumber
+    ) {
+      barber = await assignForwardingRoutingNumber(barberId);
+    }
+
     const status = await getStrategyStatus(barberId);
     return res.json({
       forwardFromNumber: status.forwardFromNumber,
@@ -372,6 +386,9 @@ export const getForwardingStatus = async (req, res) => {
     console.error("getForwardingStatus error:", err);
     if (err?.code === "BARBER_NOT_FOUND") {
       return res.status(404).json({ code: err.code, message: err.message });
+    }
+    if (err?.code === "TRIAL_REQUIRED") {
+      return res.status(err.status || 400).json({ code: err.code, message: err.message });
     }
     return res.status(500).json({
       code: "FORWARDING_STATUS_FAILED",
@@ -464,6 +481,19 @@ export const startPorting = async (req, res) => {
     const barber = await Barber.findById(barberId);
     if (!barber) {
       return res.status(404).json({ code: "BARBER_NOT_FOUND", message: "Barber not found" });
+    }
+
+    if (
+      (barber.subscriptionStatus === "trialing" || barber.subscriptionStatus === "active") &&
+      !barber.interimTwilioNumber
+    ) {
+      try {
+        await assignPortingInterimNumber(barberId);
+      } catch (assignErr) {
+        console.error(
+          `[PORTING_INTERIM_ASSIGN_FAILED] barberId=${String(barberId)} reason=${String(assignErr?.message || assignErr)}`
+        );
+      }
     }
 
     const normalizedInput = normalizeStartInput(req.body || {}, barber);

@@ -8,6 +8,8 @@ import CallTranscript from "../models/CallTranscript.js";
 import IdempotencyKey from "../models/IdempotencyKey.js";
 
 import { createCheckoutSession } from "../controllers/billingController.js";
+import { assignPortingInterimNumber } from "../services/phoneStrategyService.js";
+import { assignPhoneNumber } from "../utils/assignPhoneNumber.js";
 
 const router = express.Router();
 
@@ -199,6 +201,27 @@ router.post("/trial/start", protect, async (req, res) => {
     barber.onboarding.lastStep = "trial_start";
     barber.onboarding.updatedAt = now;
     await barber.save();
+
+    const strategy = barber.numberStrategy || barber.phoneNumberStrategy || null;
+    if (strategy === "new_number" && !barber.twilioNumber) {
+      try {
+        await assignPhoneNumber(barberId);
+      } catch (err) {
+        console.error(
+          `[TRIAL_START] assignPhoneNumber failed barberId=${String(barberId)} reason=${String(err?.message || err)}`
+        );
+      }
+    }
+
+    if (strategy === "port_existing" && !barber.interimTwilioNumber) {
+      try {
+        await assignPortingInterimNumber(barberId);
+      } catch (err) {
+        console.error(
+          `[TRIAL_START] assignPortingInterimNumber failed barberId=${String(barberId)} reason=${String(err?.message || err)}`
+        );
+      }
+    }
 
     const payload = {
       ok: true,

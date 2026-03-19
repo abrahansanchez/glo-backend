@@ -33,6 +33,11 @@ const BarberSchema = new mongoose.Schema(
       default: null,
     },
 
+    interimTwilioNumber: {
+      type: String,
+      default: null,
+    },
+
     twilioSid: {
       type: String,
       default: null,

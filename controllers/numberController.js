@@ -1,5 +1,6 @@
 import { assignPhoneNumber } from "../utils/assignPhoneNumber.js";
 import { releasePhoneNumber } from "../utils/releasePhoneNumber.js";
+import Barber from "../models/Barber.js";
 
 export const assignNumberController = async (req, res) => {
   try {
@@ -7,6 +8,16 @@ export const assignNumberController = async (req, res) => {
     const barberId = req.user?.id || req.user?._id;
     if (!barberId) {
       return res.status(401).json({ message: "Authentication required" });
+    }
+    const barber = await Barber.findById(barberId).select("subscriptionStatus");
+    if (!barber) {
+      return res.status(404).json({ message: "Barber not found" });
+    }
+    if (!["trialing", "active"].includes(String(barber.subscriptionStatus || "").toLowerCase())) {
+      return res.status(400).json({
+        code: "TRIAL_REQUIRED",
+        message: "Cannot assign a Twilio number before trial has started",
+      });
     }
     const number = await assignPhoneNumber(barberId);
     res.status(200).json({ message: "Number assigned", number });
