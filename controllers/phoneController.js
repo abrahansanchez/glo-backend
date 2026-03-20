@@ -368,7 +368,8 @@ export const getForwardingStatus = async (req, res) => {
 
     if (
       (barber.numberStrategy || barber.phoneNumberStrategy) === "forward_existing" &&
-      !barber.twilioNumber
+      !barber.twilioNumber &&
+      (barber.subscriptionStatus === "trialing" || barber.subscriptionStatus === "active")
     ) {
       barber = await assignForwardingRoutingNumber(barberId);
     }
