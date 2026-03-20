@@ -269,6 +269,11 @@ const BarberSchema = new mongoose.Schema(
         default: {},
       },
     },
+
+    barberName: {
+      type: String,
+      default: null,
+    },
   },
   {
     timestamps: true,

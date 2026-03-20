@@ -10,7 +10,10 @@ const ONBOARDING_STEPS = [
   "forwarding_setup",
   "forwarding_verification",
   "porting_flow",
+  "ai_intro",
+  "permissions",
   "trial_start",
+  "celebration",
   "go_live_checklist",
 ];
 
@@ -66,17 +69,23 @@ const getOnboardingFlowState = (barber) => {
       !subscriptionActive
     ) {
       nextStep = "forwarding_verification";
-    } else if (!subscriptionActive) {
-      nextStep = "trial_start";
     }
   } else if (numberStrategy === "port_existing") {
     if (!portingSubmitted) {
       nextStep = "porting_flow";
+    }
+  }
+
+  if (nextStep === "go_live_checklist") {
+    if (!stepMap.ai_intro) {
+      nextStep = "ai_intro";
+    } else if (!stepMap.permissions) {
+      nextStep = "permissions";
     } else if (!subscriptionActive) {
       nextStep = "trial_start";
+    } else if (!stepMap.celebration) {
+      nextStep = "celebration";
     }
-  } else if (!subscriptionActive) {
-    nextStep = "trial_start";
   }
 
   const numberReady =
@@ -100,7 +109,7 @@ export const getOnboardingStatus = async (req, res) => {
     }
 
     const barber = await Barber.findById(barberId).select(
-      "onboarding preferredLanguage subscriptionStatus numberStrategy forwardingStatus porting phoneNumberStrategy twilioNumber assignedTwilioNumber"
+      "onboarding preferredLanguage subscriptionStatus numberStrategy forwardingStatus porting phoneNumberStrategy twilioNumber assignedTwilioNumber barberName shopName"
     );
     if (!barber) {
       return res.status(404).json({ code: "BARBER_NOT_FOUND", message: "Barber not found" });
@@ -124,6 +133,7 @@ export const getOnboardingStatus = async (req, res) => {
       forwardingStatus,
       portingStatus,
       preferredLanguage,
+      barberName: barber.barberName || barber.shopName || null,
     });
   } catch (err) {
     console.error("getOnboardingStatus error:", err);
@@ -149,7 +159,7 @@ export const postOnboardingStep = async (req, res) => {
     }
 
     const barber = await Barber.findById(barberId).select(
-      "onboarding preferredLanguage subscriptionStatus numberStrategy phoneNumberStrategy forwardingStatus porting twilioNumber assignedTwilioNumber"
+      "onboarding preferredLanguage subscriptionStatus numberStrategy phoneNumberStrategy forwardingStatus porting twilioNumber assignedTwilioNumber barberName shopName"
     );
     if (!barber) {
       return res.status(404).json({ code: "BARBER_NOT_FOUND", message: "Barber not found" });
@@ -165,6 +175,14 @@ export const postOnboardingStep = async (req, res) => {
         });
       }
       barber.preferredLanguage = preferredLanguage;
+    }
+
+    if (step === "business_snapshot") {
+      const barberName = req.body?.data?.barberName || req.body?.data?.shopName;
+      if (barberName && typeof barberName === "string" && barberName.trim()) {
+        barber.barberName = barberName.trim();
+        barber.shopName = barberName.trim();
+      }
     }
 
     const stepMap = getStepMapObject(barber);
