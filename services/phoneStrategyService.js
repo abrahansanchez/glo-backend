@@ -72,6 +72,27 @@ const getTwilioClient = () => {
   return twilio(accountSid, authToken);
 };
 
+const getForwardingVerificationSourceNumber = () => {
+  const sourceNumber = sanitize(
+    process.env.TWILIO_VERIFICATION_FROM_NUMBER ||
+    process.env.GLO_ROUTING_NUMBER ||
+    process.env.TWILIO_PHONE_NUMBER
+  );
+
+  if (!sourceNumber) {
+    const error = new Error(
+      "A Twilio-owned verification source number is not configured. Set TWILIO_VERIFICATION_FROM_NUMBER, GLO_ROUTING_NUMBER, or TWILIO_PHONE_NUMBER."
+    );
+    error.code = "FORWARDING_VERIFICATION_SOURCE_MISSING";
+    error.status = 500;
+    throw error;
+  }
+
+  return validatePhoneOrThrow("FORWARDING_VERIFICATION_SOURCE", sourceNumber, {
+    required: true,
+  });
+};
+
 export const expireForwardingVerificationIfNeeded = async (barber) => {
   if (!barber) return barber;
   if (barber.forwardingStatus !== "verification_pending") return barber;
@@ -253,16 +274,7 @@ export const startForwardingTest = async ({ barberId, forwardFromNumber }) => {
   const now = new Date();
   const expiresAt = new Date(now.getTime() + FORWARDING_TEST_WINDOW_MS);
   const verificationSessionId = randomUUID();
-  const rawTestFromNumber = sanitize(process.env.TWILIO_TEST_NUMBER);
-  if (!rawTestFromNumber) {
-    const error = new Error("TWILIO_TEST_NUMBER is not configured.");
-    error.code = "TWILIO_TEST_NUMBER_MISSING";
-    error.status = 500;
-    throw error;
-  }
-  const testFromNumber = validatePhoneOrThrow("TWILIO_TEST_NUMBER", rawTestFromNumber, {
-    required: true,
-  });
+  const verificationFromNumber = getForwardingVerificationSourceNumber();
 
   barber.forwardingStatus = "activation_started";
   barber.forwardFromNumber = normalizedForwardFromNumber;
@@ -275,7 +287,7 @@ export const startForwardingTest = async ({ barberId, forwardFromNumber }) => {
   try {
     await client.calls.create({
       to: normalizedForwardFromNumber,
-      from: testFromNumber,
+      from: verificationFromNumber,
       twiml:
         "<Response><Say>This is a Glo forwarding verification test call. If your forwarding is active, no action is needed.</Say></Response>",
     });
@@ -349,7 +361,12 @@ export const maybeVerifyForwardingCall = async ({ to, from, callSid }) => {
     ? new Date(barber.verificationWindowExpiresAt)
     : null;
   const normalizedFrom = sanitize(from);
-  const expectedFrom = sanitize(process.env.TWILIO_TEST_NUMBER);
+  let expectedFrom = "";
+  try {
+    expectedFrom = sanitize(getForwardingVerificationSourceNumber());
+  } catch {
+    expectedFrom = "";
+  }
 
   if (!activeSessionId || !expiresAt || expiresAt.getTime() <= Date.now()) {
     return false;

@@ -458,7 +458,7 @@ export const triggerForwardingTest = async (req, res, next) => {
         verificationWindowExpiresAt: err.verificationWindowExpiresAt || undefined,
       });
     }
-    if (err?.code === "TWILIO_TEST_NUMBER_MISSING") {
+    if (err?.code === "TWILIO_TEST_NUMBER_MISSING" || err?.code === "FORWARDING_VERIFICATION_SOURCE_MISSING") {
       return res.status(err.status || 500).json({ code: err.code, message: err.message });
     }
     if (err?.code === "INVALID_FORWARDING_PHONE" && err?.field === "TWILIO_TEST_NUMBER") {
