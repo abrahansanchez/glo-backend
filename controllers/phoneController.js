@@ -445,9 +445,21 @@ export const triggerForwardingTest = async (req, res, next) => {
     });
   } catch (err) {
     console.error("triggerForwardingTest error:", err);
-    if (typeof next === "function") return next(err);
     if (err?.code === "BARBER_NOT_FOUND") {
       return res.status(404).json({ code: err.code, message: err.message });
+    }
+    if (err?.code === "FORWARDING_NOT_READY") {
+      return res.status(err.status || 400).json({ code: err.code, message: err.message });
+    }
+    if (err?.code === "VERIFICATION_ALREADY_RUNNING") {
+      return res.status(err.status || 409).json({
+        code: err.code,
+        message: err.message,
+        verificationWindowExpiresAt: err.verificationWindowExpiresAt || undefined,
+      });
+    }
+    if (err?.code === "TWILIO_TEST_NUMBER_MISSING") {
+      return res.status(err.status || 500).json({ code: err.code, message: err.message });
     }
     if (err?.code === "INVALID_FORWARDING_PHONE" && err?.field === "TWILIO_TEST_NUMBER") {
       return res.status(500).json({ code: err.code, message: err.message });
@@ -461,6 +473,9 @@ export const triggerForwardingTest = async (req, res, next) => {
     }
     if (err?.code === "TWILIO_CONFIG_MISSING") {
       return res.status(500).json({ code: err.code, message: err.message });
+    }
+    if (err?.code === "FORWARDING_TEST_CALL_FAILED") {
+      return res.status(err.status || 502).json({ code: err.code, message: err.message });
     }
     return res.status(500).json({
       code: "FORWARDING_TEST_FAILED",

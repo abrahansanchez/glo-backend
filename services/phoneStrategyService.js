@@ -208,6 +208,28 @@ export const startForwardingTest = async ({ barberId, forwardFromNumber }) => {
   const barber = await ensureBarber(barberId);
   await expireForwardingVerificationIfNeeded(barber);
 
+  if ((barber.numberStrategy || barber.phoneNumberStrategy) !== "forward_existing") {
+    const error = new Error("Forwarding is not ready for verification yet.");
+    error.code = "FORWARDING_NOT_READY";
+    error.status = 400;
+    throw error;
+  }
+
+  const activeExpiresAt = barber.verificationWindowExpiresAt
+    ? new Date(barber.verificationWindowExpiresAt)
+    : null;
+  if (
+    barber.forwardingStatus === "verification_pending" &&
+    activeExpiresAt &&
+    activeExpiresAt.getTime() > Date.now()
+  ) {
+    const error = new Error("A forwarding verification test is already in progress.");
+    error.code = "VERIFICATION_ALREADY_RUNNING";
+    error.status = 409;
+    error.verificationWindowExpiresAt = activeExpiresAt;
+    throw error;
+  }
+
   const normalizedForwardFromNumber = validatePhoneOrThrow(
     "forwardFromNumber",
     forwardFromNumber || barber.forwardFromNumber,
@@ -221,14 +243,26 @@ export const startForwardingTest = async ({ barberId, forwardFromNumber }) => {
     { required: true }
   );
 
+  if (!forwardToNumber) {
+    const error = new Error("Forwarding is not ready for verification yet.");
+    error.code = "FORWARDING_NOT_READY";
+    error.status = 400;
+    throw error;
+  }
+
   const now = new Date();
   const expiresAt = new Date(now.getTime() + FORWARDING_TEST_WINDOW_MS);
   const verificationSessionId = randomUUID();
-  const testFromNumber = validatePhoneOrThrow(
-    "TWILIO_TEST_NUMBER",
-    process.env.TWILIO_TEST_NUMBER,
-    { required: true }
-  );
+  const rawTestFromNumber = sanitize(process.env.TWILIO_TEST_NUMBER);
+  if (!rawTestFromNumber) {
+    const error = new Error("TWILIO_TEST_NUMBER is not configured.");
+    error.code = "TWILIO_TEST_NUMBER_MISSING";
+    error.status = 500;
+    throw error;
+  }
+  const testFromNumber = validatePhoneOrThrow("TWILIO_TEST_NUMBER", rawTestFromNumber, {
+    required: true,
+  });
 
   barber.forwardingStatus = "activation_started";
   barber.forwardFromNumber = normalizedForwardFromNumber;
@@ -254,6 +288,10 @@ export const startForwardingTest = async ({ barberId, forwardFromNumber }) => {
     console.log(
       `[FORWARDING_ACTIVATION_FAILED] barberId=${String(barber._id)} reason=${String(err?.message || "twilio_call_failed")}`
     );
+    if (!err?.code) {
+      err.code = "FORWARDING_TEST_CALL_FAILED";
+      err.status = err?.status || err?.statusCode || 502;
+    }
     throw err;
   }
 
