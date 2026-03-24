@@ -134,6 +134,7 @@ export const getOnboardingStatus = async (req, res) => {
       portingStatus,
       preferredLanguage,
       barberName: barber.barberName || barber.shopName || null,
+      setupCompletedViaCall: barber.setupCompletedViaCall || false,
     });
   } catch (err) {
     console.error("getOnboardingStatus error:", err);
