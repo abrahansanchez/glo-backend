@@ -115,23 +115,52 @@ export const handleForwardExisting = async (barber, options = {}) => {
 
 export const assignForwardingRoutingNumber = async (barberId) => {
   const barber = await ensureBarber(barberId);
+
+  // If already has a routing number assigned, return as-is
   if (barber.twilioNumber && barber.twilioSid) {
     return barber;
   }
 
   console.log(`[TWILIO_FORWARDING_ASSIGN_ATTEMPT] barberId=${String(barberId)}`);
-  await assignPhoneNumber(barberId);
-  const refreshed = await ensureBarber(barberId);
-  refreshed.forwardToNumber = refreshed.twilioNumber || refreshed.assignedTwilioNumber || null;
-  if (refreshed.forwardToNumber && refreshed.forwardingStatus === "not_started") {
-    refreshed.forwardingStatus = "routing_ready";
+
+  // Use the dedicated GLO routing number from env - do NOT purchase a new number
+  const routingNumber = process.env.GLO_ROUTING_NUMBER || process.env.TWILIO_PHONE_NUMBER;
+  if (!routingNumber) {
+    throw new Error("GLO_ROUTING_NUMBER not configured in environment");
   }
-  await refreshed.save();
+
+  // Look up the SID for this number from Twilio
+  const accountSid = process.env.TWILIO_ACCOUNT_SID;
+  const authToken = process.env.TWILIO_AUTH_TOKEN;
+  const twilioClient = twilio(accountSid, authToken);
+
+  let twilioSid = null;
+  try {
+    const numbers = await twilioClient.incomingPhoneNumbers.list({
+      phoneNumber: routingNumber,
+    });
+    if (numbers.length > 0) {
+      twilioSid = numbers[0].sid;
+    }
+  } catch (err) {
+    console.error(`[TWILIO_FORWARDING_SID_LOOKUP] failed:`, err?.message);
+  }
+
+  barber.twilioNumber = routingNumber;
+  barber.assignedTwilioNumber = routingNumber;
+  barber.forwardToNumber = routingNumber;
+  if (twilioSid) barber.twilioSid = twilioSid;
+
+  if (barber.forwardingStatus === "not_started") {
+    barber.forwardingStatus = "routing_ready";
+  }
+
+  await barber.save();
 
   console.log(
-    `[TWILIO_FORWARDING_ASSIGN_SUCCESS] barberId=${String(barberId)} forwardToNumber=${String(refreshed.forwardToNumber || "")}`
+    `[TWILIO_FORWARDING_ASSIGN_SUCCESS] barberId=${String(barberId)} forwardToNumber=${routingNumber}`
   );
-  return refreshed;
+  return barber;
 };
 
 export const assignPortingInterimNumber = async (barberId) => {
