@@ -95,6 +95,7 @@ router.post("/demo-call", async (req, res) => {
     }
 
     const barberName = barber.barberName || barber.shopName || "there";
+    console.log(`[DEMO_CALL_DEBUG] barberName=${barberName} preferredLanguage=${barber.preferredLanguage}`);
     const toNumber = barber.phoneNumber || barber.phone;
     const isSpanish = barber.preferredLanguage === "es";
     const language = isSpanish ? "es" : "en";

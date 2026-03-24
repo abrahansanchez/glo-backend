@@ -400,7 +400,9 @@ RULES:
           ? `\n\nBOOKING STATE:\n- name: ${bookingState.name || "(missing)"}\n- service: ${bookingState.service || "(missing)"}\n- datetime: ${bookingState.dateTimeText || "(missing)"}\n- askedConfirm: ${bookingState.askedConfirm}\n- confirmed: ${bookingState.confirmed}\n\nNEXT ACTION (MANDATORY): ${forcedNext}\nAsk ONLY one question.`
           : "";
 
-      const instructions = `${baseInstructions}\n\n${languageInstructionFor()}${bookingOverlay}`;
+      const instructions = isSetupCall && initialPrompt
+        ? initialPrompt
+        : `${baseInstructions}\n\n${languageInstructionFor()}${bookingOverlay}`;
 
       sendToAI({
         type: "response.create",
@@ -438,10 +440,14 @@ RULES:
         aiReady = true;
 
         // Send initial session config immediately after connection
+        const sessionInstructions = isSetupCall && initialPrompt
+          ? initialPrompt
+          : `${baseInstructions}\n\n${languageInstructionFor()}`;
+
         sendToAI({
           type: "session.update",
           session: {
-            instructions: `${baseInstructions}\n\n${languageInstructionFor()}`, 
+            instructions: sessionInstructions,
             temperature: 0.2,
             max_response_output_tokens: 300,
             turn_detection: null, // VAD disabled during greeting
