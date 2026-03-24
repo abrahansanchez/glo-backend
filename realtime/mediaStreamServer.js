@@ -142,6 +142,8 @@ export const attachMediaWebSocketServer = (server) => {
     let initialPrompt = null;
     let callerNumber = "";
     let toNumber = "";
+    let isSetupCall = false;
+    let setupLanguage = "en";
     let barberPreferredLang = "en";
     let callStartedAt = new Date();
     const userTranscriptLines = [];
@@ -625,6 +627,31 @@ RULES:
           assistantResponseText = "";
           aiResponseInProgress = false;
           hasCommittedUserAudioForTurn = false;
+
+          // Detect SETUP_DATA from conversational onboarding call
+          if (isSetupCall && barberId && assistantTranscriptLines.length > 0) {
+            const fullText = assistantTranscriptLines.join("\n");
+            const setupMatch = fullText.match(/```SETUP_DATA\n([\s\S]*?)```/);
+            if (setupMatch) {
+              try {
+                const setupData = JSON.parse(setupMatch[1].trim());
+                console.log(`[SETUP_DATA_DETECTED] barberId=${barberId} parsing setup data...`);
+                const appBaseUrl = process.env.APP_BASE_URL;
+                if (appBaseUrl) {
+                  fetch(`${appBaseUrl}/api/onboarding/setup-call-complete`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ barberId, setupData }),
+                  })
+                    .then(r => r.json())
+                    .then(result => console.log(`[SETUP_DATA_SAVED] barberId=${barberId} ok=${result?.ok}`))
+                    .catch(err => console.error(`[SETUP_DATA_SAVE_FAILED] barberId=${barberId}`, err?.message));
+                }
+              } catch (parseErr) {
+                console.error("[SETUP_DATA_PARSE] failed:", parseErr?.message);
+              }
+            }
+          }
         }
 
         if (
@@ -678,6 +705,8 @@ RULES:
         callerNumber = custom.from || msg.start?.from || callerNumber || "";
         toNumber = custom.to || msg.start?.to || toNumber || "";
         callSid = custom.callSid || msg.start?.callSid || callSid || "";
+        isSetupCall = custom.isSetupCall === "true";
+        setupLanguage = custom.language || "en";
 
         console.log(
           `[STREAM_META_WS] callSid=${callSid} from=${callerNumber} to=${toNumber} barberId=${barberId}`

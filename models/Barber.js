@@ -274,6 +274,24 @@ const BarberSchema = new mongoose.Schema(
       type: String,
       default: null,
     },
+
+    services: [
+      {
+        name: { type: String, required: true },
+        price: { type: Number, default: null },
+        durationMinutes: { type: Number, default: null },
+      },
+    ],
+
+    setupCompletedViaCall: {
+      type: Boolean,
+      default: false,
+    },
+
+    setupCallCompletedAt: {
+      type: Date,
+      default: null,
+    },
   },
   {
     timestamps: true,
