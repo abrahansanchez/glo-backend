@@ -118,14 +118,16 @@ router.post("/demo-call", async (req, res) => {
     const client = twilio(accountSid, authToken);
     const twimlMessage = isSpanish
       ? `<Response>
-          <Say voice="Polly.Joanna" language="es-US">Hola ${barberName}, soy tu recepcionista de inteligencia artificial de Glō. Voy a contestar cada llamada, agendar citas, y nunca dejar escapar a un cliente. Tu negocio nunca va a perder una llamada más.</Say>
+          <Say voice="Polly.Lupe" language="es-US">Hola ${barberName}, soy tu recepcionista de inteligencia artificial de Glō. Voy a contestar cada llamada, agendar citas, y nunca dejar escapar a un cliente. Tu negocio nunca va a perder una llamada más.</Say>
           <Pause length="1"/>
-          <Say voice="Polly.Matthew" language="es-US">Completa tu configuración en la aplicación para que pueda conocer tus horarios, servicios y precios. Entre más me enseñes, mejor voy a atender a tus clientes. ¡Vamos a ponerte en línea!</Say>
+          <Say voice="Polly.Pedro" language="es-US">Completa tu configuración en la aplicación para que pueda conocer tus horarios, servicios y precios. Entre más me enseñes, mejor voy a atender a tus clientes. ¡Vamos a ponerte en línea!</Say>
+          <Pause length="2"/>
         </Response>`
       : `<Response>
           <Say voice="Polly.Joanna" language="en-US">Hi ${barberName}! I am your Glō AI receptionist. I will answer every call, book appointments, and never let a client slip away. Your shop will never miss a call again.</Say>
           <Pause length="1"/>
           <Say voice="Polly.Matthew" language="en-US">Finish your setup in the app so I can learn your hours, services, and pricing. The more you teach me, the better I handle every call. Let us get you live!</Say>
+          <Pause length="2"/>
         </Response>`;
 
     const call = await client.calls.create({
