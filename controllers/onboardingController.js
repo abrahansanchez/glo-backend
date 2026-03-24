@@ -63,11 +63,7 @@ const getOnboardingFlowState = (barber) => {
       nextStep = "forwarding_flow";
     } else if (!stepMap.forwarding_setup) {
       nextStep = "forwarding_setup";
-    } else if (
-      stepMap.forwarding_verification &&
-      !forwardingVerified &&
-      !subscriptionActive
-    ) {
+    } else if (!forwardingVerified && !stepMap.forwarding_verification) {
       nextStep = "forwarding_verification";
     }
   } else if (numberStrategy === "port_existing") {
