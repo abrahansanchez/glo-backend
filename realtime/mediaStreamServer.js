@@ -409,7 +409,7 @@ RULES:
         response: {
           modalities: ["audio", "text"],
           instructions,
-          max_output_tokens: isSetupCall ? 400 : 220,
+          max_output_tokens: isSetupCall ? 800 : 220,
         },
       });
 
@@ -640,7 +640,13 @@ RULES:
             const setupMatch = fullText.match(/```SETUP_DATA\n([\s\S]*?)```/);
             if (setupMatch) {
               try {
-                const setupData = JSON.parse(setupMatch[1].trim());
+                let rawJson = setupMatch[1].trim();
+                // Ensure JSON is complete - truncate at last valid closing brace
+                const lastBrace = rawJson.lastIndexOf("}");
+                if (lastBrace !== -1) {
+                  rawJson = rawJson.substring(0, lastBrace + 1);
+                }
+                const setupData = JSON.parse(rawJson);
                 console.log(`[SETUP_DATA_DETECTED] barberId=${barberId} parsing setup data...`);
                 const appBaseUrl = process.env.APP_BASE_URL;
                 if (appBaseUrl) {
@@ -650,7 +656,23 @@ RULES:
                     body: JSON.stringify({ barberId, setupData }),
                   })
                     .then(r => r.json())
-                    .then(result => console.log(`[SETUP_DATA_SAVED] barberId=${barberId} ok=${result?.ok}`))
+                    .then(result => {
+                      console.log(`[SETUP_DATA_SAVED] barberId=${barberId} ok=${result?.ok}`);
+                      // End the call after setup is complete
+                      setTimeout(() => {
+                        try {
+                          if (twilioWs.readyState === twilioWs.OPEN && streamSid) {
+                            twilioWs.send(JSON.stringify({
+                              event: "stop",
+                              streamSid,
+                            }));
+                            console.log(`[SETUP_CALL_ENDED] barberId=${barberId} stream stopped`);
+                          }
+                        } catch (endErr) {
+                          console.error("[SETUP_CALL_END] error:", endErr?.message);
+                        }
+                      }, 2000);
+                    })
                     .catch(err => console.error(`[SETUP_DATA_SAVE_FAILED] barberId=${barberId}`, err?.message));
                 }
               } catch (parseErr) {
