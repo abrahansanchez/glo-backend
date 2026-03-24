@@ -329,6 +329,17 @@ export const selectNumberStrategy = async (req, res) => {
     barber.onboarding.updatedAt = new Date();
     await barber.save();
 
+    // For forward_existing - assign routing number immediately so ForwardingSetup has a number ready
+    if (strategy === "forward_existing") {
+      try {
+        await assignForwardingRoutingNumber(String(barberId));
+        console.log(`[NUMBER_STRATEGY] forwarding routing number assigned barberId=${String(barberId)}`);
+      } catch (routingErr) {
+        console.error(`[NUMBER_STRATEGY] forwarding routing assignment failed:`, routingErr?.message);
+        // Non-fatal - ForwardingSetup screen will show error if number still not ready
+      }
+    }
+
     console.log(`[NUMBER_STRATEGY_SELECTED] barberId=${String(barberId)} strategy=${strategy}`);
 
     return res.json({
