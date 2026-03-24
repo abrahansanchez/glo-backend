@@ -394,6 +394,12 @@ RULES:
       if (aiResponseInProgress) return;
       if (!canSendAI()) return;
 
+      // During setup calls, only respond when there is real transcript content
+      if (isSetupCall && userTranscriptLines.length === 0 && reason === "speech_stopped") {
+        console.log("[SETUP_CALL] blocked response - no real user transcript yet");
+        return;
+      }
+
       const forcedNext = nextBookingQuestion();
       const bookingOverlay =
         bookingState.intent === "BOOK"
@@ -604,9 +610,9 @@ RULES:
               session: {
                 turn_detection: {
                   type: "server_vad",
-                  threshold: 0.4, // ✅ Lowered from 0.5 for better detection
-                  prefix_padding_ms: 300,
-                  silence_duration_ms: 700, // ✅ Increased from 500 for more time
+                  threshold: 0.7,
+                  prefix_padding_ms: 500,
+                  silence_duration_ms: 1200,
                 },
               },
             });

@@ -179,9 +179,13 @@ export const postOnboardingStep = async (req, res) => {
 
     if (step === "business_snapshot") {
       const barberName = req.body?.data?.barberName || req.body?.data?.shopName;
+      console.log(`[BUSINESS_SNAPSHOT_DEBUG] raw body data:`, JSON.stringify(req.body?.data || {}));
       if (barberName && typeof barberName === "string" && barberName.trim()) {
         barber.barberName = barberName.trim();
         barber.shopName = barberName.trim();
+        console.log(`[BUSINESS_SNAPSHOT_DEBUG] saved barberName=${barber.barberName}`);
+      } else {
+        console.log(`[BUSINESS_SNAPSHOT_DEBUG] barberName missing or empty`);
       }
     }
 
