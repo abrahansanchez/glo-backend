@@ -288,10 +288,10 @@ export const startForwardingTest = async ({ barberId, forwardFromNumber }) => {
     console.log(
       `[FORWARDING_ACTIVATION_FAILED] barberId=${String(barber._id)} reason=${String(err?.message || "twilio_call_failed")}`
     );
-    if (!err?.code) {
-      err.code = "FORWARDING_TEST_CALL_FAILED";
-      err.status = err?.status || err?.statusCode || 502;
-    }
+    const originalTwilioCode = err?.code;
+    err.code = "FORWARDING_TEST_CALL_FAILED";
+    err.status = err?.status || err?.statusCode || 502;
+    err.twilioCode = originalTwilioCode || err?.twilioCode || undefined;
     throw err;
   }
 

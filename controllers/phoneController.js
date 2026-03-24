@@ -475,7 +475,11 @@ export const triggerForwardingTest = async (req, res, next) => {
       return res.status(500).json({ code: err.code, message: err.message });
     }
     if (err?.code === "FORWARDING_TEST_CALL_FAILED") {
-      return res.status(err.status || 502).json({ code: err.code, message: err.message });
+      return res.status(err.status || 502).json({
+        code: err.code,
+        message: err.message || "Failed to place forwarding verification call.",
+        twilioCode: err.twilioCode || undefined,
+      });
     }
     return res.status(500).json({
       code: "FORWARDING_TEST_FAILED",
