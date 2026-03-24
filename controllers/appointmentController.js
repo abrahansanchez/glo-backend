@@ -1,4 +1,5 @@
 import Appointment from "../models/Appointment.js";
+import { sendAppointmentConfirmationSms } from "../utils/appointments/appointmentSms.js";
 
 const oneHourMs = 60 * 60 * 1000;
 
@@ -136,6 +137,8 @@ export const createAppointment = async (req, res) => {
       status: status || "confirmed",
       source: source || "manual",
     });
+
+    await sendAppointmentConfirmationSms(appt);
 
     return res.status(201).json({
       message: "Appointment created",

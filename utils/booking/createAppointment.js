@@ -1,5 +1,6 @@
 // utils/booking/createAppointment.js
 import Appointment from "../../models/Appointment.js";
+import { sendAppointmentConfirmationSms } from "../appointments/appointmentSms.js";
 
 /**
  * Creates an appointment and returns success/failure
@@ -23,6 +24,8 @@ export const createAppointment = async (
       status: "confirmed",
       source: "ai",
     });
+
+    await sendAppointmentConfirmationSms(appt);
 
     return { ok: true, appointment: appt };
   } catch (err) {

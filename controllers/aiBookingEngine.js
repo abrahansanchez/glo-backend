@@ -3,6 +3,7 @@ import Appointment from "../models/Appointment.js";
 import Barber from "../models/Barber.js";
 import { formatDateSpoken } from "../utils/voice/formatDateSpoken.js";
 import { suggestClosestSlots, isSlotAvailable } from "../utils/ai/availabilityHelpers.js";
+import { sendAppointmentConfirmationSms } from "../utils/appointments/appointmentSms.js";
 
 /**
  * BOOK an appointment with full availability validation
@@ -32,6 +33,8 @@ export async function bookAppointment({ barberId, phone, name, date, time }) {
     status: "confirmed",
     source: "ai",
   });
+
+  await sendAppointmentConfirmationSms(appt);
 
   return {
     success: true,

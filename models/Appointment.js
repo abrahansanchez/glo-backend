@@ -37,6 +37,18 @@ const appointmentSchema = new mongoose.Schema(
       default: "confirmed",
       set: normalizeStatus,
     },
+    reminderSent: {
+      type: Boolean,
+      default: false,
+    },
+    cancelledAt: {
+      type: Date,
+      default: null,
+    },
+    cancelledBy: {
+      type: String,
+      default: null,
+    },
     source: {
       type: String,
       enum: ["ai", "manual"],

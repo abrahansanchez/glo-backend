@@ -26,13 +26,45 @@ const getMediaWebsocketUrl = (req) => {
   return `wss://${normalized}/ws/media`;
 };
 
-const buildInitialPrompt = (barberName) =>
-  `You are Glo, the AI receptionist for ${barberName}.\n` +
-  `When you answer:\n` +
-  `- Say: "Thanks for calling Glo. This is ${barberName}'s AI receptionist. How can I help you today?"\n` +
-  `- Be natural and brief (1 sentence + a question).\n` +
-  `- NEVER invent dates or times.\n` +
-  `- If booking: require BOTH date and time, repeat back EXACTLY, then confirm YES before finalizing.\n`;
+const buildInitialPrompt = (barberName, options = {}) => {
+  const { services = [], businessHours = null, timezone = "America/New_York" } = options;
+
+  let servicesText = "";
+  if (services.length > 0) {
+    servicesText = "\n\nSERVICES AND PRICING:\n" +
+      services.map((s) =>
+        `- ${s.name}${s.price ? ": $" + s.price : ""}${s.durationMinutes ? " (" + s.durationMinutes + " min)" : ""}`
+      ).join("\n");
+  } else {
+    servicesText = "\n\nSERVICES: Not configured yet. If asked about services or prices, say you will have the barber follow up with details.";
+  }
+
+  let hoursText = "";
+  if (businessHours) {
+    const days = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+    const dayNames = { mon: "Monday", tue: "Tuesday", wed: "Wednesday", thu: "Thursday", fri: "Friday", sat: "Saturday", sun: "Sunday" };
+    const openDays = days
+      .filter((d) => businessHours[d] && !businessHours[d].isClosed)
+      .map((d) => `${dayNames[d]} ${businessHours[d].open} to ${businessHours[d].close}`)
+      .join(", ");
+    hoursText = openDays
+      ? `\n\nBUSINESS HOURS (${timezone}):\n${openDays}`
+      : "\n\nBUSINESS HOURS: Not configured yet. If asked about hours, say you will have the barber follow up.";
+  } else {
+    hoursText = "\n\nBUSINESS HOURS: Not configured yet. If asked about hours, say you will have the barber follow up.";
+  }
+
+  return (
+    `You are Glo, the AI receptionist for ${barberName}.\n` +
+    `When you answer:\n` +
+    `- Say: "Thanks for calling ${barberName}'s. This is Glo, the AI receptionist. How can I help you today?"\n` +
+    `- Be natural and brief (1 sentence + a question).\n` +
+    `- NEVER invent dates or times.\n` +
+    `- If booking: require BOTH date and time, repeat back EXACTLY, then confirm YES before finalizing.\n` +
+    servicesText +
+    hoursText
+  );
+};
 
 export const buildSetupCallPrompt = (barberName, language = "en") => {
   if (language === "es") {
@@ -126,8 +158,20 @@ const buildAiStreamTwiml = ({ req, barberId, initialPrompt }) => {
   return response;
 };
 
-const getAiStreamTwimlString = ({ req, barberId, barberName }) => {
-  const initialPrompt = buildInitialPrompt(barberName);
+const getAiStreamTwimlString = async ({ req, barberId, barberName }) => {
+  let services = [];
+  let businessHours = null;
+  let timezone = "America/New_York";
+  try {
+    const barber = await Barber.findById(barberId).select("services availability");
+    services = barber?.services || [];
+    businessHours = barber?.availability?.businessHours || null;
+    timezone = barber?.availability?.timezone || "America/New_York";
+  } catch (e) {
+    console.error("[PROMPT_BUILD] failed to fetch barber data:", e?.message);
+  }
+
+  const initialPrompt = buildInitialPrompt(barberName, { services, businessHours, timezone });
   return buildAiStreamTwiml({ req, barberId, initialPrompt }).toString();
 };
 
@@ -287,7 +331,7 @@ export const handleDialFallback = async (req, res) => {
       }
     }
 
-    const twimlOutput = getAiStreamTwimlString({
+    const twimlOutput = await getAiStreamTwimlString({
       req,
       barberId,
       barberName: barber.name,
@@ -326,7 +370,7 @@ export const handleAiTakeover = async (req, res) => {
       return res.status(404).json({ error: "BARBER_NOT_FOUND" });
     }
 
-    const twiml = getAiStreamTwimlString({
+    const twiml = await getAiStreamTwimlString({
       req,
       barberId: String(barberId),
       barberName: barber.name,

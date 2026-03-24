@@ -1,4 +1,5 @@
 // routes/stripeWebhookRoutes.js
+import twilio from "twilio";
 import { stripe } from "../utils/stripe.js";
 import Barber from "../models/Barber.js";
 import Subscription from "../models/Subscription.js";
@@ -36,6 +37,67 @@ const pushSubscriptionIssue = async ({ barber, status, stripeSubscriptionId }) =
   console.log(
     `[PUSH_SUBSCRIPTION] sent barberId=${String(barber._id || "")} status=${cleanStatus}`
   );
+};
+
+const handleCanceledSubscription = async ({ subscription, eventType }) => {
+  const barber = await Barber.findOne({
+    stripeSubscriptionId: subscription.id,
+  }).select("_id twilioNumber assignedTwilioNumber interimTwilioNumber twilioSid barberName name forwardingEnabled expoPushToken subscriptionStatus");
+
+  if (!barber) {
+    console.log(`[CANCEL_WEBHOOK] no barber found for subscriptionId=${subscription.id}`);
+    return null;
+  }
+
+  const barberId = String(barber._id);
+  const twilioClient = twilio(
+    process.env.TWILIO_ACCOUNT_SID,
+    process.env.TWILIO_AUTH_TOKEN
+  );
+
+  const mainNumber = barber.twilioNumber || barber.assignedTwilioNumber;
+  if (mainNumber && barber.twilioSid) {
+    try {
+      await twilioClient.incomingPhoneNumbers(barber.twilioSid).remove();
+      console.log(`[CANCEL_WEBHOOK] released twilioNumber=${mainNumber} barberId=${barberId}`);
+    } catch (releaseErr) {
+      console.error(`[CANCEL_WEBHOOK] failed to release mainNumber:`, releaseErr?.message);
+    }
+  }
+
+  if (barber.interimTwilioNumber) {
+    try {
+      const interimNumbers = await twilioClient.incomingPhoneNumbers.list({
+        phoneNumber: barber.interimTwilioNumber,
+      });
+      if (interimNumbers.length > 0) {
+        await twilioClient.incomingPhoneNumbers(interimNumbers[0].sid).remove();
+        console.log(
+          `[CANCEL_WEBHOOK] released interimNumber=${barber.interimTwilioNumber} barberId=${barberId}`
+        );
+      }
+    } catch (interimErr) {
+      console.error(`[CANCEL_WEBHOOK] failed to release interimNumber:`, interimErr?.message);
+    }
+  }
+
+  barber.subscriptionStatus = "canceled";
+  barber.twilioNumber = null;
+  barber.assignedTwilioNumber = null;
+  barber.interimTwilioNumber = null;
+  barber.twilioSid = null;
+  barber.forwardingEnabled = false;
+  await barber.save();
+
+  await pushSubscriptionIssue({
+    barber,
+    status: "canceled",
+    stripeSubscriptionId: subscription.id,
+  });
+
+  console.log(`[CANCEL_WEBHOOK] barberId=${barberId} subscription canceled, numbers released`);
+
+  return { barberId, eventType };
 };
 
 /**
@@ -179,23 +241,14 @@ export default async function stripeWebhookHandler(req, res) {
           await subscriptionDoc.save();
         }
 
-        const barber = await Barber.findOne({
-          stripeSubscriptionId: sub.id,
+        const cancelResult = await handleCanceledSubscription({
+          subscription: sub,
+          eventType: event.type,
         });
-
-        if (barber) {
-          barber.subscriptionStatus = "canceled";
-          await barber.save();
-          await pushSubscriptionIssue({
-            barber,
-            status: "canceled",
-            stripeSubscriptionId: sub.id,
-          });
-        }
 
         logWebhook({
           type: event.type,
-          barberId: barber?._id,
+          barberId: cancelResult?.barberId,
           subscriptionId: sub.id,
         });
         console.log("Subscription canceled:", sub.id);
@@ -223,7 +276,12 @@ export default async function stripeWebhookHandler(req, res) {
         if (barber) {
           barber.subscriptionStatus = nextStatus;
           await barber.save();
-          if (ISSUE_STATUSES.has(nextStatus)) {
+          if (nextStatus === "canceled") {
+            await handleCanceledSubscription({
+              subscription: sub,
+              eventType: event.type,
+            });
+          } else if (ISSUE_STATUSES.has(nextStatus)) {
             await pushSubscriptionIssue({
               barber,
               status: nextStatus,

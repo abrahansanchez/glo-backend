@@ -20,6 +20,7 @@ connectDB();
 // REALTIME TWILIO MEDIA STREAM SERVER
 // ---------------------------------------------------------
 import { attachMediaWebSocketServer } from "./realtime/mediaStreamServer.js";
+import { startAppointmentReminderJob } from "./jobs/appointmentReminders.js";
 
 // ---------------------------------------------------------
 // ROUTES
@@ -59,7 +60,9 @@ import smsRoutes from "./routes/smsRoutes.js";
 // Business logic
 import dashboardRoutes from "./routes/dashboardRoutes.js";
 import availabilityRoutes from "./routes/availabilityRoutes.js";
+import hoursRoutes from "./routes/hoursRoutes.js";
 import appointmentRoutes from "./routes/appointmentRoutes.js";
+import servicesRoutes from "./routes/servicesRoutes.js";
 import analyticsRoutes from "./routes/analyticsRoutes.js";
 import onboardingRoutes from "./routes/onboardingRoutes.js";
 import phoneRoutes from "./routes/phoneRoutes.js";
@@ -163,6 +166,8 @@ app.use("/api/dashboard", dashboardRoutes);
 
 // 🔟 Availability settings
 app.use("/api/barber/availability", availabilityRoutes);
+app.use("/api/hours", hoursRoutes);
+app.use("/api/services", servicesRoutes);
 
 // 1️⃣1️⃣ Appointments
 app.use("/api/appointments", appointmentRoutes);
@@ -199,6 +204,7 @@ if (enableQaRoutes) {
 // ATTACH TWILIO MEDIA STREAM WEBSOCKET SERVER
 // ---------------------------------------------------------
 attachMediaWebSocketServer(server);
+startAppointmentReminderJob();
 
 // ---------------------------------------------------------
 // SERVER START
