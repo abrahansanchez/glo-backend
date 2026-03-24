@@ -1,7 +1,6 @@
 import express from "express";
 import twilio from "twilio";
 import { protect } from "../middleware/authMiddleware.js";
-import { buildSetupCallPrompt } from "../controllers/callController.js";
 import { getOnboardingStatus, postOnboardingStep } from "../controllers/onboardingController.js";
 import Barber from "../models/Barber.js";
 
@@ -117,35 +116,22 @@ router.post("/demo-call", async (req, res) => {
     }
 
     const client = twilio(accountSid, authToken);
-    const appBaseUrl = process.env.APP_BASE_URL;
-    if (!appBaseUrl) {
-      return res.status(500).json({ code: "CONFIG_ERROR", message: "APP_BASE_URL not set" });
-    }
-
-    const wsBase = appBaseUrl
-      .replace(/^https/, "wss")
-      .replace(/^http/, "ws")
-      .replace(/\/$/, "");
-    const wsUrl = `${wsBase}/ws/media`;
-
-    const setupPrompt = buildSetupCallPrompt(barberName, language);
-
-    const VoiceResponse = twilio.twiml.VoiceResponse;
-    const twimlResponse = new VoiceResponse();
-    const connect = twimlResponse.connect();
-    const stream = connect.stream({ url: wsUrl, track: "inbound_track" });
-    stream.parameter({ name: "barberId", value: String(barberId) });
-    stream.parameter({ name: "initialPrompt", value: setupPrompt });
-    stream.parameter({ name: "from", value: toNumber });
-    stream.parameter({ name: "to", value: fromNumber });
-    stream.parameter({ name: "callSid", value: "demo-setup" });
-    stream.parameter({ name: "isSetupCall", value: "true" });
-    stream.parameter({ name: "language", value: language });
+    const twimlMessage = isSpanish
+      ? `<Response>
+          <Say voice="Polly.Joanna" language="es-US">Hola ${barberName}, soy tu recepcionista de inteligencia artificial de Glō. Voy a contestar cada llamada, agendar citas, y nunca dejar escapar a un cliente. Tu negocio nunca va a perder una llamada más.</Say>
+          <Pause length="1"/>
+          <Say voice="Polly.Matthew" language="es-US">Completa tu configuración en la aplicación para que pueda conocer tus horarios, servicios y precios. Entre más me enseñes, mejor voy a atender a tus clientes. ¡Vamos a ponerte en línea!</Say>
+        </Response>`
+      : `<Response>
+          <Say voice="Polly.Joanna" language="en-US">Hi ${barberName}! I am your Glō AI receptionist. I will answer every call, book appointments, and never let a client slip away. Your shop will never miss a call again.</Say>
+          <Pause length="1"/>
+          <Say voice="Polly.Matthew" language="en-US">Finish your setup in the app so I can learn your hours, services, and pricing. The more you teach me, the better I handle every call. Let us get you live!</Say>
+        </Response>`;
 
     const call = await client.calls.create({
       to: toNumber,
       from: fromNumber,
-      twiml: twimlResponse.toString(),
+      twiml: twimlMessage,
     });
 
     console.log(
