@@ -45,6 +45,7 @@ const getOnboardingFlowState = (barber) => {
   const forwardingVerified = barber?.forwardingStatus === "verified";
   const portingSubmitted = hasSubmittedPortingFlow(barber);
   const numberAssigned = hasAssignedNumber(barber);
+  let forwardingNextStep = null;
 
   let nextStep = "go_live_checklist";
 
@@ -59,11 +60,11 @@ const getOnboardingFlowState = (barber) => {
   } else if (!numberStrategy) {
     nextStep = "number_strategy";
   } else if (numberStrategy === "forward_existing") {
-    if (!stepMap.forwarding_flow) {
-      nextStep = "forwarding_flow";
-    } else if (!stepMap.forwarding_setup) {
+    if (!stepMap.forwarding_setup) {
+      forwardingNextStep = "forwarding_setup";
       nextStep = "forwarding_setup";
     } else if (!forwardingVerified && !stepMap.forwarding_verification) {
+      forwardingNextStep = "forwarding_verification";
       nextStep = "forwarding_verification";
     }
   } else if (numberStrategy === "port_existing") {
@@ -93,6 +94,7 @@ const getOnboardingFlowState = (barber) => {
   return {
     stepMap,
     nextStep,
+    forwardingNextStep,
     isComplete: nextStep === "go_live_checklist" && subscriptionActive && numberReady,
   };
 };
@@ -111,7 +113,7 @@ export const getOnboardingStatus = async (req, res) => {
       return res.status(404).json({ code: "BARBER_NOT_FOUND", message: "Barber not found" });
     }
 
-    const { stepMap, nextStep, isComplete } = getOnboardingFlowState(barber);
+    const { stepMap, nextStep, forwardingNextStep, isComplete } = getOnboardingFlowState(barber);
     const preferredLanguage = barber.preferredLanguage || null;
     const subscriptionStatus = barber.subscriptionStatus || "incomplete";
     const numberStrategy = barber.numberStrategy || barber.phoneNumberStrategy || null;
@@ -126,6 +128,7 @@ export const getOnboardingStatus = async (req, res) => {
       completedAt: barber.onboarding?.completedAt || null,
       subscriptionStatus,
       numberStrategy,
+      forwardingNextStep,
       forwardingStatus,
       portingStatus,
       preferredLanguage,
