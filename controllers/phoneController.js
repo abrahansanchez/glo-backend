@@ -409,6 +409,42 @@ export const getForwardingStatus = async (req, res) => {
   }
 };
 
+export const forwardingStatusCallback = async (req, res) => {
+  try {
+    const { barberId } = req.query;
+    const { CallStatus, To } = req.body;
+
+    console.log("[FORWARDING_STATUS_CALLBACK]", {
+      barberId,
+      CallStatus,
+      To,
+    });
+
+    if (["answered", "completed"].includes(CallStatus)) {
+      const barber = await Barber.findById(barberId);
+
+      if (!barber) {
+        console.log("[FORWARDING_STATUS_CALLBACK] barber not found");
+        return res.sendStatus(200);
+      }
+
+      barber.forwardingStatus = "verified";
+      barber.forwardingVerifiedAt = new Date();
+
+      await barber.save();
+
+      console.log(
+        `[FORWARDING_VERIFIED] barberId=${barber._id} number=${To}`
+      );
+    }
+
+    return res.sendStatus(200);
+  } catch (err) {
+    console.error("[FORWARDING_STATUS_CALLBACK_ERROR]", err.message);
+    return res.sendStatus(500);
+  }
+};
+
 export const triggerForwardingTest = async (req, res, next) => {
   try {
     console.log("Forwarding test body:", req.body);

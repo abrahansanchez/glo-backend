@@ -4,6 +4,7 @@ import upload from "../middleware/uploadMiddleware.js";
 import {
   selectNumberStrategy,
   getForwardingStatus,
+  forwardingStatusCallback,
   triggerForwardingTest,
   startPorting,
   submitPorting,
@@ -17,6 +18,7 @@ const router = express.Router();
 
 // Twilio webhook (no auth middleware)
 router.post("/porting/webhook", portingWebhook);
+router.post("/forwarding/status-callback", forwardingStatusCallback);
 
 router.use(protect);
 router.post("/number-strategy", selectNumberStrategy);

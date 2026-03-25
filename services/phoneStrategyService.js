@@ -288,8 +288,10 @@ export const startForwardingTest = async ({ barberId, forwardFromNumber }) => {
     await client.calls.create({
       to: normalizedForwardFromNumber,
       from: verificationFromNumber,
-      twiml:
-        "<Response><Say>This is a Glo forwarding verification test call. If your forwarding is active, no action is needed.</Say></Response>",
+      twiml: "<Response><Say>Your forwarding test is successful.</Say></Response>",
+      statusCallback: `${process.env.APP_BASE_URL}/api/phone/forwarding/status-callback?barberId=${barber._id}`,
+      statusCallbackMethod: "POST",
+      statusCallbackEvent: ["initiated", "ringing", "answered", "completed"],
     });
   } catch (err) {
     barber.forwardingStatus = "activation_failed";
