@@ -393,6 +393,7 @@ export const getForwardingStatus = async (req, res) => {
       forwardingStatus: status.forwardingStatus,
       forwardingVerifiedAt: status.forwardingVerifiedAt,
       verificationWindowExpiresAt: status.verificationWindowExpiresAt,
+      verified: status.forwardingStatus === "verified",
     });
   } catch (err) {
     console.error("getForwardingStatus error:", err);

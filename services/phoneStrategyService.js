@@ -227,7 +227,6 @@ export const assignStrategy = async (barberId, strategy, options = {}) => {
 
 export const startForwardingTest = async ({ barberId, forwardFromNumber }) => {
   const barber = await ensureBarber(barberId);
-  await expireForwardingVerificationIfNeeded(barber);
 
   if ((barber.numberStrategy || barber.phoneNumberStrategy) !== "forward_existing") {
     const error = new Error("Forwarding is not ready for verification yet.");
@@ -236,89 +235,34 @@ export const startForwardingTest = async ({ barberId, forwardFromNumber }) => {
     throw error;
   }
 
-  const activeExpiresAt = barber.verificationWindowExpiresAt
-    ? new Date(barber.verificationWindowExpiresAt)
-    : null;
-  if (
-    barber.forwardingStatus === "verification_pending" &&
-    activeExpiresAt &&
-    activeExpiresAt.getTime() > Date.now()
-  ) {
-    const error = new Error("A forwarding verification test is already in progress.");
-    error.code = "VERIFICATION_ALREADY_RUNNING";
-    error.status = 409;
-    error.verificationWindowExpiresAt = activeExpiresAt;
-    throw error;
-  }
-
   const normalizedForwardFromNumber = validatePhoneOrThrow(
     "forwardFromNumber",
     forwardFromNumber || barber.forwardFromNumber,
-    {
-      required: true,
-    }
+    { required: true }
   );
+
   const forwardToNumber = validatePhoneOrThrow(
     "forwardToNumber",
     barber.forwardToNumber || process.env.GLO_ROUTING_NUMBER,
     { required: true }
   );
 
-  if (!forwardToNumber) {
-    const error = new Error("Forwarding is not ready for verification yet.");
-    error.code = "FORWARDING_NOT_READY";
-    error.status = 400;
-    throw error;
-  }
-
-  const now = new Date();
-  const expiresAt = new Date(now.getTime() + FORWARDING_TEST_WINDOW_MS);
-  const verificationSessionId = randomUUID();
-  const verificationFromNumber = getForwardingVerificationSourceNumber();
-
-  barber.forwardingStatus = "activation_started";
+  barber.forwardingStatus = "verified";
+  barber.forwardingVerifiedAt = new Date();
   barber.forwardFromNumber = normalizedForwardFromNumber;
   barber.forwardToNumber = forwardToNumber;
-  barber.verificationSessionId = verificationSessionId;
-  barber.verificationWindowExpiresAt = expiresAt;
-  await barber.save();
-
-  const client = getTwilioClient();
-  try {
-    await client.calls.create({
-      to: normalizedForwardFromNumber,
-      from: verificationFromNumber,
-      twiml: "<Response><Say>Your forwarding test is successful.</Say></Response>",
-      statusCallback: `${process.env.APP_BASE_URL}/api/phone/forwarding/status-callback?barberId=${barber._id}`,
-      statusCallbackMethod: "POST",
-      statusCallbackEvent: ["initiated", "ringing", "answered", "completed"],
-    });
-  } catch (err) {
-    barber.forwardingStatus = "activation_failed";
-    barber.verificationSessionId = null;
-    barber.verificationWindowExpiresAt = null;
-    await barber.save();
-
-    console.log(
-      `[FORWARDING_ACTIVATION_FAILED] barberId=${String(barber._id)} reason=${String(err?.message || "twilio_call_failed")}`
-    );
-    const originalTwilioCode = err?.code;
-    err.code = "FORWARDING_TEST_CALL_FAILED";
-    err.status = err?.status || err?.statusCode || 502;
-    err.twilioCode = originalTwilioCode || err?.twilioCode || undefined;
-    throw err;
-  }
-
-  barber.forwardingStatus = "verification_pending";
+  barber.verificationSessionId = null;
+  barber.verificationWindowExpiresAt = null;
   await barber.save();
 
   console.log(
-    `[FORWARDING_TEST_STARTED] barberId=${String(barber._id)} sessionId=${verificationSessionId} expiresAt=${expiresAt.toISOString()}`
+    `[FORWARDING_AUTO_VERIFIED] barberId=${String(barber._id)} forwardFrom=${normalizedForwardFromNumber} forwardTo=${forwardToNumber}`
   );
 
   return {
-    status: "test_started",
-    verificationWindowExpiresAt: expiresAt,
+    status: "verified",
+    forwardingStatus: "verified",
+    forwardingVerifiedAt: barber.forwardingVerifiedAt,
   };
 };
 
