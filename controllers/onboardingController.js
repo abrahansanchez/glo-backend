@@ -189,6 +189,14 @@ export const postOnboardingStep = async (req, res) => {
       }
     }
 
+    if (req.body.forwardFromNumber !== undefined) {
+      barber.forwardFromNumber = req.body.forwardFromNumber;
+    }
+
+    if (req.body.forwardingCarrier !== undefined) {
+      barber.forwardingCarrier = req.body.forwardingCarrier;
+    }
+
     const stepMap = getStepMapObject(barber);
     const previous = Boolean(stepMap[step]);
     stepMap[step] = Boolean(completed);
@@ -206,7 +214,9 @@ export const postOnboardingStep = async (req, res) => {
       barber.onboarding.completedAt = null;
     }
 
+    console.log("[BACKEND_SAVE_FORWARDING]", req.body.forwardFromNumber);
     await barber.save();
+    console.log("[BACKEND_SAVED_FORWARDING]", barber.forwardFromNumber);
 
     const languageChanged =
       step === "language" && previousPreferredLanguage !== (barber.preferredLanguage || "en");
