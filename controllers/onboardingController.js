@@ -189,12 +189,12 @@ export const postOnboardingStep = async (req, res) => {
       }
     }
 
-    if (req.body.forwardFromNumber !== undefined) {
-      barber.forwardFromNumber = req.body.forwardFromNumber;
+    if (req.body.data?.forwardFromNumber !== undefined) {
+      barber.forwardFromNumber = req.body.data.forwardFromNumber;
     }
 
-    if (req.body.forwardingCarrier !== undefined) {
-      barber.forwardingCarrier = req.body.forwardingCarrier;
+    if (req.body.data?.forwardingCarrier !== undefined) {
+      barber.forwardingCarrier = req.body.data.forwardingCarrier;
     }
 
     const stepMap = getStepMapObject(barber);
@@ -214,7 +214,7 @@ export const postOnboardingStep = async (req, res) => {
       barber.onboarding.completedAt = null;
     }
 
-    console.log("[BACKEND_SAVE_FORWARDING]", req.body.forwardFromNumber);
+    console.log("[BACKEND_SAVE_FORWARDING]", req.body.data?.forwardFromNumber);
     await barber.save();
     console.log("[BACKEND_SAVED_FORWARDING]", barber.forwardFromNumber);
 
