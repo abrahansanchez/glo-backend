@@ -115,8 +115,10 @@ router.post("/demo-call", async (req, res) => {
       return res.status(500).json({ code: "NO_FROM_NUMBER", message: "Demo number not configured. Add TWILIO_DEMO_NUMBER to environment." });
     }
 
-    if (toNumber === fromNumber) {
-      console.log(`[DEMO_CALL] skipped - toNumber equals fromNumber (${toNumber}), would cause self-call loop`);
+    const toDigits = String(toNumber || "").replace(/\D/g, "").slice(-10);
+    const fromDigits = String(fromNumber || "").replace(/\D/g, "").slice(-10);
+    if (toDigits && fromDigits && toDigits === fromDigits) {
+      console.log(`[DEMO_CALL] skipped - self-call prevented toDigits=${toDigits} fromDigits=${fromDigits}`);
       return res.json({ ok: true, callSid: "skipped", reason: "self_call_prevented" });
     }
 
