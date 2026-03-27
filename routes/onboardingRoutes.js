@@ -87,7 +87,7 @@ router.post("/demo-call", async (req, res) => {
     }
 
     const barber = await Barber.findById(barberId).select(
-      "phone phoneNumber barberName shopName preferredLanguage"
+      "phone phoneNumber barberName shopName preferredLanguage numberStrategy phoneNumberStrategy"
     );
     if (!barber) {
       return res.status(404).json({ code: "BARBER_NOT_FOUND", message: "Barber not found" });
@@ -117,9 +117,17 @@ router.post("/demo-call", async (req, res) => {
 
     const toDigits = String(toNumber || "").replace(/\D/g, "").slice(-10);
     const fromDigits = String(fromNumber || "").replace(/\D/g, "").slice(-10);
+    const routingDigits = String(process.env.GLO_ROUTING_NUMBER || "").replace(/\D/g, "").slice(-10);
+
     if (toDigits && fromDigits && toDigits === fromDigits) {
-      console.log(`[DEMO_CALL] skipped - self-call prevented toDigits=${toDigits} fromDigits=${fromDigits}`);
+      console.log(`[DEMO_CALL] skipped - self-call prevented toDigits=${toDigits}`);
       return res.json({ ok: true, callSid: "skipped", reason: "self_call_prevented" });
+    }
+
+    const barberStrategy = barber.numberStrategy || barber.phoneNumberStrategy;
+    if (barberStrategy === "forward_existing" && fromDigits === routingDigits) {
+      console.log(`[DEMO_CALL] skipped - forward_existing barber would create forwarding loop`);
+      return res.json({ ok: true, callSid: "skipped", reason: "forwarding_loop_prevented" });
     }
 
     const client = twilio(accountSid, authToken);
