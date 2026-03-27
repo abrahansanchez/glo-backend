@@ -115,6 +115,11 @@ router.post("/demo-call", async (req, res) => {
       return res.status(500).json({ code: "NO_FROM_NUMBER", message: "Demo number not configured. Add TWILIO_DEMO_NUMBER to environment." });
     }
 
+    if (toNumber === fromNumber) {
+      console.log(`[DEMO_CALL] skipped - toNumber equals fromNumber (${toNumber}), would cause self-call loop`);
+      return res.json({ ok: true, callSid: "skipped", reason: "self_call_prevented" });
+    }
+
     const client = twilio(accountSid, authToken);
     const twimlMessage = isSpanish
       ? `<Response>

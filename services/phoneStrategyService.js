@@ -249,6 +249,16 @@ export const startForwardingTest = async ({ barberId, forwardFromNumber }) => {
 
   barber.forwardingStatus = "verified";
   barber.forwardingVerifiedAt = new Date();
+  const stepMap =
+    barber.onboarding?.stepMap instanceof Map
+      ? Object.fromEntries(barber.onboarding.stepMap.entries())
+      : { ...(barber.onboarding?.stepMap || {}) };
+  stepMap.forwarding_flow = true;
+  stepMap.forwarding_setup = true;
+  stepMap.forwarding_verification = true;
+  barber.onboarding = barber.onboarding || {};
+  barber.onboarding.stepMap = stepMap;
+  barber.onboarding.updatedAt = new Date();
   barber.forwardFromNumber = normalizedForwardFromNumber;
   barber.forwardToNumber = forwardToNumber;
   barber.verificationSessionId = null;

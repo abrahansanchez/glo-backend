@@ -60,7 +60,7 @@ const getOnboardingFlowState = (barber) => {
   } else if (!numberStrategy) {
     nextStep = "number_strategy";
   } else if (numberStrategy === "forward_existing") {
-    if (!stepMap.forwarding_setup) {
+    if (!forwardingVerified && !stepMap.forwarding_setup) {
       forwardingNextStep = "forwarding_setup";
       nextStep = "forwarding_setup";
     } else if (!forwardingVerified && !stepMap.forwarding_verification) {
