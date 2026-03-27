@@ -227,6 +227,7 @@ export const assignStrategy = async (barberId, strategy, options = {}) => {
 
 export const startForwardingTest = async ({ barberId, forwardFromNumber }) => {
   const barber = await ensureBarber(barberId);
+  console.log("[FORWARDING_TEST_HIT]", barber._id);
 
   if ((barber.numberStrategy || barber.phoneNumberStrategy) !== "forward_existing") {
     const error = new Error("Forwarding is not ready for verification yet.");
@@ -248,6 +249,7 @@ export const startForwardingTest = async ({ barberId, forwardFromNumber }) => {
   );
 
   barber.forwardingStatus = "verified";
+  console.log("[AUTO_VERIFY_TRIGGERED]", barber._id);
   barber.forwardingVerifiedAt = new Date();
   const stepMap =
     barber.onboarding?.stepMap instanceof Map
@@ -264,6 +266,7 @@ export const startForwardingTest = async ({ barberId, forwardFromNumber }) => {
   barber.verificationSessionId = null;
   barber.verificationWindowExpiresAt = null;
   await barber.save();
+  console.log("[AUTO_VERIFY_SAVED]", barber._id, barber.forwardingStatus);
 
   console.log(
     `[FORWARDING_AUTO_VERIFIED] barberId=${String(barber._id)} forwardFrom=${normalizedForwardFromNumber} forwardTo=${forwardToNumber}`
