@@ -450,6 +450,7 @@ export const triggerForwardingTest = async (req, res, next) => {
   try {
     console.log("Forwarding test body:", req.body);
     console.log("Forwarding test query:", req.query);
+    console.log("[BACKEND_RECEIVE_FORWARD_NUMBER]", req.body.forwardFromNumber);
 
     const barberId = req.user?.id || req.user?._id;
     if (!barberId) {
