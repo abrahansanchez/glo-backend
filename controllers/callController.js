@@ -207,6 +207,10 @@ export const handleIncomingCall = async (req, res) => {
     console.log("[INCOMING] normalized called number:", cleanNumber);
 
     const barber = await Barber.findOne({ twilioNumber: cleanNumber });
+    console.log("[ROUTING_FIXED]", {
+      toNumber: cleanNumber,
+      matchedBarber: barber?.name,
+    });
 
     if (!barber) {
       console.log("[INCOMING] no barber found for number:", cleanNumber);
