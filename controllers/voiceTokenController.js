@@ -49,6 +49,11 @@ export const getVoiceToken = async (req, res) => {
       { identity: String(barberId) }
     );
 
+    console.log("[VOICE_TOKEN_DEBUG]", {
+      identity: String(barberId),
+      pushCredentialSid: process.env.TWILIO_PUSH_CREDENTIAL_SID,
+    });
+
     token.addGrant(voiceGrant);
 
     return res.status(200).json({
