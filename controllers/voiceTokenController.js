@@ -37,7 +37,7 @@ export const getVoiceToken = async (req, res) => {
 
     const voiceGrant = new VoiceGrant({
       outgoingApplicationSid: TWILIO_TWIML_APP_SID,
-      pushCredentialSid: "CRcc4ce22ab3f7bbeb711f19a29549620a",
+      pushCredentialSid: "CR6e19ee5d76f5eee446eae0766fcd9f1f",
       incomingAllow: true,
       // sandbox: true, // enable only for APNs sandbox testing
     });
@@ -53,7 +53,7 @@ export const getVoiceToken = async (req, res) => {
 
     console.log("[VOICE_TOKEN_DEBUG]", {
       identity: String(barberId),
-      pushCredentialSid: "CRcc4ce22ab3f7bbeb711f19a29549620a",
+      pushCredentialSid: "CR6e19ee5d76f5eee446eae0766fcd9f1f",
     });
 
     return res.status(200).json({
