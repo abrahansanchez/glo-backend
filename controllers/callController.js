@@ -26,6 +26,18 @@ const getMediaWebsocketUrl = (req) => {
   return `wss://${normalized}/ws/media`;
 };
 
+const findBarberByInboundNumber = async (phoneNumber) => {
+  if (!phoneNumber) return null;
+
+  return Barber.findOne({
+    $or: [
+      { twilioNumber: phoneNumber },
+      { assignedTwilioNumber: phoneNumber },
+      { twilioPhoneNumber: phoneNumber },
+    ],
+  }).sort({ updatedAt: -1, createdAt: -1 });
+};
+
 const buildInitialPrompt = (barberName, options = {}) => {
   const { services = [], businessHours = null, timezone = "America/New_York" } = options;
 
@@ -206,7 +218,7 @@ export const handleIncomingCall = async (req, res) => {
 
     console.log("[INCOMING] normalized called number:", cleanNumber);
 
-    const barber = await Barber.findOne({ twilioNumber: cleanNumber });
+    const barber = await findBarberByInboundNumber(cleanNumber);
     console.log("[ROUTING_FIXED]", {
       toNumber: cleanNumber,
       matchedBarber: barber?.name,
@@ -220,6 +232,7 @@ export const handleIncomingCall = async (req, res) => {
     }
 
     const barberId = barber._id.toString();
+    console.log("[ROUTING_DEBUG] assigned barberId:", barberId);
     const callSid = req.body.CallSid || "";
     const from = req.body.From || "";
     const to = req.body.To || req.body.Called || "";
@@ -282,7 +295,7 @@ export const handleDialFallback = async (req, res) => {
     }
 
     const cleanNumber = to ? String(to).trim() : null;
-    const barber = cleanNumber ? await Barber.findOne({ twilioNumber: cleanNumber }) : null;
+    const barber = cleanNumber ? await findBarberByInboundNumber(cleanNumber) : null;
 
     if (!barber) {
       twiml.say("Sorry, this number is not assigned.");
