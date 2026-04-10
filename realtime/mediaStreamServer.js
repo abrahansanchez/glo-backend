@@ -142,6 +142,7 @@ export const attachMediaWebSocketServer = (server) => {
     let initialPrompt = null;
     let callerNumber = "";
     let toNumber = "";
+    let streamParams = null;
     let isSetupCall = false;
     let setupLanguage = "en";
     let barberPreferredLang = "en";
@@ -728,6 +729,7 @@ RULES:
         callStartedAt = new Date();
 
         const custom = msg.start?.customParameters || {};
+        streamParams = custom;
         barberId = custom.barberId || barberId || null;
         initialPrompt = custom.initialPrompt || initialPrompt || null;
         callerNumber = custom.from || msg.start?.from || callerNumber || "";
@@ -802,6 +804,13 @@ RULES:
             0,
             Math.round((callEndedAt.getTime() - callStartedAt.getTime()) / 1000)
           );
+          const finalCallerNumber = callerNumber || streamParams?.from || "";
+          const finalCalledNumber = toNumber || streamParams?.to || "";
+
+          if (!finalCallerNumber) {
+            console.warn("[TRANSCRIPT_SKIP] callerNumber missing, skipping save", { callSid });
+            return;
+          }
 
           let transcriptDoc = null;
           if (safeCallSid) {
@@ -815,8 +824,8 @@ RULES:
             transcriptDoc = new CallTranscript({
               barberId: safeBarberId,
               callSid: callSid || "",
-              callerNumber: callerNumber || "",
-              toNumber: toNumber || "",
+              callerNumber: finalCallerNumber,
+              toNumber: finalCalledNumber,
             });
           }
 
@@ -838,8 +847,8 @@ RULES:
           transcriptDoc.callEndedAt = callEndedAt;
           transcriptDoc.durationSeconds = durationSeconds;
           transcriptDoc.callSid = callSid || "";
-          transcriptDoc.callerNumber = callerNumber || "";
-          transcriptDoc.toNumber = toNumber || "";
+          transcriptDoc.callerNumber = finalCallerNumber;
+          transcriptDoc.toNumber = finalCalledNumber;
           transcriptDoc.outcome = outcome;
           transcriptDoc.intent = intent;
           transcriptDoc.summary = summary;
@@ -851,7 +860,7 @@ RULES:
           }
 
           console.log(
-            `[TRANSCRIPT_META_SAVE] callSid=${callSid || ""} from=${callerNumber || ""} to=${toNumber || ""} barberId=${barberId}`
+            `[TRANSCRIPT_META_SAVE] callSid=${callSid || ""} from=${finalCallerNumber} to=${finalCalledNumber || ""} barberId=${barberId}`
           );
           await transcriptDoc.save();
 
