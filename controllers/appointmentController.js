@@ -1,5 +1,8 @@
 import Appointment from "../models/Appointment.js";
+import Barber from "../models/Barber.js";
+import { getServiceDurationMinutes, isSlotAvailable } from "../utils/ai/availabilityHelpers.js";
 import { sendAppointmentConfirmationSms } from "../utils/appointments/appointmentSms.js";
+import moment from "moment-timezone";
 
 const oneHourMs = 60 * 60 * 1000;
 
@@ -103,10 +106,7 @@ export const getPastAppointments = async (req, res) => {
 export const createAppointment = async (req, res) => {
   try {
     const barberId = req.user?._id;
-
-    if (!barberId) {
-      return res.status(401).json({ message: "Unauthorized: No barber on token" });
-    }
+    if (!barberId) return res.status(401).json({ message: "Unauthorized" });
 
     const { clientName, clientPhone, date, time, startAt, endAt, service, status, source } = req.body;
 
@@ -123,7 +123,30 @@ export const createAppointment = async (req, res) => {
       return res.status(400).json({ message: "Invalid date/startAt" });
     }
 
-    const resolvedEnd = parseIsoDate(endAt) || new Date(resolvedStart.getTime() + oneHourMs);
+    const barber = await Barber.findById(barberId).select("services availability").lean();
+    if (!barber) return res.status(404).json({ message: "Barber not found" });
+
+    const tz = barber.availability?.timezone || "America/New_York";
+    const durationMinutes = getServiceDurationMinutes(barber, service);
+    const resolvedEnd = parseIsoDate(endAt) ||
+      new Date(resolvedStart.getTime() + durationMinutes * 60 * 1000);
+
+    const checkDate = moment.tz(resolvedStart, tz).format("YYYY-MM-DD");
+    const checkTime = moment.tz(resolvedStart, tz).format("h:mm A");
+    const normalizedTime = time || checkTime;
+
+    const available = await isSlotAvailable({
+      barber,
+      date: checkDate,
+      time: checkTime,
+      durationMinutes,
+    });
+
+    if (!available) {
+      return res.status(409).json({
+        message: "This time slot is not available. Please choose a different time.",
+      });
+    }
 
     const appt = await Appointment.create({
       barberId,
@@ -131,7 +154,7 @@ export const createAppointment = async (req, res) => {
       clientPhone,
       service,
       date: resolvedStart,
-      time: time || "",
+      time: normalizedTime,
       startAt: resolvedStart,
       endAt: resolvedEnd,
       status: status || "confirmed",
@@ -140,10 +163,7 @@ export const createAppointment = async (req, res) => {
 
     await sendAppointmentConfirmationSms(appt);
 
-    return res.status(201).json({
-      message: "Appointment created",
-      appointment: appt,
-    });
+    return res.status(201).json({ message: "Appointment created", appointment: appt });
   } catch (err) {
     console.error("createAppointment error:", err);
     res.status(500).json({ message: "Failed to create appointment" });
@@ -155,34 +175,64 @@ export const updateAppointment = async (req, res) => {
   try {
     const barberId = req.user?._id;
     const apptId = req.params.id;
+    if (!barberId) return res.status(401).json({ message: "Unauthorized" });
 
-    if (!barberId) {
-      return res.status(401).json({ message: "Unauthorized: No barber on token" });
-    }
+    const existing = await Appointment.findOne({ _id: apptId, barberId });
+    if (!existing) return res.status(404).json({ message: "Appointment not found" });
 
     const update = { ...req.body };
+
     if (Object.prototype.hasOwnProperty.call(update, "status")) {
       update.status = normalizeStatus(update.status);
     }
     if (Object.prototype.hasOwnProperty.call(update, "source")) {
       update.source = normalizeSource(update.source);
     }
-    if (Object.prototype.hasOwnProperty.call(update, "startAt")) {
-      const parsedStart = parseIsoDate(update.startAt);
-      if (!parsedStart) {
-        return res.status(400).json({ message: "Invalid startAt" });
+
+    const isRescheduling =
+      Object.prototype.hasOwnProperty.call(update, "startAt") ||
+      Object.prototype.hasOwnProperty.call(update, "date") ||
+      Object.prototype.hasOwnProperty.call(update, "time");
+
+    if (isRescheduling) {
+      const parsedStart = parseIsoDate(update.startAt) || parseIsoDate(update.date);
+      if (!parsedStart) return res.status(400).json({ message: "Invalid startAt" });
+
+      const barber = await Barber.findById(barberId).select("services availability").lean();
+      if (!barber) return res.status(404).json({ message: "Barber not found" });
+
+      const effectiveService = update.service || existing.service;
+      const durationMinutes = getServiceDurationMinutes(barber, effectiveService);
+
+      const tz = barber.availability?.timezone || "America/New_York";
+      const checkDate = moment.tz(parsedStart, tz).format("YYYY-MM-DD");
+      const checkTime = moment.tz(parsedStart, tz).format("h:mm A");
+
+      const available = await isSlotAvailable({
+        barber,
+        date: checkDate,
+        time: checkTime,
+        durationMinutes,
+        excludeAppointmentId: apptId,
+      });
+
+      if (!available) {
+        return res.status(409).json({
+          message: "This time slot is not available. Please choose a different time.",
+        });
       }
+
       update.startAt = parsedStart;
       update.date = parsedStart;
+
       if (!Object.prototype.hasOwnProperty.call(update, "endAt")) {
-        update.endAt = new Date(parsedStart.getTime() + oneHourMs);
+        update.endAt = new Date(parsedStart.getTime() + durationMinutes * 60 * 1000);
       }
     }
+
     if (Object.prototype.hasOwnProperty.call(update, "endAt")) {
       const parsedEnd = parseIsoDate(update.endAt);
-      if (!parsedEnd) {
-        return res.status(400).json({ message: "Invalid endAt" });
-      }
+      if (!parsedEnd) return res.status(400).json({ message: "Invalid endAt" });
       update.endAt = parsedEnd;
     }
 
@@ -192,14 +242,7 @@ export const updateAppointment = async (req, res) => {
       { new: true }
     );
 
-    if (!appt) {
-      return res.status(404).json({ message: "Appointment not found" });
-    }
-
-    return res.json({
-      message: "Appointment updated",
-      appointment: appt,
-    });
+    return res.json({ message: "Appointment updated", appointment: appt });
   } catch (err) {
     console.error("updateAppointment error:", err);
     res.status(500).json({ message: "Failed to update appointment" });

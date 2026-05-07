@@ -1,35 +1,50 @@
 // controllers/aiBookingEngine.js
 import Appointment from "../models/Appointment.js";
 import Barber from "../models/Barber.js";
+import moment from "moment-timezone";
 import { formatDateSpoken } from "../utils/voice/formatDateSpoken.js";
-import { suggestClosestSlots, isSlotAvailable } from "../utils/ai/availabilityHelpers.js";
+import {
+  getServiceDurationMinutes,
+  isSlotAvailable,
+  suggestClosestSlots,
+} from "../utils/ai/availabilityHelpers.js";
 import { sendAppointmentConfirmationSms } from "../utils/appointments/appointmentSms.js";
 
 /**
  * BOOK an appointment with full availability validation
  */
-export async function bookAppointment({ barberId, phone, name, date, time }) {
+export async function bookAppointment({ barberId, phone, name, date, time, service }) {
   const barber = await Barber.findById(barberId);
   if (!barber) return { error: "Barber not found" };
 
-  const available = await isSlotAvailable({ barber, date, time });
+  const tz = barber.availability?.timezone || "America/New_York";
+  const durationMinutes = getServiceDurationMinutes(barber, service);
 
+  const available = await isSlotAvailable({ barber, date, time, durationMinutes });
   if (!available) {
-    const alternatives = await suggestClosestSlots({ barber, date });
-    return {
-      unavailable: true,
-      alternatives,
-    };
+    const alternatives = await suggestClosestSlots({ barber, date, durationMinutes });
+    return { unavailable: true, alternatives };
   }
+
+  // Race condition guard
+  const doubleCheck = await isSlotAvailable({ barber, date, time, durationMinutes });
+  if (!doubleCheck) {
+    const alternatives = await suggestClosestSlots({ barber, date, durationMinutes });
+    return { unavailable: true, alternatives };
+  }
+
+  const startAt = moment.tz(`${date} ${time}`, "YYYY-MM-DD h:mm A", tz).toDate();
+  const endAt = moment(startAt).add(durationMinutes, "minutes").toDate();
 
   const appt = await Appointment.create({
     barberId,
     clientPhone: phone,
     clientName: name,
-    startAt: new Date(`${date} ${time}`),
-    endAt: new Date(new Date(`${date} ${time}`).getTime() + 60 * 60 * 1000),
-    date: new Date(`${date} ${time}`),
+    service,
+    date: startAt,
     time,
+    startAt,
+    endAt,
     status: "confirmed",
     source: "ai",
   });
@@ -46,39 +61,40 @@ export async function bookAppointment({ barberId, phone, name, date, time }) {
 /**
  * RESCHEDULE appointment
  */
-export async function rescheduleAppointment({ barberId, phone, oldDate, newDate, newTime }) {
+export async function rescheduleAppointment({ barberId, phone, oldDate, newDate, newTime, service }) {
   const barber = await Barber.findById(barberId);
   if (!barber) return { error: "Barber not found" };
+
+  const tz = barber.availability?.timezone || "America/New_York";
+  const dayStart = moment.tz(oldDate, tz).startOf("day").toDate();
+  const dayEnd = moment.tz(oldDate, tz).endOf("day").toDate();
 
   const current = await Appointment.findOne({
     barberId,
     clientPhone: phone,
-    $or: [
-      { startAt: { $gte: new Date(oldDate), $lt: new Date(oldDate + "T23:59:59Z") } },
-      {
-        startAt: { $exists: false },
-        date: { $gte: new Date(oldDate), $lt: new Date(oldDate + "T23:59:59Z") },
-      },
-    ],
+    startAt: { $gte: dayStart, $lte: dayEnd },
     status: "confirmed",
   });
 
-  if (!current)
-    return { error: "No existing appointment found to reschedule." };
+  if (!current) return { error: "No existing appointment found to reschedule." };
+
+  const durationMinutes = getServiceDurationMinutes(barber, service || current.service);
 
   const available = await isSlotAvailable({
     barber,
     date: newDate,
     time: newTime,
+    durationMinutes,
+    excludeAppointmentId: current._id,
   });
 
   if (!available) {
-    const alternatives = await suggestClosestSlots({ barber, date: newDate });
+    const alternatives = await suggestClosestSlots({ barber, date: newDate, durationMinutes });
     return { unavailable: true, alternatives };
   }
 
-  current.startAt = new Date(`${newDate} ${newTime}`);
-  current.endAt = new Date(current.startAt.getTime() + 60 * 60 * 1000);
+  current.startAt = moment.tz(`${newDate} ${newTime}`, "YYYY-MM-DD h:mm A", tz).toDate();
+  current.endAt = moment(current.startAt).add(durationMinutes, "minutes").toDate();
   current.date = current.startAt;
   current.time = newTime;
   await current.save();
