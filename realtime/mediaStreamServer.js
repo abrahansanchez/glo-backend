@@ -830,6 +830,15 @@ RULES:
             }
 
             console.log("TRANSCRIPT:", transcriptText, `(${currentLanguage})`);
+            console.log("[BOOKING_STATE_SNAPSHOT]", JSON.stringify({
+              intent: bookingState.intent,
+              name: bookingState.name,
+              service: bookingState.service,
+              parsedDate: bookingState.parsedDate,
+              parsedTime: bookingState.parsedTime,
+              askedConfirm: bookingState.askedConfirm,
+              confirmed: bookingState.confirmed,
+            }));
 
             const text = String(transcriptText || "").toLowerCase();
             if (
