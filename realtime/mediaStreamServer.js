@@ -366,6 +366,8 @@ export const attachMediaWebSocketServer = (server) => {
 
     let aiResponseInProgress = false;
     let hasCommittedUserAudioForTurn = false;
+    let pendingResponseAfterTranscript = false;
+    const processedTranscriptIds = new Set();
 
     let greetingQueued = false;
     let greetingSent = false;
@@ -377,6 +379,8 @@ export const attachMediaWebSocketServer = (server) => {
     let assistantResponseText = "";
     let currentLanguage = "en";
     let hasSwitchedLanguage = false;
+    let languageLocked = false;
+    let lockedLanguage = null;
     const bookingState = {
       intent: "OTHER",
       name: "",
@@ -801,13 +805,26 @@ RULES:
         ) {
           const transcriptText = (evt.transcript || "").trim();
           if (transcriptText) {
+            const transcriptId = evt.item_id || evt.event_id || evt.id || transcriptText;
+            if (processedTranscriptIds.has(transcriptId)) {
+              console.log("[TRANSCRIPT_DEDUPE] skipping duplicate transcript", transcriptId);
+              return;
+            }
+            processedTranscriptIds.add(transcriptId);
+
             userTranscriptLines.push(transcriptText);
             await appendMessage({ role: "caller", text: transcriptText, lang: currentLanguage });
 
-            const nextLanguage =
+            const detectedLanguage =
               !hasSwitchedLanguage ? detectCallerLanguagePreference(transcriptText, currentLanguage) : null;
-            if (nextLanguage) {
-              currentLanguage = nextLanguage;
+            if (!languageLocked && detectedLanguage && transcriptText.length > 10) {
+              languageLocked = true;
+              lockedLanguage = detectedLanguage;
+              console.log("[LANG_LOCK] language locked to", lockedLanguage);
+            }
+            const effectiveLang = languageLocked ? lockedLanguage : detectedLanguage;
+            if (effectiveLang && effectiveLang !== currentLanguage) {
+              currentLanguage = effectiveLang;
               hasSwitchedLanguage = true;
               await applyLanguageToSession();
             }
@@ -851,10 +868,8 @@ RULES:
                 lower.includes("me llamo")
               ) {
                 const explicitName = cleanClientName(transcriptText);
-                if (isClearNameResponse(explicitName)) {
+                if (!bookingState.name && isClearNameResponse(explicitName)) {
                   bookingState.name = explicitName;
-                  bookingState.askedConfirm = false;
-                  bookingState.confirmed = false;
                   bookingState.awaitingName = false;
                   await updateTranscriptFields({ clientName: bookingState.name });
                 }
@@ -865,8 +880,6 @@ RULES:
                 isClearNameResponse(transcriptText)
               ) {
                 bookingState.name = cleanClientName(transcriptText);
-                bookingState.askedConfirm = false;
-                bookingState.confirmed = false;
                 bookingState.awaitingName = false;
                 await updateTranscriptFields({ clientName: bookingState.name });
               }
@@ -883,27 +896,30 @@ RULES:
               lower.includes("beard") ||
               lower.includes("barba")
             ) {
-              bookingState.service = normalizeServiceName(transcriptText) || transcriptText;
-              bookingState.askedConfirm = false;
-              bookingState.confirmed = false;
-              await updateTranscriptFields({ serviceRequested: bookingState.service });
+              const extractedService = normalizeServiceName(transcriptText) || transcriptText;
+              if (!bookingState.service && extractedService) {
+                bookingState.service = extractedService;
+                await updateTranscriptFields({ serviceRequested: bookingState.service });
+              }
             }
 
             const hasDate = containsDateSignal(transcriptText);
             const hasTime = containsTimeSignal(transcriptText) || containsLooseTimeSignal(transcriptText);
             if (hasDate || hasTime) {
-              if (hasDate) bookingState.requestedDateText = transcriptText;
-              if (hasTime) bookingState.requestedTimeText = transcriptText;
+              if (hasDate && !bookingState.requestedDateText) bookingState.requestedDateText = transcriptText;
+              if (hasTime && !bookingState.requestedTimeText) bookingState.requestedTimeText = transcriptText;
               bookingState.dateTimeText = [bookingState.requestedDateText, bookingState.requestedTimeText]
                 .filter(Boolean)
                 .join(" ");
               const parsedBookingTime = await parseBookingDateTime();
               if (parsedBookingTime) {
-                bookingState.parsedDate = parsedBookingTime.date;
-                bookingState.parsedTime = parsedBookingTime.time;
+                if (!bookingState.parsedDate && parsedBookingTime.date) {
+                  bookingState.parsedDate = parsedBookingTime.date;
+                }
+                if (!bookingState.parsedTime && parsedBookingTime.time) {
+                  bookingState.parsedTime = parsedBookingTime.time;
+                }
               }
-              bookingState.askedConfirm = false;
-              bookingState.confirmed = false;
               await updateTranscriptFields({ requestedDateTimeText: bookingState.dateTimeText });
             }
 
@@ -916,16 +932,24 @@ RULES:
 
             lastUserSpokeAt = Date.now();
 
-            if (assistantSpeaking && responseInFlightId) {
-              try {
-                ai.send(JSON.stringify({ type: "response.cancel" }));
-                console.log("[BARGE_IN] user interrupted assistant -> response.cancel");
-              } catch {}
-              assistantSpeaking = false;
-              responseInFlightId = null;
+            if (pendingResponseAfterTranscript) {
+              pendingResponseAfterTranscript = false;
+              await requestAssistantResponse({ immediate: true, reason: "transcript_ready" });
             }
           }
         }
+        if (evt.type === "input_audio_buffer.speech_started") {
+          if (assistantSpeaking && responseInFlightId) {
+            try {
+              ai.send(JSON.stringify({ type: "response.cancel" }));
+              console.log("[BARGE_IN] verified caller audio -> response.cancel");
+            } catch {}
+            assistantSpeaking = false;
+            responseInFlightId = null;
+          }
+          return;
+        }
+
         if (evt.type === "input_audio_buffer.speech_stopped") {
           if (!greetingComplete) return;
           if (aiResponseInProgress) return;
@@ -935,7 +959,8 @@ RULES:
             hasCommittedUserAudioForTurn = true;
             sendToAI({ type: "input_audio_buffer.commit" });
             framesSinceLastCommit = 0;
-            await requestAssistantResponse({ immediate: true, reason: "speech_stopped" });
+            pendingResponseAfterTranscript = true;
+            console.log("[GATE] waiting for transcript completion before response");
           }
           return;
         }
@@ -1113,6 +1138,8 @@ RULES:
         }
         currentLanguage = barberPreferredLang;
         hasSwitchedLanguage = false;
+        languageLocked = false;
+        lockedLanguage = null;
         console.log(`[LANG_PREF] barberId=${barberId} preferred=${barberPreferredLang}`);
 
         console.log("📡 Stream started - streamSid:", streamSid);
@@ -1130,6 +1157,11 @@ RULES:
       }
 
       if (msg.event === "media") {
+        // Only forward inbound caller audio, never outbound/mixed
+        if (msg.media?.track && msg.media.track !== "inbound") {
+          return; // skip outbound assistant audio
+        }
+
         // ✅ FIX #1: Block audio forwarding until greeting is complete
         if (!greetingComplete) {
           return; // Don't forward caller audio during greeting
