@@ -96,6 +96,7 @@ const normalizeSpanishDateTimeText = (text) =>
     .replace(/mi[eé]rcoles/gi, "wednesday")
     .replace(/jueves/gi, "thursday")
     .replace(/viernes/gi, "friday")
+    .replace(/\ba las\b/gi, "at")
     .replace(/(\d{1,2})\s*de la ma[ñn]ana/gi, "$1 AM")
     .replace(/(\d{1,2})\s*de la tarde/gi, "$1 PM")
     .replace(/(\d{1,2})\s*de la noche/gi, "$1 PM");
@@ -108,6 +109,25 @@ const cleanClientName = (text) => {
     .replace(/[.?!,]+$/g, "")
     .trim();
   return candidate.slice(0, 80);
+};
+
+const isLikelyNameOnly = (text) => {
+  const raw = String(text || "").trim();
+  if (!raw) return false;
+  const words = raw.replace(/[.?!,]+$/g, "").split(/\s+/).filter(Boolean);
+  if (words.length < 1 || words.length > 4) return false;
+  const lower = raw.toLowerCase();
+  return !(
+    containsDateSignal(raw) ||
+    containsTimeSignal(raw) ||
+    containsLooseTimeSignal(raw) ||
+    normalizeServiceName(raw) ||
+    lower.includes("book") ||
+    lower.includes("appointment") ||
+    lower.includes("cita") ||
+    lower.includes("precio") ||
+    lower.includes("price")
+  );
 };
 
 const extractNameFromAssistant = (text) => {
@@ -124,6 +144,25 @@ const formatAlternativeSlots = (alternatives = []) => {
     .slice(0, 3)
     .map((slot) => `${slot.date} at ${slot.time}`)
     .join(", ");
+};
+
+const containsLooseTimeSignal = (text) =>
+  /\b(?:at|a las)\s*\d{1,2}(?::\d{2})?\b/i.test(String(text || ""));
+
+const normalizeServiceName = (text) => {
+  const t = String(text || "").toLowerCase();
+  const wantsHaircut =
+    t.includes("haircut") ||
+    t.includes("corte") ||
+    t.includes("cabello") ||
+    t.includes("pelo") ||
+    t.includes("cortarme");
+  const wantsBeard = t.includes("beard") || t.includes("barba");
+
+  if (wantsHaircut && wantsBeard) return "Haircut + Beard";
+  if (wantsHaircut) return "Haircut";
+  if (wantsBeard) return "Beard";
+  return "";
 };
 
 const formatTimeForBooking = (value) => {
@@ -154,6 +193,15 @@ const extractSpokenTimeForBooking = (text) => {
   if (hourOnly && /\b(afternoon|evening|tarde|noche)\b/i.test(normalized)) {
     const hour = Number(hourOnly[1]);
     return `${hour}:00 PM`;
+  }
+
+  const bareHour = normalized.match(/\b(?:at|a las)\s*(\d{1,2})(?::(\d{2}))?\b/i);
+  if (bareHour) {
+    const hour = Number(bareHour[1]);
+    const minute = bareHour[2] || "00";
+    if (hour >= 7 && hour <= 11) return `${hour}:${minute} AM`;
+    if (hour >= 1 && hour <= 6) return `${hour}:${minute} PM`;
+    if (hour === 12) return `12:${minute} PM`;
   }
 
   return "";
@@ -421,6 +469,32 @@ export const attachMediaWebSocketServer = (server) => {
       Boolean(barberId) &&
       Boolean(callerNumber);
 
+    const getMissingBookingField = () => {
+      if (!bookingState.name) return "name";
+      if (!bookingState.service) return "service";
+      if (!bookingState.parsedDate || !bookingState.parsedTime) return "date_time";
+      if (!bookingState.askedConfirm) return "confirmation";
+      if (!bookingState.confirmed) return "confirmation_response";
+      return "";
+    };
+
+    const logBookingState = (reason) => {
+      console.log(
+        `[BOOKING_STATE] reason=${reason} callSid=${callSid || ""} barberId=${barberId || ""} state=${JSON.stringify({
+          intent: bookingState.intent,
+          name: bookingState.name || null,
+          service: bookingState.service || null,
+          requestedDateText: bookingState.requestedDateText || null,
+          requestedTimeText: bookingState.requestedTimeText || null,
+          parsedDate: bookingState.parsedDate || null,
+          parsedTime: bookingState.parsedTime || null,
+          askedConfirm: bookingState.askedConfirm,
+          confirmed: bookingState.confirmed,
+          missing: getMissingBookingField() || null,
+        })}`
+      );
+    };
+
     const requestCallEnd = async (reason) => {
       if (endingCall) return;
       endingCall = true;
@@ -457,6 +531,77 @@ export const attachMediaWebSocketServer = (server) => {
           max_output_tokens: 160,
         },
       });
+    };
+
+    const promptForNextBookingStep = async (reason) => {
+      if (bookingState.intent !== "BOOK" || bookingState.bookingFinalized || bookingState.bookingAttempted) {
+        return false;
+      }
+
+      const missing = getMissingBookingField();
+      logBookingState(reason);
+      if (!missing) return false;
+
+      console.log(
+        `[BOOKING_MISSING_FIELD] callSid=${callSid || ""} barberId=${barberId || ""} field=${missing}`
+      );
+
+      if (responseInFlightId && canSendAI()) {
+        try {
+          sendToAI({ type: "response.cancel" });
+        } catch {}
+      }
+      aiResponseInProgress = false;
+      assistantSpeaking = false;
+      responseInFlightId = null;
+
+      if (missing === "name") {
+        return speakExact(
+          currentLanguage === "es"
+            ? "Claro. ¿Me puedes decir tu nombre?"
+            : "Sure. What's your name?"
+        );
+      }
+
+      if (missing === "service") {
+        return speakExact(
+          currentLanguage === "es"
+            ? "¿Qué servicio quieres: corte de cabello o corte y barba?"
+            : "What service would you like: haircut or haircut and beard?"
+        );
+      }
+
+      if (missing === "date_time") {
+        return speakExact(
+          currentLanguage === "es"
+            ? "¿Qué día y a qué hora quieres venir?"
+            : "What day and time would you like to come in?"
+        );
+      }
+
+      if (missing === "confirmation") {
+        bookingState.askedConfirm = true;
+        await updateTranscriptFields({
+          requestedDateTimeText: `${bookingState.parsedDate} ${bookingState.parsedTime}`,
+          serviceRequested: bookingState.service,
+          clientName: bookingState.name,
+        });
+        return speakExact(
+          currentLanguage === "es"
+            ? `${bookingState.name}, confirmo ${bookingState.service} para ${bookingState.parsedDate} a las ${bookingState.parsedTime}?`
+            : `${bookingState.name}, should I confirm ${bookingState.service} for ${bookingState.parsedDate} at ${bookingState.parsedTime}?`
+        );
+      }
+
+      if (missing === "confirmation_response") {
+        return speakExact(
+          currentLanguage === "es"
+            ? "¿Confirmo esa cita?"
+            : "Should I confirm that appointment?"
+        );
+      }
+
+      return false;
     };
 
     const executeBookingIfReady = async () => {
@@ -641,11 +786,11 @@ RULES:
       if (!bookingState.service) {
         return "Ask what service they want (haircut, beard, haircut+beard).";
       }
-      if (!bookingState.dateTimeText) return "Ask the date and time they want.";
+      if (!bookingState.parsedDate || !bookingState.parsedTime) return "Ask the date and time they want.";
       if (!bookingState.askedConfirm) {
         return "Repeat back Name + Service + Date/Time and ask: 'Should I confirm that?'";
       }
-      return "If they confirmed, say only: 'One moment while I finalize that.' Do not say the appointment is confirmed.";
+      return "Ask whether they want to confirm. Do not say 'one moment' unless backend booking execution has started.";
     };
 
     const requestAssistantResponse = async ({ immediate = false, reason = "unknown" } = {}) => {
@@ -803,6 +948,15 @@ RULES:
                 bookingState.askedConfirm = false;
                 bookingState.confirmed = false;
                 await updateTranscriptFields({ clientName: bookingState.name });
+              } else if (
+                bookingState.intent === "BOOK" &&
+                !bookingState.name &&
+                isLikelyNameOnly(transcriptText)
+              ) {
+                bookingState.name = cleanClientName(transcriptText);
+                bookingState.askedConfirm = false;
+                bookingState.confirmed = false;
+                await updateTranscriptFields({ clientName: bookingState.name });
               }
             }
 
@@ -810,19 +964,21 @@ RULES:
               lower.includes("haircut") ||
               lower.includes("corte") ||
               lower.includes("cabello") ||
+              lower.includes("pelo") ||
+              lower.includes("cortarme") ||
               lower.includes("fade") ||
               lower.includes("lineup") ||
               lower.includes("beard") ||
               lower.includes("barba")
             ) {
-              bookingState.service = transcriptText;
+              bookingState.service = normalizeServiceName(transcriptText) || transcriptText;
               bookingState.askedConfirm = false;
               bookingState.confirmed = false;
-              await updateTranscriptFields({ serviceRequested: transcriptText });
+              await updateTranscriptFields({ serviceRequested: bookingState.service });
             }
 
             const hasDate = containsDateSignal(transcriptText);
-            const hasTime = containsTimeSignal(transcriptText);
+            const hasTime = containsTimeSignal(transcriptText) || containsLooseTimeSignal(transcriptText);
             if (hasDate || hasTime) {
               if (hasDate) bookingState.requestedDateText = transcriptText;
               if (hasTime) bookingState.requestedTimeText = transcriptText;
@@ -839,11 +995,20 @@ RULES:
               await updateTranscriptFields({ requestedDateTimeText: bookingState.dateTimeText });
             }
 
+            if (bookingState.intent === "BOOK") {
+              logBookingState("intent_updated");
+            }
+
             if (bookingState.intent === "BOOK" && bookingState.askedConfirm && isYes(transcriptText)) {
               bookingState.confirmed = true;
               await updateTranscriptFields({ confirmed: true });
               const handled = await executeBookingIfReady();
               if (handled) return;
+            }
+
+            if (bookingState.intent === "BOOK" && !bookingState.bookingFinalized) {
+              const prompted = await promptForNextBookingStep("post_transcript_update");
+              if (prompted) return;
             }
 
             lastUserSpokeAt = Date.now();
