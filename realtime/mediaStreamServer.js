@@ -5,6 +5,11 @@ import CallTranscript from "../models/CallTranscript.js";
 import Barber from "../models/Barber.js";
 import { bookAppointment } from "../controllers/aiBookingEngine.js";
 import { parseNaturalDateTime } from "../utils/ai/dateParser.js";
+import {
+  isSlotAvailable,
+  getAvailableSlots,
+  getServiceDurationMinutes,
+} from "../utils/ai/availabilityHelpers.js";
 
 const WS_PATH = "/ws/media";
 
@@ -381,6 +386,12 @@ export const attachMediaWebSocketServer = (server) => {
     let hasSwitchedLanguage = false;
     let languageLocked = false;
     let lockedLanguage = null;
+    let slotChecked = false;
+    let slotAvailable = false;
+    let slotAlternatives = [];
+    let lastAvailabilityCheckKey = "";
+    let lastUnavailableInjectionKey = "";
+    let barberDoc = null;
     const bookingState = {
       intent: "OTHER",
       name: "",
@@ -475,6 +486,78 @@ export const attachMediaWebSocketServer = (server) => {
       Boolean(bookingState.parsedTime) &&
       Boolean(barberId) &&
       Boolean(callerNumber);
+
+    async function checkSlotAvailability() {
+      const { service, parsedDate, parsedTime } = bookingState;
+      if (!service || !parsedDate || !parsedTime) return;
+
+      const checkKey = `${service}|${parsedDate}|${parsedTime}`;
+      if (checkKey === lastAvailabilityCheckKey) return;
+      lastAvailabilityCheckKey = checkKey;
+
+      try {
+        if (!barberDoc) {
+          barberDoc = await Barber.findById(barberId).lean();
+        }
+        if (!barberDoc) return;
+
+        const durationMinutes = getServiceDurationMinutes(barberDoc, service);
+        const available = await isSlotAvailable({
+          barber: barberDoc,
+          date: parsedDate,
+          time: parsedTime,
+          durationMinutes,
+        });
+
+        slotChecked = true;
+        slotAvailable = available;
+        console.log("[SLOT_CHECK]", parsedDate, parsedTime, service, "available:", available);
+
+        if (!available) {
+          const alternatives = await getAvailableSlots({
+            barber: barberDoc,
+            date: parsedDate,
+            durationMinutes,
+          });
+          slotAlternatives = alternatives.slice(0, 3);
+          console.log("[SLOT_ALTERNATIVES]", JSON.stringify(slotAlternatives));
+        }
+      } catch (err) {
+        console.error("[SLOT_CHECK_ERROR]", err?.message || err);
+      }
+    }
+
+    async function injectUnavailableSlotContextIfNeeded() {
+      if (!bookingState.service || !bookingState.parsedDate || !bookingState.parsedTime || bookingState.askedConfirm) {
+        return;
+      }
+
+      await checkSlotAvailability();
+
+      if (slotChecked && !slotAvailable) {
+        const injectionKey = `${bookingState.service}|${bookingState.parsedDate}|${bookingState.parsedTime}`;
+        if (injectionKey === lastUnavailableInjectionKey) return;
+        lastUnavailableInjectionKey = injectionKey;
+
+        const altText = slotAlternatives.length > 0
+          ? slotAlternatives.map((s) => s.time).join(", ")
+          : "no other slots today";
+
+        const unavailableMsg = currentLanguage === "es"
+          ? `[SYSTEM: That slot is NOT available in the database. Do NOT confirm it. Tell the caller it's taken and offer these alternatives: ${altText}]`
+          : `[SYSTEM: That slot is NOT available in the database. Do NOT confirm it. Tell the caller it's taken and offer these alternatives: ${altText}]`;
+
+        sendToAI({
+          type: "conversation.item.create",
+          item: {
+            type: "message",
+            role: "user",
+            content: [{ type: "input_text", text: unavailableMsg }],
+          },
+        });
+        console.log("[SLOT_UNAVAILABLE_INJECTED]", bookingState.parsedDate, bookingState.parsedTime, "alternatives:", altText);
+      }
+    }
 
     const requestCallEnd = async (reason) => {
       if (endingCall) return;
@@ -839,6 +922,8 @@ RULES:
               askedConfirm: bookingState.askedConfirm,
               confirmed: bookingState.confirmed,
             }));
+            // Check real availability once we have service + date + time
+            await injectUnavailableSlotContextIfNeeded();
 
             const text = String(transcriptText || "").toLowerCase();
             if (
@@ -922,15 +1007,28 @@ RULES:
                 .join(" ");
               const parsedBookingTime = await parseBookingDateTime();
               if (parsedBookingTime) {
+                let slotChanged = false;
                 if (!bookingState.parsedDate && parsedBookingTime.date) {
                   bookingState.parsedDate = parsedBookingTime.date;
+                  slotChanged = true;
                 }
                 if (!bookingState.parsedTime && parsedBookingTime.time) {
                   bookingState.parsedTime = parsedBookingTime.time;
+                  slotChanged = true;
+                }
+                if (slotChanged) {
+                  // Reset slot check when slot changes
+                  slotChecked = false;
+                  slotAvailable = false;
+                  slotAlternatives = [];
+                  lastAvailabilityCheckKey = "";
+                  lastUnavailableInjectionKey = "";
                 }
               }
               await updateTranscriptFields({ requestedDateTimeText: bookingState.dateTimeText });
             }
+
+            await injectUnavailableSlotContextIfNeeded();
 
             if (bookingState.intent === "BOOK" && bookingState.askedConfirm && isYes(transcriptText)) {
               bookingState.confirmed = true;
