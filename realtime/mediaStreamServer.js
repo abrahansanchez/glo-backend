@@ -60,10 +60,7 @@ const isYes = (text) => {
     t.includes(" yes") ||
     t.includes("sí") ||
     t.includes("confirm") ||
-    t.includes("correct") ||
-    t.includes("perfect") ||
-    t.includes("claro") ||
-    t.includes("dale")
+    t.includes("correct")
   );
 };
 
@@ -117,6 +114,28 @@ const isLikelyNameOnly = (text) => {
   const words = raw.replace(/[.?!,]+$/g, "").split(/\s+/).filter(Boolean);
   if (words.length < 1 || words.length > 4) return false;
   const lower = raw.toLowerCase();
+  const rejectedNameWords = new Set([
+    "for",
+    "okay",
+    "ok",
+    "hello",
+    "hi",
+    "yes",
+    "yeah",
+    "yep",
+    "si",
+    "sí",
+    "sÃ­",
+    "no",
+    "nope",
+    "perfect",
+    "perfecto",
+    "claro",
+    "dale",
+    "thanks",
+    "gracias",
+  ]);
+  if (words.some((word) => rejectedNameWords.has(word.toLowerCase()))) return false;
   return !(
     containsDateSignal(raw) ||
     containsTimeSignal(raw) ||
@@ -388,9 +407,11 @@ export const attachMediaWebSocketServer = (server) => {
       confirmed: false,
       bookingAttempted: false,
       bookingFinalized: false,
+      lastPromptField: "",
     };
     let pendingEndCallAfterResponse = false;
     let endingCall = false;
+    let languageLocked = false;
 
     // Silence injection state
     let silenceInterval = null;
@@ -545,6 +566,14 @@ export const attachMediaWebSocketServer = (server) => {
       console.log(
         `[BOOKING_MISSING_FIELD] callSid=${callSid || ""} barberId=${barberId || ""} field=${missing}`
       );
+      bookingState.lastPromptField = missing === "confirmation_response" ? "confirmation" : missing;
+
+      if (aiResponseInProgress || assistantSpeaking) {
+        return true;
+      }
+
+      await requestAssistantResponse({ immediate: true, reason: `booking_missing_${missing}` });
+      return true;
 
       if (responseInFlightId && canSendAI()) {
         try {
@@ -899,10 +928,16 @@ RULES:
             await appendMessage({ role: "caller", text: transcriptText, lang: currentLanguage });
 
             const nextLanguage =
-              !hasSwitchedLanguage ? detectCallerLanguagePreference(transcriptText, currentLanguage) : null;
+              !languageLocked && !hasSwitchedLanguage
+                ? detectCallerLanguagePreference(transcriptText, currentLanguage)
+                : null;
             if (nextLanguage) {
               currentLanguage = nextLanguage;
               hasSwitchedLanguage = true;
+              if (nextLanguage === "es") {
+                languageLocked = true;
+                console.log(`[LANG_LOCK] callSid=${callSid || ""} barberId=${barberId || ""} lang=es reason=strong_signal`);
+              }
               await applyLanguageToSession();
             }
 
@@ -919,6 +954,10 @@ RULES:
               text.includes("reservar")
             ) {
               bookingState.intent = "BOOK";
+              if (currentLanguage === "es" && !languageLocked) {
+                languageLocked = true;
+                console.log(`[LANG_LOCK] callSid=${callSid || ""} barberId=${barberId || ""} lang=es reason=booking_flow`);
+              }
               await setTranscriptIntentOutcome({ intent: "BOOK", outcome: "NO_ACTION" });
             } else if (
               text.includes("cancel") ||
@@ -948,15 +987,24 @@ RULES:
                 bookingState.askedConfirm = false;
                 bookingState.confirmed = false;
                 await updateTranscriptFields({ clientName: bookingState.name });
+                console.log(`[BOOKING_NAME_ACCEPTED] callSid=${callSid || ""} barberId=${barberId || ""} source=explicit name=${bookingState.name}`);
               } else if (
                 bookingState.intent === "BOOK" &&
                 !bookingState.name &&
+                bookingState.lastPromptField === "name" &&
                 isLikelyNameOnly(transcriptText)
               ) {
                 bookingState.name = cleanClientName(transcriptText);
                 bookingState.askedConfirm = false;
                 bookingState.confirmed = false;
                 await updateTranscriptFields({ clientName: bookingState.name });
+                console.log(`[BOOKING_NAME_ACCEPTED] callSid=${callSid || ""} barberId=${barberId || ""} source=name_prompt name=${bookingState.name}`);
+              } else if (
+                bookingState.intent === "BOOK" &&
+                !bookingState.name &&
+                bookingState.lastPromptField === "name"
+              ) {
+                console.log(`[BOOKING_NAME_REJECTED] callSid=${callSid || ""} barberId=${barberId || ""} text=${JSON.stringify(transcriptText)}`);
               }
             }
 
@@ -1002,8 +1050,11 @@ RULES:
             if (bookingState.intent === "BOOK" && bookingState.askedConfirm && isYes(transcriptText)) {
               bookingState.confirmed = true;
               await updateTranscriptFields({ confirmed: true });
+              console.log(`[BOOKING_CONFIRM_ACCEPTED] callSid=${callSid || ""} barberId=${barberId || ""} text=${JSON.stringify(transcriptText)}`);
               const handled = await executeBookingIfReady();
               if (handled) return;
+            } else if (bookingState.intent === "BOOK" && bookingState.askedConfirm) {
+              console.log(`[BOOKING_CONFIRM_REJECTED] callSid=${callSid || ""} barberId=${barberId || ""} text=${JSON.stringify(transcriptText)}`);
             }
 
             if (bookingState.intent === "BOOK" && !bookingState.bookingFinalized) {
@@ -1072,6 +1123,9 @@ RULES:
               responseLower.includes("debo confirmar") ||
               responseLower.includes("quieres que lo confirme")
             ) {
+              bookingState.askedConfirm = true;
+            }
+            if (bookingState.lastPromptField === "confirmation") {
               bookingState.askedConfirm = true;
             }
             assistantTranscriptLines.push(assistantResponseText.trim());
