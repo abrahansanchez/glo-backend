@@ -374,7 +374,7 @@ export const attachMediaWebSocketServer = (server) => {
       }
     }
 
-    let framesSinceLastCommit = 0;
+    let openAiInputFramesSinceLastCommit = 0;
 
     let aiResponseInProgress = false;
     let hasCommittedUserAudioForTurn = false;
@@ -918,7 +918,9 @@ RULES:
           evt.type === "response.done" ||
           evt.type === "response.completed" ||
           evt.type === "response.cancelled" ||
-          evt.type === "response.output_audio.done"
+          evt.type === "response.output_audio.done" ||
+          evt.type === "response.audio.done" ||
+          evt.type === "response.output_item.done"
         ) {
           responseActive = false;
         }
@@ -1106,7 +1108,7 @@ RULES:
           }
         }
         if (evt.type === "input_audio_buffer.speech_started") {
-          if (assistantSpeaking && responseInFlightId && responseActive) {
+          if (assistantSpeaking === true && responseActive === true && responseInFlightId) {
             try {
               ai.send(JSON.stringify({ type: "response.cancel" }));
               console.log("[BARGE_IN] verified caller audio -> response.cancel");
@@ -1115,7 +1117,11 @@ RULES:
             assistantSpeaking = false;
             responseInFlightId = null;
           } else {
-            console.log("[SKIP_CANCEL_NO_ACTIVE_RESPONSE]");
+            console.log("[SKIP_CANCEL_NO_ACTIVE_RESPONSE]", {
+              assistantSpeaking,
+              responseActive,
+              responseInFlightId,
+            });
           }
           return;
         }
@@ -1126,13 +1132,15 @@ RULES:
 
           lastUserSpokeAt = Date.now();
           if (!hasCommittedUserAudioForTurn) {
-            if (framesSinceLastCommit < MIN_COMMIT_FRAMES) {
-              console.log("[SKIP_COMMIT_EMPTY_BUFFER]", { packetsSinceLastCommit: framesSinceLastCommit });
+            if (openAiInputFramesSinceLastCommit < MIN_COMMIT_FRAMES) {
+              console.log("[SKIP_COMMIT_EMPTY_BUFFER]", {
+                openAiInputFramesSinceLastCommit,
+              });
               return;
             }
             hasCommittedUserAudioForTurn = true;
             sendToAI({ type: "input_audio_buffer.commit" });
-            framesSinceLastCommit = 0;
+            openAiInputFramesSinceLastCommit = 0;
             pendingResponseAfterTranscript = true;
             console.log("[GATE] waiting for transcript completion before response");
           }
@@ -1142,23 +1150,33 @@ RULES:
         if (evt.type === "response.done") {
           if (greetingSent && !greetingComplete) {
             greetingComplete = true;
+            assistantSpeaking = false;
+            responseActive = false;
+            responseInFlightId = null;
             console.log("✅ Greeting complete - enabling VAD and audio forwarding");
 
             // ✅ FIX #4: Better VAD settings
-            const payload = {
+            const vadUpdatePayload = {
               type: "session.update",
               session: {
                 type: "realtime",
-                turn_detection: {
-                  type: "server_vad",
-                  threshold: 0.6,
-                  prefix_padding_ms: 400,
-                  silence_duration_ms: 800,
+                audio: {
+                  input: {
+                    format: {
+                      type: "audio/pcmu",
+                    },
+                    turn_detection: {
+                      type: "server_vad",
+                      threshold: 0.6,
+                      prefix_padding_ms: 400,
+                      silence_duration_ms: 800,
+                    },
+                  },
                 },
               },
             };
-            console.log("[OPENAI_SESSION_UPDATE]", JSON.stringify(payload));
-            sendToAI(payload);
+            console.log("[OPENAI_SESSION_UPDATE]", JSON.stringify(vadUpdatePayload));
+            ai.send(JSON.stringify(vadUpdatePayload));
             console.log("🎙️ VAD enabled for conversation");
           }
           assistantSpeaking = false;
@@ -1340,11 +1358,11 @@ RULES:
         if (!payloadB64) return;
 
         if (canSendAI()) {
-          sendToAI({
+          const appended = sendToAI({
             type: "input_audio_buffer.append",
             audio: payloadB64,
           });
-          framesSinceLastCommit++;
+          if (appended) openAiInputFramesSinceLastCommit++;
         }
       }
     });
