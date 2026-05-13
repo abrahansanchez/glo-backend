@@ -909,26 +909,7 @@ RULES:
         console.log("🤖 OpenAI Realtime Connected");
         aiReady = true;
 
-        // Send initial session config immediately after connection
-        const sessionInstructions = isSetupCall && initialPrompt
-          ? initialPrompt
-          : `${baseInstructions}\n\n${languageInstructionFor()}`;
-
-        const payload = {
-          type: "session.update",
-          session: {
-            type: "realtime",
-            instructions: sessionInstructions,
-            temperature: 0.2,
-            max_response_output_tokens: 300,
-            turn_detection: null, // VAD disabled during greeting
-            input_audio_transcription: {
-              model: "whisper-1",
-            },
-          },
-        };
-        console.log("[OPENAI_SESSION_UPDATE]", JSON.stringify(payload));
-        sendToAI(payload);
+        console.log("[SESSION_UPDATE_PATH_AUDIT] using only GA-compatible session.update payloads");
       });
 
       ai.on("message", async (raw) => {
