@@ -33,24 +33,29 @@ export function createOpenAISession() {
         session: {
           type: "realtime",
           model: process.env.OPENAI_MODEL || "gpt-realtime",
-          modalities: ["audio", "text"],
           instructions:
             `LANGUAGE RULE: Follow the language provided by the latest session instructions.\n\n` +
             `You are a phone receptionist. Be brief. Ask one question at a time.\n\n` +
             `${SYSTEM_PERSONALITY}`,
-          voice: "alloy",
-          input_audio_format: "g711_ulaw",
-          output_audio_format: "g711_ulaw",
-          input_audio_transcription: {
-            model: "gpt-4o-transcribe",
+          audio: {
+            input: {
+              format: "g711_ulaw",
+              transcription: {
+                model: "gpt-4o-transcribe",
+              },
+              turn_detection: {
+                type: "server_vad",
+                create_response: false,
+                silence_duration_ms: 450,
+                prefix_padding_ms: 300,
+              },
+            },
+            output: {
+              format: "g711_ulaw",
+              voice: "alloy",
+            },
           },
-          turn_detection: {
-            type: "server_vad",
-            create_response: false,
-            silence_duration_ms: 450,
-            prefix_padding_ms: 300,
-          },
-          max_response_output_tokens: 250,
+          max_output_tokens: 250,
         },
       })
     );
