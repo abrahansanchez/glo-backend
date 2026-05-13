@@ -386,6 +386,7 @@ export const attachMediaWebSocketServer = (server) => {
     let greetingComplete = false;
 
     let responseInFlightId = null;
+    let responseActive = false;
     let assistantSpeaking = false;
     let lastUserSpokeAt = 0;
     let assistantResponseText = "";
@@ -738,12 +739,15 @@ RULES:
     const applyLanguageToSession = async () => {
       const instruction = languageInstructionFor();
       try {
-        sendToAI({
+        const payload = {
           type: "session.update",
           session: {
+            type: "realtime",
             instructions: `${baseInstructions}\n\n${instruction}`,
           },
-        });
+        };
+        console.log("[OPENAI_SESSION_UPDATE]", JSON.stringify(payload));
+        sendToAI(payload);
         console.log(`[LANG_APPLIED] mode=${currentLanguage || barberPreferredLang || "en"}`);
       } catch (e) {
         console.error("[LANG_APPLIED] error:", e?.message || e);
@@ -865,9 +869,10 @@ RULES:
           ? initialPrompt
           : `${baseInstructions}\n\n${languageInstructionFor()}`;
 
-        sendToAI({
+        const payload = {
           type: "session.update",
           session: {
+            type: "realtime",
             instructions: sessionInstructions,
             temperature: 0.2,
             max_response_output_tokens: 300,
@@ -876,7 +881,9 @@ RULES:
               model: "whisper-1",
             },
           },
-        });
+        };
+        console.log("[OPENAI_SESSION_UPDATE]", JSON.stringify(payload));
+        sendToAI(payload);
       });
 
       ai.on("message", async (raw) => {
@@ -897,6 +904,31 @@ RULES:
           responseInFlightId = evt.response.id;
         } else if (evt.response_id) {
           responseInFlightId = evt.response_id;
+        }
+
+        if (
+          evt.type === "response.created" ||
+          evt.type === "response.audio.delta" ||
+          evt.type === "response.output_audio.delta"
+        ) {
+          responseActive = true;
+        }
+
+        if (
+          evt.type === "response.done" ||
+          evt.type === "response.completed" ||
+          evt.type === "response.cancelled" ||
+          evt.type === "response.output_audio.done"
+        ) {
+          responseActive = false;
+        }
+
+        if (
+          evt.type === "error" &&
+          (evt.error?.code === "response_cancel_not_active" ||
+            evt.error?.message?.includes("no active response"))
+        ) {
+          responseActive = false;
         }
 
         if (
@@ -1074,13 +1106,16 @@ RULES:
           }
         }
         if (evt.type === "input_audio_buffer.speech_started") {
-          if (assistantSpeaking && responseInFlightId) {
+          if (assistantSpeaking && responseInFlightId && responseActive) {
             try {
               ai.send(JSON.stringify({ type: "response.cancel" }));
               console.log("[BARGE_IN] verified caller audio -> response.cancel");
             } catch {}
+            responseActive = false;
             assistantSpeaking = false;
             responseInFlightId = null;
+          } else {
+            console.log("[SKIP_CANCEL_NO_ACTIVE_RESPONSE]");
           }
           return;
         }
@@ -1091,6 +1126,10 @@ RULES:
 
           lastUserSpokeAt = Date.now();
           if (!hasCommittedUserAudioForTurn) {
+            if (framesSinceLastCommit < MIN_COMMIT_FRAMES) {
+              console.log("[SKIP_COMMIT_EMPTY_BUFFER]", { packetsSinceLastCommit: framesSinceLastCommit });
+              return;
+            }
             hasCommittedUserAudioForTurn = true;
             sendToAI({ type: "input_audio_buffer.commit" });
             framesSinceLastCommit = 0;
@@ -1106,9 +1145,10 @@ RULES:
             console.log("✅ Greeting complete - enabling VAD and audio forwarding");
 
             // ✅ FIX #4: Better VAD settings
-            sendToAI({
+            const payload = {
               type: "session.update",
               session: {
+                type: "realtime",
                 turn_detection: {
                   type: "server_vad",
                   threshold: 0.6,
@@ -1116,7 +1156,9 @@ RULES:
                   silence_duration_ms: 800,
                 },
               },
-            });
+            };
+            console.log("[OPENAI_SESSION_UPDATE]", JSON.stringify(payload));
+            sendToAI(payload);
             console.log("🎙️ VAD enabled for conversation");
           }
           assistantSpeaking = false;

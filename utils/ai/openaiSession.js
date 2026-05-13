@@ -54,6 +54,7 @@ export function createOpenAISession() {
       },
     };
 
+    console.log("[OPENAI_SESSION_UPDATE]", JSON.stringify(sessionUpdate));
     console.log("OpenAI session.update payload:", JSON.stringify(sessionUpdate));
     ws.send(JSON.stringify(sessionUpdate));
   };
