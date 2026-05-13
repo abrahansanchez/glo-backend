@@ -24,8 +24,10 @@ export function createOpenAISession() {
     },
   });
 
-  ws.on("open", () => {
-    console.log("🤖 OpenAI Realtime Connected");
+  let sessionUpdateSent = false;
+  const sendSessionUpdate = () => {
+    if (sessionUpdateSent) return;
+    sessionUpdateSent = true;
 
     ws.send(
       JSON.stringify({
@@ -48,6 +50,10 @@ export function createOpenAISession() {
         },
       })
     );
+  };
+
+  ws.on("open", () => {
+    console.log("🤖 OpenAI Realtime Connected");
   });
 
   ws.on("message", (data) => {
@@ -64,6 +70,10 @@ export function createOpenAISession() {
 
     if (event?.type === "session.created" || event?.type === "session.updated") {
       console.log("OpenAI WS session event:", event);
+    }
+
+    if (event?.type === "session.created") {
+      sendSessionUpdate();
     }
   });
 
