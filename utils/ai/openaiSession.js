@@ -29,27 +29,33 @@ export function createOpenAISession() {
     if (sessionUpdateSent) return;
     sessionUpdateSent = true;
 
-    ws.send(
-      JSON.stringify({
-        type: "session.update",
-        session: {
-          type: "realtime",
-          model: process.env.OPENAI_MODEL || "gpt-realtime",
-          instructions:
-            `You are a phone receptionist. Be brief. Ask one question at a time.\n\n` +
-            `${SYSTEM_PERSONALITY}`,
-          audio: {
-            input: {
-              format: "g711_ulaw",
-            },
-            output: {
-              format: "g711_ulaw",
-              voice: "alloy",
+    const sessionUpdate = {
+      type: "session.update",
+      session: {
+        type: "realtime",
+        model,
+        instructions:
+          `You are a phone receptionist. Be brief. Ask one question at a time.\n\n` +
+          `${SYSTEM_PERSONALITY}`,
+        output_modalities: ["audio"],
+        audio: {
+          input: {
+            format: {
+              type: "audio/pcmu",
             },
           },
+          output: {
+            format: {
+              type: "audio/pcmu",
+            },
+            voice: "alloy",
+          },
         },
-      })
-    );
+      },
+    };
+
+    console.log("OpenAI session.update payload:", JSON.stringify(sessionUpdate));
+    ws.send(JSON.stringify(sessionUpdate));
   };
 
   ws.on("open", () => {
