@@ -438,27 +438,13 @@ export const attachMediaWebSocketServer = (server) => {
     }
 
     function safeCancelResponse(reason = "unknown") {
-      if (!(assistantSpeaking === true && responseActive === true && responseInFlightId)) {
-        console.log("[SKIP_CANCEL_NO_ACTIVE_RESPONSE]", {
-          reason,
-          assistantSpeaking,
-          responseActive,
-          responseInFlightId,
-        });
-        return false;
-      }
-
-      console.log("[OPENAI_RESPONSE_CANCEL]", {
+      console.log("[RESPONSE_CANCEL_DISABLED_TEMP]", {
         reason,
+        assistantSpeaking,
+        responseActive,
         responseInFlightId,
       });
-
-      ai.send(JSON.stringify({
-        type: "response.cancel",
-        response_id: responseInFlightId,
-      }));
-
-      return true;
+      return false;
     }
 
     console.log("[REALTIME_GUARD_AUDIT] all commit/cancel sends should use safe helpers");
@@ -970,7 +956,10 @@ RULES:
           evt.type === "conversation.item.input_audio_transcription.completed" ||
           evt.type === "input_audio_transcription.completed"
         ) {
-          console.log("[USER_TRANSCRIPT_COMPLETED]", evt.transcript);
+          console.log("[USER_TRANSCRIPT_COMPLETED]", {
+            item_id: evt.item_id,
+            transcript: evt.transcript,
+          });
           const transcriptText = (evt.transcript || "").trim();
           if (transcriptText) {
             const transcriptId = evt.item_id || evt.event_id || evt.id || transcriptText;
@@ -1134,8 +1123,14 @@ RULES:
             }
           }
         }
-        if (evt.type === "conversation.item.input_audio_transcription.failed") {
+        if (
+          evt.type === "conversation.item.input_audio_transcription.failed" ||
+          evt.type === "input_audio_transcription.failed"
+        ) {
           console.log("[USER_TRANSCRIPT_FAILED]", evt);
+        }
+        if (evt.type === "conversation.item.created") {
+          console.log("[CONVERSATION_ITEM_CREATED]", evt);
         }
         if (evt.type === "input_audio_buffer.committed") {
           console.log("[SERVER_VAD_COMMITTED]", evt);
@@ -1146,19 +1141,11 @@ RULES:
             console.log("[BARGE_IN_IGNORED_NO_ACTIVE_ASSISTANT]");
             return;
           }
-          if (assistantSpeaking === true && responseActive === true && responseInFlightId && safeCancelResponse("barge_in")) {
-            console.log("[BARGE_IN] verified caller audio -> response.cancel");
-            responseActive = false;
-            assistantSpeaking = false;
-            responseInFlightId = null;
-          } else {
-            console.log("[SKIP_CANCEL_NO_ACTIVE_RESPONSE]", {
-              reason: "barge_in",
-              assistantSpeaking,
-              responseActive,
-              responseInFlightId,
-            });
-          }
+          console.log("[BARGE_IN_DETECTED_CANCEL_DISABLED]", {
+            assistantSpeaking,
+            responseActive,
+            responseInFlightId,
+          });
           return;
         }
 
@@ -1193,6 +1180,9 @@ RULES:
                   input: {
                     format: {
                       type: "audio/pcmu",
+                    },
+                    transcription: {
+                      model: "gpt-4o-transcribe",
                     },
                     turn_detection: {
                       type: "server_vad",
