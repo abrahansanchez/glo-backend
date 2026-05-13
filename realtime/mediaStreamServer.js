@@ -989,6 +989,7 @@ RULES:
           evt.type === "conversation.item.input_audio_transcription.completed" ||
           evt.type === "input_audio_transcription.completed"
         ) {
+          console.log("[USER_TRANSCRIPT_COMPLETED]", evt.transcript);
           const transcriptText = (evt.transcript || "").trim();
           if (transcriptText) {
             const transcriptId = evt.item_id || evt.event_id || evt.id || transcriptText;
@@ -1152,23 +1153,41 @@ RULES:
             }
           }
         }
+        if (evt.type === "conversation.item.input_audio_transcription.failed") {
+          console.log("[USER_TRANSCRIPT_FAILED]", evt);
+        }
+        if (evt.type === "input_audio_buffer.committed") {
+          console.log("[SERVER_VAD_COMMITTED]", evt);
+        }
         if (evt.type === "input_audio_buffer.speech_started") {
-          if (safeCancelResponse("barge_in")) {
+          console.log("[SERVER_VAD_SPEECH_STARTED]", evt);
+          if (!assistantSpeaking) {
+            console.log("[BARGE_IN_IGNORED_NO_ACTIVE_ASSISTANT]");
+            return;
+          }
+          if (assistantSpeaking === true && responseActive === true && responseInFlightId && safeCancelResponse("barge_in")) {
             console.log("[BARGE_IN] verified caller audio -> response.cancel");
             responseActive = false;
             assistantSpeaking = false;
             responseInFlightId = null;
+          } else {
+            console.log("[SKIP_CANCEL_NO_ACTIVE_RESPONSE]", {
+              reason: "barge_in",
+              assistantSpeaking,
+              responseActive,
+              responseInFlightId,
+            });
           }
           return;
         }
 
         if (evt.type === "input_audio_buffer.speech_stopped") {
+          console.log("[SERVER_VAD_SPEECH_STOPPED]", evt);
           if (!greetingComplete) return;
           if (aiResponseInProgress) return;
 
           lastUserSpokeAt = Date.now();
           if (!hasCommittedUserAudioForTurn) {
-            if (!safeCommitInputBuffer("speech_stopped")) return;
             hasCommittedUserAudioForTurn = true;
             pendingResponseAfterTranscript = true;
             console.log("[GATE] waiting for transcript completion before response");
