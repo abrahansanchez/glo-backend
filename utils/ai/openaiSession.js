@@ -19,7 +19,6 @@ export function createOpenAISession() {
   const ws = new WebSocket(`wss://api.openai.com/v1/realtime?model=${model}`, {
     headers: {
       Authorization: `Bearer ${apiKey}`,
-      "OpenAI-Beta": "realtime=v1",
     },
   });
 
@@ -37,7 +36,7 @@ export function createOpenAISession() {
           output_audio_format: "g711_ulaw",
 
           // ✅ Enable caller transcription
-          input_audio_transcription: { model: "whisper-1" },
+          input_audio_transcription: { model: "gpt-4o-transcribe" },
 
           // ✅ Let backend manually create responses (your design)
           turn_detection: {
@@ -48,7 +47,6 @@ export function createOpenAISession() {
           },
 
           voice: "alloy",
-          temperature: 0.7,
           max_response_output_tokens: 250,
 
           // ✅ FIX: Enforce English-only at session level
