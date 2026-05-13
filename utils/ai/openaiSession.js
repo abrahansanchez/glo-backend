@@ -29,6 +29,7 @@ export function createOpenAISession() {
       JSON.stringify({
         type: "session.update",
         session: {
+          type: "realtime",
           modalities: ["audio", "text"],
 
           // ✅ Match Twilio Media Streams format exactly
