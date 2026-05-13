@@ -16,6 +16,8 @@ export function createOpenAISession() {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) throw new Error("OPENAI_API_KEY is missing");
 
+  console.log("OpenAI Realtime model:", model);
+
   const ws = new WebSocket(`wss://api.openai.com/v1/realtime?model=${model}`, {
     headers: {
       Authorization: `Bearer ${apiKey}`,
@@ -58,8 +60,33 @@ export function createOpenAISession() {
     );
   });
 
+  ws.on("message", (data) => {
+    let event;
+    try {
+      event = JSON.parse(data.toString());
+    } catch {
+      return;
+    }
+
+    if (event?.type === "error") {
+      console.error("❌ OpenAI WS server error:", event);
+    }
+
+    if (event?.type === "session.created" || event?.type === "session.updated") {
+      console.log("OpenAI WS session event:", event);
+    }
+  });
+
   ws.on("error", (err) => {
     console.error("❌ OpenAI Session Error:", err.message);
+  });
+
+  ws.on("error", (err) => {
+    console.error("❌ OpenAI WS error:", err);
+  });
+
+  ws.on("close", (code, reason) => {
+    console.error("❌ OpenAI WS closed:", code, reason?.toString());
   });
 
   return ws;
