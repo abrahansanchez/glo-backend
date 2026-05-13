@@ -30,27 +30,25 @@ export function createOpenAISession() {
         type: "session.update",
         session: {
           type: "realtime",
-          modalities: ["audio", "text"],
-
-          // ✅ Match Twilio Media Streams format exactly
-          input_audio_format: "g711_ulaw",
-          output_audio_format: "g711_ulaw",
-
-          // ✅ Enable caller transcription
-          input_audio_transcription: { model: "gpt-4o-transcribe" },
-
-          // ✅ Let backend manually create responses (your design)
-          turn_detection: {
-            type: "server_vad",
-            create_response: false,
-            silence_duration_ms: 450,
-            prefix_padding_ms: 300,
+          model: process.env.OPENAI_MODEL,
+          output_modalities: ["audio", "text"],
+          audio: {
+            input: {
+              format: "g711_ulaw",
+              transcription: { model: "gpt-4o-transcribe" },
+              turn_detection: {
+                type: "server_vad",
+                create_response: false,
+                silence_duration_ms: 450,
+                prefix_padding_ms: 300,
+              },
+            },
+            output: {
+              format: "g711_ulaw",
+              voice: "alloy",
+            },
           },
-
-          voice: "alloy",
-          max_response_output_tokens: 250,
-
-          // ✅ FIX: Enforce English-only at session level
+          max_output_tokens: 250,
           instructions:
             `LANGUAGE RULE: Follow the language provided by the latest session instructions.\n\n` +
             `You are a phone receptionist. Be brief. Ask one question at a time.\n\n` +
