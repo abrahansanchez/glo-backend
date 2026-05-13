@@ -55,15 +55,22 @@ const detectLanguageMode = (text) => {
 };
 
 const isYes = (text) => {
-  const t = String(text || "").toLowerCase();
-  return (
-    t === "yes" ||
-    t === "si" ||
-    t === "sí" ||
-    t.includes(" yes") ||
-    t.includes("sí") ||
-    t.includes("confirm")
-  );
+  // Normalize: lowercase, strip accents
+  const t = String(text || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .trim();
+
+  const yesPatterns = [
+    "yes", "yep", "yup", "yeah", "sure", "correct", "confirm", "confirmed",
+    "ok", "okay", "alright", "sounds good", "perfect", "great",
+    "si", "dale", "claro", "perfecto", "exacto", "adelante",
+    "si dale", "yes please", "go ahead", "that works", "that's right",
+    "sounds right", "do it", "book it", "let's do it"
+  ];
+
+  return yesPatterns.some((p) => t === p || t.includes(p));
 };
 
 const containsDateSignal = (text) => {
@@ -533,6 +540,20 @@ export const attachMediaWebSocketServer = (server) => {
       }
 
       await checkSlotAvailability();
+
+      // When slot IS available and all fields ready — deterministically enter confirmation state
+      if (
+        slotChecked &&
+        slotAvailable &&
+        bookingState.name &&
+        bookingState.service &&
+        bookingState.parsedDate &&
+        bookingState.parsedTime &&
+        !bookingState.askedConfirm
+      ) {
+        bookingState.askedConfirm = true;
+        console.log("[CONFIRM_STATE] all fields ready + slot available → askedConfirm set deterministically");
+      }
 
       if (slotChecked && !slotAvailable) {
         const injectionKey = `${bookingState.service}|${bookingState.parsedDate}|${bookingState.parsedTime}`;
@@ -1008,12 +1029,16 @@ RULES:
               const parsedBookingTime = await parseBookingDateTime();
               if (parsedBookingTime) {
                 let slotChanged = false;
-                if (!bookingState.parsedDate && parsedBookingTime.date) {
-                  bookingState.parsedDate = parsedBookingTime.date;
+                // Always allow overwrite when slot was unavailable or when new value differs
+                const newDate = parsedBookingTime.date;
+                const newTime = parsedBookingTime.time;
+
+                if (newDate && (newDate !== bookingState.parsedDate)) {
+                  bookingState.parsedDate = newDate;
                   slotChanged = true;
                 }
-                if (!bookingState.parsedTime && parsedBookingTime.time) {
-                  bookingState.parsedTime = parsedBookingTime.time;
+                if (newTime && (newTime !== bookingState.parsedTime)) {
+                  bookingState.parsedTime = newTime;
                   slotChanged = true;
                 }
                 if (slotChanged) {
@@ -1095,14 +1120,6 @@ RULES:
           responseInFlightId = null;
           if (assistantResponseText && assistantResponseText.trim()) {
             const responseLower = assistantResponseText.toLowerCase();
-            if (
-              isBookingReady() &&
-              (responseLower.includes("should i confirm that") ||
-                responseLower.includes("debo confirmar") ||
-                responseLower.includes("quieres que lo confirme"))
-            ) {
-              bookingState.askedConfirm = true;
-            }
             if (
               bookingState.intent === "BOOK" &&
               !bookingState.name &&

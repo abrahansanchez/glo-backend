@@ -90,6 +90,14 @@ export async function getAvailableSlots({ barber, date, durationMinutes }) {
   let cursor = open.clone();
 
   while (cursor.clone().add(duration, "minutes").isSameOrBefore(close)) {
+    // Skip slots that are in the past for today
+    const now = moment.tz(tz);
+    const isToday = date === now.format("YYYY-MM-DD");
+    if (isToday && cursor.isBefore(now)) {
+      cursor.add(30, "minutes");
+      continue;
+    }
+
     const formattedTime = cursor.format("h:mm A");
     const available = await isSlotAvailable({
       barber,
