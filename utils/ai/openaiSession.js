@@ -33,6 +33,7 @@ export function createOpenAISession() {
         session: {
           type: "realtime",
           model: process.env.OPENAI_MODEL || "gpt-realtime",
+          output_modalities: ["audio"],
           instructions:
             `LANGUAGE RULE: Follow the language provided by the latest session instructions.\n\n` +
             `You are a phone receptionist. Be brief. Ask one question at a time.\n\n` +
