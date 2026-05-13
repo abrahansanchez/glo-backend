@@ -418,6 +418,51 @@ export const attachMediaWebSocketServer = (server) => {
     let pendingEndCallAfterResponse = false;
     let endingCall = false;
 
+    function safeCommitInputBuffer(reason = "unknown") {
+      if (openAiInputFramesSinceLastCommit < 5) {
+        console.log("[SKIP_COMMIT_EMPTY_BUFFER]", {
+          reason,
+          openAiInputFramesSinceLastCommit,
+        });
+        return false;
+      }
+
+      console.log("[OPENAI_COMMIT_INPUT_BUFFER]", {
+        reason,
+        openAiInputFramesSinceLastCommit,
+      });
+
+      ai.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+      openAiInputFramesSinceLastCommit = 0;
+      return true;
+    }
+
+    function safeCancelResponse(reason = "unknown") {
+      if (!(assistantSpeaking === true && responseActive === true && responseInFlightId)) {
+        console.log("[SKIP_CANCEL_NO_ACTIVE_RESPONSE]", {
+          reason,
+          assistantSpeaking,
+          responseActive,
+          responseInFlightId,
+        });
+        return false;
+      }
+
+      console.log("[OPENAI_RESPONSE_CANCEL]", {
+        reason,
+        responseInFlightId,
+      });
+
+      ai.send(JSON.stringify({
+        type: "response.cancel",
+        response_id: responseInFlightId,
+      }));
+
+      return true;
+    }
+
+    console.log("[REALTIME_GUARD_AUDIT] all commit/cancel sends should use safe helpers");
+
     // Silence injection state
     let silenceInterval = null;
     let sendingSilence = false;
@@ -1108,20 +1153,11 @@ RULES:
           }
         }
         if (evt.type === "input_audio_buffer.speech_started") {
-          if (assistantSpeaking === true && responseActive === true && responseInFlightId) {
-            try {
-              ai.send(JSON.stringify({ type: "response.cancel" }));
-              console.log("[BARGE_IN] verified caller audio -> response.cancel");
-            } catch {}
+          if (safeCancelResponse("barge_in")) {
+            console.log("[BARGE_IN] verified caller audio -> response.cancel");
             responseActive = false;
             assistantSpeaking = false;
             responseInFlightId = null;
-          } else {
-            console.log("[SKIP_CANCEL_NO_ACTIVE_RESPONSE]", {
-              assistantSpeaking,
-              responseActive,
-              responseInFlightId,
-            });
           }
           return;
         }
@@ -1132,15 +1168,8 @@ RULES:
 
           lastUserSpokeAt = Date.now();
           if (!hasCommittedUserAudioForTurn) {
-            if (openAiInputFramesSinceLastCommit < MIN_COMMIT_FRAMES) {
-              console.log("[SKIP_COMMIT_EMPTY_BUFFER]", {
-                openAiInputFramesSinceLastCommit,
-              });
-              return;
-            }
+            if (!safeCommitInputBuffer("speech_stopped")) return;
             hasCommittedUserAudioForTurn = true;
-            sendToAI({ type: "input_audio_buffer.commit" });
-            openAiInputFramesSinceLastCommit = 0;
             pendingResponseAfterTranscript = true;
             console.log("[GATE] waiting for transcript completion before response");
           }
