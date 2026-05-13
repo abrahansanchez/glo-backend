@@ -608,14 +608,15 @@ export const attachMediaWebSocketServer = (server) => {
       if (!text || !canSendAI()) return false;
       assistantResponseText = "";
       aiResponseInProgress = true;
-      return sendToAI({
+      const responseCreatePayload = {
         type: "response.create",
         response: {
-          modalities: ["audio", "text"],
           instructions: `Say this exactly, with no extra words: "${text}"`,
           max_output_tokens: 160,
         },
-      });
+      };
+      console.log("[OPENAI_RESPONSE_CREATE]", JSON.stringify(responseCreatePayload));
+      return sendToAI(responseCreatePayload);
     };
 
     const executeBookingIfReady = async () => {
@@ -777,14 +778,15 @@ RULES:
         console.log("📜 Using fallback greeting (no initialPrompt found)");
       }
 
-      const ok = sendToAI({
+      const responseCreatePayload = {
         type: "response.create",
         response: {
-          modalities: ["audio", "text"],
           instructions: greetingInstruction,
           max_output_tokens: 250, // ✅ FIX #2: Increased from 150 to 250
         },
-      });
+      };
+      console.log("[OPENAI_RESPONSE_CREATE]", JSON.stringify(responseCreatePayload));
+      const ok = sendToAI(responseCreatePayload);
 
       if (ok) {
         greetingSent = true;
@@ -822,14 +824,15 @@ RULES:
         ? initialPrompt
         : `${baseInstructions}\n\n${languageInstructionFor()}${bookingOverlay}`;
 
-      sendToAI({
+      const responseCreatePayload = {
         type: "response.create",
         response: {
-          modalities: ["audio", "text"],
           instructions,
           max_output_tokens: isSetupCall ? 800 : 220,
         },
-      });
+      };
+      console.log("[OPENAI_RESPONSE_CREATE]", JSON.stringify(responseCreatePayload));
+      sendToAI(responseCreatePayload);
 
       console.log(
         `[RESPONSE_REQUESTED] reason=${reason} immediate=${String(immediate)} lang=${currentLanguage}`
