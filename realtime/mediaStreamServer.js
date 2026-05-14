@@ -73,6 +73,56 @@ const isYes = (text) => {
   return yesPatterns.some((p) => t === p || t.includes(p));
 };
 
+const isNo = (text) => {
+  const t = String(text || "").trim().toLowerCase().replace(/[.?!,]+$/g, "");
+  return [
+    "no",
+    "nope",
+    "nah",
+    "not that",
+    "no gracias",
+    "no thank you",
+    "cambiar",
+    "cámbialo",
+    "quiero cambiar",
+    "otra hora",
+    "otro día",
+    "different time",
+    "different day",
+    "change it",
+    "change the time",
+    "change the day",
+    "make it later",
+    "make it earlier"
+  ].some((phrase) => t.includes(phrase));
+};
+
+const FILLER_TRANSCRIPTS = new Set([
+  "vamos", "sim", "menu", "hmm", "hm", "uh", "um", "ah", "oh",
+  "ok", "okay", "sure", "right", "yeah", "mhm", "mmm",
+  ".", "..", "...", "?", "!", "", " ",
+]);
+
+const isNoisyTranscript = (text, bookingState) => {
+  const t = String(text || "").trim().toLowerCase().replace(/[.?!,]+$/g, "");
+
+  if (!t) return true;
+
+  const confirmationWords = new Set([
+    "yes", "yeah", "yep", "si", "sí", "no", "nope", "ok", "okay"
+  ]);
+
+  if (bookingState?.askedConfirm && confirmationWords.has(t)) {
+    return false;
+  }
+
+  if (t.length <= 2) return true;
+
+  if (FILLER_TRANSCRIPTS.has(t)) return true;
+
+  return false;
+};
+
 const containsDateSignal = (text) => {
   const t = String(text || "").toLowerCase();
   return (
@@ -439,10 +489,12 @@ export const attachMediaWebSocketServer = (server) => {
       parsedDate: "",
       parsedTime: "",
       askedConfirm: false,
+      confirmationPromptRequested: false,
       confirmed: false,
       bookingAttempted: false,
       bookingFinalized: false,
       awaitingName: false,
+      awaitingCorrection: false,
     };
     let pendingEndCallAfterResponse = false;
     let endingCall = false;
@@ -641,8 +693,7 @@ export const attachMediaWebSocketServer = (server) => {
         bookingState.parsedTime &&
         !bookingState.askedConfirm
       ) {
-        bookingState.askedConfirm = true;
-        console.log("[CONFIRM_STATE] all fields ready + slot available → askedConfirm set deterministically");
+        console.log("[CONFIRM_STATE_READY] all fields ready + slot available; deterministic reply will ask for confirmation");
       }
 
       if (slotChecked && !slotAvailable) {
@@ -696,16 +747,28 @@ export const attachMediaWebSocketServer = (server) => {
 
     const speakExact = (text) => {
       if (!text || !canSendAI()) return false;
+      const exactInstructions = `Say this exactly, with no extra words: "${text}"`;
+      if (responseActive || assistantSpeaking || responseInFlightId) {
+        pendingAssistantResponse = {
+          exactInstructions,
+          reason: "speak_exact",
+          lang: currentLanguage,
+          immediate: true,
+        };
+        console.log("[SPEAK_EXACT_QUEUED]", { text: text?.slice(0, 60) });
+        return true;
+      }
       assistantResponseText = "";
       aiResponseInProgress = true;
       const responseCreatePayload = {
         type: "response.create",
         response: {
-          instructions: `Say this exactly, with no extra words: "${text}"`,
+          instructions: exactInstructions,
           max_output_tokens: 160,
         },
       };
       console.log("[OPENAI_RESPONSE_CREATE]", JSON.stringify(responseCreatePayload));
+      responseActive = true;
       return sendToAI(responseCreatePayload);
     };
 
@@ -748,7 +811,10 @@ export const attachMediaWebSocketServer = (server) => {
             requestedDateTimeText: `${bookingState.parsedDate} ${bookingState.parsedTime}`,
           });
           await setTranscriptIntentOutcome({ intent: "BOOK", outcome: "BOOKED" });
-          const ok = speakExact(`Your appointment is confirmed for ${result.spoken}. Thank you, goodbye.`);
+          const confirmMsg = currentLanguage === "es"
+            ? `Tu cita ha sido confirmada para ${result.spoken}. ¡Gracias, hasta luego!`
+            : `Your appointment is confirmed for ${result.spoken}. Thank you, goodbye.`;
+          const ok = speakExact(confirmMsg);
           pendingEndCallAfterResponse = ok;
           if (!ok) await requestCallEnd("booking_success_no_ai_response");
           return true;
@@ -763,9 +829,13 @@ export const attachMediaWebSocketServer = (server) => {
             `[BOOKING_UNAVAILABLE] callSid=${callSid || ""} barberId=${barberId} alternatives=${alternatives || "none"}`
           );
           speakExact(
-            alternatives
-              ? `That time is not available. I can offer ${alternatives}. Which one works for you?`
-              : "That time is not available. What other day or time works for you?"
+            currentLanguage === "es"
+              ? alternatives
+                ? `Esa hora no está disponible. Puedo ofrecerte ${alternatives}. ¿Cuál te funciona?`
+                : "Esa hora no está disponible. ¿Qué otro día u hora te funciona?"
+              : alternatives
+                ? `That time is not available. I can offer ${alternatives}. Which one works for you?`
+                : "That time is not available. What other day or time works for you?"
           );
           return true;
         }
@@ -773,7 +843,10 @@ export const attachMediaWebSocketServer = (server) => {
         console.log(`[BOOKING_ERROR] callSid=${callSid || ""} barberId=${barberId} error=${result?.error || "unknown"}`);
         bookingState.bookingFinalized = true;
         await setTranscriptIntentOutcome({ intent: "BOOK", outcome: "FAILED" });
-        const ok = speakExact("I couldn't finalize that booking right now. The barber will follow up with you. Goodbye.");
+        const errorMsg = currentLanguage === "es"
+          ? "No pude finalizar la cita en este momento. El barbero se comunicará contigo. ¡Hasta luego!"
+          : "I couldn't finalize that booking right now. The barber will follow up with you. Goodbye.";
+        const ok = speakExact(errorMsg);
         pendingEndCallAfterResponse = ok;
         if (!ok) await requestCallEnd("booking_error_no_ai_response");
         return true;
@@ -781,7 +854,10 @@ export const attachMediaWebSocketServer = (server) => {
         console.error(`[BOOKING_ERROR] callSid=${callSid || ""} barberId=${barberId}`, err?.message || err);
         bookingState.bookingFinalized = true;
         await setTranscriptIntentOutcome({ intent: "BOOK", outcome: "FAILED" });
-        const ok = speakExact("I couldn't finalize that booking right now. The barber will follow up with you. Goodbye.");
+        const errorMsg = currentLanguage === "es"
+          ? "No pude finalizar la cita en este momento. El barbero se comunicará contigo. ¡Hasta luego!"
+          : "I couldn't finalize that booking right now. The barber will follow up with you. Goodbye.";
+        const ok = speakExact(errorMsg);
         pendingEndCallAfterResponse = ok;
         if (!ok) await requestCallEnd("booking_exception_no_ai_response");
         return true;
@@ -903,9 +979,174 @@ RULES:
       return "Ask whether they want to confirm. Do not say 'one moment' unless backend booking execution has started.";
     };
 
+    const getDeterministicBookingReply = () => {
+      const isSpanish = currentLanguage === "es";
+
+      if (bookingState.awaitingCorrection) {
+        return isSpanish
+          ? "Claro, ¿qué quieres cambiar, el servicio, el día o la hora?"
+          : "Of course. What would you like to change, the service, the day, or the time?";
+      }
+
+      if (!bookingState.service) {
+        return isSpanish
+          ? "Perfecto, ¿qué servicio estás buscando? Tenemos corte, barba, o corte con barba."
+          : "Perfect, what service are you looking for? We offer haircut, beard, or haircut and beard.";
+      }
+
+      if (!bookingState.name) {
+        bookingState.awaitingName = true;
+        return isSpanish
+          ? "Perfecto. ¿A qué nombre pongo la cita?"
+          : "Perfect. What name should I put the appointment under?";
+      }
+
+      if (!bookingState.parsedDate) {
+        return isSpanish
+          ? "¿Qué día quieres venir?"
+          : "What day would you like to come in?";
+      }
+
+      if (!bookingState.parsedTime) {
+        return isSpanish
+          ? "¿A qué hora quieres venir ese día?"
+          : "What time would you like to come in?";
+      }
+
+      if (slotChecked && slotAvailable === false) {
+        const alternatives = slotAlternatives?.length
+          ? slotAlternatives.map((s) => `${s.date} a las ${s.time}`).join(", ")
+          : "";
+
+        return isSpanish
+          ? alternatives
+            ? `Esa hora no está disponible. Puedo ofrecerte ${alternatives}. ¿Cuál te funciona?`
+            : "Esa hora no está disponible. ¿Qué otro día u hora te funciona?"
+          : alternatives
+            ? `That time is not available. I can offer ${alternatives}. Which one works for you?`
+            : "That time is not available. What other day or time works for you?";
+      }
+
+      if (!slotChecked) {
+        return isSpanish
+          ? "Perfecto, déjame verificar ese horario."
+          : "Perfect, let me check that time for you.";
+      }
+
+      if (slotChecked && slotAvailable === true && !bookingState.confirmationPromptRequested) {
+        return isSpanish
+          ? `Perfecto, tengo ${bookingState.name} para ${bookingState.service} el ${bookingState.parsedDate} a las ${bookingState.parsedTime}. ¿Quieres que confirme esa cita?`
+          : `Perfect, I have ${bookingState.name} for ${bookingState.service} on ${bookingState.parsedDate} at ${bookingState.parsedTime}. Should I confirm that appointment?`;
+      }
+
+      return isSpanish
+        ? "Dime sí para confirmar, o dime qué quieres cambiar."
+        : "Say yes to confirm, or tell me what you want to change.";
+    };
+
     const requestAssistantResponse = async ({ immediate = false, reason = "unknown" } = {}) => {
       if (!greetingComplete) return;
       if (!canSendAI()) return;
+
+      if (bookingState.intent === "BOOK") {
+        const reply = getDeterministicBookingReply();
+        const isConfirmationPrompt =
+          bookingState.intent === "BOOK" &&
+          bookingState.service &&
+          bookingState.name &&
+          bookingState.parsedDate &&
+          bookingState.parsedTime &&
+          slotChecked &&
+          slotAvailable === true &&
+          !bookingState.confirmationPromptRequested &&
+          (
+            reply.includes("¿Quieres que confirme") ||
+            reply.includes("Should I confirm")
+          );
+
+        console.log("[DETERMINISTIC_BOOKING_REPLY]", {
+          reply,
+          state: {
+            intent: bookingState.intent,
+            name: bookingState.name,
+            service: bookingState.service,
+            parsedDate: bookingState.parsedDate,
+            parsedTime: bookingState.parsedTime,
+            askedConfirm: bookingState.askedConfirm,
+            confirmationPromptRequested: bookingState.confirmationPromptRequested,
+            confirmed: bookingState.confirmed,
+            slotChecked,
+            slotAvailable,
+            activeLanguage: currentLanguage,
+          },
+        });
+
+        const exactInstructions = `Say this exactly and only this: "${reply}"`;
+
+        if (responseActive === true || assistantSpeaking === true || responseInFlightId) {
+          if (isConfirmationPrompt) {
+            bookingState.confirmationPromptRequested = true;
+            bookingState.askedConfirm = true;
+            console.log("[CONFIRMATION_PROMPT_QUEUED]", {
+              reason,
+              service: bookingState.service,
+              name: bookingState.name,
+              parsedDate: bookingState.parsedDate,
+              parsedTime: bookingState.parsedTime,
+            });
+          }
+
+          pendingAssistantResponse = {
+            exactInstructions,
+            reason,
+            lang: currentLanguage,
+            immediate,
+          };
+
+          console.log("[QUEUE_DETERMINISTIC_BOOKING_REPLY]", {
+            reason,
+            responseActive,
+            assistantSpeaking,
+            responseInFlightId,
+          });
+
+          return;
+        }
+
+        if (aiResponseInProgress) return;
+
+        if (isConfirmationPrompt) {
+          bookingState.confirmationPromptRequested = true;
+          bookingState.askedConfirm = true;
+          console.log("[CONFIRMATION_PROMPT_REQUESTED]", {
+            reason,
+            service: bookingState.service,
+            name: bookingState.name,
+            parsedDate: bookingState.parsedDate,
+            parsedTime: bookingState.parsedTime,
+          });
+        }
+
+        const responseCreatePayload = {
+          type: "response.create",
+          response: {
+            instructions: exactInstructions,
+            max_output_tokens: 120,
+          },
+        };
+
+        console.log("[OPENAI_RESPONSE_CREATE]", JSON.stringify(responseCreatePayload));
+        responseActive = true;
+        sendToAI(responseCreatePayload);
+
+        console.log(
+          `[RESPONSE_REQUESTED] reason=${reason} immediate=${String(immediate)} lang=${currentLanguage} deterministic=true`
+        );
+
+        aiResponseInProgress = true;
+        assistantResponseText = "";
+        return;
+      }
 
       const forcedNext = nextBookingQuestion();
       const bookingOverlay =
@@ -974,10 +1215,30 @@ RULES:
         reason: queued.reason,
       });
 
-      await requestAssistantResponse({
-        immediate: queued.immediate,
-        reason: queued.reason,
-      });
+      // If queued response has exact instructions (e.g. from speakExact), use them directly
+      if (queued.exactInstructions) {
+        if (responseActive || assistantSpeaking || responseInFlightId) {
+          pendingAssistantResponse = queued;
+          return;
+        }
+        responseActive = true;
+        const payload = {
+          type: "response.create",
+          response: {
+            instructions: queued.exactInstructions,
+            max_output_tokens: 250,
+          },
+        };
+        console.log("[FLUSH_QUEUED_SPEAK_EXACT]", { reason: queued.reason });
+        sendToAI(payload);
+        aiResponseInProgress = true;
+        assistantResponseText = "";
+      } else {
+        await requestAssistantResponse({
+          immediate: queued.immediate,
+          reason: queued.reason,
+        });
+      }
     };
 
     // ----------------------------
@@ -1067,15 +1328,21 @@ RULES:
             }
             processedTranscriptIds.add(transcriptId);
 
+            // Noise/filler gate — but never ignore if askedConfirm is true (yes/no matters)
+            if (isNoisyTranscript(transcriptText, bookingState)) {
+              console.log("[TRANSCRIPT_IGNORED_NOISE]", { transcript: transcriptText, reason: "filler_or_noise" });
+              return;
+            }
+
             userTranscriptLines.push(transcriptText);
             await appendMessage({ role: "caller", text: transcriptText, lang: currentLanguage });
 
             const detectedLanguage =
               !hasSwitchedLanguage ? detectCallerLanguagePreference(transcriptText, currentLanguage) : null;
-            if (!languageLocked && detectedLanguage && transcriptText.length > 10) {
+            if (!languageLocked && detectedLanguage && transcriptText.length > 10 && transcriptText.trim().split(/\s+/).length >= 3) {
               languageLocked = true;
               lockedLanguage = detectedLanguage;
-              console.log("[LANG_LOCK] language locked to", lockedLanguage);
+              console.log("[LANG_LOCK] language locked to", lockedLanguage, "transcript length:", transcriptText.length);
             }
             const effectiveLang = languageLocked ? lockedLanguage : detectedLanguage;
             if (effectiveLang && effectiveLang !== currentLanguage) {
@@ -1123,47 +1390,102 @@ RULES:
             }
 
             const lower = transcriptText.toLowerCase();
-            if (!lower.includes("unknown")) {
-              if (
-                lower.includes("my name is") ||
-                lower.startsWith("i'm ") ||
-                lower.startsWith("i am ") ||
-                lower.startsWith("soy ") ||
-                lower.includes("me llamo")
-              ) {
-                const explicitName = cleanClientName(transcriptText);
-                if (!bookingState.name && isClearNameResponse(explicitName)) {
-                  bookingState.name = explicitName;
+            // Global name extraction — capture obvious names even out of order
+            if (!bookingState.name && bookingState.intent === "BOOK") {
+              const explicitPhrases = [
+                "my name is", "i'm ", "i am ", "soy ", "me llamo ", "llámame ", "me puedes llamar "
+              ];
+              const hasExplicitPhrase = explicitPhrases.some(p => lower.includes(p));
+
+              if (hasExplicitPhrase) {
+                const extracted = cleanClientName(transcriptText);
+                if (isClearNameResponse(extracted)) {
+                  bookingState.name = extracted;
                   bookingState.awaitingName = false;
+                  bookingState.awaitingCorrection = false;
                   await updateTranscriptFields({ clientName: bookingState.name });
+                  console.log("[NAME_EXTRACTED]", { name: bookingState.name, method: "explicit_phrase" });
                 }
-              } else if (
-                bookingState.intent === "BOOK" &&
-                bookingState.awaitingName &&
-                !bookingState.name &&
-                isClearNameResponse(transcriptText)
-              ) {
-                bookingState.name = cleanClientName(transcriptText);
-                bookingState.awaitingName = false;
-                await updateTranscriptFields({ clientName: bookingState.name });
+              } else if (isClearNameResponse(transcriptText)) {
+                // Bare name candidate — only capture if transcript is 1-3 words
+                // and does not contain service/date/time/booking keywords
+                const wordCount = transcriptText.trim().split(/\s+/).length;
+                const hasBookingKeyword = [
+                  "haircut", "beard", "barba", "corte", "pelo", "cabello", "fade",
+                  "cita", "appointment", "book", "schedule", "cancel", "reschedule",
+                  "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+                  "lunes", "martes", "miercoles", "jueves", "viernes", "sabado", "domingo",
+                  "today", "tomorrow", "hoy", "mañana",
+                  "am", "pm", "morning", "afternoon", "tarde", "noche",
+                ].some(kw => lower.includes(kw));
+
+                if (wordCount <= 3 && !hasBookingKeyword) {
+                  bookingState.name = cleanClientName(transcriptText);
+                  bookingState.awaitingName = false;
+                  bookingState.awaitingCorrection = false;
+                  await updateTranscriptFields({ clientName: bookingState.name });
+                  console.log("[NAME_EXTRACTED]", { name: bookingState.name, method: "bare_name_candidate", wordCount });
+                } else {
+                  console.log("[NAME_REJECTED]", { transcript: transcriptText, wordCount, hasBookingKeyword });
+                }
               }
             }
 
-            if (
-              lower.includes("haircut") ||
-              lower.includes("corte") ||
-              lower.includes("cabello") ||
-              lower.includes("pelo") ||
-              lower.includes("cortarme") ||
-              lower.includes("fade") ||
-              lower.includes("lineup") ||
-              lower.includes("beard") ||
-              lower.includes("barba")
-            ) {
-              const extractedService = normalizeServiceName(transcriptText) || transcriptText;
-              if (!bookingState.service && extractedService) {
+            // Global service extraction — check barber's configured services first, then aliases
+            if (bookingState.intent === "BOOK" && (!bookingState.service || bookingState.awaitingCorrection)) {
+              let extractedService = null;
+
+              // Step 1: Check against barber's actual configured services
+              if (barberDoc?.services?.length) {
+                for (const svc of barberDoc.services) {
+                  const svcName = String(svc.name || "").toLowerCase();
+                  if (lower.includes(svcName)) {
+                    extractedService = svc.name;
+                    break;
+                  }
+                }
+              }
+
+              // Step 2: Fall back to aliases if no direct match
+              if (!extractedService) {
+                const serviceAliases = [
+                  { keywords: ["haircut + beard", "haircut and beard", "corte y barba", "corte con barba", "hair and beard", "everything", "todo"], service: "Haircut + Beard" },
+                  { keywords: ["haircut", "corte", "pelo", "cabello", "cortarme", "cut", "fade", "lineup", "kids cut", "shape up"], service: "Haircut" },
+                  { keywords: ["beard", "barba", "shave"], service: "Beard" },
+                ];
+
+                for (const alias of serviceAliases) {
+                  if (alias.keywords.some(kw => lower.includes(kw))) {
+                    extractedService = alias.service;
+                    break;
+                  }
+                }
+              }
+
+              if (extractedService) {
+                const previousService = bookingState.service;
+                const correctionMode = Boolean(bookingState.awaitingCorrection);
                 bookingState.service = extractedService;
+                if (previousService !== extractedService) {
+                  slotChecked = false;
+                  slotAvailable = false;
+                  slotAlternatives = [];
+                  lastAvailabilityCheckKey = "";
+                  lastUnavailableInjectionKey = "";
+                  bookingState.askedConfirm = false;
+                  bookingState.confirmationPromptRequested = false;
+                  bookingState.confirmed = false;
+                  bookingState.bookingAttempted = false;
+                }
+                bookingState.awaitingCorrection = false;
                 await updateTranscriptFields({ serviceRequested: bookingState.service });
+                console.log("[SERVICE_UPDATED]", {
+                  previousService,
+                  newService: bookingState.service,
+                  correctionMode,
+                });
+              } else {
+                console.log("[SERVICE_EXTRACT_ATTEMPT]", { transcript: transcriptText, result: "no_match" });
               }
             }
 
@@ -1217,6 +1539,10 @@ RULES:
                   slotAlternatives = [];
                   lastAvailabilityCheckKey = "";
                   lastUnavailableInjectionKey = "";
+                  bookingState.askedConfirm = false;
+                  bookingState.confirmationPromptRequested = false;
+                  bookingState.confirmed = false;
+                  bookingState.awaitingCorrection = false;
                 }
               }
               await updateTranscriptFields({ requestedDateTimeText: bookingState.dateTimeText });
@@ -1230,8 +1556,40 @@ RULES:
               await injectUnavailableSlotContextIfNeeded();
             }
 
+            if (bookingState.intent === "BOOK" && bookingState.askedConfirm && isNo(transcriptText)) {
+              bookingState.confirmed = false;
+              bookingState.askedConfirm = false;
+              bookingState.confirmationPromptRequested = false;
+              bookingState.bookingAttempted = false;
+              bookingState.awaitingCorrection = true;
+
+              console.log("[CONFIRMATION_REJECTED]", {
+                transcript: transcriptText,
+                state: {
+                  service: bookingState.service,
+                  name: bookingState.name,
+                  parsedDate: bookingState.parsedDate,
+                  parsedTime: bookingState.parsedTime,
+                },
+              });
+
+              // If the caller gives a new date/time in the same correction, existing date/time parser can update it.
+              // If not, deterministic reply will ask what they want to change.
+            }
+
             if (bookingState.intent === "BOOK" && bookingState.askedConfirm && isYes(transcriptText)) {
               bookingState.confirmed = true;
+              console.log("[CONFIRMATION_ACCEPTED]", {
+                transcript: transcriptText,
+                state: {
+                  service: bookingState.service,
+                  name: bookingState.name,
+                  parsedDate: bookingState.parsedDate,
+                  parsedTime: bookingState.parsedTime,
+                  slotChecked,
+                  slotAvailable,
+                },
+              });
               await updateTranscriptFields({ confirmed: true });
               const handled = await executeBookingIfReady();
               if (handled) return;

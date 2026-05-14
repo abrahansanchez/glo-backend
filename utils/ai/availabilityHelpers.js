@@ -34,6 +34,18 @@ export async function isSlotAvailable({ barber, date, time, durationMinutes, exc
   // 1. Check closed day
   const dayKey = DAY_MAP[start.day()];
   const dayHours = barber.availability?.businessHours?.[dayKey];
+  console.log("[AVAILABILITY_DAY_RESOLVE]", {
+    date,
+    time,
+    tz,
+    dayKey,
+    dayHours: dayHours || "NOT_FOUND",
+    isClosed: dayHours?.isClosed,
+    open: dayHours?.open,
+    close: dayHours?.close,
+    startLocal: start.format("YYYY-MM-DD HH:mm z"),
+    endLocal: end.format("YYYY-MM-DD HH:mm z"),
+  });
   if (!dayHours || dayHours.isClosed) return false;
 
   // 2. Check business hours
@@ -52,6 +64,14 @@ export async function isSlotAvailable({ barber, date, time, durationMinutes, exc
   // 4. Check appointment overlap with buffer
   const bufferedStart = start.clone().subtract(buffer, "minutes").toDate();
   const bufferedEnd = end.clone().add(buffer, "minutes").toDate();
+  console.log("[AVAILABILITY_SLOT_PARSE]", {
+    bufferedStart: moment(bufferedStart).tz(tz).format("YYYY-MM-DD HH:mm z"),
+    bufferedEnd: moment(bufferedEnd).tz(tz).format("YYYY-MM-DD HH:mm z"),
+    openTime: openTime.format("YYYY-MM-DD HH:mm z"),
+    closeTime: closeTime.format("YYYY-MM-DD HH:mm z"),
+    startBeforeOpen: start.isBefore(openTime),
+    endAfterClose: end.isAfter(closeTime),
+  });
 
   const query = {
     barberId: barber._id,
@@ -68,6 +88,13 @@ export async function isSlotAvailable({ barber, date, time, durationMinutes, exc
   }
 
   const conflict = await Appointment.findOne(query);
+  console.log("[AVAILABILITY_RESULT]", {
+    date,
+    time,
+    service: durationMinutes + "min",
+    conflict: conflict ? conflict._id : null,
+    available: !conflict,
+  });
   return !conflict;
 }
 
