@@ -388,6 +388,7 @@ export const attachMediaWebSocketServer = (server) => {
     let responseInFlightId = null;
     let responseActive = false;
     let assistantSpeaking = false;
+    let pendingAssistantResponse = null;
     let lastUserSpokeAt = 0;
     let assistantResponseText = "";
     let currentLanguage = "en";
@@ -501,19 +502,30 @@ export const attachMediaWebSocketServer = (server) => {
     };
 
     const parseBookingDateTime = async () => {
+      const dateSource = [bookingState.requestedDateText, bookingState.dateTimeText]
+        .filter(Boolean)
+        .join(" ");
+      const timeSource = [bookingState.requestedTimeText, bookingState.dateTimeText]
+        .filter(Boolean)
+        .join(" ");
       const combined = normalizeSpanishDateTimeText(
         [bookingState.requestedDateText, bookingState.requestedTimeText, bookingState.dateTimeText]
           .filter(Boolean)
           .join(" ")
       );
       const parsed = await parseNaturalDateTime(combined);
-      if (!parsed?.date || !parsed?.time) return null;
-      const spokenTime = extractSpokenTimeForBooking(
-        [bookingState.requestedTimeText, bookingState.dateTimeText].filter(Boolean).join(" ")
-      );
+      const spokenTime = extractSpokenTimeForBooking(timeSource);
+      const hasExplicitDate = containsDateSignal(dateSource);
+      const hasExplicitTime =
+        Boolean(spokenTime) ||
+        containsTimeSignal(timeSource) ||
+        containsLooseTimeSignal(timeSource);
+
+      if (!parsed?.date && !parsed?.time && !spokenTime) return null;
+
       return {
-        date: parsed.date,
-        time: spokenTime || formatTimeForBooking(parsed.time),
+        date: hasExplicitDate ? (parsed?.date || "") : "",
+        time: hasExplicitTime ? (spokenTime || formatTimeForBooking(parsed?.time)) : "",
       };
     };
 
@@ -736,7 +748,7 @@ export const attachMediaWebSocketServer = (server) => {
       `Do not invent dates or times.\n` +
       `When given a specific phrase to speak, say it EXACTLY with no changes.\n\n` +
       `BOOKING FLOW (REQUIRED):\n` +
-      `1) Collect missing: name, service, date, time.\n` +
+      `1) Collect missing: service, name, date, time.\n` +
       `2) Ask ONE question at a time.\n` +
       `3) After you have all details, repeat back Name + Service + Date + Time, then ask "Should I confirm that?".\n` +
       `4) Never say a booking is confirmed, booked, locked in, scheduled, or finalized. The backend will say final confirmation after it creates the appointment.\n` +
@@ -833,20 +845,20 @@ RULES:
     // ----------------------------
     // Response creation
     const nextBookingQuestion = () => {
-      if (!bookingState.name) return "Ask for their name.";
       if (!bookingState.service) {
         return "Ask what service they want (haircut, beard, haircut+beard).";
       }
-      if (!bookingState.parsedDate || !bookingState.parsedTime) return "Ask the date and time they want.";
+      if (!bookingState.name) return "Ask for their name.";
+      if (!bookingState.parsedDate) return "Ask what day they want.";
+      if (!bookingState.parsedTime) return "Ask what time they want.";
       if (!bookingState.askedConfirm) {
-        return "Repeat back Name + Service + Date/Time and ask: 'Should I confirm that?'";
+        return `Repeat back name, service, date, and time, then ask: "Should I confirm that?"`;
       }
       return "Ask whether they want to confirm. Do not say 'one moment' unless backend booking execution has started.";
     };
 
     const requestAssistantResponse = async ({ immediate = false, reason = "unknown" } = {}) => {
       if (!greetingComplete) return;
-      if (aiResponseInProgress) return;
       if (!canSendAI()) return;
 
       const forcedNext = nextBookingQuestion();
@@ -859,6 +871,26 @@ RULES:
         ? initialPrompt
         : `${baseInstructions}\n\n${languageInstructionFor()}${bookingOverlay}`;
 
+      if (responseActive === true || assistantSpeaking === true || responseInFlightId) {
+        pendingAssistantResponse = {
+          instructions,
+          reason,
+          lang: currentLanguage,
+          immediate,
+        };
+
+        console.log("[QUEUE_RESPONSE_CREATE_ACTIVE_RESPONSE]", {
+          reason,
+          responseActive,
+          assistantSpeaking,
+          responseInFlightId,
+        });
+
+        return;
+      }
+
+      if (aiResponseInProgress) return;
+
       const responseCreatePayload = {
         type: "response.create",
         response: {
@@ -867,6 +899,7 @@ RULES:
         },
       };
       console.log("[OPENAI_RESPONSE_CREATE]", JSON.stringify(responseCreatePayload));
+      responseActive = true;
       sendToAI(responseCreatePayload);
 
       console.log(
@@ -874,6 +907,31 @@ RULES:
       );
       aiResponseInProgress = true;
       assistantResponseText = "";
+    };
+
+    const terminalResponseEvents = new Set([
+      "response.done",
+      "response.completed",
+      "response.output_audio.done",
+      "response.audio.done",
+      "response.output_item.done",
+      "response.cancelled",
+    ]);
+
+    const flushQueuedAssistantResponse = async () => {
+      if (!pendingAssistantResponse) return;
+
+      const queued = pendingAssistantResponse;
+      pendingAssistantResponse = null;
+
+      console.log("[FLUSH_QUEUED_RESPONSE_CREATE]", {
+        reason: queued.reason,
+      });
+
+      await requestAssistantResponse({
+        immediate: queued.immediate,
+        reason: queued.reason,
+      });
     };
 
     // ----------------------------
@@ -912,29 +970,23 @@ RULES:
           trySendGreeting();
         }
 
-        if (evt.response?.id) {
+        const isTerminalResponseEvent = terminalResponseEvents.has(evt.type);
+
+        if (evt.type === "response.created") {
+          responseActive = true;
+          responseInFlightId = evt.response?.id || evt.response_id || responseInFlightId;
+        } else if (evt.response?.id) {
           responseInFlightId = evt.response.id;
         } else if (evt.response_id) {
           responseInFlightId = evt.response_id;
         }
 
         if (
-          evt.type === "response.created" ||
           evt.type === "response.audio.delta" ||
           evt.type === "response.output_audio.delta"
         ) {
+          assistantSpeaking = true;
           responseActive = true;
-        }
-
-        if (
-          evt.type === "response.done" ||
-          evt.type === "response.completed" ||
-          evt.type === "response.cancelled" ||
-          evt.type === "response.output_audio.done" ||
-          evt.type === "response.audio.done" ||
-          evt.type === "response.output_item.done"
-        ) {
-          responseActive = false;
         }
 
         if (
@@ -996,8 +1048,6 @@ RULES:
               askedConfirm: bookingState.askedConfirm,
               confirmed: bookingState.confirmed,
             }));
-            // Check real availability once we have service + date + time
-            await injectUnavailableSlotContextIfNeeded();
 
             const text = String(transcriptText || "").toLowerCase();
             if (
@@ -1073,6 +1123,7 @@ RULES:
 
             const hasDate = containsDateSignal(transcriptText);
             const hasTime = containsTimeSignal(transcriptText) || containsLooseTimeSignal(transcriptText);
+            let shouldCheckAvailabilityAfterParse = true;
             if (hasDate || hasTime) {
               if (hasDate && !bookingState.requestedDateText) bookingState.requestedDateText = transcriptText;
               if (hasTime && !bookingState.requestedTimeText) bookingState.requestedTimeText = transcriptText;
@@ -1080,17 +1131,36 @@ RULES:
                 .filter(Boolean)
                 .join(" ");
               const parsedBookingTime = await parseBookingDateTime();
+              console.log("[BOOKING_PARSE_RESULT]", {
+                transcript: transcriptText,
+                parsedDate: parsedBookingTime?.date || "",
+                parsedTime: parsedBookingTime?.time || "",
+              });
+
               if (parsedBookingTime) {
                 let slotChanged = false;
                 // Always allow overwrite when slot was unavailable or when new value differs
                 const newDate = parsedBookingTime.date;
                 const newTime = parsedBookingTime.time;
 
+                if (newDate && !newTime) {
+                  shouldCheckAvailabilityAfterParse = false;
+                  console.log("[BOOKING_PARSE_DATE_ONLY_NO_TIME_DEFAULT]", {
+                    transcript: transcriptText,
+                    parsedDate: parsedBookingTime.date,
+                  });
+                }
+
                 if (newDate && (newDate !== bookingState.parsedDate)) {
                   bookingState.parsedDate = newDate;
                   slotChanged = true;
                 }
-                if (newTime && (newTime !== bookingState.parsedTime)) {
+
+                if (
+                  newTime &&
+                  newTime !== bookingState.parsedTime &&
+                  (newDate || bookingState.parsedDate)
+                ) {
                   bookingState.parsedTime = newTime;
                   slotChanged = true;
                 }
@@ -1106,7 +1176,13 @@ RULES:
               await updateTranscriptFields({ requestedDateTimeText: bookingState.dateTimeText });
             }
 
-            await injectUnavailableSlotContextIfNeeded();
+            if (
+              shouldCheckAvailabilityAfterParse &&
+              bookingState.parsedDate &&
+              bookingState.parsedTime
+            ) {
+              await injectUnavailableSlotContextIfNeeded();
+            }
 
             if (bookingState.intent === "BOOK" && bookingState.askedConfirm && isYes(transcriptText)) {
               bookingState.confirmed = true;
@@ -1284,6 +1360,7 @@ RULES:
         ) {
           stopSilence();
           assistantSpeaking = true;
+          responseActive = true;
 
           if (twilioWs.readyState === twilioWs.OPEN && streamSid) {
             twilioWs.send(
@@ -1294,6 +1371,14 @@ RULES:
               })
             );
           }
+        }
+
+        if (isTerminalResponseEvent) {
+          assistantSpeaking = false;
+          responseActive = false;
+          responseInFlightId = null;
+          aiResponseInProgress = false;
+          await flushQueuedAssistantResponse();
         }
       });
 
