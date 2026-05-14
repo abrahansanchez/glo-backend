@@ -86,13 +86,33 @@ const containsTimeSignal = (text) => {
   const t = String(text || "").toLowerCase();
   return (
     /\b\d{1,2}\s*(:\d{2})?\s*(am|pm)\b/.test(t) ||
-    /\b\d{1,2}\s*(de la mañana|de la tarde|de la noche)\b/.test(t) ||
-    /\b(noon|morning|afternoon|evening|mañana|tarde|noche)\b/.test(t)
+    /\b\d{1,2}\s*(de la ma[ñn]ana|de la tarde|de la noche)\b/.test(t) ||
+    /\b(noon|morning|afternoon|evening|ma[ñn]ana|tarde|noche)\b/.test(t)
   );
 };
 
-const normalizeSpanishDateTimeText = (text) =>
-  String(text || "")
+const normalizeSpanishDateTimeText = (text) => {
+  const spanishNumbers = {
+    "doce": "12", "once": "11", "diez": "10",
+    "nueve": "9", "ocho": "8", "siete": "7",
+    "seis": "6", "cinco": "5", "cuatro": "4",
+    "tres": "3", "dos": "2", "uno": "1",
+  };
+
+  let t = String(text || "");
+
+  // Convert Spanish number words to digits before digit-based replacements
+  for (const [word, digit] of Object.entries(spanishNumbers)) {
+    t = t.replace(new RegExp(`\\b${word}\\b`, "gi"), digit);
+  }
+
+  // Fix mojibake encoding variants
+  t = t
+    .replace(/maÃ±ana|maÃƒÂ±ana/gi, "mañana")
+    .replace(/sÃ¡bado|sÃ¡bado/gi, "sábado")
+    .replace(/miÃ©rcoles/gi, "miércoles");
+
+  return t
     .replace(/este\s+/gi, "this ")
     .replace(/pr[oó]ximo\s+/gi, "next ")
     .replace(/s[aá]bado/gi, "saturday")
@@ -102,10 +122,14 @@ const normalizeSpanishDateTimeText = (text) =>
     .replace(/mi[eé]rcoles/gi, "wednesday")
     .replace(/jueves/gi, "thursday")
     .replace(/viernes/gi, "friday")
+    .replace(/mañana/gi, "tomorrow")
+    .replace(/hoy/gi, "today")
     .replace(/\ba las\b/gi, "at")
     .replace(/(\d{1,2})\s*de la ma[ñn]ana/gi, "$1 AM")
     .replace(/(\d{1,2})\s*de la tarde/gi, "$1 PM")
-    .replace(/(\d{1,2})\s*de la noche/gi, "$1 PM");
+    .replace(/(\d{1,2})\s*de la noche/gi, "$1 PM")
+    .replace(/(\d{1,2})\s*y media/gi, (_, h) => `${h}:30`);
+};
 
 const cleanClientName = (text) => {
   const raw = String(text || "").trim();
@@ -161,6 +185,10 @@ const formatAlternativeSlots = (alternatives = []) => {
 };
 
 const containsLooseTimeSignal = (text) =>
+  /\b(?:at|a las)\s*\d{1,2}(?::\d{2})?\b/i.test(String(text || ""));
+
+const hasNumericTimeSignal = (text) =>
+  /\b\d{1,2}\s*(:\d{2})?\s*(am|pm)?\b/i.test(String(text || "")) ||
   /\b(?:at|a las)\s*\d{1,2}(?::\d{2})?\b/i.test(String(text || ""));
 
 const normalizeServiceName = (text) => {
@@ -523,9 +551,27 @@ export const attachMediaWebSocketServer = (server) => {
 
       if (!parsed?.date && !parsed?.time && !spokenTime) return null;
 
+      const chronoTime = formatTimeForBooking(parsed?.time);
+      const numericTimeSignal = hasNumericTimeSignal(timeSource);
+      const parsedTime = spokenTime
+        ? spokenTime
+        : numericTimeSignal
+          ? chronoTime
+          : "";
+
+      console.log("[PARSE_BOOKING_TIME_DEBUG]", {
+        timeSource,
+        combined,
+        spokenTime,
+        chronoTime,
+        hasExplicitTime,
+        hasNumericTimeSignal: numericTimeSignal,
+        finalParsedTime: parsedTime,
+      });
+
       return {
         date: hasExplicitDate ? (parsed?.date || "") : "",
-        time: hasExplicitTime ? (spokenTime || formatTimeForBooking(parsed?.time)) : "",
+        time: hasExplicitTime ? parsedTime : "",
       };
     };
 
