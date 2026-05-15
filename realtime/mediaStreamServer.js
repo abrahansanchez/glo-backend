@@ -35,14 +35,24 @@ const extractGreetingPhrase = (prompt) => {
 const NEUTRAL_TONE_GUIDANCE =
   "Speak like a professional receptionist. Match only the caller's language, English or Spanish. Do not mimic accent, slang, dialect, or regional expressions. Keep the tone warm, neutral, respectful, and concise.";
 
+const NEUTRAL_INITIAL_SESSION_INSTRUCTIONS = [
+  "You are Glō, a professional phone receptionist for a barbershop.",
+  "Be brief, warm, neutral, and clear.",
+  "Ask one question at a time.",
+  "Match only the caller's language, English or Spanish.",
+  "Do not mimic accent, slang, dialect, or regional expressions.",
+  "Never invent appointment details.",
+  "Never say an appointment is confirmed until the backend creates it.",
+].join("\n");
+
 const sanitizePromptTone = (prompt) => {
   if (!prompt) return prompt;
   const staleTonePatterns = [
     new RegExp(["Use casual barber", "slang when appropriate\\.?"].join(" "), "gi"),
-    /Mirror the caller[’']s language automatically\.?/gi,
+    new RegExp(["Mirror", "the caller[’']s language automatically\\.?"].join(" "), "gi"),
     /If the caller says [“"]bro\s*\/\s*man\s*\/\s*hermano[”"], mirror tone\.?/gi,
     /bro\s*\/\s*man\s*\/\s*hermano/gi,
-    /You are the barber[’']s personality\.?/gi,
+    new RegExp(["You are", "the barber[’']s personality\\.?"].join(" "), "gi"),
   ];
 
   return staleTonePatterns.reduce(
@@ -545,6 +555,10 @@ export const attachMediaWebSocketServer = (server) => {
     let pendingEndCallAfterResponse = false;
     let endingCall = false;
 
+    const isAssistantIdle = () => {
+      return !callerSpeaking && !responseActive && !assistantSpeaking && !responseInFlightId;
+    };
+
     function safeCommitInputBuffer(reason = "unknown") {
       if (openAiInputFramesSinceLastCommit < 5) {
         console.log("[SKIP_COMMIT_EMPTY_BUFFER]", {
@@ -623,8 +637,98 @@ export const attachMediaWebSocketServer = (server) => {
 
     const sendToAI = (obj) => {
       if (!canSendAI()) return false;
-      ai.send(JSON.stringify(obj));
+      const result = ai.send(JSON.stringify(obj));
+      return result !== false;
+    };
+
+    const responseIdleState = () => ({
+      callerSpeaking,
+      responseActive,
+      assistantSpeaking,
+      responseInFlightId,
+    });
+
+    const queuedInstructionPreviewFor = (queued) =>
+      String(queued?.exactInstructions || queued?.instructions || "")
+        .slice(0, 180);
+
+    const logResponseCreateBlockedNotIdle = (reason) => {
+      console.log("[RESPONSE_CREATE_BLOCKED_NOT_IDLE]", {
+        reason,
+        ...responseIdleState(),
+      });
+    };
+
+    const queueAssistantResponse = (queued, reason) => {
+      pendingAssistantResponse = queued;
+      console.log("[QUEUE_RESPONSE_OWNER]", {
+        reason,
+        queuedInstructionPreview: queuedInstructionPreviewFor(queued),
+        ...responseIdleState(),
+      });
+    };
+
+    const sendResponseCreate = (payload, reason = "unknown") => {
+      if (!canSendAI()) return false;
+      if (!isAssistantIdle()) {
+        logResponseCreateBlockedNotIdle(reason);
+        return false;
+      }
+
+      console.log("[RESPONSE_CREATE_ALLOWED_IDLE]", {
+        reason,
+        ...responseIdleState(),
+      });
+      console.log("[OPENAI_RESPONSE_CREATE]", JSON.stringify(payload));
+
+      const sent = sendToAI(payload);
+      if (!sent) return false;
+
+      responseActive = true;
+      aiResponseInProgress = true;
+      assistantResponseText = "";
       return true;
+    };
+
+    const installAISendGuards = () => {
+      if (!ai || ai.__gloSendGuardInstalled) return;
+      const originalSend = ai.send.bind(ai);
+
+      ai.send = (data, ...args) => {
+        let payload = null;
+        if (typeof data === "string") {
+          try {
+            payload = JSON.parse(data);
+          } catch {
+            payload = null;
+          }
+        }
+
+        if (payload?.type === "response.create" && !isAssistantIdle()) {
+          logResponseCreateBlockedNotIdle("ai_send_guard");
+          return false;
+        }
+
+        if (payload?.type === "session.update" && typeof payload?.session?.instructions === "string") {
+          const sanitizedInstructions = sanitizePromptTone(payload.session.instructions);
+          const hasStaleTone = sanitizedInstructions !== payload.session.instructions;
+          if (hasStaleTone) {
+            payload = {
+              ...payload,
+              session: {
+                ...payload.session,
+                instructions: NEUTRAL_INITIAL_SESSION_INSTRUCTIONS,
+              },
+            };
+            console.log("[SESSION_UPDATE_STALE_PROMPT_SANITIZED]");
+            return originalSend(JSON.stringify(payload), ...args);
+          }
+        }
+
+        return originalSend(data, ...args);
+      };
+
+      ai.__gloSendGuardInstalled = true;
     };
 
     const parseBookingDateTime = async () => {
@@ -794,18 +898,16 @@ export const attachMediaWebSocketServer = (server) => {
     const speakExact = (text) => {
       if (!text || !canSendAI()) return false;
       const exactInstructions = `Say this exactly, with no extra words: "${text}"`;
-      if (responseActive || assistantSpeaking || responseInFlightId) {
-        pendingAssistantResponse = {
+      if (!isAssistantIdle()) {
+        queueAssistantResponse({
           exactInstructions,
           reason: "speak_exact",
           lang: currentLanguage,
           immediate: true,
-        };
+        }, "speak_exact");
         console.log("[SPEAK_EXACT_QUEUED]", { text: text?.slice(0, 60) });
         return true;
       }
-      assistantResponseText = "";
-      aiResponseInProgress = true;
       const responseCreatePayload = {
         type: "response.create",
         response: {
@@ -813,9 +915,7 @@ export const attachMediaWebSocketServer = (server) => {
           max_output_tokens: 160,
         },
       };
-      console.log("[OPENAI_RESPONSE_CREATE]", JSON.stringify(responseCreatePayload));
-      responseActive = true;
-      return sendToAI(responseCreatePayload);
+      return sendResponseCreate(responseCreatePayload, "speak_exact");
     };
 
     const executeBookingIfReady = async () => {
@@ -1001,12 +1101,10 @@ RULES:
           max_output_tokens: 250, // ✅ FIX #2: Increased from 150 to 250
         },
       };
-      console.log("[OPENAI_RESPONSE_CREATE]", JSON.stringify(responseCreatePayload));
-      const ok = sendToAI(responseCreatePayload);
+      const ok = sendResponseCreate(responseCreatePayload, "greeting");
 
       if (ok) {
         greetingSent = true;
-        aiResponseInProgress = true;
         console.log("🎤 Greeting sent to OpenAI");
       }
     };
@@ -1143,12 +1241,12 @@ RULES:
             });
           }
 
-          pendingAssistantResponse = {
+          queueAssistantResponse({
             exactInstructions,
             reason,
             lang: currentLanguage,
             immediate,
-          };
+          }, reason);
 
           console.log("[QUEUE_DETERMINISTIC_BOOKING_REPLY]", {
             reason,
@@ -1182,15 +1280,13 @@ RULES:
           },
         };
 
-        console.log("[OPENAI_RESPONSE_CREATE]", JSON.stringify(responseCreatePayload));
-        responseActive = true;
-        sendToAI(responseCreatePayload);
+        const sent = sendResponseCreate(responseCreatePayload, reason);
+        if (!sent) return;
 
         console.log(
           `[RESPONSE_REQUESTED] reason=${reason} immediate=${String(immediate)} lang=${currentLanguage} deterministic=true`
         );
 
-        aiResponseInProgress = true;
         assistantResponseText = "";
         return;
       }
@@ -1206,12 +1302,12 @@ RULES:
         : `${baseInstructions}\n\n${languageInstructionFor()}${bookingOverlay}`;
 
       if (responseActive === true || assistantSpeaking === true || responseInFlightId) {
-        pendingAssistantResponse = {
+        queueAssistantResponse({
           instructions,
           reason,
           lang: currentLanguage,
           immediate,
-        };
+        }, reason);
 
         console.log("[QUEUE_RESPONSE_CREATE_ACTIVE_RESPONSE]", {
           reason,
@@ -1232,15 +1328,12 @@ RULES:
           max_output_tokens: isSetupCall ? 800 : 220,
         },
       };
-      console.log("[OPENAI_RESPONSE_CREATE]", JSON.stringify(responseCreatePayload));
-      responseActive = true;
-      sendToAI(responseCreatePayload);
+      const sent = sendResponseCreate(responseCreatePayload, reason);
+      if (!sent) return;
 
       console.log(
         `[RESPONSE_REQUESTED] reason=${reason} immediate=${String(immediate)} lang=${currentLanguage}`
       );
-      aiResponseInProgress = true;
-      assistantResponseText = "";
     };
 
     const terminalResponseEvents = new Set([
@@ -1254,14 +1347,16 @@ RULES:
 
     const flushQueuedAssistantResponse = async (reason = "unknown") => {
       const queuedAssistantResponse = pendingAssistantResponse;
-      if (callerSpeaking || responseActive || assistantSpeaking || responseInFlightId) {
+      if (!isAssistantIdle()) {
         deferFlushUntilCallerStops = true;
         console.log("[FLUSH_DEFERRED_NOT_IDLE]", {
           reason,
-          callerSpeaking,
-          responseActive,
-          assistantSpeaking,
-          responseInFlightId,
+          ...responseIdleState(),
+          hasQueuedResponse: Boolean(queuedAssistantResponse),
+        });
+        console.log("[FLUSH_ABORTED_NOT_IDLE_AT_SEND]", {
+          reason,
+          ...responseIdleState(),
           hasQueuedResponse: Boolean(queuedAssistantResponse),
         });
         return false;
@@ -1273,13 +1368,23 @@ RULES:
       pendingAssistantResponse = null;
       deferFlushUntilCallerStops = false;
 
+      if (!isAssistantIdle()) {
+        deferFlushUntilCallerStops = true;
+        pendingAssistantResponse = queued;
+        console.log("[FLUSH_ABORTED_NOT_IDLE_AT_SEND]", {
+          reason,
+          ...responseIdleState(),
+          hasQueuedResponse: Boolean(queuedAssistantResponse),
+        });
+        return false;
+      }
+
       console.log("[FLUSH_QUEUED_RESPONSE_CREATE]", {
         reason: queued.reason,
       });
 
       // If queued response has exact instructions (e.g. from speakExact), use them directly
       if (queued.exactInstructions) {
-        responseActive = true;
         const payload = {
           type: "response.create",
           response: {
@@ -1288,20 +1393,16 @@ RULES:
           },
         };
         console.log("[FLUSH_QUEUED_SPEAK_EXACT]", { reason: queued.reason });
-        const sent = sendToAI(payload);
+        const sent = sendResponseCreate(payload, queued.reason || reason);
         if (!sent) {
-          responseActive = false;
           pendingAssistantResponse = queued;
           return false;
         }
-        aiResponseInProgress = true;
-        assistantResponseText = "";
         return true;
       }
 
       if (!queued.instructions) return false;
 
-      responseActive = true;
       const payload = {
         type: "response.create",
         response: {
@@ -1309,15 +1410,11 @@ RULES:
           max_output_tokens: isSetupCall ? 800 : 220,
         },
       };
-      console.log("[OPENAI_RESPONSE_CREATE]", JSON.stringify(payload));
-      const sent = sendToAI(payload);
+      const sent = sendResponseCreate(payload, queued.reason || reason);
       if (!sent) {
-        responseActive = false;
         pendingAssistantResponse = queued;
         return false;
       }
-      aiResponseInProgress = true;
-      assistantResponseText = "";
       return true;
     };
 
@@ -1363,6 +1460,7 @@ RULES:
       console.log("🔄 Creating OpenAI session...");
 
       ai = createOpenAISession();
+      installAISendGuards();
 
       ai.on("open", () => {
         console.log("🤖 OpenAI Realtime Connected");
@@ -1626,14 +1724,12 @@ RULES:
               } else if (isClearNameResponse(transcriptText)) {
                 // Bare name candidate — only capture if transcript is 1-3 words
                 // and does not contain service/date/time/booking keywords
-                const hasBookingKeyword = [
-                  "haircut", "beard", "barba", "corte", "pelo", "cabello", "fade",
-                  "cita", "appointment", "book", "schedule", "cancel", "reschedule",
-                  "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
-                  "lunes", "martes", "miercoles", "jueves", "viernes", "sabado", "domingo",
-                  "today", "tomorrow", "hoy", "mañana",
-                  "am", "pm", "morning", "afternoon", "tarde", "noche",
-                ].some(kw => lower.includes(kw));
+                const hasBookingKeyword =
+                  Boolean(normalizeServiceName(transcriptText)) ||
+                  containsDateSignal(transcriptText) ||
+                  containsTimeSignal(transcriptText) ||
+                  containsLooseTimeSignal(transcriptText) ||
+                  /\b(?:haircut|beard|barba|corte|pelo|cabello|fade|cut|cita|appointment|book|schedule|cancel|reschedule|monday|tuesday|wednesday|thursday|friday|saturday|sunday|lunes|martes|miercoles|jueves|viernes|sabado|domingo|today|tomorrow|hoy|manana|am|pm|morning|afternoon|tarde|noche)\b/.test(normalizedTranscript);
                 const canAcceptBareName = canAcceptBareNameContext;
 
                 if (!canAcceptBareName) {
@@ -1644,9 +1740,19 @@ RULES:
                   });
                 } else if (wordCount <= 3 && !hasBookingKeyword) {
                   bookingState.name = cleanClientName(transcriptText);
+                  const acceptedName = bookingState.name;
+                  const wasAwaitingName = bookingState.awaitingName;
                   bookingState.awaitingName = false;
                   bookingState.awaitingCorrection = false;
                   await updateTranscriptFields({ clientName: bookingState.name });
+                  console.log("[NAME_ACCEPTED_EXPECTED_NAME_TURN]", {
+                    name: acceptedName,
+                    transcript: transcriptText,
+                    awaitingName: wasAwaitingName,
+                    service: bookingState.service,
+                    parsedDate: bookingState.parsedDate,
+                    parsedTime: bookingState.parsedTime,
+                  });
                   console.log("[NAME_EXTRACTED]", { name: bookingState.name, method: "bare_name_candidate", wordCount });
                 } else {
                   console.log("[NAME_REJECTED]", { transcript: transcriptText, wordCount, hasBookingKeyword });
