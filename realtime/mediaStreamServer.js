@@ -65,12 +65,16 @@ const isYes = (text) => {
   const yesPatterns = [
     "yes", "yep", "yup", "yeah", "sure", "correct", "confirm", "confirmed",
     "ok", "okay", "alright", "sounds good", "perfect", "great",
-    "si", "dale", "claro", "perfecto", "exacto", "adelante",
+    "si", "sí confirma", "si confirma", "dale", "claro", "correcto", "confirma", "confirmar", "perfecto", "exacto", "adelante",
     "si dale", "yes please", "go ahead", "that works", "that's right",
+    "listo", "por favor", "va", "va bien", "está bien", "esta bien",
     "sounds right", "do it", "book it", "let's do it"
   ];
 
-  return yesPatterns.some((p) => t === p || t.includes(p));
+  return yesPatterns.some((p) => {
+    const pattern = p.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+    return t === pattern || t.includes(pattern);
+  });
 };
 
 const isNo = (text) => {
@@ -882,6 +886,7 @@ export const attachMediaWebSocketServer = (server) => {
       `- haircut + beard\n` +
       `- other (ask what they want)\n\n` +
       `STYLE:\n` +
+      `Speak like a professional receptionist. Match the caller’s language, English or Spanish, but do not mimic their accent, slang, dialect, or regional expressions. Keep the tone warm, neutral, respectful, and concise. Do not use regional slang. Do not switch dialects. If speaking Spanish, use neutral professional Spanish.\n` +
       `- 1-2 short sentences max per turn.\n` +
       `- No long speeches.\n` +
       `- No awkward pauses.\n`;
@@ -1334,6 +1339,49 @@ RULES:
               return;
             }
 
+            // Confirmation-stage filter — when waiting for yes/no, ignore unrelated noise
+            if (bookingState.askedConfirm && !bookingState.confirmed) {
+              const confirmationWords = [
+                "si", "sí", "yes", "yeah", "yep",
+                "claro", "correcto", "confirma", "confirmar",
+                "that works", "go ahead", "correct",
+                "no", "nope", "cambiar", "otra hora", "otro dia", "otro día",
+                "different time", "different day", "change it",
+                "make it later", "make it earlier",
+                "quiero cambiar", "no gracias",
+                "perfecto", "listo", "por favor",
+                "va", "va bien", "esta bien", "está bien"
+              ];
+
+              const t = transcriptText
+                .toLowerCase()
+                .normalize("NFD")
+                .replace(/[\u0300-\u036f]/g, "")
+                .trim();
+
+              const hasDate = containsDateSignal(transcriptText);
+              const hasTime = containsTimeSignal(transcriptText) || containsLooseTimeSignal(transcriptText);
+              const hasService = ["haircut", "beard", "barba", "corte", "pelo", "cabello", "fade"].some(kw => t.includes(kw));
+
+              const isConfirmationRelevant =
+                confirmationWords.some(w =>
+                  t.includes(
+                    w.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+                  )
+                ) ||
+                hasDate ||
+                hasTime ||
+                hasService;
+
+              if (!isConfirmationRelevant) {
+                console.log("[CONFIRMATION_TRANSCRIPT_IGNORED_NOISE]", {
+                  transcript: transcriptText,
+                  reason: "not_confirmation_relevant",
+                });
+                return;
+              }
+            }
+
             userTranscriptLines.push(transcriptText);
             await appendMessage({ role: "caller", text: transcriptText, lang: currentLanguage });
 
@@ -1668,7 +1716,7 @@ RULES:
                       type: "server_vad",
                       threshold: 0.6,
                       prefix_padding_ms: 400,
-                      silence_duration_ms: 800,
+                      silence_duration_ms: 1200,
                     },
                   },
                 },
