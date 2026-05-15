@@ -1896,7 +1896,8 @@ RULES:
                       type: "audio/pcmu",
                     },
                     transcription: {
-                      model: "whisper-1",
+                      model: "gpt-realtime-whisper",
+                      language: "es",
                     },
                     turn_detection: {
                       type: "server_vad",
@@ -1908,6 +1909,12 @@ RULES:
                 },
               },
             };
+            console.log("[TRANSCRIPTION_CONFIG]", {
+              model: vadUpdatePayload?.session?.audio?.input?.transcription?.model,
+              language: vadUpdatePayload?.session?.audio?.input?.transcription?.language || null,
+              format: vadUpdatePayload?.session?.audio?.input?.format,
+              turnDetection: vadUpdatePayload?.session?.audio?.input?.turn_detection,
+            });
             console.log("[OPENAI_SESSION_UPDATE]", JSON.stringify(vadUpdatePayload));
             ai.send(JSON.stringify(vadUpdatePayload));
             console.log("🎙️ VAD enabled for conversation");
