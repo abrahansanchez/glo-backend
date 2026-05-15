@@ -32,6 +32,25 @@ const extractGreetingPhrase = (prompt) => {
   return null;
 };
 
+const NEUTRAL_TONE_GUIDANCE =
+  "Speak like a professional receptionist. Match only the caller's language, English or Spanish. Do not mimic accent, slang, dialect, or regional expressions. Keep the tone warm, neutral, respectful, and concise.";
+
+const sanitizePromptTone = (prompt) => {
+  if (!prompt) return prompt;
+  const staleTonePatterns = [
+    new RegExp(["Use casual barber", "slang when appropriate\\.?"].join(" "), "gi"),
+    /Mirror the caller[’']s language automatically\.?/gi,
+    /If the caller says [“"]bro\s*\/\s*man\s*\/\s*hermano[”"], mirror tone\.?/gi,
+    /bro\s*\/\s*man\s*\/\s*hermano/gi,
+    /You are the barber[’']s personality\.?/gi,
+  ];
+
+  return staleTonePatterns.reduce(
+    (text, pattern) => text.replace(pattern, NEUTRAL_TONE_GUIDANCE),
+    String(prompt)
+  );
+};
+
 const detectLanguageMode = (text) => {
   if (/[áéíóúñ¿¡]/i.test(text)) return "es";
   const t = String(text || "").toLowerCase();
@@ -75,6 +94,26 @@ const isYes = (text) => {
     const pattern = p.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
     return t === pattern || t.includes(pattern);
   });
+};
+
+const isConfirmationYes = (text) => {
+  const t = String(text || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[.?!,]+$/g, "")
+    .trim();
+
+  if (isYes(text)) return true;
+
+  const confirmationOnlyYesAliases = [
+    "see you",
+    "see ya",
+    "si you",
+    "c you",
+  ];
+
+  return confirmationOnlyYesAliases.includes(t);
 };
 
 const isNo = (text) => {
@@ -472,6 +511,7 @@ export const attachMediaWebSocketServer = (server) => {
     let assistantSpeaking = false;
     let callerSpeaking = false;
     let deferFlushUntilCallerStops = false;
+    let flushDelayTimer = null;
     let pendingAssistantResponse = null;
     let lastUserSpokeAt = 0;
     let assistantResponseText = "";
@@ -888,7 +928,7 @@ export const attachMediaWebSocketServer = (server) => {
       `- haircut + beard\n` +
       `- other (ask what they want)\n\n` +
       `STYLE:\n` +
-      `Speak like a professional receptionist. Match the caller’s language, English or Spanish, but do not mimic their accent, slang, dialect, or regional expressions. Keep the tone warm, neutral, respectful, and concise. Do not use regional slang. Do not switch dialects. If speaking Spanish, use neutral professional Spanish.\n` +
+      `${NEUTRAL_TONE_GUIDANCE}\n` +
       `- 1-2 short sentences max per turn.\n` +
       `- No long speeches.\n` +
       `- No awkward pauses.\n`;
@@ -1162,7 +1202,7 @@ RULES:
           : "";
 
       const instructions = isSetupCall && initialPrompt
-        ? initialPrompt
+        ? sanitizePromptTone(initialPrompt)
         : `${baseInstructions}\n\n${languageInstructionFor()}${bookingOverlay}`;
 
       if (responseActive === true || assistantSpeaking === true || responseInFlightId) {
@@ -1214,19 +1254,24 @@ RULES:
 
     const flushQueuedAssistantResponse = async (reason = "unknown") => {
       const queuedAssistantResponse = pendingAssistantResponse;
-      if (callerSpeaking) {
+      if (callerSpeaking || responseActive || assistantSpeaking || responseInFlightId) {
         deferFlushUntilCallerStops = true;
-        console.log("[FLUSH_DEFERRED_CALLER_SPEAKING]", {
+        console.log("[FLUSH_DEFERRED_NOT_IDLE]", {
           reason,
+          callerSpeaking,
+          responseActive,
+          assistantSpeaking,
+          responseInFlightId,
           hasQueuedResponse: Boolean(queuedAssistantResponse),
         });
-        return;
+        return false;
       }
 
-      if (!queuedAssistantResponse) return;
+      if (!queuedAssistantResponse) return false;
 
       const queued = queuedAssistantResponse;
       pendingAssistantResponse = null;
+      deferFlushUntilCallerStops = false;
 
       console.log("[FLUSH_QUEUED_RESPONSE_CREATE]", {
         reason: queued.reason,
@@ -1234,10 +1279,6 @@ RULES:
 
       // If queued response has exact instructions (e.g. from speakExact), use them directly
       if (queued.exactInstructions) {
-        if (responseActive || assistantSpeaking || responseInFlightId) {
-          pendingAssistantResponse = queued;
-          return;
-        }
         responseActive = true;
         const payload = {
           type: "response.create",
@@ -1247,33 +1288,65 @@ RULES:
           },
         };
         console.log("[FLUSH_QUEUED_SPEAK_EXACT]", { reason: queued.reason });
-        sendToAI(payload);
+        const sent = sendToAI(payload);
+        if (!sent) {
+          responseActive = false;
+          pendingAssistantResponse = queued;
+          return false;
+        }
         aiResponseInProgress = true;
         assistantResponseText = "";
-      } else {
-        await requestAssistantResponse({
-          immediate: queued.immediate,
-          reason: queued.reason,
-        });
+        return true;
       }
+
+      if (!queued.instructions) return false;
+
+      responseActive = true;
+      const payload = {
+        type: "response.create",
+        response: {
+          instructions: queued.instructions,
+          max_output_tokens: isSetupCall ? 800 : 220,
+        },
+      };
+      console.log("[OPENAI_RESPONSE_CREATE]", JSON.stringify(payload));
+      const sent = sendToAI(payload);
+      if (!sent) {
+        responseActive = false;
+        pendingAssistantResponse = queued;
+        return false;
+      }
+      aiResponseInProgress = true;
+      assistantResponseText = "";
+      return true;
+    };
+
+    const scheduleQueuedAssistantFlush = (reason = "unknown") => {
+      if (flushDelayTimer) {
+        clearTimeout(flushDelayTimer);
+      }
+
+      flushDelayTimer = setTimeout(() => {
+        flushDelayTimer = null;
+        void flushQueuedAssistantResponse(reason);
+      }, 250);
     };
 
     const finishCallerTranscriptHandling = async (reason = "transcript_completed") => {
-      let flushedDeferredResponse = false;
+      let scheduledDeferredResponse = false;
       if (callerSpeaking) {
         callerSpeaking = false;
         console.log("[CALLER_SPEAKING_STOPPED_AFTER_TRANSCRIPT]", { reason });
       }
 
       if (deferFlushUntilCallerStops && pendingAssistantResponse) {
-        deferFlushUntilCallerStops = false;
-        console.log("[FLUSH_RESUMED_AFTER_CALLER_STOPPED]");
-        await flushQueuedAssistantResponse("caller_stopped_after_transcript");
-        flushedDeferredResponse = true;
+        console.log("[FLUSH_RESCHEDULED_AFTER_CALLER_STOPPED]");
+        scheduleQueuedAssistantFlush("caller_stopped_after_transcript_delayed");
+        scheduledDeferredResponse = true;
       } else if (deferFlushUntilCallerStops) {
         deferFlushUntilCallerStops = false;
       }
-      return flushedDeferredResponse;
+      return scheduledDeferredResponse;
     };
 
     // ----------------------------
@@ -1416,7 +1489,8 @@ RULES:
                 "make it later", "make it earlier",
                 "quiero cambiar", "no gracias",
                 "perfecto", "listo", "por favor",
-                "va", "va bien", "esta bien", "está bien"
+                "va", "va bien", "esta bien", "está bien",
+                "see you", "see ya", "si you", "c you"
               ];
 
               const t = transcriptText
@@ -1505,25 +1579,42 @@ RULES:
             }
 
             const lower = transcriptText.toLowerCase();
+            const notNamePhrases = [
+              "alucinando", "hallucinating", "no funciona", "esto no", "me esta cortando",
+              "no me deja hablar", "wait", "espera", "hold on", "un momento",
+              "au revoir", "bye", "goodbye", "see you", "see ya", "hasta luego",
+              "adios", "adiós", "me voy", "colgar", "hang up"
+            ];
+            const hasNotNamePhrase = notNamePhrases.some((phrase) =>
+              normalizedTranscript.includes(
+                phrase.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+              )
+            );
+            if (bookingState.intent === "BOOK" && hasNotNamePhrase && !bookingState.askedConfirm) {
+              console.log("[NAME_REJECTED_NOT_NAME_PHRASE]", { transcript: transcriptText });
+              console.log("[TRANSCRIPT_IGNORED_NOT_NAME_NO_RESPONSE]", {
+                transcript: transcriptText,
+              });
+              await finishCallerTranscriptHandling("not_name_phrase");
+              return;
+            }
+
             // Global name extraction — capture obvious names even out of order
             if (!bookingState.name && bookingState.intent === "BOOK") {
-              const notNamePhrases = [
-                "alucinando", "hallucinating", "no funciona", "esto no", "me esta cortando",
-                "no me deja hablar", "wait", "espera", "hold on", "un momento"
-              ];
-              const hasNotNamePhrase = notNamePhrases.some((phrase) =>
-                normalizedTranscript.includes(
-                  phrase.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "")
-                )
-              );
+              const canAcceptBareNameContext =
+                bookingState.awaitingName === true ||
+                Boolean(
+                  bookingState.service &&
+                  bookingState.parsedDate &&
+                  bookingState.parsedTime &&
+                  !bookingState.name
+                );
               const explicitPhrases = [
                 "my name is", "i'm ", "i am ", "soy ", "me llamo ", "a nombre de ", "llámame ", "me puedes llamar "
               ];
               const hasExplicitPhrase = explicitPhrases.some(p => lower.includes(p));
 
-              if (hasNotNamePhrase) {
-                console.log("[NAME_REJECTED_NOT_NAME_PHRASE]", { transcript: transcriptText });
-              } else if (hasExplicitPhrase) {
+              if (hasExplicitPhrase) {
                 const extracted = cleanClientName(transcriptText);
                 if (isClearNameResponse(extracted)) {
                   bookingState.name = extracted;
@@ -1543,14 +1634,7 @@ RULES:
                   "today", "tomorrow", "hoy", "mañana",
                   "am", "pm", "morning", "afternoon", "tarde", "noche",
                 ].some(kw => lower.includes(kw));
-                const canAcceptBareName =
-                  bookingState.awaitingName === true ||
-                  Boolean(
-                    bookingState.service &&
-                    bookingState.parsedDate &&
-                    bookingState.parsedTime &&
-                    !bookingState.name
-                  );
+                const canAcceptBareName = canAcceptBareNameContext;
 
                 if (!canAcceptBareName) {
                   console.log("[NAME_REJECTED]", {
@@ -1716,7 +1800,7 @@ RULES:
               // If not, deterministic reply will ask what they want to change.
             }
 
-            if (bookingState.intent === "BOOK" && bookingState.askedConfirm && isYes(transcriptText)) {
+            if (bookingState.intent === "BOOK" && bookingState.askedConfirm && isConfirmationYes(transcriptText)) {
               bookingState.confirmed = true;
               console.log("[CONFIRMATION_ACCEPTED]", {
                 transcript: transcriptText,
@@ -1739,11 +1823,11 @@ RULES:
 
             lastUserSpokeAt = Date.now();
 
-            const flushedDeferredResponse = await finishCallerTranscriptHandling("transcript_completed");
+            const scheduledDeferredResponse = await finishCallerTranscriptHandling("transcript_completed");
 
             if (pendingResponseAfterTranscript) {
               pendingResponseAfterTranscript = false;
-              if (flushedDeferredResponse) return;
+              if (scheduledDeferredResponse) return;
               await requestAssistantResponse({ immediate: true, reason: "transcript_ready" });
             }
           } else {
@@ -1798,7 +1882,7 @@ RULES:
             greetingComplete = true;
             assistantSpeaking = false;
             responseActive = false;
-            responseInFlightId = null;
+            responseInFlightId = "";
             console.log("✅ Greeting complete - enabling VAD and audio forwarding");
 
             // ✅ FIX #4: Better VAD settings
@@ -1829,7 +1913,7 @@ RULES:
             console.log("🎙️ VAD enabled for conversation");
           }
           assistantSpeaking = false;
-          responseInFlightId = null;
+          responseInFlightId = "";
           if (assistantResponseText && assistantResponseText.trim()) {
             const responseLower = assistantResponseText.toLowerCase();
             if (
@@ -1930,9 +2014,9 @@ RULES:
         if (isTerminalResponseEvent) {
           assistantSpeaking = false;
           responseActive = false;
-          responseInFlightId = null;
+          responseInFlightId = "";
           aiResponseInProgress = false;
-          await flushQueuedAssistantResponse("terminal_response_event");
+          scheduleQueuedAssistantFlush("terminal_response_event_delayed");
         }
       });
 
@@ -1965,7 +2049,7 @@ RULES:
         const custom = msg.start?.customParameters || {};
         streamParams = custom;
         barberId = custom.barberId || barberId || null;
-        initialPrompt = custom.initialPrompt || initialPrompt || null;
+        initialPrompt = custom.initialPrompt ? sanitizePromptTone(custom.initialPrompt) : initialPrompt || null;
         callerNumber = custom.from || msg.start?.from || callerNumber || "";
         toNumber = custom.to || msg.start?.to || toNumber || "";
         callSid = custom.callSid || msg.start?.callSid || callSid || "";
