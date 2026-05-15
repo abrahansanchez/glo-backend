@@ -522,6 +522,13 @@ export const attachMediaWebSocketServer = (server) => {
     let callerSpeaking = false;
     let deferFlushUntilCallerStops = false;
     let flushDelayTimer = null;
+    let readyForCallerInput = false;
+    let assistantPlaybackActive = false;
+    let pendingAssistantMarkName = null;
+    let assistantTurnSeq = 0;
+    let assistantAudioSentThisResponse = false;
+    let assistantPlaybackWatchdogTimer = null;
+    let responseCreateSendReason = null;
     let pendingAssistantResponse = null;
     let lastUserSpokeAt = 0;
     let assistantResponseText = "";
@@ -555,8 +562,17 @@ export const attachMediaWebSocketServer = (server) => {
     let pendingEndCallAfterResponse = false;
     let endingCall = false;
 
-    const isAssistantIdle = () => {
-      return !callerSpeaking && !responseActive && !assistantSpeaking && !responseInFlightId;
+    const isAssistantIdle = (reason = "unknown") => {
+      const inputReady = readyForCallerInput || reason === "greeting";
+      return (
+        inputReady &&
+        !callerSpeaking &&
+        !responseActive &&
+        !assistantSpeaking &&
+        !responseInFlightId &&
+        !assistantPlaybackActive &&
+        !pendingAssistantMarkName
+      );
     };
 
     function safeCommitInputBuffer(reason = "unknown") {
@@ -642,10 +658,13 @@ export const attachMediaWebSocketServer = (server) => {
     };
 
     const responseIdleState = () => ({
+      readyForCallerInput,
       callerSpeaking,
       responseActive,
       assistantSpeaking,
       responseInFlightId,
+      assistantPlaybackActive,
+      pendingAssistantMarkName,
     });
 
     const queuedInstructionPreviewFor = (queued) =>
@@ -670,7 +689,7 @@ export const attachMediaWebSocketServer = (server) => {
 
     const sendResponseCreate = (payload, reason = "unknown") => {
       if (!canSendAI()) return false;
-      if (!isAssistantIdle()) {
+      if (!isAssistantIdle(reason)) {
         logResponseCreateBlockedNotIdle(reason);
         return false;
       }
@@ -681,8 +700,15 @@ export const attachMediaWebSocketServer = (server) => {
       });
       console.log("[OPENAI_RESPONSE_CREATE]", JSON.stringify(payload));
 
+      const previousReadyForCallerInput = readyForCallerInput;
+      readyForCallerInput = false;
+      responseCreateSendReason = reason;
       const sent = sendToAI(payload);
-      if (!sent) return false;
+      responseCreateSendReason = null;
+      if (!sent) {
+        readyForCallerInput = previousReadyForCallerInput;
+        return false;
+      }
 
       responseActive = true;
       aiResponseInProgress = true;
@@ -704,8 +730,8 @@ export const attachMediaWebSocketServer = (server) => {
           }
         }
 
-        if (payload?.type === "response.create" && !isAssistantIdle()) {
-          logResponseCreateBlockedNotIdle("ai_send_guard");
+        if (payload?.type === "response.create" && !isAssistantIdle(responseCreateSendReason || "ai_send_guard")) {
+          logResponseCreateBlockedNotIdle(responseCreateSendReason || "ai_send_guard");
           return false;
         }
 
@@ -1101,6 +1127,8 @@ RULES:
           max_output_tokens: 250, // ✅ FIX #2: Increased from 150 to 250
         },
       };
+      readyForCallerInput = false;
+      console.log("[CALLER_INPUT_DISABLED_GREETING]");
       const ok = sendResponseCreate(responseCreatePayload, "greeting");
 
       if (ok) {
@@ -1429,6 +1457,70 @@ RULES:
       }, 250);
     };
 
+    const clearAssistantPlaybackWatchdog = () => {
+      if (assistantPlaybackWatchdogTimer) {
+        clearTimeout(assistantPlaybackWatchdogTimer);
+        assistantPlaybackWatchdogTimer = null;
+      }
+    };
+
+    const clearAssistantPlaybackState = () => {
+      clearAssistantPlaybackWatchdog();
+      assistantPlaybackActive = false;
+      assistantSpeaking = false;
+      pendingAssistantMarkName = null;
+      assistantAudioSentThisResponse = false;
+      responseInFlightId = "";
+      readyForCallerInput = true;
+    };
+
+    const startAssistantPlaybackWatchdog = () => {
+      clearAssistantPlaybackWatchdog();
+      assistantPlaybackWatchdogTimer = setTimeout(() => {
+        console.log("[TWILIO_PLAYBACK_WATCHDOG_RESET_CALLER_INPUT_READY]", {
+          assistantPlaybackActive,
+          pendingAssistantMarkName,
+          assistantSpeaking,
+          responseInFlightId,
+          readyForCallerInput,
+        });
+
+        clearAssistantPlaybackState();
+        scheduleQueuedAssistantFlush("twilio_playback_watchdog_reset");
+      }, 12000);
+    };
+
+    const sendAssistantPlaybackMark = (reason = "unknown") => {
+      if (!assistantAudioSentThisResponse || pendingAssistantMarkName) return false;
+      if (twilioWs.readyState !== twilioWs.OPEN || !streamSid) {
+        console.log("[TWILIO_PLAYBACK_MARK_SKIPPED]", {
+          reason,
+          hasStreamSid: Boolean(streamSid),
+          twilioReadyState: twilioWs.readyState,
+        });
+        clearAssistantPlaybackState();
+        scheduleQueuedAssistantFlush("twilio_playback_mark_unavailable");
+        return false;
+      }
+
+      assistantTurnSeq += 1;
+      const markName = `assistant-playback-${assistantTurnSeq}`;
+      pendingAssistantMarkName = markName;
+      twilioWs.send(JSON.stringify({
+        event: "mark",
+        streamSid,
+        mark: {
+          name: markName,
+        },
+      }));
+      console.log("[TWILIO_PLAYBACK_MARK_SENT]", {
+        markName,
+        responseInFlightId,
+      });
+      startAssistantPlaybackWatchdog();
+      return true;
+    };
+
     const finishCallerTranscriptHandling = async (reason = "transcript_completed") => {
       let scheduledDeferredResponse = false;
       if (callerSpeaking) {
@@ -1527,6 +1619,21 @@ RULES:
           });
           const transcriptText = (evt.transcript || "").trim();
           if (transcriptText) {
+            if (!readyForCallerInput) {
+              console.log("[TRANSCRIPT_IGNORED_CALLER_INPUT_NOT_READY]", {
+                transcript: transcriptText,
+                readyForCallerInput,
+                assistantPlaybackActive,
+                pendingAssistantMarkName,
+                responseActive,
+                assistantSpeaking,
+                responseInFlightId,
+              });
+
+              await finishCallerTranscriptHandling("caller_input_not_ready");
+              return;
+            }
+
             const transcriptId = evt.item_id || evt.event_id || evt.id || transcriptText;
             if (processedTranscriptIds.has(transcriptId)) {
               console.log("[TRANSCRIPT_DEDUPE] skipping duplicate transcript", transcriptId);
@@ -1957,6 +2064,25 @@ RULES:
           console.log("[SERVER_VAD_SPEECH_STARTED]", evt);
           callerSpeaking = true;
           console.log("[CALLER_SPEAKING_STARTED]");
+          if (assistantPlaybackActive || pendingAssistantMarkName) {
+            if (twilioWs.readyState === twilioWs.OPEN && streamSid) {
+              twilioWs.send(JSON.stringify({
+                event: "clear",
+                streamSid,
+              }));
+            }
+            clearAssistantPlaybackWatchdog();
+            assistantPlaybackActive = false;
+            assistantSpeaking = false;
+            pendingAssistantMarkName = null;
+            assistantAudioSentThisResponse = false;
+            readyForCallerInput = true;
+            console.log("[TWILIO_PLAYBACK_CLEARED_ON_BARGE_IN_CALLER_INPUT_READY]", {
+              responseActive,
+              responseInFlightId,
+              readyForCallerInput,
+            });
+          }
           if (!assistantSpeaking) {
             console.log("[BARGE_IN_IGNORED_NO_ACTIVE_ASSISTANT]");
             return;
@@ -1986,9 +2112,7 @@ RULES:
         if (evt.type === "response.done") {
           if (greetingSent && !greetingComplete) {
             greetingComplete = true;
-            assistantSpeaking = false;
             responseActive = false;
-            responseInFlightId = "";
             console.log("✅ Greeting complete - enabling VAD and audio forwarding");
 
             // ✅ FIX #4: Better VAD settings
@@ -2025,8 +2149,6 @@ RULES:
             ai.send(JSON.stringify(vadUpdatePayload));
             console.log("🎙️ VAD enabled for conversation");
           }
-          assistantSpeaking = false;
-          responseInFlightId = "";
           if (assistantResponseText && assistantResponseText.trim()) {
             const responseLower = assistantResponseText.toLowerCase();
             if (
@@ -2110,8 +2232,6 @@ RULES:
           evt.type === "response.output_audio.delta"
         ) {
           stopSilence();
-          assistantSpeaking = true;
-          responseActive = true;
 
           if (twilioWs.readyState === twilioWs.OPEN && streamSid) {
             twilioWs.send(
@@ -2121,15 +2241,33 @@ RULES:
                 media: { payload: evt.delta },
               })
             );
+            const shouldLogPlaybackActive = !assistantPlaybackActive || !assistantAudioSentThisResponse;
+            assistantPlaybackActive = true;
+            assistantSpeaking = true;
+            assistantAudioSentThisResponse = true;
+            readyForCallerInput = false;
+            responseActive = true;
+            if (shouldLogPlaybackActive) {
+              console.log("[TWILIO_PLAYBACK_ACTIVE]", {
+                responseInFlightId,
+                assistantPlaybackActive,
+                readyForCallerInput,
+              });
+            }
           }
         }
 
         if (isTerminalResponseEvent) {
-          assistantSpeaking = false;
           responseActive = false;
-          responseInFlightId = "";
           aiResponseInProgress = false;
-          scheduleQueuedAssistantFlush("terminal_response_event_delayed");
+          if (assistantAudioSentThisResponse) {
+            sendAssistantPlaybackMark("terminal_response_event");
+          } else {
+            assistantSpeaking = false;
+            responseInFlightId = "";
+            readyForCallerInput = true;
+            scheduleQueuedAssistantFlush("terminal_response_event_delayed");
+          }
         }
       });
 
@@ -2151,6 +2289,27 @@ RULES:
       try {
         msg = JSON.parse(Buffer.from(msgData).toString("utf8"));
       } catch {
+        return;
+      }
+
+      if (msg.event === "mark" && msg.mark?.name === pendingAssistantMarkName) {
+        const markName = msg.mark?.name;
+        clearAssistantPlaybackWatchdog();
+        assistantPlaybackActive = false;
+        assistantSpeaking = false;
+        pendingAssistantMarkName = null;
+        assistantAudioSentThisResponse = false;
+        responseInFlightId = "";
+        readyForCallerInput = true;
+
+        console.log("[TWILIO_PLAYBACK_MARK_ACKED_CALLER_INPUT_READY]", {
+          markName,
+          readyForCallerInput,
+          assistantPlaybackActive,
+          assistantSpeaking,
+        });
+
+        scheduleQueuedAssistantFlush("twilio_playback_complete");
         return;
       }
 
@@ -2224,6 +2383,7 @@ RULES:
 
     twilioWs.on("close", () => {
       console.log("📴 Twilio WebSocket closed");
+      clearAssistantPlaybackWatchdog();
       stopSilence();
       if (ai && ai.readyState === ai.OPEN) ai.close();
       aiSessionStarted = false;
