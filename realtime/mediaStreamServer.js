@@ -188,7 +188,7 @@ const normalizeSpanishDateTimeText = (text) => {
 const cleanClientName = (text) => {
   const raw = String(text || "").trim();
   if (!raw) return "";
-  const direct = raw.match(/\b(?:my name is|i am|i'm|soy|me llamo)\s+(.+)/i);
+  const direct = raw.match(/\b(?:my name is|i am|i'm|soy|me llamo|a nombre de)\s+(.+)/i);
   const candidate = (direct?.[1] || raw)
     .replace(/[.?!,]+$/g, "")
     .trim();
@@ -470,6 +470,8 @@ export const attachMediaWebSocketServer = (server) => {
     let responseInFlightId = null;
     let responseActive = false;
     let assistantSpeaking = false;
+    let callerSpeaking = false;
+    let deferFlushUntilCallerStops = false;
     let pendingAssistantResponse = null;
     let lastUserSpokeAt = 0;
     let assistantResponseText = "";
@@ -1210,10 +1212,20 @@ RULES:
       "response.cancelled",
     ]);
 
-    const flushQueuedAssistantResponse = async () => {
-      if (!pendingAssistantResponse) return;
+    const flushQueuedAssistantResponse = async (reason = "unknown") => {
+      const queuedAssistantResponse = pendingAssistantResponse;
+      if (callerSpeaking) {
+        deferFlushUntilCallerStops = true;
+        console.log("[FLUSH_DEFERRED_CALLER_SPEAKING]", {
+          reason,
+          hasQueuedResponse: Boolean(queuedAssistantResponse),
+        });
+        return;
+      }
 
-      const queued = pendingAssistantResponse;
+      if (!queuedAssistantResponse) return;
+
+      const queued = queuedAssistantResponse;
       pendingAssistantResponse = null;
 
       console.log("[FLUSH_QUEUED_RESPONSE_CREATE]", {
@@ -1244,6 +1256,24 @@ RULES:
           reason: queued.reason,
         });
       }
+    };
+
+    const finishCallerTranscriptHandling = async (reason = "transcript_completed") => {
+      let flushedDeferredResponse = false;
+      if (callerSpeaking) {
+        callerSpeaking = false;
+        console.log("[CALLER_SPEAKING_STOPPED_AFTER_TRANSCRIPT]", { reason });
+      }
+
+      if (deferFlushUntilCallerStops && pendingAssistantResponse) {
+        deferFlushUntilCallerStops = false;
+        console.log("[FLUSH_RESUMED_AFTER_CALLER_STOPPED]");
+        await flushQueuedAssistantResponse("caller_stopped_after_transcript");
+        flushedDeferredResponse = true;
+      } else if (deferFlushUntilCallerStops) {
+        deferFlushUntilCallerStops = false;
+      }
+      return flushedDeferredResponse;
     };
 
     // ----------------------------
@@ -1329,6 +1359,7 @@ RULES:
             const transcriptId = evt.item_id || evt.event_id || evt.id || transcriptText;
             if (processedTranscriptIds.has(transcriptId)) {
               console.log("[TRANSCRIPT_DEDUPE] skipping duplicate transcript", transcriptId);
+              await finishCallerTranscriptHandling("duplicate_transcript");
               return;
             }
             processedTranscriptIds.add(transcriptId);
@@ -1336,6 +1367,41 @@ RULES:
             // Noise/filler gate — but never ignore if askedConfirm is true (yes/no matters)
             if (isNoisyTranscript(transcriptText, bookingState)) {
               console.log("[TRANSCRIPT_IGNORED_NOISE]", { transcript: transcriptText, reason: "filler_or_noise" });
+              console.log("[NO_RESPONSE_LOW_SIGNAL_TRANSCRIPT]", { transcript: transcriptText });
+              await finishCallerTranscriptHandling("noisy_transcript");
+              return;
+            }
+
+            // Pre-intent garbage filter — ignore obvious transcription junk before booking flow
+            const normalizedTranscript = transcriptText
+              .toLowerCase()
+              .normalize("NFD")
+              .replace(/[\u0300-\u036f]/g, "")
+              .trim();
+
+            const wordCount = normalizedTranscript.split(/\s+/).filter(Boolean).length;
+
+            const hasBookingSignal =
+              /cita|appointment|book|booking|agendar|reservar|schedule|quiero|necesito/.test(normalizedTranscript) ||
+              containsDateSignal(transcriptText) ||
+              containsTimeSignal(transcriptText) ||
+              containsLooseTimeSignal(transcriptText) ||
+              ["haircut", "beard", "barba", "corte", "pelo", "cabello", "fade"].some((kw) =>
+                normalizedTranscript.includes(kw)
+              );
+
+            if (
+              bookingState.intent !== "BOOK" &&
+              !bookingState.awaitingName &&
+              wordCount <= 2 &&
+              !hasBookingSignal
+            ) {
+              console.log("[TRANSCRIPT_IGNORED_PRE_INTENT_GARBAGE]", {
+                transcript: transcriptText,
+                wordCount,
+              });
+              console.log("[NO_RESPONSE_LOW_SIGNAL_TRANSCRIPT]", { transcript: transcriptText });
+              await finishCallerTranscriptHandling("pre_intent_garbage");
               return;
             }
 
@@ -1378,6 +1444,7 @@ RULES:
                   transcript: transcriptText,
                   reason: "not_confirmation_relevant",
                 });
+                await finishCallerTranscriptHandling("confirmation_noise");
                 return;
               }
             }
@@ -1440,12 +1507,23 @@ RULES:
             const lower = transcriptText.toLowerCase();
             // Global name extraction — capture obvious names even out of order
             if (!bookingState.name && bookingState.intent === "BOOK") {
+              const notNamePhrases = [
+                "alucinando", "hallucinating", "no funciona", "esto no", "me esta cortando",
+                "no me deja hablar", "wait", "espera", "hold on", "un momento"
+              ];
+              const hasNotNamePhrase = notNamePhrases.some((phrase) =>
+                normalizedTranscript.includes(
+                  phrase.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+                )
+              );
               const explicitPhrases = [
-                "my name is", "i'm ", "i am ", "soy ", "me llamo ", "llámame ", "me puedes llamar "
+                "my name is", "i'm ", "i am ", "soy ", "me llamo ", "a nombre de ", "llámame ", "me puedes llamar "
               ];
               const hasExplicitPhrase = explicitPhrases.some(p => lower.includes(p));
 
-              if (hasExplicitPhrase) {
+              if (hasNotNamePhrase) {
+                console.log("[NAME_REJECTED_NOT_NAME_PHRASE]", { transcript: transcriptText });
+              } else if (hasExplicitPhrase) {
                 const extracted = cleanClientName(transcriptText);
                 if (isClearNameResponse(extracted)) {
                   bookingState.name = extracted;
@@ -1457,7 +1535,6 @@ RULES:
               } else if (isClearNameResponse(transcriptText)) {
                 // Bare name candidate — only capture if transcript is 1-3 words
                 // and does not contain service/date/time/booking keywords
-                const wordCount = transcriptText.trim().split(/\s+/).length;
                 const hasBookingKeyword = [
                   "haircut", "beard", "barba", "corte", "pelo", "cabello", "fade",
                   "cita", "appointment", "book", "schedule", "cancel", "reschedule",
@@ -1466,8 +1543,22 @@ RULES:
                   "today", "tomorrow", "hoy", "mañana",
                   "am", "pm", "morning", "afternoon", "tarde", "noche",
                 ].some(kw => lower.includes(kw));
+                const canAcceptBareName =
+                  bookingState.awaitingName === true ||
+                  Boolean(
+                    bookingState.service &&
+                    bookingState.parsedDate &&
+                    bookingState.parsedTime &&
+                    !bookingState.name
+                  );
 
-                if (wordCount <= 3 && !hasBookingKeyword) {
+                if (!canAcceptBareName) {
+                  console.log("[NAME_REJECTED]", {
+                    transcript: transcriptText,
+                    reason: "not_awaiting_name_or_ready_for_name",
+                    wordCount,
+                  });
+                } else if (wordCount <= 3 && !hasBookingKeyword) {
                   bookingState.name = cleanClientName(transcriptText);
                   bookingState.awaitingName = false;
                   bookingState.awaitingCorrection = false;
@@ -1640,15 +1731,23 @@ RULES:
               });
               await updateTranscriptFields({ confirmed: true });
               const handled = await executeBookingIfReady();
-              if (handled) return;
+              if (handled) {
+                await finishCallerTranscriptHandling("booking_executed");
+                return;
+              }
             }
 
             lastUserSpokeAt = Date.now();
 
+            const flushedDeferredResponse = await finishCallerTranscriptHandling("transcript_completed");
+
             if (pendingResponseAfterTranscript) {
               pendingResponseAfterTranscript = false;
+              if (flushedDeferredResponse) return;
               await requestAssistantResponse({ immediate: true, reason: "transcript_ready" });
             }
+          } else {
+            await finishCallerTranscriptHandling("empty_transcript");
           }
         }
         if (
@@ -1656,6 +1755,7 @@ RULES:
           evt.type === "input_audio_transcription.failed"
         ) {
           console.log("[USER_TRANSCRIPT_FAILED]", evt);
+          await finishCallerTranscriptHandling("transcript_failed");
         }
         if (evt.type === "conversation.item.created") {
           console.log("[CONVERSATION_ITEM_CREATED]", evt);
@@ -1665,6 +1765,8 @@ RULES:
         }
         if (evt.type === "input_audio_buffer.speech_started") {
           console.log("[SERVER_VAD_SPEECH_STARTED]", evt);
+          callerSpeaking = true;
+          console.log("[CALLER_SPEAKING_STARTED]");
           if (!assistantSpeaking) {
             console.log("[BARGE_IN_IGNORED_NO_ACTIVE_ASSISTANT]");
             return;
@@ -1710,7 +1812,7 @@ RULES:
                       type: "audio/pcmu",
                     },
                     transcription: {
-                      model: "gpt-4o-transcribe",
+                      model: "whisper-1",
                     },
                     turn_detection: {
                       type: "server_vad",
@@ -1830,7 +1932,7 @@ RULES:
           responseActive = false;
           responseInFlightId = null;
           aiResponseInProgress = false;
-          await flushQueuedAssistantResponse();
+          await flushQueuedAssistantResponse("terminal_response_event");
         }
       });
 
