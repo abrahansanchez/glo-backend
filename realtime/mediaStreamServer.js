@@ -818,17 +818,50 @@ export const attachMediaWebSocketServer = (server) => {
 
     async function checkSlotAvailability() {
       const { service, parsedDate, parsedTime } = bookingState;
-      if (!service || !parsedDate || !parsedTime) return;
+      if (!service || !parsedDate || !parsedTime) {
+        console.log("[AVAILABILITY_CHECK_COMPLETED]", {
+          status: "skipped_missing_fields",
+          service,
+          parsedDate,
+          parsedTime,
+        });
+        return;
+      }
 
       const checkKey = `${service}|${parsedDate}|${parsedTime}`;
-      if (checkKey === lastAvailabilityCheckKey) return;
+      if (checkKey === lastAvailabilityCheckKey) {
+        console.log("[AVAILABILITY_CHECK_COMPLETED]", {
+          status: "skipped_cached",
+          service,
+          parsedDate,
+          parsedTime,
+          slotChecked,
+          slotAvailable,
+        });
+        return;
+      }
       lastAvailabilityCheckKey = checkKey;
 
       try {
+        console.log("[AVAILABILITY_CHECK_STARTED]", {
+          service,
+          parsedDate,
+          parsedTime,
+          barberId,
+        });
+
         if (!barberDoc) {
           barberDoc = await Barber.findById(barberId).lean();
         }
-        if (!barberDoc) return;
+        if (!barberDoc) {
+          console.log("[AVAILABILITY_CHECK_COMPLETED]", {
+            status: "no_barber_doc",
+            service,
+            parsedDate,
+            parsedTime,
+          });
+          return;
+        }
 
         const durationMinutes = getServiceDurationMinutes(barberDoc, service);
         const available = await isSlotAvailable({
@@ -851,8 +884,26 @@ export const attachMediaWebSocketServer = (server) => {
           slotAlternatives = alternatives.slice(0, 3);
           console.log("[SLOT_ALTERNATIVES]", JSON.stringify(slotAlternatives));
         }
+
+        console.log("[AVAILABILITY_CHECK_COMPLETED]", {
+          status: "checked",
+          service,
+          parsedDate,
+          parsedTime,
+          slotChecked,
+          slotAvailable,
+          alternativesCount: slotAlternatives.length,
+        });
       } catch (err) {
+        console.error("[AVAILABILITY_CHECK_ERROR]", {
+          message: err?.message || String(err),
+          service,
+          parsedDate,
+          parsedTime,
+          barberId,
+        });
         console.error("[SLOT_CHECK_ERROR]", err?.message || err);
+        throw err;
       }
     }
 
@@ -925,17 +976,18 @@ export const attachMediaWebSocketServer = (server) => {
       }
     };
 
-    const speakExact = (text) => {
+    const speakExact = (text, options = {}) => {
       if (!text || !canSendAI()) return false;
+      const reason = options.reason || "speak_exact";
       const exactInstructions = `Say this exactly, with no extra words: "${text}"`;
       if (!isAssistantIdle()) {
         queueAssistantResponse({
           exactInstructions,
-          reason: "speak_exact",
+          reason,
           lang: currentLanguage,
           immediate: true,
-        }, "speak_exact");
-        console.log("[SPEAK_EXACT_QUEUED]", { text: text?.slice(0, 60) });
+        }, reason);
+        console.log("[SPEAK_EXACT_QUEUED]", { reason, text: text?.slice(0, 60) });
         return true;
       }
       const responseCreatePayload = {
@@ -945,7 +997,7 @@ export const attachMediaWebSocketServer = (server) => {
           max_output_tokens: 160,
         },
       };
-      return sendResponseCreate(responseCreatePayload, "speak_exact");
+      return sendResponseCreate(responseCreatePayload, reason);
     };
 
     const executeBookingIfReady = async () => {
@@ -1156,6 +1208,30 @@ RULES:
       return "Ask whether they want to confirm. Do not say 'one moment' unless backend booking execution has started.";
     };
 
+    const bookingDecisionState = () => ({
+      intent: bookingState.intent,
+      name: bookingState.name,
+      service: bookingState.service,
+      parsedDate: bookingState.parsedDate,
+      parsedTime: bookingState.parsedTime,
+      askedConfirm: bookingState.askedConfirm,
+      confirmationPromptRequested: bookingState.confirmationPromptRequested,
+      confirmed: bookingState.confirmed,
+      awaitingName: bookingState.awaitingName,
+      slotChecked,
+      slotAvailable,
+      language: currentLanguage,
+    });
+
+    const shouldRequestNameAfterAvailableSlot = () =>
+      bookingState.intent === "BOOK" &&
+      Boolean(bookingState.service) &&
+      Boolean(bookingState.parsedDate) &&
+      Boolean(bookingState.parsedTime) &&
+      slotChecked &&
+      slotAvailable === true &&
+      !bookingState.name;
+
     const getDeterministicBookingReply = () => {
       const isSpanish = currentLanguage === "es";
 
@@ -1169,6 +1245,23 @@ RULES:
         return isSpanish
           ? "Perfecto, ¿qué servicio estás buscando? Tenemos corte, barba, o corte con barba."
           : "Perfect, what service are you looking for? We offer haircut, beard, or haircut and beard.";
+      }
+
+      if (shouldRequestNameAfterAvailableSlot()) {
+        bookingState.awaitingName = true;
+
+        console.log("[REQUEST_NAME_AFTER_SLOT_AVAILABLE]", {
+          service: bookingState.service,
+          parsedDate: bookingState.parsedDate,
+          parsedTime: bookingState.parsedTime,
+          slotChecked,
+          slotAvailable,
+          language: currentLanguage,
+        });
+
+        return isSpanish
+          ? "Perfecto. ¿A qué nombre pongo la cita?"
+          : "Perfect. What name should I put the appointment under?";
       }
 
       if (!bookingState.name) {
@@ -1226,7 +1319,18 @@ RULES:
       if (!canSendAI()) return;
 
       if (bookingState.intent === "BOOK") {
+        console.log("[DETERMINISTIC_REPLY_DECISION]", {
+          reason,
+          phase: "before",
+          state: bookingDecisionState(),
+        });
         const reply = getDeterministicBookingReply();
+        console.log("[DETERMINISTIC_REPLY_DECISION]", {
+          reason,
+          phase: "selected",
+          reply,
+          state: bookingDecisionState(),
+        });
         const isConfirmationPrompt =
           bookingState.intent === "BOOK" &&
           bookingState.service &&
@@ -1929,71 +2033,114 @@ RULES:
         }
       }
 
-      const hasDate = containsDateSignal(transcriptText);
-      const hasTime = containsTimeSignal(transcriptText) || containsLooseTimeSignal(transcriptText);
-      let shouldCheckAvailabilityAfterParse = true;
-      if (hasDate || hasTime) {
-        if (hasDate && !bookingState.requestedDateText) bookingState.requestedDateText = transcriptText;
-        if (hasTime && !bookingState.requestedTimeText) bookingState.requestedTimeText = transcriptText;
-        bookingState.dateTimeText = [bookingState.requestedDateText, bookingState.requestedTimeText]
-          .filter(Boolean)
-          .join(" ");
-        const parsedBookingTime = await parseBookingDateTime();
-        console.log("[BOOKING_PARSE_RESULT]", {
+      try {
+        const hasDate = containsDateSignal(transcriptText);
+        const hasTime = containsTimeSignal(transcriptText) || containsLooseTimeSignal(transcriptText);
+        let shouldCheckAvailabilityAfterParse = true;
+        if (hasDate || hasTime) {
+          if (hasDate && !bookingState.requestedDateText) bookingState.requestedDateText = transcriptText;
+          if (hasTime && !bookingState.requestedTimeText) bookingState.requestedTimeText = transcriptText;
+          bookingState.dateTimeText = [bookingState.requestedDateText, bookingState.requestedTimeText]
+            .filter(Boolean)
+            .join(" ");
+          const parsedBookingTime = await parseBookingDateTime();
+          console.log("[BOOKING_PARSE_RESULT]", {
+            transcript: transcriptText,
+            parsedDate: parsedBookingTime?.date || "",
+            parsedTime: parsedBookingTime?.time || "",
+          });
+
+          if (parsedBookingTime) {
+            let slotChanged = false;
+            // Always allow overwrite when slot was unavailable or when new value differs
+            const newDate = parsedBookingTime.date;
+            const newTime = parsedBookingTime.time;
+
+            if (newDate && !newTime) {
+              shouldCheckAvailabilityAfterParse = false;
+              console.log("[BOOKING_PARSE_DATE_ONLY_NO_TIME_DEFAULT]", {
+                transcript: transcriptText,
+                parsedDate: parsedBookingTime.date,
+              });
+            }
+
+            if (newDate && (newDate !== bookingState.parsedDate)) {
+              bookingState.parsedDate = newDate;
+              slotChanged = true;
+            }
+
+            if (
+              newTime &&
+              newTime !== bookingState.parsedTime &&
+              (newDate || bookingState.parsedDate)
+            ) {
+              bookingState.parsedTime = newTime;
+              slotChanged = true;
+            }
+            if (slotChanged) {
+              // Reset slot check when slot changes
+              slotChecked = false;
+              slotAvailable = false;
+              slotAlternatives = [];
+              lastAvailabilityCheckKey = "";
+              lastUnavailableInjectionKey = "";
+              bookingState.askedConfirm = false;
+              bookingState.confirmationPromptRequested = false;
+              bookingState.confirmed = false;
+              bookingState.awaitingCorrection = false;
+            }
+          }
+          await updateTranscriptFields({ requestedDateTimeText: bookingState.dateTimeText });
+        }
+
+        console.log("[POST_PARSE_BOOKING_STATE]", {
           transcript: transcriptText,
-          parsedDate: parsedBookingTime?.date || "",
-          parsedTime: parsedBookingTime?.time || "",
+          shouldCheckAvailabilityAfterParse,
+          state: bookingDecisionState(),
         });
 
-        if (parsedBookingTime) {
-          let slotChanged = false;
-          // Always allow overwrite when slot was unavailable or when new value differs
-          const newDate = parsedBookingTime.date;
-          const newTime = parsedBookingTime.time;
-
-          if (newDate && !newTime) {
-            shouldCheckAvailabilityAfterParse = false;
-            console.log("[BOOKING_PARSE_DATE_ONLY_NO_TIME_DEFAULT]", {
-              transcript: transcriptText,
-              parsedDate: parsedBookingTime.date,
-            });
-          }
-
-          if (newDate && (newDate !== bookingState.parsedDate)) {
-            bookingState.parsedDate = newDate;
-            slotChanged = true;
-          }
-
-          if (
-            newTime &&
-            newTime !== bookingState.parsedTime &&
-            (newDate || bookingState.parsedDate)
-          ) {
-            bookingState.parsedTime = newTime;
-            slotChanged = true;
-          }
-          if (slotChanged) {
-            // Reset slot check when slot changes
-            slotChecked = false;
-            slotAvailable = false;
-            slotAlternatives = [];
-            lastAvailabilityCheckKey = "";
-            lastUnavailableInjectionKey = "";
-            bookingState.askedConfirm = false;
-            bookingState.confirmationPromptRequested = false;
-            bookingState.confirmed = false;
-            bookingState.awaitingCorrection = false;
-          }
+        if (
+          shouldCheckAvailabilityAfterParse &&
+          bookingState.parsedDate &&
+          bookingState.parsedTime
+        ) {
+          await injectUnavailableSlotContextIfNeeded();
+          console.log("[POST_AVAILABILITY_BOOKING_STATE]", {
+            transcript: transcriptText,
+            state: bookingDecisionState(),
+          });
         }
-        await updateTranscriptFields({ requestedDateTimeText: bookingState.dateTimeText });
-      }
 
-      if (
-        shouldCheckAvailabilityAfterParse &&
-        bookingState.parsedDate &&
-        bookingState.parsedTime
-      ) {
-        await injectUnavailableSlotContextIfNeeded();
+        if (shouldRequestNameAfterAvailableSlot()) {
+          console.log("[DETERMINISTIC_REPLY_DECISION]", {
+            reason: "request_name_after_slot_available",
+            phase: "forced_after_availability",
+            state: bookingDecisionState(),
+          });
+          const reply = getDeterministicBookingReply();
+          await finishCallerTranscriptHandling("requested_name_after_slot_available");
+          const sent = speakExact(reply, { reason: "request_name_after_slot_available" });
+          console.log("[DETERMINISTIC_REPLY_DECISION]", {
+            reason: "request_name_after_slot_available",
+            phase: "sent",
+            reply,
+            sent,
+            state: bookingDecisionState(),
+          });
+          return;
+        }
+      } catch (err) {
+        console.error("[HANDLE_CALLER_TRANSCRIPT_ERROR]", {
+          reason: "availability_or_deterministic_reply",
+          message: err?.message || String(err),
+          state: bookingDecisionState(),
+        });
+        const fallbackReply = currentLanguage === "es"
+          ? "Estoy teniendo problema verificando ese horario ahora mismo. ¿A qué nombre pongo esta solicitud para que el barbero pueda darle seguimiento?"
+          : "I'm having trouble checking that time right now. What name should I put this request under so the barber can follow up?";
+        await finishCallerTranscriptHandling("availability_check_error");
+        speakExact(fallbackReply, { reason: "availability_check_error_request_follow_up" });
+        return;
       }
 
       if (bookingState.intent === "BOOK" && bookingState.askedConfirm && isNo(transcriptText)) {
