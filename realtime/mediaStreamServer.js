@@ -1100,6 +1100,7 @@ export const attachMediaWebSocketServer = (server) => {
       `4) Never say a booking is confirmed, booked, locked in, scheduled, or finalized. The backend will say final confirmation after it creates the appointment.\n` +
       `5) If caller says yes, say only: "One moment while I finalize that."\n` +
       `6) Start in the barber's preferred language and follow the active language rules.\n\n` +
+      `The barber is already assigned from the phone number. Never ask which barber, stylist, provider, or person the caller wants to book with.\n\n` +
       `SERVICE OPTIONS:\n` +
       `- haircut\n` +
       `- beard\n` +
@@ -1229,6 +1230,7 @@ RULES:
       !bookingState.name;
 
     const getDeterministicBookingReply = () => {
+      // Safety: barber is pre-assigned from routing — never ask which barber
       const isSpanish = currentLanguage === "es";
 
       if (bookingState.awaitingCorrection) {
@@ -1723,6 +1725,10 @@ RULES:
           bookingState.confirmationPromptRequested === true;
         const isConfirmationResponse =
           isInConfirmationContext && (isYes(transcriptText) || isNo(transcriptText));
+        const isServiceResponse =
+          bookingState.intent === "BOOK" &&
+          !bookingState.service &&
+          /haircut|beard|barba|corte|pelo|cabello|fade|lineup|line up|cut|shave|todo|everything/i.test(transcriptText);
 
         if (readyForNameContext && isClearNameResponse(transcriptText)) {
           bufferedCallerTranscript = transcriptText;
@@ -1741,7 +1747,7 @@ RULES:
             parsedDate: bookingState.parsedDate,
             parsedTime: bookingState.parsedTime,
           });
-        } else if (hasBookingSignal || isConfirmationResponse) {
+        } else if (hasBookingSignal || isConfirmationResponse || isServiceResponse) {
           bufferedCallerTranscript = transcriptText;
           bufferedCallerTranscriptAt = Date.now();
 
@@ -1749,6 +1755,7 @@ RULES:
             transcript: transcriptText,
             hasBookingSignal,
             isConfirmationResponse,
+            isServiceResponse,
             askedConfirm: bookingState.askedConfirm,
             confirmationPromptRequested: bookingState.confirmationPromptRequested,
             readyForCallerInput,
