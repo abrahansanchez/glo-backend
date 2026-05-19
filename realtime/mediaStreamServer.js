@@ -297,12 +297,8 @@ const hasNumericTimeSignal = (text) =>
 const normalizeServiceName = (text) => {
   const t = String(text || "").toLowerCase();
   const wantsHaircut =
-    t.includes("haircut") ||
-    t.includes("corte") ||
-    t.includes("cabello") ||
-    t.includes("pelo") ||
-    t.includes("cortarme");
-  const wantsBeard = t.includes("beard") || t.includes("barba");
+    /\b(?:haircut|cut|fade|lineup|line up|corte|cabello|pelo|cortarme)\b/i.test(t);
+  const wantsBeard = /\b(?:beard|barba|shave)\b/i.test(t);
 
   if (wantsHaircut && wantsBeard) return "Haircut + Beard";
   if (wantsHaircut) return "Haircut";
@@ -1711,11 +1707,36 @@ RULES:
 
       if (!readyForCallerInput && !isBuffered) {
         const normalizedTranscript = String(transcriptText || "").toLowerCase();
+        const readyForNameContext =
+          bookingState.awaitingName === true ||
+          Boolean(
+            bookingState.service &&
+            bookingState.parsedDate &&
+            bookingState.parsedTime &&
+            !bookingState.name
+          );
 
         const hasBookingSignal =
           /cita|appointment|book|booking|agendar|reservar|schedule|quiero|necesito|corte|barba|pelo|cabello|fade|sábado|sabado|lunes|martes|miércoles|miercoles|jueves|viernes|domingo|tarde|mañana|manana|\d/.test(normalizedTranscript);
 
-        if (hasBookingSignal) {
+        if (readyForNameContext && isClearNameResponse(transcriptText)) {
+          bufferedCallerTranscript = transcriptText;
+          bufferedCallerTranscriptAt = Date.now();
+
+          console.log("[TRANSCRIPT_BUFFERED_EXPECTED_NAME_NOT_READY]", {
+            transcript: transcriptText,
+            readyForCallerInput,
+            assistantPlaybackActive,
+            pendingAssistantMarkName,
+            responseActive,
+            assistantSpeaking,
+            responseInFlightId,
+            awaitingName: bookingState.awaitingName,
+            service: bookingState.service,
+            parsedDate: bookingState.parsedDate,
+            parsedTime: bookingState.parsedTime,
+          });
+        } else if (hasBookingSignal) {
           bufferedCallerTranscript = transcriptText;
           bufferedCallerTranscriptAt = Date.now();
 
@@ -1865,6 +1886,33 @@ RULES:
       }));
 
       const text = String(transcriptText || "").toLowerCase();
+      const inferredServiceFromTranscript = normalizeServiceName(transcriptText);
+      const hasServiceKeywordForIntent =
+        Boolean(inferredServiceFromTranscript) ||
+        /\b(?:haircut|cut|beard|shave|lineup|line up|fade|corte|pelo|cabello|barba)\b/.test(normalizedTranscript);
+      const hasDateTimeSignalForIntent =
+        containsDateSignal(transcriptText) ||
+        containsTimeSignal(transcriptText) ||
+        containsLooseTimeSignal(transcriptText);
+      const hasBookingPhraseForIntent =
+        /\b(?:want|need|looking for|trying to|can i get|i need|i want|quisiera|quiero|necesito)\b/.test(normalizedTranscript);
+
+      if (
+        bookingState.intent !== "BOOK" &&
+        hasServiceKeywordForIntent &&
+        hasDateTimeSignalForIntent
+      ) {
+        bookingState.intent = "BOOK";
+        await setTranscriptIntentOutcome({ intent: "BOOK", outcome: "NO_ACTION" });
+        console.log("[INTENT_INFERRED_FROM_SERVICE_DATETIME]", {
+          transcript: transcriptText,
+          inferredService: inferredServiceFromTranscript,
+          hasServiceKeyword: hasServiceKeywordForIntent,
+          hasDateTimeSignal: hasDateTimeSignalForIntent,
+          hasBookingPhrase: hasBookingPhraseForIntent,
+        });
+      }
+
       if (
         text.includes("book") ||
         text.includes("appointment") ||
@@ -1991,6 +2039,11 @@ RULES:
         }
 
         // Step 2: Fall back to aliases if no direct match
+        if (!extractedService) {
+          extractedService = normalizeServiceName(transcriptText);
+        }
+
+        // Step 3: Fall back to keyword aliases if normalization finds no match
         if (!extractedService) {
           const serviceAliases = [
             { keywords: ["haircut + beard", "haircut and beard", "corte y barba", "corte con barba", "hair and beard", "everything", "todo"], service: "Haircut + Beard" },
