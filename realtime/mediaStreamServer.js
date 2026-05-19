@@ -511,6 +511,7 @@ export const attachMediaWebSocketServer = (server) => {
     let hasCommittedUserAudioForTurn = false;
     let pendingResponseAfterTranscript = false;
     const processedTranscriptIds = new Set();
+    let currentCallerTranscriptId = null;
 
     let greetingQueued = false;
     let greetingSent = false;
@@ -525,6 +526,9 @@ export const attachMediaWebSocketServer = (server) => {
     let readyForCallerInput = false;
     let assistantPlaybackActive = false;
     let pendingAssistantMarkName = null;
+    let bufferedCallerTranscript = null;
+    let bufferedCallerTranscriptAt = null;
+    let isProcessingBufferedTranscript = false;
     let assistantTurnSeq = 0;
     let assistantAudioSentThisResponse = false;
     let assistantPlaybackWatchdogTimer = null;
@@ -1390,6 +1394,15 @@ RULES:
         return false;
       }
 
+      if (bufferedCallerTranscript) {
+        console.log("[FLUSH_DEFERRED_PENDING_CALLER_TRANSCRIPT]", {
+          reason,
+          transcript: bufferedCallerTranscript,
+          bufferedCallerTranscriptAt,
+        });
+        return false;
+      }
+
       if (!queuedAssistantResponse) return false;
 
       const queued = queuedAssistantResponse;
@@ -1486,7 +1499,14 @@ RULES:
         });
 
         clearAssistantPlaybackState();
-        scheduleQueuedAssistantFlush("twilio_playback_watchdog_reset");
+        processBufferedCallerTranscript("playback_watchdog_reset").then((processedBuffered) => {
+          if (!processedBuffered) {
+            scheduleQueuedAssistantFlush("twilio_playback_watchdog_reset");
+          }
+        }).catch((err) => {
+          console.error("[BUFFERED_TRANSCRIPT_PROCESSING_ERROR]", err);
+          scheduleQueuedAssistantFlush("twilio_playback_watchdog_reset");
+        });
       }, 12000);
     };
 
@@ -1537,6 +1557,497 @@ RULES:
       }
       return scheduledDeferredResponse;
     };
+
+    async function processBufferedCallerTranscript(reason) {
+      if (!bufferedCallerTranscript || isProcessingBufferedTranscript) {
+        return false;
+      }
+
+      if (!readyForCallerInput) {
+        console.log("[BUFFERED_TRANSCRIPT_WAITING]", {
+          reason,
+          transcript: bufferedCallerTranscript,
+          readyForCallerInput,
+          assistantPlaybackActive,
+          pendingAssistantMarkName,
+          responseActive,
+          assistantSpeaking,
+          responseInFlightId,
+        });
+        return false;
+      }
+
+      const toProcess = bufferedCallerTranscript;
+
+      bufferedCallerTranscript = null;
+      bufferedCallerTranscriptAt = null;
+      isProcessingBufferedTranscript = true;
+
+      console.log("[BUFFERED_TRANSCRIPT_PROCESSING]", {
+        reason,
+        transcript: toProcess,
+      });
+
+      try {
+        await handleCallerTranscript(toProcess, { buffered: true, reason });
+        return true;
+      } finally {
+        isProcessingBufferedTranscript = false;
+      }
+    }
+
+    async function handleCallerTranscript(transcriptText, options = {}) {
+      const isBuffered = options.buffered === true;
+      transcriptText = String(transcriptText || "").trim();
+
+      if (!transcriptText) {
+        await finishCallerTranscriptHandling("empty_transcript");
+        return;
+      }
+
+      if (!readyForCallerInput && !isBuffered) {
+        const normalizedTranscript = String(transcriptText || "").toLowerCase();
+
+        const hasBookingSignal =
+          /cita|appointment|book|booking|agendar|reservar|schedule|quiero|necesito|corte|barba|pelo|cabello|fade|sábado|sabado|lunes|martes|miércoles|miercoles|jueves|viernes|domingo|tarde|mañana|manana|\d/.test(normalizedTranscript);
+
+        if (hasBookingSignal) {
+          bufferedCallerTranscript = transcriptText;
+          bufferedCallerTranscriptAt = Date.now();
+
+          console.log("[TRANSCRIPT_BUFFERED_CALLER_INPUT_NOT_READY]", {
+            transcript: transcriptText,
+            readyForCallerInput,
+            assistantPlaybackActive,
+            pendingAssistantMarkName,
+            responseActive,
+            assistantSpeaking,
+            responseInFlightId,
+          });
+        } else {
+          console.log("[TRANSCRIPT_IGNORED_CALLER_INPUT_NOT_READY]", {
+            transcript: transcriptText,
+            reason: "no_booking_signal",
+            readyForCallerInput,
+            assistantPlaybackActive,
+            pendingAssistantMarkName,
+          });
+        }
+
+        await finishCallerTranscriptHandling("caller_input_not_ready");
+        return;
+      }
+
+      const transcriptId = options.transcriptId || currentCallerTranscriptId || transcriptText;
+      if (processedTranscriptIds.has(transcriptId)) {
+        console.log("[TRANSCRIPT_DEDUPE] skipping duplicate transcript", transcriptId);
+        await finishCallerTranscriptHandling("duplicate_transcript");
+        return;
+      }
+      processedTranscriptIds.add(transcriptId);
+
+      // Noise/filler gate — but never ignore if askedConfirm is true (yes/no matters)
+      if (isNoisyTranscript(transcriptText, bookingState)) {
+        console.log("[TRANSCRIPT_IGNORED_NOISE]", { transcript: transcriptText, reason: "filler_or_noise" });
+        console.log("[NO_RESPONSE_LOW_SIGNAL_TRANSCRIPT]", { transcript: transcriptText });
+        await finishCallerTranscriptHandling("noisy_transcript");
+        return;
+      }
+
+      // Pre-intent garbage filter — ignore obvious transcription junk before booking flow
+      const normalizedTranscript = transcriptText
+        .toLowerCase()
+        .normalize("NFD")
+        .replace(/[\u0300-\u036f]/g, "")
+        .trim();
+
+      const wordCount = normalizedTranscript.split(/\s+/).filter(Boolean).length;
+
+      const hasBookingSignal =
+        /cita|appointment|book|booking|agendar|reservar|schedule|quiero|necesito/.test(normalizedTranscript) ||
+        containsDateSignal(transcriptText) ||
+        containsTimeSignal(transcriptText) ||
+        containsLooseTimeSignal(transcriptText) ||
+        ["haircut", "beard", "barba", "corte", "pelo", "cabello", "fade"].some((kw) =>
+          normalizedTranscript.includes(kw)
+        );
+
+      if (
+        bookingState.intent !== "BOOK" &&
+        !bookingState.awaitingName &&
+        wordCount <= 2 &&
+        !hasBookingSignal
+      ) {
+        console.log("[TRANSCRIPT_IGNORED_PRE_INTENT_GARBAGE]", {
+          transcript: transcriptText,
+          wordCount,
+        });
+        console.log("[NO_RESPONSE_LOW_SIGNAL_TRANSCRIPT]", { transcript: transcriptText });
+        await finishCallerTranscriptHandling("pre_intent_garbage");
+        return;
+      }
+
+      // Confirmation-stage filter — when waiting for yes/no, ignore unrelated noise
+      if (bookingState.askedConfirm && !bookingState.confirmed) {
+        const confirmationWords = [
+          "si", "sí", "yes", "yeah", "yep",
+          "claro", "correcto", "confirma", "confirmar",
+          "that works", "go ahead", "correct",
+          "no", "nope", "cambiar", "otra hora", "otro dia", "otro día",
+          "different time", "different day", "change it",
+          "make it later", "make it earlier",
+          "quiero cambiar", "no gracias",
+          "perfecto", "listo", "por favor",
+          "va", "va bien", "esta bien", "está bien",
+          "see you", "see ya", "si you", "c you"
+        ];
+
+        const t = transcriptText
+          .toLowerCase()
+          .normalize("NFD")
+          .replace(/[\u0300-\u036f]/g, "")
+          .trim();
+
+        const hasDate = containsDateSignal(transcriptText);
+        const hasTime = containsTimeSignal(transcriptText) || containsLooseTimeSignal(transcriptText);
+        const hasService = ["haircut", "beard", "barba", "corte", "pelo", "cabello", "fade"].some(kw => t.includes(kw));
+
+        const isConfirmationRelevant =
+          confirmationWords.some(w =>
+            t.includes(
+              w.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+            )
+          ) ||
+          hasDate ||
+          hasTime ||
+          hasService;
+
+        if (!isConfirmationRelevant) {
+          console.log("[CONFIRMATION_TRANSCRIPT_IGNORED_NOISE]", {
+            transcript: transcriptText,
+            reason: "not_confirmation_relevant",
+          });
+          await finishCallerTranscriptHandling("confirmation_noise");
+          return;
+        }
+      }
+
+      userTranscriptLines.push(transcriptText);
+      await appendMessage({ role: "caller", text: transcriptText, lang: currentLanguage });
+
+      const detectedLanguage =
+        !hasSwitchedLanguage ? detectCallerLanguagePreference(transcriptText, currentLanguage) : null;
+      if (!languageLocked && detectedLanguage && transcriptText.length > 10 && transcriptText.trim().split(/\s+/).length >= 3) {
+        languageLocked = true;
+        lockedLanguage = detectedLanguage;
+        console.log("[LANG_LOCK] language locked to", lockedLanguage, "transcript length:", transcriptText.length);
+      }
+      const effectiveLang = languageLocked ? lockedLanguage : detectedLanguage;
+      if (effectiveLang && effectiveLang !== currentLanguage) {
+        currentLanguage = effectiveLang;
+        hasSwitchedLanguage = true;
+        await applyLanguageToSession();
+      }
+
+      console.log("TRANSCRIPT:", transcriptText, `(${currentLanguage})`);
+      console.log("[BOOKING_STATE_SNAPSHOT]", JSON.stringify({
+        intent: bookingState.intent,
+        name: bookingState.name,
+        service: bookingState.service,
+        parsedDate: bookingState.parsedDate,
+        parsedTime: bookingState.parsedTime,
+        askedConfirm: bookingState.askedConfirm,
+        confirmed: bookingState.confirmed,
+      }));
+
+      const text = String(transcriptText || "").toLowerCase();
+      if (
+        text.includes("book") ||
+        text.includes("appointment") ||
+        text.includes("schedule") ||
+        text.includes("reserve") ||
+        text.includes("cita") ||
+        text.includes("agendar") ||
+        text.includes("reservar")
+      ) {
+        bookingState.intent = "BOOK";
+        await setTranscriptIntentOutcome({ intent: "BOOK", outcome: "NO_ACTION" });
+      } else if (
+        text.includes("cancel") ||
+        text.includes("cancellation")
+      ) {
+        bookingState.intent = "CANCEL";
+      } else if (text.includes("reschedule")) {
+        bookingState.intent = "RESCHEDULE";
+      } else if (
+        text.includes("price") ||
+        text.includes("hours") ||
+        text.includes("open")
+      ) {
+        bookingState.intent = "INQUIRE";
+      }
+
+      const lower = transcriptText.toLowerCase();
+      const notNamePhrases = [
+        "alucinando", "hallucinating", "no funciona", "esto no", "me esta cortando",
+        "no me deja hablar", "wait", "espera", "hold on", "un momento",
+        "au revoir", "bye", "goodbye", "see you", "see ya", "hasta luego",
+        "adios", "adiós", "me voy", "colgar", "hang up"
+      ];
+      const hasNotNamePhrase = notNamePhrases.some((phrase) =>
+        normalizedTranscript.includes(
+          phrase.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+        )
+      );
+      if (bookingState.intent === "BOOK" && hasNotNamePhrase && !bookingState.askedConfirm) {
+        console.log("[NAME_REJECTED_NOT_NAME_PHRASE]", { transcript: transcriptText });
+        console.log("[TRANSCRIPT_IGNORED_NOT_NAME_NO_RESPONSE]", {
+          transcript: transcriptText,
+        });
+        await finishCallerTranscriptHandling("not_name_phrase");
+        return;
+      }
+
+      // Global name extraction — capture obvious names even out of order
+      if (!bookingState.name && bookingState.intent === "BOOK") {
+        const canAcceptBareNameContext =
+          bookingState.awaitingName === true ||
+          Boolean(
+            bookingState.service &&
+            bookingState.parsedDate &&
+            bookingState.parsedTime &&
+            !bookingState.name
+          );
+        const explicitPhrases = [
+          "my name is", "i'm ", "i am ", "soy ", "me llamo ", "a nombre de ", "llámame ", "me puedes llamar "
+        ];
+        const hasExplicitPhrase = explicitPhrases.some(p => lower.includes(p));
+
+        if (hasExplicitPhrase) {
+          const extracted = cleanClientName(transcriptText);
+          if (isClearNameResponse(extracted)) {
+            bookingState.name = extracted;
+            bookingState.awaitingName = false;
+            bookingState.awaitingCorrection = false;
+            await updateTranscriptFields({ clientName: bookingState.name });
+            console.log("[NAME_EXTRACTED]", { name: bookingState.name, method: "explicit_phrase" });
+          }
+        } else if (isClearNameResponse(transcriptText)) {
+          // Bare name candidate — only capture if transcript is 1-3 words
+          // and does not contain service/date/time/booking keywords
+          const hasBookingKeyword =
+            Boolean(normalizeServiceName(transcriptText)) ||
+            containsDateSignal(transcriptText) ||
+            containsTimeSignal(transcriptText) ||
+            containsLooseTimeSignal(transcriptText) ||
+            /\b(?:haircut|beard|barba|corte|pelo|cabello|fade|cut|cita|appointment|book|schedule|cancel|reschedule|monday|tuesday|wednesday|thursday|friday|saturday|sunday|lunes|martes|miercoles|jueves|viernes|sabado|domingo|today|tomorrow|hoy|manana|am|pm|morning|afternoon|tarde|noche)\b/.test(normalizedTranscript);
+          const canAcceptBareName = canAcceptBareNameContext;
+
+          if (!canAcceptBareName) {
+            console.log("[NAME_REJECTED]", {
+              transcript: transcriptText,
+              reason: "not_awaiting_name_or_ready_for_name",
+              wordCount,
+            });
+          } else if (wordCount <= 3 && !hasBookingKeyword) {
+            bookingState.name = cleanClientName(transcriptText);
+            const acceptedName = bookingState.name;
+            const wasAwaitingName = bookingState.awaitingName;
+            bookingState.awaitingName = false;
+            bookingState.awaitingCorrection = false;
+            await updateTranscriptFields({ clientName: bookingState.name });
+            console.log("[NAME_ACCEPTED_EXPECTED_NAME_TURN]", {
+              name: acceptedName,
+              transcript: transcriptText,
+              awaitingName: wasAwaitingName,
+              service: bookingState.service,
+              parsedDate: bookingState.parsedDate,
+              parsedTime: bookingState.parsedTime,
+            });
+            console.log("[NAME_EXTRACTED]", { name: bookingState.name, method: "bare_name_candidate", wordCount });
+          } else {
+            console.log("[NAME_REJECTED]", { transcript: transcriptText, wordCount, hasBookingKeyword });
+          }
+        }
+      }
+
+      // Global service extraction — check barber's configured services first, then aliases
+      if (bookingState.intent === "BOOK" && (!bookingState.service || bookingState.awaitingCorrection)) {
+        let extractedService = null;
+
+        // Step 1: Check against barber's actual configured services
+        if (barberDoc?.services?.length) {
+          for (const svc of barberDoc.services) {
+            const svcName = String(svc.name || "").toLowerCase();
+            if (lower.includes(svcName)) {
+              extractedService = svc.name;
+              break;
+            }
+          }
+        }
+
+        // Step 2: Fall back to aliases if no direct match
+        if (!extractedService) {
+          const serviceAliases = [
+            { keywords: ["haircut + beard", "haircut and beard", "corte y barba", "corte con barba", "hair and beard", "everything", "todo"], service: "Haircut + Beard" },
+            { keywords: ["haircut", "corte", "pelo", "cabello", "cortarme", "cut", "fade", "lineup", "kids cut", "shape up"], service: "Haircut" },
+            { keywords: ["beard", "barba", "shave"], service: "Beard" },
+          ];
+
+          for (const alias of serviceAliases) {
+            if (alias.keywords.some(kw => lower.includes(kw))) {
+              extractedService = alias.service;
+              break;
+            }
+          }
+        }
+
+        if (extractedService) {
+          const previousService = bookingState.service;
+          const correctionMode = Boolean(bookingState.awaitingCorrection);
+          bookingState.service = extractedService;
+          if (previousService !== extractedService) {
+            slotChecked = false;
+            slotAvailable = false;
+            slotAlternatives = [];
+            lastAvailabilityCheckKey = "";
+            lastUnavailableInjectionKey = "";
+            bookingState.askedConfirm = false;
+            bookingState.confirmationPromptRequested = false;
+            bookingState.confirmed = false;
+            bookingState.bookingAttempted = false;
+          }
+          bookingState.awaitingCorrection = false;
+          await updateTranscriptFields({ serviceRequested: bookingState.service });
+          console.log("[SERVICE_UPDATED]", {
+            previousService,
+            newService: bookingState.service,
+            correctionMode,
+          });
+        } else {
+          console.log("[SERVICE_EXTRACT_ATTEMPT]", { transcript: transcriptText, result: "no_match" });
+        }
+      }
+
+      const hasDate = containsDateSignal(transcriptText);
+      const hasTime = containsTimeSignal(transcriptText) || containsLooseTimeSignal(transcriptText);
+      let shouldCheckAvailabilityAfterParse = true;
+      if (hasDate || hasTime) {
+        if (hasDate && !bookingState.requestedDateText) bookingState.requestedDateText = transcriptText;
+        if (hasTime && !bookingState.requestedTimeText) bookingState.requestedTimeText = transcriptText;
+        bookingState.dateTimeText = [bookingState.requestedDateText, bookingState.requestedTimeText]
+          .filter(Boolean)
+          .join(" ");
+        const parsedBookingTime = await parseBookingDateTime();
+        console.log("[BOOKING_PARSE_RESULT]", {
+          transcript: transcriptText,
+          parsedDate: parsedBookingTime?.date || "",
+          parsedTime: parsedBookingTime?.time || "",
+        });
+
+        if (parsedBookingTime) {
+          let slotChanged = false;
+          // Always allow overwrite when slot was unavailable or when new value differs
+          const newDate = parsedBookingTime.date;
+          const newTime = parsedBookingTime.time;
+
+          if (newDate && !newTime) {
+            shouldCheckAvailabilityAfterParse = false;
+            console.log("[BOOKING_PARSE_DATE_ONLY_NO_TIME_DEFAULT]", {
+              transcript: transcriptText,
+              parsedDate: parsedBookingTime.date,
+            });
+          }
+
+          if (newDate && (newDate !== bookingState.parsedDate)) {
+            bookingState.parsedDate = newDate;
+            slotChanged = true;
+          }
+
+          if (
+            newTime &&
+            newTime !== bookingState.parsedTime &&
+            (newDate || bookingState.parsedDate)
+          ) {
+            bookingState.parsedTime = newTime;
+            slotChanged = true;
+          }
+          if (slotChanged) {
+            // Reset slot check when slot changes
+            slotChecked = false;
+            slotAvailable = false;
+            slotAlternatives = [];
+            lastAvailabilityCheckKey = "";
+            lastUnavailableInjectionKey = "";
+            bookingState.askedConfirm = false;
+            bookingState.confirmationPromptRequested = false;
+            bookingState.confirmed = false;
+            bookingState.awaitingCorrection = false;
+          }
+        }
+        await updateTranscriptFields({ requestedDateTimeText: bookingState.dateTimeText });
+      }
+
+      if (
+        shouldCheckAvailabilityAfterParse &&
+        bookingState.parsedDate &&
+        bookingState.parsedTime
+      ) {
+        await injectUnavailableSlotContextIfNeeded();
+      }
+
+      if (bookingState.intent === "BOOK" && bookingState.askedConfirm && isNo(transcriptText)) {
+        bookingState.confirmed = false;
+        bookingState.askedConfirm = false;
+        bookingState.confirmationPromptRequested = false;
+        bookingState.bookingAttempted = false;
+        bookingState.awaitingCorrection = true;
+
+        console.log("[CONFIRMATION_REJECTED]", {
+          transcript: transcriptText,
+          state: {
+            service: bookingState.service,
+            name: bookingState.name,
+            parsedDate: bookingState.parsedDate,
+            parsedTime: bookingState.parsedTime,
+          },
+        });
+
+        // If the caller gives a new date/time in the same correction, existing date/time parser can update it.
+        // If not, deterministic reply will ask what they want to change.
+      }
+
+      if (bookingState.intent === "BOOK" && bookingState.askedConfirm && isConfirmationYes(transcriptText)) {
+        bookingState.confirmed = true;
+        console.log("[CONFIRMATION_ACCEPTED]", {
+          transcript: transcriptText,
+          state: {
+            service: bookingState.service,
+            name: bookingState.name,
+            parsedDate: bookingState.parsedDate,
+            parsedTime: bookingState.parsedTime,
+            slotChecked,
+            slotAvailable,
+          },
+        });
+        await updateTranscriptFields({ confirmed: true });
+        const handled = await executeBookingIfReady();
+        if (handled) {
+          await finishCallerTranscriptHandling("booking_executed");
+          return;
+        }
+      }
+
+      lastUserSpokeAt = Date.now();
+
+      const scheduledDeferredResponse = await finishCallerTranscriptHandling("transcript_completed");
+
+      if (pendingResponseAfterTranscript) {
+        pendingResponseAfterTranscript = false;
+        if (scheduledDeferredResponse) return;
+        await requestAssistantResponse({ immediate: true, reason: "transcript_ready" });
+      }
+    }
 
     // ----------------------------
     // Create AI Session (with strict guard)
@@ -1618,433 +2129,11 @@ RULES:
             transcript: evt.transcript,
           });
           const transcriptText = (evt.transcript || "").trim();
-          if (transcriptText) {
-            if (!readyForCallerInput) {
-              console.log("[TRANSCRIPT_IGNORED_CALLER_INPUT_NOT_READY]", {
-                transcript: transcriptText,
-                readyForCallerInput,
-                assistantPlaybackActive,
-                pendingAssistantMarkName,
-                responseActive,
-                assistantSpeaking,
-                responseInFlightId,
-              });
-
-              await finishCallerTranscriptHandling("caller_input_not_ready");
-              return;
-            }
-
-            const transcriptId = evt.item_id || evt.event_id || evt.id || transcriptText;
-            if (processedTranscriptIds.has(transcriptId)) {
-              console.log("[TRANSCRIPT_DEDUPE] skipping duplicate transcript", transcriptId);
-              await finishCallerTranscriptHandling("duplicate_transcript");
-              return;
-            }
-            processedTranscriptIds.add(transcriptId);
-
-            // Noise/filler gate — but never ignore if askedConfirm is true (yes/no matters)
-            if (isNoisyTranscript(transcriptText, bookingState)) {
-              console.log("[TRANSCRIPT_IGNORED_NOISE]", { transcript: transcriptText, reason: "filler_or_noise" });
-              console.log("[NO_RESPONSE_LOW_SIGNAL_TRANSCRIPT]", { transcript: transcriptText });
-              await finishCallerTranscriptHandling("noisy_transcript");
-              return;
-            }
-
-            // Pre-intent garbage filter — ignore obvious transcription junk before booking flow
-            const normalizedTranscript = transcriptText
-              .toLowerCase()
-              .normalize("NFD")
-              .replace(/[\u0300-\u036f]/g, "")
-              .trim();
-
-            const wordCount = normalizedTranscript.split(/\s+/).filter(Boolean).length;
-
-            const hasBookingSignal =
-              /cita|appointment|book|booking|agendar|reservar|schedule|quiero|necesito/.test(normalizedTranscript) ||
-              containsDateSignal(transcriptText) ||
-              containsTimeSignal(transcriptText) ||
-              containsLooseTimeSignal(transcriptText) ||
-              ["haircut", "beard", "barba", "corte", "pelo", "cabello", "fade"].some((kw) =>
-                normalizedTranscript.includes(kw)
-              );
-
-            if (
-              bookingState.intent !== "BOOK" &&
-              !bookingState.awaitingName &&
-              wordCount <= 2 &&
-              !hasBookingSignal
-            ) {
-              console.log("[TRANSCRIPT_IGNORED_PRE_INTENT_GARBAGE]", {
-                transcript: transcriptText,
-                wordCount,
-              });
-              console.log("[NO_RESPONSE_LOW_SIGNAL_TRANSCRIPT]", { transcript: transcriptText });
-              await finishCallerTranscriptHandling("pre_intent_garbage");
-              return;
-            }
-
-            // Confirmation-stage filter — when waiting for yes/no, ignore unrelated noise
-            if (bookingState.askedConfirm && !bookingState.confirmed) {
-              const confirmationWords = [
-                "si", "sí", "yes", "yeah", "yep",
-                "claro", "correcto", "confirma", "confirmar",
-                "that works", "go ahead", "correct",
-                "no", "nope", "cambiar", "otra hora", "otro dia", "otro día",
-                "different time", "different day", "change it",
-                "make it later", "make it earlier",
-                "quiero cambiar", "no gracias",
-                "perfecto", "listo", "por favor",
-                "va", "va bien", "esta bien", "está bien",
-                "see you", "see ya", "si you", "c you"
-              ];
-
-              const t = transcriptText
-                .toLowerCase()
-                .normalize("NFD")
-                .replace(/[\u0300-\u036f]/g, "")
-                .trim();
-
-              const hasDate = containsDateSignal(transcriptText);
-              const hasTime = containsTimeSignal(transcriptText) || containsLooseTimeSignal(transcriptText);
-              const hasService = ["haircut", "beard", "barba", "corte", "pelo", "cabello", "fade"].some(kw => t.includes(kw));
-
-              const isConfirmationRelevant =
-                confirmationWords.some(w =>
-                  t.includes(
-                    w.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "")
-                  )
-                ) ||
-                hasDate ||
-                hasTime ||
-                hasService;
-
-              if (!isConfirmationRelevant) {
-                console.log("[CONFIRMATION_TRANSCRIPT_IGNORED_NOISE]", {
-                  transcript: transcriptText,
-                  reason: "not_confirmation_relevant",
-                });
-                await finishCallerTranscriptHandling("confirmation_noise");
-                return;
-              }
-            }
-
-            userTranscriptLines.push(transcriptText);
-            await appendMessage({ role: "caller", text: transcriptText, lang: currentLanguage });
-
-            const detectedLanguage =
-              !hasSwitchedLanguage ? detectCallerLanguagePreference(transcriptText, currentLanguage) : null;
-            if (!languageLocked && detectedLanguage && transcriptText.length > 10 && transcriptText.trim().split(/\s+/).length >= 3) {
-              languageLocked = true;
-              lockedLanguage = detectedLanguage;
-              console.log("[LANG_LOCK] language locked to", lockedLanguage, "transcript length:", transcriptText.length);
-            }
-            const effectiveLang = languageLocked ? lockedLanguage : detectedLanguage;
-            if (effectiveLang && effectiveLang !== currentLanguage) {
-              currentLanguage = effectiveLang;
-              hasSwitchedLanguage = true;
-              await applyLanguageToSession();
-            }
-
-            console.log("TRANSCRIPT:", transcriptText, `(${currentLanguage})`);
-            console.log("[BOOKING_STATE_SNAPSHOT]", JSON.stringify({
-              intent: bookingState.intent,
-              name: bookingState.name,
-              service: bookingState.service,
-              parsedDate: bookingState.parsedDate,
-              parsedTime: bookingState.parsedTime,
-              askedConfirm: bookingState.askedConfirm,
-              confirmed: bookingState.confirmed,
-            }));
-
-            const text = String(transcriptText || "").toLowerCase();
-            if (
-              text.includes("book") ||
-              text.includes("appointment") ||
-              text.includes("schedule") ||
-              text.includes("reserve") ||
-              text.includes("cita") ||
-              text.includes("agendar") ||
-              text.includes("reservar")
-            ) {
-              bookingState.intent = "BOOK";
-              await setTranscriptIntentOutcome({ intent: "BOOK", outcome: "NO_ACTION" });
-            } else if (
-              text.includes("cancel") ||
-              text.includes("cancellation")
-            ) {
-              bookingState.intent = "CANCEL";
-            } else if (text.includes("reschedule")) {
-              bookingState.intent = "RESCHEDULE";
-            } else if (
-              text.includes("price") ||
-              text.includes("hours") ||
-              text.includes("open")
-            ) {
-              bookingState.intent = "INQUIRE";
-            }
-
-            const lower = transcriptText.toLowerCase();
-            const notNamePhrases = [
-              "alucinando", "hallucinating", "no funciona", "esto no", "me esta cortando",
-              "no me deja hablar", "wait", "espera", "hold on", "un momento",
-              "au revoir", "bye", "goodbye", "see you", "see ya", "hasta luego",
-              "adios", "adiós", "me voy", "colgar", "hang up"
-            ];
-            const hasNotNamePhrase = notNamePhrases.some((phrase) =>
-              normalizedTranscript.includes(
-                phrase.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "")
-              )
-            );
-            if (bookingState.intent === "BOOK" && hasNotNamePhrase && !bookingState.askedConfirm) {
-              console.log("[NAME_REJECTED_NOT_NAME_PHRASE]", { transcript: transcriptText });
-              console.log("[TRANSCRIPT_IGNORED_NOT_NAME_NO_RESPONSE]", {
-                transcript: transcriptText,
-              });
-              await finishCallerTranscriptHandling("not_name_phrase");
-              return;
-            }
-
-            // Global name extraction — capture obvious names even out of order
-            if (!bookingState.name && bookingState.intent === "BOOK") {
-              const canAcceptBareNameContext =
-                bookingState.awaitingName === true ||
-                Boolean(
-                  bookingState.service &&
-                  bookingState.parsedDate &&
-                  bookingState.parsedTime &&
-                  !bookingState.name
-                );
-              const explicitPhrases = [
-                "my name is", "i'm ", "i am ", "soy ", "me llamo ", "a nombre de ", "llámame ", "me puedes llamar "
-              ];
-              const hasExplicitPhrase = explicitPhrases.some(p => lower.includes(p));
-
-              if (hasExplicitPhrase) {
-                const extracted = cleanClientName(transcriptText);
-                if (isClearNameResponse(extracted)) {
-                  bookingState.name = extracted;
-                  bookingState.awaitingName = false;
-                  bookingState.awaitingCorrection = false;
-                  await updateTranscriptFields({ clientName: bookingState.name });
-                  console.log("[NAME_EXTRACTED]", { name: bookingState.name, method: "explicit_phrase" });
-                }
-              } else if (isClearNameResponse(transcriptText)) {
-                // Bare name candidate — only capture if transcript is 1-3 words
-                // and does not contain service/date/time/booking keywords
-                const hasBookingKeyword =
-                  Boolean(normalizeServiceName(transcriptText)) ||
-                  containsDateSignal(transcriptText) ||
-                  containsTimeSignal(transcriptText) ||
-                  containsLooseTimeSignal(transcriptText) ||
-                  /\b(?:haircut|beard|barba|corte|pelo|cabello|fade|cut|cita|appointment|book|schedule|cancel|reschedule|monday|tuesday|wednesday|thursday|friday|saturday|sunday|lunes|martes|miercoles|jueves|viernes|sabado|domingo|today|tomorrow|hoy|manana|am|pm|morning|afternoon|tarde|noche)\b/.test(normalizedTranscript);
-                const canAcceptBareName = canAcceptBareNameContext;
-
-                if (!canAcceptBareName) {
-                  console.log("[NAME_REJECTED]", {
-                    transcript: transcriptText,
-                    reason: "not_awaiting_name_or_ready_for_name",
-                    wordCount,
-                  });
-                } else if (wordCount <= 3 && !hasBookingKeyword) {
-                  bookingState.name = cleanClientName(transcriptText);
-                  const acceptedName = bookingState.name;
-                  const wasAwaitingName = bookingState.awaitingName;
-                  bookingState.awaitingName = false;
-                  bookingState.awaitingCorrection = false;
-                  await updateTranscriptFields({ clientName: bookingState.name });
-                  console.log("[NAME_ACCEPTED_EXPECTED_NAME_TURN]", {
-                    name: acceptedName,
-                    transcript: transcriptText,
-                    awaitingName: wasAwaitingName,
-                    service: bookingState.service,
-                    parsedDate: bookingState.parsedDate,
-                    parsedTime: bookingState.parsedTime,
-                  });
-                  console.log("[NAME_EXTRACTED]", { name: bookingState.name, method: "bare_name_candidate", wordCount });
-                } else {
-                  console.log("[NAME_REJECTED]", { transcript: transcriptText, wordCount, hasBookingKeyword });
-                }
-              }
-            }
-
-            // Global service extraction — check barber's configured services first, then aliases
-            if (bookingState.intent === "BOOK" && (!bookingState.service || bookingState.awaitingCorrection)) {
-              let extractedService = null;
-
-              // Step 1: Check against barber's actual configured services
-              if (barberDoc?.services?.length) {
-                for (const svc of barberDoc.services) {
-                  const svcName = String(svc.name || "").toLowerCase();
-                  if (lower.includes(svcName)) {
-                    extractedService = svc.name;
-                    break;
-                  }
-                }
-              }
-
-              // Step 2: Fall back to aliases if no direct match
-              if (!extractedService) {
-                const serviceAliases = [
-                  { keywords: ["haircut + beard", "haircut and beard", "corte y barba", "corte con barba", "hair and beard", "everything", "todo"], service: "Haircut + Beard" },
-                  { keywords: ["haircut", "corte", "pelo", "cabello", "cortarme", "cut", "fade", "lineup", "kids cut", "shape up"], service: "Haircut" },
-                  { keywords: ["beard", "barba", "shave"], service: "Beard" },
-                ];
-
-                for (const alias of serviceAliases) {
-                  if (alias.keywords.some(kw => lower.includes(kw))) {
-                    extractedService = alias.service;
-                    break;
-                  }
-                }
-              }
-
-              if (extractedService) {
-                const previousService = bookingState.service;
-                const correctionMode = Boolean(bookingState.awaitingCorrection);
-                bookingState.service = extractedService;
-                if (previousService !== extractedService) {
-                  slotChecked = false;
-                  slotAvailable = false;
-                  slotAlternatives = [];
-                  lastAvailabilityCheckKey = "";
-                  lastUnavailableInjectionKey = "";
-                  bookingState.askedConfirm = false;
-                  bookingState.confirmationPromptRequested = false;
-                  bookingState.confirmed = false;
-                  bookingState.bookingAttempted = false;
-                }
-                bookingState.awaitingCorrection = false;
-                await updateTranscriptFields({ serviceRequested: bookingState.service });
-                console.log("[SERVICE_UPDATED]", {
-                  previousService,
-                  newService: bookingState.service,
-                  correctionMode,
-                });
-              } else {
-                console.log("[SERVICE_EXTRACT_ATTEMPT]", { transcript: transcriptText, result: "no_match" });
-              }
-            }
-
-            const hasDate = containsDateSignal(transcriptText);
-            const hasTime = containsTimeSignal(transcriptText) || containsLooseTimeSignal(transcriptText);
-            let shouldCheckAvailabilityAfterParse = true;
-            if (hasDate || hasTime) {
-              if (hasDate && !bookingState.requestedDateText) bookingState.requestedDateText = transcriptText;
-              if (hasTime && !bookingState.requestedTimeText) bookingState.requestedTimeText = transcriptText;
-              bookingState.dateTimeText = [bookingState.requestedDateText, bookingState.requestedTimeText]
-                .filter(Boolean)
-                .join(" ");
-              const parsedBookingTime = await parseBookingDateTime();
-              console.log("[BOOKING_PARSE_RESULT]", {
-                transcript: transcriptText,
-                parsedDate: parsedBookingTime?.date || "",
-                parsedTime: parsedBookingTime?.time || "",
-              });
-
-              if (parsedBookingTime) {
-                let slotChanged = false;
-                // Always allow overwrite when slot was unavailable or when new value differs
-                const newDate = parsedBookingTime.date;
-                const newTime = parsedBookingTime.time;
-
-                if (newDate && !newTime) {
-                  shouldCheckAvailabilityAfterParse = false;
-                  console.log("[BOOKING_PARSE_DATE_ONLY_NO_TIME_DEFAULT]", {
-                    transcript: transcriptText,
-                    parsedDate: parsedBookingTime.date,
-                  });
-                }
-
-                if (newDate && (newDate !== bookingState.parsedDate)) {
-                  bookingState.parsedDate = newDate;
-                  slotChanged = true;
-                }
-
-                if (
-                  newTime &&
-                  newTime !== bookingState.parsedTime &&
-                  (newDate || bookingState.parsedDate)
-                ) {
-                  bookingState.parsedTime = newTime;
-                  slotChanged = true;
-                }
-                if (slotChanged) {
-                  // Reset slot check when slot changes
-                  slotChecked = false;
-                  slotAvailable = false;
-                  slotAlternatives = [];
-                  lastAvailabilityCheckKey = "";
-                  lastUnavailableInjectionKey = "";
-                  bookingState.askedConfirm = false;
-                  bookingState.confirmationPromptRequested = false;
-                  bookingState.confirmed = false;
-                  bookingState.awaitingCorrection = false;
-                }
-              }
-              await updateTranscriptFields({ requestedDateTimeText: bookingState.dateTimeText });
-            }
-
-            if (
-              shouldCheckAvailabilityAfterParse &&
-              bookingState.parsedDate &&
-              bookingState.parsedTime
-            ) {
-              await injectUnavailableSlotContextIfNeeded();
-            }
-
-            if (bookingState.intent === "BOOK" && bookingState.askedConfirm && isNo(transcriptText)) {
-              bookingState.confirmed = false;
-              bookingState.askedConfirm = false;
-              bookingState.confirmationPromptRequested = false;
-              bookingState.bookingAttempted = false;
-              bookingState.awaitingCorrection = true;
-
-              console.log("[CONFIRMATION_REJECTED]", {
-                transcript: transcriptText,
-                state: {
-                  service: bookingState.service,
-                  name: bookingState.name,
-                  parsedDate: bookingState.parsedDate,
-                  parsedTime: bookingState.parsedTime,
-                },
-              });
-
-              // If the caller gives a new date/time in the same correction, existing date/time parser can update it.
-              // If not, deterministic reply will ask what they want to change.
-            }
-
-            if (bookingState.intent === "BOOK" && bookingState.askedConfirm && isConfirmationYes(transcriptText)) {
-              bookingState.confirmed = true;
-              console.log("[CONFIRMATION_ACCEPTED]", {
-                transcript: transcriptText,
-                state: {
-                  service: bookingState.service,
-                  name: bookingState.name,
-                  parsedDate: bookingState.parsedDate,
-                  parsedTime: bookingState.parsedTime,
-                  slotChecked,
-                  slotAvailable,
-                },
-              });
-              await updateTranscriptFields({ confirmed: true });
-              const handled = await executeBookingIfReady();
-              if (handled) {
-                await finishCallerTranscriptHandling("booking_executed");
-                return;
-              }
-            }
-
-            lastUserSpokeAt = Date.now();
-
-            const scheduledDeferredResponse = await finishCallerTranscriptHandling("transcript_completed");
-
-            if (pendingResponseAfterTranscript) {
-              pendingResponseAfterTranscript = false;
-              if (scheduledDeferredResponse) return;
-              await requestAssistantResponse({ immediate: true, reason: "transcript_ready" });
-            }
-          } else {
-            await finishCallerTranscriptHandling("empty_transcript");
+          currentCallerTranscriptId = evt.item_id || evt.event_id || evt.id || transcriptText;
+          try {
+            await handleCallerTranscript(transcriptText);
+          } finally {
+            currentCallerTranscriptId = null;
           }
         }
         if (
@@ -2082,6 +2171,12 @@ RULES:
               responseInFlightId,
               readyForCallerInput,
             });
+            const processedBuffered = await processBufferedCallerTranscript("barge_in_clear");
+            if (processedBuffered) {
+              console.log("[FLUSH_DEFERRED_PENDING_CALLER_TRANSCRIPT]", {
+                reason: "barge_in_clear",
+              });
+            }
           }
           if (!assistantSpeaking) {
             console.log("[BARGE_IN_IGNORED_NO_ACTIVE_ASSISTANT]");
@@ -2309,7 +2404,14 @@ RULES:
           assistantSpeaking,
         });
 
-        scheduleQueuedAssistantFlush("twilio_playback_complete");
+        const processedBuffered = await processBufferedCallerTranscript("twilio_playback_mark_acked");
+        if (processedBuffered) {
+          console.log("[FLUSH_DEFERRED_PENDING_CALLER_TRANSCRIPT]", {
+            reason: "twilio_playback_mark_acked",
+          });
+        } else {
+          scheduleQueuedAssistantFlush("twilio_playback_complete");
+        }
         return;
       }
 
