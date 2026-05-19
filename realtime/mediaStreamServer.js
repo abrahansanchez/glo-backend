@@ -1257,14 +1257,14 @@ RULES:
 
         return isSpanish
           ? "Perfecto. ¿A qué nombre pongo la cita?"
-          : "Perfect. What name should I put the appointment under?";
+          : "Perfect. May I have your name for the appointment?";
       }
 
       if (!bookingState.name) {
         bookingState.awaitingName = true;
         return isSpanish
           ? "Perfecto. ¿A qué nombre pongo la cita?"
-          : "Perfect. What name should I put the appointment under?";
+          : "Perfect. May I have your name for the appointment?";
       }
 
       if (!bookingState.parsedDate) {
@@ -1970,6 +1970,43 @@ RULES:
             bookingState.parsedTime &&
             !bookingState.name
           );
+        const confusionWords = [
+          "what", "who", "where", "why", "when", "how", "huh", "sorry",
+          "repeat", "repeat that", "say that again", "what was that",
+          "can you repeat", "i thought", "thought this was",
+          "qué", "que", "quién", "quien", "cómo", "como",
+          "perdón", "perdon", "repite", "repítelo", "no entendí", "no entendi"
+        ];
+        const normalizedForConfusion = transcriptText
+          .toLowerCase()
+          .normalize("NFD")
+          .replace(/[\u0300-\u036f]/g, "")
+          .trim()
+          .replace(/[.?!,]+$/, "");
+        const isConfusionWord = confusionWords.some(w =>
+          normalizedForConfusion === w.normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+        );
+
+        if (isConfusionWord) {
+          console.log("[NAME_REJECTED_CONFUSION_WORD]", { transcript: transcriptText });
+
+          if (bookingState.awaitingName) {
+            const reprompt = currentLanguage === "es"
+              ? "Claro. ¿A qué nombre pongo la cita?"
+              : "Of course. May I have your name for the appointment?";
+
+            speakExact(reprompt, { reason: "name_reprompt_after_confusion" });
+
+            console.log("[NAME_REPROMPT_AFTER_CONFUSION]", { transcript: transcriptText });
+
+            await finishCallerTranscriptHandling("confusion_word_reprompt");
+            return;
+          }
+
+          await finishCallerTranscriptHandling("confusion_word_rejected");
+          return;
+        }
+
         const explicitPhrases = [
           "my name is", "i'm ", "i am ", "soy ", "me llamo ", "a nombre de ", "llámame ", "me puedes llamar "
         ];
