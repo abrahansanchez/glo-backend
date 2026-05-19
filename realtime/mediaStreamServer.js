@@ -169,6 +169,10 @@ const isNoisyTranscript = (text, bookingState) => {
     return false;
   }
 
+  if (bookingState?.awaitingAlternativeSelection && (["ok", "okay"].includes(t) || /\d/.test(t))) {
+    return false;
+  }
+
   if (t.length <= 2) return true;
 
   if (FILLER_TRANSCRIPTS.has(t)) return true;
@@ -286,6 +290,82 @@ const formatAlternativeSlots = (alternatives = []) => {
     .map((slot) => `${slot.date} at ${slot.time}`)
     .join(", ");
 };
+
+const formatAlternativeChoiceTimes = (alternatives = []) =>
+  alternatives
+    .slice(0, 3)
+    .map((slot) => slot.time)
+    .filter(Boolean)
+    .join(", ");
+
+const normalizeAlternativeSelectionText = (text) =>
+  normalizeSpanishDateTimeText(text)
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/\b([ap])\s*\.?\s*m\.?\b/g, "$1m")
+    .replace(/[.?!,]+$/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+const isAlternativeSelectionGoodbye = (text) => {
+  const t = normalizeAlternativeSelectionText(text);
+  return /\b(okay bye|ok bye|bye|goodbye|see you|see ya|adios|hasta luego|hang up)\b/.test(t);
+};
+
+const isOriginalUnavailableConfirmRequest = (text) => {
+  const t = normalizeAlternativeSelectionText(text);
+  return /\bno\b/.test(t) && /\b(confirm|confirmar|confirma|book|schedule)\b/.test(t);
+};
+
+const parseSlotTimeParts = (time) => {
+  const match = String(time || "").trim().match(/^(\d{1,2})(?::(\d{2}))?\s*(AM|PM)$/i);
+  if (!match) return null;
+  return {
+    hour: Number(match[1]),
+    minute: match[2] || "00",
+    suffix: match[3].toLowerCase(),
+  };
+};
+
+const alternativeTimeMatches = (text, slotTime) => {
+  const slot = parseSlotTimeParts(slotTime);
+  if (!slot) return false;
+
+  const match = text.match(/\b(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/);
+  if (!match) return false;
+
+  const hour = Number(match[1]);
+  const minute = match[2] || "00";
+  const suffix = match[3] || "";
+
+  if (hour !== slot.hour) return false;
+  if (suffix && suffix !== slot.suffix) return false;
+  if (match[2]) return minute === slot.minute;
+  return slot.minute === "00";
+};
+
+const findSelectedAlternativeSlot = (text, alternatives = []) => {
+  if (!alternatives.length) return null;
+
+  const t = normalizeAlternativeSelectionText(text);
+  if (
+    /^(ok|okay)$/.test(t) ||
+    /^(?:the\s+)?(?:first|earliest)(?:\s+one)?$/.test(t) ||
+    /^(that one|that works|yes that works|la primera|primera|esa)$/.test(t)
+  ) {
+    return alternatives[0];
+  }
+
+  return alternatives.find((slot) => alternativeTimeMatches(t, slot.time)) || null;
+};
+
+const isLikelyAlternativeSelectionResponse = (text, alternatives = []) =>
+  Boolean(
+    isAlternativeSelectionGoodbye(text) ||
+      isOriginalUnavailableConfirmRequest(text) ||
+      findSelectedAlternativeSlot(text, alternatives)
+  );
 
 const containsLooseTimeSignal = (text) =>
   /\b(?:at|a las)\s*\d{1,2}(?::\d{2})?\b/i.test(String(text || ""));
@@ -558,6 +638,8 @@ export const attachMediaWebSocketServer = (server) => {
       bookingFinalized: false,
       awaitingName: false,
       awaitingCorrection: false,
+      awaitingAlternativeSelection: false,
+      alternatives: [],
     };
     let pendingEndCallAfterResponse = false;
     let endingCall = false;
@@ -878,7 +960,17 @@ export const attachMediaWebSocketServer = (server) => {
             durationMinutes,
           });
           slotAlternatives = alternatives.slice(0, 3);
+          bookingState.alternatives = slotAlternatives;
+          bookingState.awaitingAlternativeSelection = slotAlternatives.length > 0;
           console.log("[SLOT_ALTERNATIVES]", JSON.stringify(slotAlternatives));
+          console.log("[ALTERNATIVE_SELECTION_STATE_SET]", {
+            awaitingAlternativeSelection: bookingState.awaitingAlternativeSelection,
+            alternativesCount: bookingState.alternatives.length,
+          });
+        } else {
+          slotAlternatives = [];
+          bookingState.alternatives = [];
+          bookingState.awaitingAlternativeSelection = false;
         }
 
         console.log("[AVAILABILITY_CHECK_COMPLETED]", {
@@ -1215,6 +1307,8 @@ RULES:
       confirmationPromptRequested: bookingState.confirmationPromptRequested,
       confirmed: bookingState.confirmed,
       awaitingName: bookingState.awaitingName,
+      awaitingAlternativeSelection: bookingState.awaitingAlternativeSelection,
+      alternativesCount: bookingState.alternatives?.length || 0,
       slotChecked,
       slotAvailable,
       language: currentLanguage,
@@ -1282,8 +1376,11 @@ RULES:
       }
 
       if (slotChecked && slotAvailable === false) {
-        const alternatives = slotAlternatives?.length
-          ? slotAlternatives.map((s) => `${s.date} a las ${s.time}`).join(", ")
+        const alternativesSource = bookingState.alternatives?.length
+          ? bookingState.alternatives
+          : slotAlternatives;
+        const alternatives = alternativesSource?.length
+          ? formatAlternativeChoiceTimes(alternativesSource)
           : "";
 
         return isSpanish
@@ -1469,6 +1566,109 @@ RULES:
         `[RESPONSE_REQUESTED] reason=${reason} immediate=${String(immediate)} lang=${currentLanguage}`
       );
     };
+
+    async function handleAlternativeSelectionIfNeeded(transcriptText) {
+      if (
+        bookingState.awaitingAlternativeSelection !== true ||
+        !bookingState.alternatives?.length
+      ) {
+        return false;
+      }
+
+      const alternatives = bookingState.alternatives;
+      const firstAlternative = alternatives[0];
+
+      if (isAlternativeSelectionGoodbye(transcriptText)) {
+        console.log("[ALTERNATIVE_SELECTION_GOODBYE]", { transcript: transcriptText });
+        pendingResponseAfterTranscript = false;
+        await finishCallerTranscriptHandling("alternative_selection_goodbye");
+        const ok = speakExact(
+          currentLanguage === "es"
+            ? "Claro. Gracias por llamar, hasta luego."
+            : "No problem. Thanks for calling, goodbye.",
+          { reason: "alternative_selection_goodbye" }
+        );
+        pendingEndCallAfterResponse = ok;
+        if (!ok) await requestCallEnd("alternative_selection_goodbye_no_ai_response");
+        return true;
+      }
+
+      if (isOriginalUnavailableConfirmRequest(transcriptText)) {
+        console.log("[ALTERNATIVE_SELECTION_ORIGINAL_UNAVAILABLE]", {
+          transcript: transcriptText,
+          firstAlternative,
+        });
+        pendingResponseAfterTranscript = false;
+        await finishCallerTranscriptHandling("alternative_selection_original_unavailable");
+        speakExact(
+          currentLanguage === "es"
+            ? `Ese horario original no está disponible. Puedo confirmar ${firstAlternative.time} en su lugar si te funciona.`
+            : `That original time is not available. I can confirm ${firstAlternative.time} instead if that works.`,
+          { reason: "alternative_selection_original_unavailable" }
+        );
+        return true;
+      }
+
+      const selectedAlternative = findSelectedAlternativeSlot(transcriptText, alternatives);
+      if (!selectedAlternative) {
+        return false;
+      }
+
+      const previousDate = bookingState.parsedDate;
+      const previousTime = bookingState.parsedTime;
+      bookingState.parsedDate = selectedAlternative.date;
+      bookingState.parsedTime = selectedAlternative.time;
+      bookingState.requestedDateText = selectedAlternative.date;
+      bookingState.requestedTimeText = selectedAlternative.time;
+      bookingState.dateTimeText = `${selectedAlternative.date} ${selectedAlternative.time}`;
+      bookingState.awaitingAlternativeSelection = false;
+      bookingState.alternatives = [];
+
+      slotChecked = false;
+      slotAvailable = false;
+      slotAlternatives = [];
+      lastAvailabilityCheckKey = "";
+      lastUnavailableInjectionKey = "";
+      bookingState.askedConfirm = false;
+      bookingState.confirmationPromptRequested = false;
+      bookingState.confirmed = false;
+      bookingState.bookingAttempted = false;
+      bookingState.awaitingCorrection = false;
+
+      await updateTranscriptFields({ requestedDateTimeText: bookingState.dateTimeText });
+
+      console.log("[ALTERNATIVE_SELECTION_ACCEPTED]", {
+        transcript: transcriptText,
+        previousDate,
+        previousTime,
+        selectedDate: bookingState.parsedDate,
+        selectedTime: bookingState.parsedTime,
+      });
+
+      try {
+        await checkSlotAvailability();
+      } catch (err) {
+        console.error("[HANDLE_CALLER_TRANSCRIPT_ERROR]", {
+          reason: "alternative_selection_availability",
+          message: err?.message || String(err),
+          state: bookingDecisionState(),
+        });
+        const fallbackReply = currentLanguage === "es"
+          ? "Estoy teniendo problema verificando ese horario ahora mismo. ¿A qué nombre pongo esta solicitud para que el barbero pueda darle seguimiento?"
+          : "I'm having trouble checking that time right now. What name should I put this request under so the barber can follow up?";
+        pendingResponseAfterTranscript = false;
+        await finishCallerTranscriptHandling("alternative_selection_availability_error");
+        speakExact(fallbackReply, { reason: "alternative_selection_availability_error" });
+        return true;
+      }
+
+      pendingResponseAfterTranscript = false;
+      const scheduledDeferredResponse = await finishCallerTranscriptHandling("alternative_selection_processed");
+      if (!scheduledDeferredResponse) {
+        await requestAssistantResponse({ immediate: true, reason: "alternative_selection_processed" });
+      }
+      return true;
+    }
 
     const terminalResponseEvents = new Set([
       "response.done",
@@ -1729,6 +1929,13 @@ RULES:
           bookingState.intent === "BOOK" &&
           !bookingState.service &&
           /haircut|beard|barba|corte|pelo|cabello|fade|lineup|line up|cut|shave|todo|everything/i.test(transcriptText);
+        const alternativeOptions = bookingState.alternatives?.length
+          ? bookingState.alternatives
+          : slotAlternatives;
+        const isAlternativeSelectionResponse =
+          bookingState.awaitingAlternativeSelection === true &&
+          alternativeOptions.length > 0 &&
+          isLikelyAlternativeSelectionResponse(transcriptText, alternativeOptions);
 
         if (readyForNameContext && isClearNameResponse(transcriptText)) {
           bufferedCallerTranscript = transcriptText;
@@ -1747,7 +1954,7 @@ RULES:
             parsedDate: bookingState.parsedDate,
             parsedTime: bookingState.parsedTime,
           });
-        } else if (hasBookingSignal || isConfirmationResponse || isServiceResponse) {
+        } else if (hasBookingSignal || isConfirmationResponse || isServiceResponse || isAlternativeSelectionResponse) {
           bufferedCallerTranscript = transcriptText;
           bufferedCallerTranscriptAt = Date.now();
 
@@ -1756,6 +1963,7 @@ RULES:
             hasBookingSignal,
             isConfirmationResponse,
             isServiceResponse,
+            isAlternativeSelectionResponse,
             askedConfirm: bookingState.askedConfirm,
             confirmationPromptRequested: bookingState.confirmationPromptRequested,
             readyForCallerInput,
@@ -1955,6 +2163,10 @@ RULES:
         bookingState.intent = "INQUIRE";
       }
 
+      if (await handleAlternativeSelectionIfNeeded(transcriptText)) {
+        return;
+      }
+
       const lower = transcriptText.toLowerCase();
       const notNamePhrases = [
         "alucinando", "hallucinating", "no funciona", "esto no", "me esta cortando",
@@ -2122,6 +2334,8 @@ RULES:
             slotAlternatives = [];
             lastAvailabilityCheckKey = "";
             lastUnavailableInjectionKey = "";
+            bookingState.awaitingAlternativeSelection = false;
+            bookingState.alternatives = [];
             bookingState.askedConfirm = false;
             bookingState.confirmationPromptRequested = false;
             bookingState.confirmed = false;
@@ -2190,6 +2404,8 @@ RULES:
               slotAlternatives = [];
               lastAvailabilityCheckKey = "";
               lastUnavailableInjectionKey = "";
+              bookingState.awaitingAlternativeSelection = false;
+              bookingState.alternatives = [];
               bookingState.askedConfirm = false;
               bookingState.confirmationPromptRequested = false;
               bookingState.confirmed = false;
