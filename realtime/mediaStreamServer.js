@@ -1718,6 +1718,11 @@ RULES:
 
         const hasBookingSignal =
           /cita|appointment|book|booking|agendar|reservar|schedule|quiero|necesito|corte|barba|pelo|cabello|fade|sábado|sabado|lunes|martes|miércoles|miercoles|jueves|viernes|domingo|tarde|mañana|manana|\d/.test(normalizedTranscript);
+        const isInConfirmationContext =
+          bookingState.askedConfirm === true ||
+          bookingState.confirmationPromptRequested === true;
+        const isConfirmationResponse =
+          isInConfirmationContext && (isYes(transcriptText) || isNo(transcriptText));
 
         if (readyForNameContext && isClearNameResponse(transcriptText)) {
           bufferedCallerTranscript = transcriptText;
@@ -1736,12 +1741,16 @@ RULES:
             parsedDate: bookingState.parsedDate,
             parsedTime: bookingState.parsedTime,
           });
-        } else if (hasBookingSignal) {
+        } else if (hasBookingSignal || isConfirmationResponse) {
           bufferedCallerTranscript = transcriptText;
           bufferedCallerTranscriptAt = Date.now();
 
           console.log("[TRANSCRIPT_BUFFERED_CALLER_INPUT_NOT_READY]", {
             transcript: transcriptText,
+            hasBookingSignal,
+            isConfirmationResponse,
+            askedConfirm: bookingState.askedConfirm,
+            confirmationPromptRequested: bookingState.confirmationPromptRequested,
             readyForCallerInput,
             assistantPlaybackActive,
             pendingAssistantMarkName,
