@@ -308,9 +308,31 @@ const normalizeAlternativeSelectionText = (text) =>
     .replace(/\s+/g, " ")
     .trim();
 
+const normalizeSpokenAlternativeTimeText = (text) =>
+  normalizeAlternativeSelectionText(text)
+    .replace(/\bten\s+thirty\b/g, "10:30")
+    .replace(/\beleven\s+thirty\b/g, "11:30")
+    .replace(/\btwelve\s+thirty\b/g, "12:30")
+    .replace(/\bten\s+o(?:'|\u2019|\s+)?clock\b/g, "10")
+    .replace(/\beleven\s+o(?:'|\u2019|\s+)?clock\b/g, "11")
+    .replace(/\btwelve\s+o(?:'|\u2019|\s+)?clock\b/g, "12")
+    .replace(/\bten\b/g, "10")
+    .replace(/\beleven\b/g, "11")
+    .replace(/\btwelve\b/g, "12")
+    .replace(/\s+/g, " ")
+    .trim();
+
 const isAlternativeSelectionGoodbye = (text) => {
   const t = normalizeAlternativeSelectionText(text);
   return /\b(okay bye|ok bye|bye|goodbye|see you|see ya|adios|hasta luego|hang up)\b/.test(t);
+};
+
+const isAlternativeSelectionCancelOrGoodbye = (text) => {
+  const t = normalizeAlternativeSelectionText(text);
+  return (
+    isAlternativeSelectionGoodbye(text) ||
+    /\b(cancel|cancelar|never mind|nevermind|no thanks|no gracias|stop|forget it|dejalo)\b/.test(t)
+  );
 };
 
 const isOriginalUnavailableConfirmRequest = (text) => {
@@ -348,22 +370,40 @@ const alternativeTimeMatches = (text, slotTime) => {
 const findSelectedAlternativeSlot = (text, alternatives = []) => {
   if (!alternatives.length) return null;
 
-  const t = normalizeAlternativeSelectionText(text);
+  const t = normalizeSpokenAlternativeTimeText(text);
   if (
     /^(ok|okay)$/.test(t) ||
-    /^(?:the\s+)?(?:first|earliest)(?:\s+one)?$/.test(t) ||
-    /^(that one|that works|yes that works|la primera|primera|esa)$/.test(t)
+    /^(?:the\s+)?(?:first|earliest|next)(?:\s+one)?$/.test(t) ||
+    /^(that one|that works|yes that works|works for me|sounds good|perfect|go ahead|la primera|primera|esa|esa esta bien|dale)$/.test(t)
   ) {
     return alternatives[0];
   }
+  if (/^(?:the\s+)?second(?:\s+one)?$/.test(t) || /^(segunda|la segunda)$/.test(t)) {
+    return alternatives[1] || null;
+  }
+  if (/^(?:the\s+)?third(?:\s+one)?$/.test(t) || /^(tercera|la tercera)$/.test(t)) {
+    return alternatives[2] || null;
+  }
 
   return alternatives.find((slot) => alternativeTimeMatches(t, slot.time)) || null;
+};
+
+const hasAlternativeSelectionReplyShape = (text) => {
+  const t = normalizeSpokenAlternativeTimeText(text);
+  return (
+    /^(ok|okay)$/.test(t) ||
+    /^(?:the\s+)?(?:first|second|third|earliest|next)(?:\s+one)?$/.test(t) ||
+    /^(la primera|primera|la segunda|segunda|la tercera|tercera)$/.test(t) ||
+    /^(that one|that works|yes that works|works for me|sounds good|perfect|go ahead|esa|esa esta bien|dale)$/.test(t) ||
+    /\b(?:10|11|12)(?::(?:00|30))?\s*(?:am|pm)?\b/.test(t)
+  );
 };
 
 const isLikelyAlternativeSelectionResponse = (text, alternatives = []) =>
   Boolean(
     isAlternativeSelectionGoodbye(text) ||
       isOriginalUnavailableConfirmRequest(text) ||
+      hasAlternativeSelectionReplyShape(text) ||
       findSelectedAlternativeSlot(text, alternatives)
   );
 
@@ -1932,9 +1972,16 @@ RULES:
         const alternativeOptions = bookingState.alternatives?.length
           ? bookingState.alternatives
           : slotAlternatives;
+        const alternativesCount = bookingState.alternatives?.length || slotAlternatives?.length || 0;
+        const hasAlternativeSelectionContext =
+          bookingState.intent === "BOOK" &&
+          (
+            bookingState.awaitingAlternativeSelection === true ||
+            Boolean(bookingState.alternatives?.length) ||
+            Boolean(slotAlternatives?.length)
+          );
         const isAlternativeSelectionResponse =
-          bookingState.awaitingAlternativeSelection === true &&
-          alternativeOptions.length > 0 &&
+          hasAlternativeSelectionContext &&
           isLikelyAlternativeSelectionResponse(transcriptText, alternativeOptions);
 
         if (readyForNameContext && isClearNameResponse(transcriptText)) {
@@ -1954,6 +2001,27 @@ RULES:
             parsedDate: bookingState.parsedDate,
             parsedTime: bookingState.parsedTime,
           });
+        } else if (isAlternativeSelectionResponse) {
+          bufferedCallerTranscript = transcriptText;
+          bufferedCallerTranscriptAt = Date.now();
+
+          console.log("[TRANSCRIPT_BUFFERED_ALTERNATIVE_SELECTION_NOT_READY]", {
+            transcript: transcriptText,
+            hasBookingSignal,
+            isConfirmationResponse,
+            isServiceResponse,
+            isAlternativeSelectionResponse,
+            awaitingAlternativeSelection: bookingState.awaitingAlternativeSelection,
+            alternativesCount,
+            askedConfirm: bookingState.askedConfirm,
+            confirmationPromptRequested: bookingState.confirmationPromptRequested,
+            readyForCallerInput,
+            assistantPlaybackActive,
+            pendingAssistantMarkName,
+            responseActive,
+            assistantSpeaking,
+            responseInFlightId,
+          });
         } else if (hasBookingSignal || isConfirmationResponse || isServiceResponse || isAlternativeSelectionResponse) {
           bufferedCallerTranscript = transcriptText;
           bufferedCallerTranscriptAt = Date.now();
@@ -1964,6 +2032,8 @@ RULES:
             isConfirmationResponse,
             isServiceResponse,
             isAlternativeSelectionResponse,
+            awaitingAlternativeSelection: bookingState.awaitingAlternativeSelection,
+            alternativesCount,
             askedConfirm: bookingState.askedConfirm,
             confirmationPromptRequested: bookingState.confirmationPromptRequested,
             readyForCallerInput,
@@ -2020,6 +2090,40 @@ RULES:
         ["haircut", "beard", "barba", "corte", "pelo", "cabello", "fade"].some((kw) =>
           normalizedTranscript.includes(kw)
         );
+
+      const alternativeOptions = bookingState.alternatives?.length
+        ? bookingState.alternatives
+        : slotAlternatives;
+      const alternativesCount = bookingState.alternatives?.length || slotAlternatives?.length || 0;
+      const hasAlternativeSelectionContext =
+        bookingState.intent === "BOOK" &&
+        (
+          bookingState.awaitingAlternativeSelection === true ||
+          Boolean(bookingState.alternatives?.length) ||
+          Boolean(slotAlternatives?.length)
+        );
+      const isAlternativeSelectionResponse =
+        hasAlternativeSelectionContext &&
+        isLikelyAlternativeSelectionResponse(transcriptText, alternativeOptions);
+      const isConfirmationResponse =
+        (bookingState.askedConfirm === true || bookingState.confirmationPromptRequested === true) &&
+        (isYes(transcriptText) || isNo(transcriptText));
+
+      if (
+        bookingState.awaitingAlternativeSelection === true &&
+        !isAlternativeSelectionResponse &&
+        !hasBookingSignal &&
+        !isConfirmationResponse &&
+        !isAlternativeSelectionCancelOrGoodbye(transcriptText)
+      ) {
+        console.log("[ALTERNATIVE_SELECTION_NOISE_IGNORED]", {
+          transcript: transcriptText,
+          awaitingAlternativeSelection: bookingState.awaitingAlternativeSelection,
+          alternativesCount,
+        });
+        await finishCallerTranscriptHandling("alternative_selection_noise");
+        return;
+      }
 
       if (
         bookingState.intent !== "BOOK" &&
