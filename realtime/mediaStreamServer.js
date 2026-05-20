@@ -165,7 +165,10 @@ const isNoisyTranscript = (text, bookingState) => {
     "yes", "yeah", "yep", "si", "sí", "no", "nope", "ok", "okay"
   ]);
 
-  if (bookingState?.askedConfirm && confirmationWords.has(t)) {
+  if (
+    (bookingState?.askedConfirm || bookingState?.confirmationPromptRequested) &&
+    confirmationWords.has(t)
+  ) {
     return false;
   }
 
@@ -644,6 +647,7 @@ export const attachMediaWebSocketServer = (server) => {
     let pendingAssistantMarkName = null;
     let bufferedCallerTranscript = null;
     let bufferedCallerTranscriptAt = null;
+    let bufferedCallerTranscriptPriority = "";
     let isProcessingBufferedTranscript = false;
     let assistantTurnSeq = 0;
     let assistantAudioSentThisResponse = false;
@@ -682,7 +686,60 @@ export const attachMediaWebSocketServer = (server) => {
       alternatives: [],
     };
     let pendingEndCallAfterResponse = false;
+    let finalConfirmationCallEndArmed = false;
+    let finalConfirmationAwaitingResponseCreated = false;
+    let finalConfirmationResponseId = "";
+    let finalConfirmationPlaybackMarkName = "";
     let endingCall = false;
+
+    const bookingStateSnapshotForLog = () => ({
+      intent: bookingState.intent,
+      name: bookingState.name,
+      service: bookingState.service,
+      parsedDate: bookingState.parsedDate,
+      parsedTime: bookingState.parsedTime,
+      askedConfirm: bookingState.askedConfirm,
+      confirmationPromptRequested: bookingState.confirmationPromptRequested,
+      confirmed: bookingState.confirmed,
+      awaitingName: bookingState.awaitingName,
+      awaitingAlternativeSelection: bookingState.awaitingAlternativeSelection,
+      alternativesCount: bookingState.alternatives?.length || 0,
+      slotChecked,
+      slotAvailable,
+    });
+
+    const normalizeBookingState = (reason = "unknown") => {
+      const corrections = [];
+      const unavailableOrAlternative =
+        bookingState.awaitingAlternativeSelection === true ||
+        slotAvailable === false;
+
+      if (unavailableOrAlternative && bookingState.awaitingName === true) {
+        bookingState.awaitingName = false;
+        corrections.push("cleared_awaiting_name");
+      }
+
+      if (
+        unavailableOrAlternative &&
+        (bookingState.askedConfirm === true || bookingState.confirmationPromptRequested === true)
+      ) {
+        if (bookingState.askedConfirm === true) corrections.push("cleared_asked_confirm");
+        if (bookingState.confirmationPromptRequested === true) corrections.push("cleared_confirmation_prompt_requested");
+        bookingState.askedConfirm = false;
+        bookingState.confirmationPromptRequested = false;
+        bookingState.confirmed = false;
+      }
+
+      if (corrections.length > 0) {
+        console.log("[BOOKING_STATE_NORMALIZED]", {
+          reason,
+          corrections,
+          state: bookingStateSnapshotForLog(),
+        });
+      }
+
+      return corrections.length > 0;
+    };
 
     const isAssistantIdle = (reason = "unknown") => {
       const inputReady = readyForCallerInput || reason === "greeting";
@@ -793,11 +850,71 @@ export const attachMediaWebSocketServer = (server) => {
       String(queued?.exactInstructions || queued?.instructions || "")
         .slice(0, 180);
 
+    const queuedInstructionTextFor = (queued) =>
+      String(queued?.exactInstructions || queued?.instructions || "").toLowerCase();
+
+    const isQueuedNamePrompt = (queued) => {
+      if (queued?.promptType === "name") return true;
+      const text = queuedInstructionTextFor(queued);
+      return (
+        text.includes("may i have your name") ||
+        text.includes("what name") ||
+        (text.includes("nombre") && text.includes("cita"))
+      );
+    };
+
+    const isQueuedConfirmationPrompt = (queued) => {
+      if (queued?.promptType === "confirmation") return true;
+      const text = queuedInstructionTextFor(queued);
+      return (
+        text.includes("should i confirm") ||
+        text.includes("confirm that appointment") ||
+        text.includes("quieres que confirme") ||
+        text.includes("dime si para confirmar")
+      );
+    };
+
+    const hasConfirmationPromptState = () =>
+      Boolean(
+        bookingState.name &&
+        bookingState.service &&
+        bookingState.parsedDate &&
+        bookingState.parsedTime &&
+        slotAvailable === true &&
+        bookingState.awaitingAlternativeSelection !== true
+      );
+
     const logResponseCreateBlockedNotIdle = (reason) => {
       console.log("[RESPONSE_CREATE_BLOCKED_NOT_IDLE]", {
         reason,
         ...responseIdleState(),
       });
+    };
+
+    const bufferCallerTranscript = (transcriptText, reason, priority = "normal") => {
+      if (bufferedCallerTranscriptPriority === "confirmation_response" && priority !== "confirmation_response") {
+        console.log("[CONFIRMATION_RESPONSE_BUFFER_PRIORITY]", {
+          reason,
+          action: "kept_existing_confirmation_response",
+          existingTranscript: bufferedCallerTranscript,
+          ignoredTranscript: transcriptText,
+        });
+        return false;
+      }
+
+      bufferedCallerTranscript = transcriptText;
+      bufferedCallerTranscriptAt = Date.now();
+      bufferedCallerTranscriptPriority = priority;
+
+      if (priority === "confirmation_response") {
+        console.log("[CONFIRMATION_RESPONSE_BUFFER_PRIORITY]", {
+          reason,
+          action: "buffered_confirmation_response",
+          transcript: transcriptText,
+        });
+      }
+
+      return true;
     };
 
     const queueAssistantResponse = (queued, reason) => {
@@ -1001,7 +1118,8 @@ export const attachMediaWebSocketServer = (server) => {
           });
           slotAlternatives = alternatives.slice(0, 3);
           bookingState.alternatives = slotAlternatives;
-          bookingState.awaitingAlternativeSelection = slotAlternatives.length > 0;
+          bookingState.awaitingAlternativeSelection = true;
+          normalizeBookingState("slot_unavailable");
           console.log("[SLOT_ALTERNATIVES]", JSON.stringify(slotAlternatives));
           console.log("[ALTERNATIVE_SELECTION_STATE_SET]", {
             awaitingAlternativeSelection: bookingState.awaitingAlternativeSelection,
@@ -1104,6 +1222,25 @@ export const attachMediaWebSocketServer = (server) => {
       }
     };
 
+    const markFinalConfirmationSent = (reason = "final_confirmation") => {
+      finalConfirmationCallEndArmed = true;
+      finalConfirmationAwaitingResponseCreated = true;
+      finalConfirmationResponseId = "";
+      finalConfirmationPlaybackMarkName = "";
+      pendingEndCallAfterResponse = false;
+
+      console.log("[FINAL_CONFIRMATION_SENT]", {
+        reason,
+        callSid: callSid || "",
+        barberId: barberId || "",
+      });
+      console.log("[CALL_END_ARMED_AFTER_FINAL_CONFIRMATION]", {
+        reason,
+        callSid: callSid || "",
+        barberId: barberId || "",
+      });
+    };
+
     const speakExact = (text, options = {}) => {
       if (!text || !canSendAI()) return false;
       const reason = options.reason || "speak_exact";
@@ -1114,6 +1251,8 @@ export const attachMediaWebSocketServer = (server) => {
           reason,
           lang: currentLanguage,
           immediate: true,
+          promptType: options.promptType || null,
+          finalConfirmation: options.finalConfirmation === true,
         }, reason);
         console.log("[SPEAK_EXACT_QUEUED]", { reason, text: text?.slice(0, 60) });
         return true;
@@ -1125,7 +1264,11 @@ export const attachMediaWebSocketServer = (server) => {
           max_output_tokens: 160,
         },
       };
-      return sendResponseCreate(responseCreatePayload, reason);
+      const sent = sendResponseCreate(responseCreatePayload, reason);
+      if (sent && options.finalConfirmation === true) {
+        markFinalConfirmationSent(reason);
+      }
+      return sent;
     };
 
     const executeBookingIfReady = async () => {
@@ -1170,8 +1313,10 @@ export const attachMediaWebSocketServer = (server) => {
           const confirmMsg = currentLanguage === "es"
             ? `Tu cita ha sido confirmada para ${result.spoken}. ¡Gracias, hasta luego!`
             : `Your appointment is confirmed for ${result.spoken}. Thank you, goodbye.`;
-          const ok = speakExact(confirmMsg);
-          pendingEndCallAfterResponse = ok;
+          const ok = speakExact(confirmMsg, {
+            reason: "final_confirmation",
+            finalConfirmation: true,
+          });
           if (!ok) await requestCallEnd("booking_success_no_ai_response");
           return true;
         }
@@ -1180,6 +1325,13 @@ export const attachMediaWebSocketServer = (server) => {
           bookingState.bookingAttempted = false;
           bookingState.confirmed = false;
           bookingState.askedConfirm = false;
+          bookingState.confirmationPromptRequested = false;
+          slotChecked = true;
+          slotAvailable = false;
+          slotAlternatives = Array.isArray(result.alternatives) ? result.alternatives.slice(0, 3) : [];
+          bookingState.alternatives = slotAlternatives;
+          bookingState.awaitingAlternativeSelection = true;
+          normalizeBookingState("booking_engine_unavailable");
           const alternatives = formatAlternativeSlots(result.alternatives);
           console.log(
             `[BOOKING_UNAVAILABLE] callSid=${callSid || ""} barberId=${barberId} alternatives=${alternatives || "none"}`
@@ -1361,6 +1513,7 @@ RULES:
       Boolean(bookingState.parsedTime) &&
       slotChecked &&
       slotAvailable === true &&
+      bookingState.awaitingAlternativeSelection !== true &&
       !bookingState.name;
 
     const getDeterministicBookingReply = () => {
@@ -1379,30 +1532,6 @@ RULES:
           : "Perfect, what service are you looking for? We offer haircut, beard, or haircut and beard.";
       }
 
-      if (shouldRequestNameAfterAvailableSlot()) {
-        bookingState.awaitingName = true;
-
-        console.log("[REQUEST_NAME_AFTER_SLOT_AVAILABLE]", {
-          service: bookingState.service,
-          parsedDate: bookingState.parsedDate,
-          parsedTime: bookingState.parsedTime,
-          slotChecked,
-          slotAvailable,
-          language: currentLanguage,
-        });
-
-        return isSpanish
-          ? "Perfecto. ¿A qué nombre pongo la cita?"
-          : "Perfect. May I have your name for the appointment?";
-      }
-
-      if (!bookingState.name) {
-        bookingState.awaitingName = true;
-        return isSpanish
-          ? "Perfecto. ¿A qué nombre pongo la cita?"
-          : "Perfect. May I have your name for the appointment?";
-      }
-
       if (!bookingState.parsedDate) {
         return isSpanish
           ? "¿Qué día quieres venir?"
@@ -1415,7 +1544,20 @@ RULES:
           : "What time would you like to come in?";
       }
 
-      if (slotChecked && slotAvailable === false) {
+      if (
+        bookingState.awaitingAlternativeSelection === true ||
+        (slotChecked && slotAvailable === false)
+      ) {
+        const blockedNamePrompt = !bookingState.name || bookingState.awaitingName === true;
+        bookingState.awaitingAlternativeSelection = true;
+        normalizeBookingState("deterministic_alternative_before_name");
+        if (blockedNamePrompt) {
+          console.log("[REQUEST_NAME_BLOCKED_AWAITING_ALTERNATIVE]", {
+            reason: "alternative_selection_or_unavailable_slot",
+            state: bookingStateSnapshotForLog(),
+          });
+        }
+
         const alternativesSource = bookingState.alternatives?.length
           ? bookingState.alternatives
           : slotAlternatives;
@@ -1438,7 +1580,39 @@ RULES:
           : "Perfect, let me check that time for you.";
       }
 
-      if (slotChecked && slotAvailable === true && !bookingState.confirmationPromptRequested) {
+      if (shouldRequestNameAfterAvailableSlot()) {
+        bookingState.awaitingName = true;
+
+        console.log("[REQUEST_NAME_AFTER_SLOT_AVAILABLE]", {
+          service: bookingState.service,
+          parsedDate: bookingState.parsedDate,
+          parsedTime: bookingState.parsedTime,
+          slotChecked,
+          slotAvailable,
+          language: currentLanguage,
+        });
+
+        return isSpanish
+          ? "Perfecto. ¿A qué nombre pongo la cita?"
+          : "Perfect. May I have your name for the appointment?";
+      }
+
+      if (slotAvailable !== true && !bookingState.name) {
+        console.log("[REQUEST_NAME_BLOCKED_AWAITING_ALTERNATIVE]", {
+          reason: "slot_not_available_for_name_prompt",
+          state: bookingStateSnapshotForLog(),
+        });
+        return isSpanish
+          ? "Perfecto, déjame verificar ese horario."
+          : "Perfect, let me check that time for you.";
+      }
+
+      if (
+        slotChecked &&
+        slotAvailable === true &&
+        bookingState.awaitingAlternativeSelection !== true &&
+        !bookingState.confirmationPromptRequested
+      ) {
         return isSpanish
           ? `Perfecto, tengo ${bookingState.name} para ${bookingState.service} el ${bookingState.parsedDate} a las ${bookingState.parsedTime}. ¿Quieres que confirme esa cita?`
           : `Perfect, I have ${bookingState.name} for ${bookingState.service} on ${bookingState.parsedDate} at ${bookingState.parsedTime}. Should I confirm that appointment?`;
@@ -1474,11 +1648,17 @@ RULES:
           bookingState.parsedTime &&
           slotChecked &&
           slotAvailable === true &&
+          bookingState.awaitingAlternativeSelection !== true &&
           !bookingState.confirmationPromptRequested &&
           (
             reply.includes("¿Quieres que confirme") ||
             reply.includes("Should I confirm")
           );
+        const isNamePrompt =
+          bookingState.intent === "BOOK" &&
+          !bookingState.name &&
+          bookingState.awaitingName === true &&
+          (reply.includes("May I have your name") || reply.toLowerCase().includes("nombre"));
 
         console.log("[DETERMINISTIC_BOOKING_REPLY]", {
           reply,
@@ -1517,6 +1697,7 @@ RULES:
             reason,
             lang: currentLanguage,
             immediate,
+            promptType: isConfirmationPrompt ? "confirmation" : isNamePrompt ? "name" : null,
           }, reason);
 
           console.log("[QUEUE_DETERMINISTIC_BOOKING_REPLY]", {
@@ -1674,6 +1855,7 @@ RULES:
       bookingState.confirmed = false;
       bookingState.bookingAttempted = false;
       bookingState.awaitingCorrection = false;
+      normalizeBookingState("alternative_selection_slot_reset");
 
       await updateTranscriptFields({ requestedDateTimeText: bookingState.dateTimeText });
 
@@ -1700,6 +1882,17 @@ RULES:
         await finishCallerTranscriptHandling("alternative_selection_availability_error");
         speakExact(fallbackReply, { reason: "alternative_selection_availability_error" });
         return true;
+      }
+
+      if (slotChecked && slotAvailable === true) {
+        bookingState.awaitingAlternativeSelection = false;
+        bookingState.alternatives = [];
+        slotAlternatives = [];
+        if (!bookingState.name) {
+          bookingState.awaitingName = true;
+        }
+      } else {
+        normalizeBookingState("alternative_selection_after_recheck");
       }
 
       pendingResponseAfterTranscript = false;
@@ -1751,6 +1944,36 @@ RULES:
       pendingAssistantResponse = null;
       deferFlushUntilCallerStops = false;
 
+      if (
+        isQueuedNamePrompt(queued) &&
+        (bookingState.awaitingAlternativeSelection === true || slotAvailable !== true)
+      ) {
+        normalizeBookingState("stale_queued_name_prompt_dropped");
+        console.log("[STALE_QUEUED_NAME_PROMPT_DROPPED]", {
+          reason,
+          queuedReason: queued.reason,
+          state: bookingStateSnapshotForLog(),
+          queuedInstructionPreview: queuedInstructionPreviewFor(queued),
+        });
+        await requestAssistantResponse({ immediate: true, reason: "stale_queued_name_prompt_dropped" });
+        return true;
+      }
+
+      if (isQueuedConfirmationPrompt(queued) && !hasConfirmationPromptState()) {
+        bookingState.askedConfirm = false;
+        bookingState.confirmationPromptRequested = false;
+        bookingState.confirmed = false;
+        normalizeBookingState("stale_queued_confirmation_dropped");
+        console.log("[STALE_QUEUED_CONFIRMATION_DROPPED]", {
+          reason,
+          queuedReason: queued.reason,
+          state: bookingStateSnapshotForLog(),
+          queuedInstructionPreview: queuedInstructionPreviewFor(queued),
+        });
+        await requestAssistantResponse({ immediate: true, reason: "stale_queued_confirmation_dropped" });
+        return true;
+      }
+
       if (!isAssistantIdle()) {
         deferFlushUntilCallerStops = true;
         pendingAssistantResponse = queued;
@@ -1780,6 +2003,9 @@ RULES:
         if (!sent) {
           pendingAssistantResponse = queued;
           return false;
+        }
+        if (queued.finalConfirmation === true) {
+          markFinalConfirmationSent(queued.reason || reason);
         }
         return true;
       }
@@ -1860,6 +2086,21 @@ RULES:
           hasStreamSid: Boolean(streamSid),
           twilioReadyState: twilioWs.readyState,
         });
+        if (
+          finalConfirmationCallEndArmed &&
+          (!finalConfirmationResponseId || responseInFlightId === finalConfirmationResponseId)
+        ) {
+          finalConfirmationCallEndArmed = false;
+          finalConfirmationAwaitingResponseCreated = false;
+          finalConfirmationResponseId = "";
+          finalConfirmationPlaybackMarkName = "";
+          console.log("[CALL_END_AFTER_FINAL_CONFIRMATION_PLAYBACK]", {
+            reason: "playback_mark_unavailable",
+            callSid: callSid || "",
+            barberId: barberId || "",
+          });
+          void requestCallEnd("final_confirmation_playback_mark_unavailable");
+        }
         clearAssistantPlaybackState();
         scheduleQueuedAssistantFlush("twilio_playback_mark_unavailable");
         return false;
@@ -1868,6 +2109,13 @@ RULES:
       assistantTurnSeq += 1;
       const markName = `assistant-playback-${assistantTurnSeq}`;
       pendingAssistantMarkName = markName;
+      if (
+        finalConfirmationCallEndArmed &&
+        !finalConfirmationPlaybackMarkName &&
+        (!finalConfirmationResponseId || responseInFlightId === finalConfirmationResponseId)
+      ) {
+        finalConfirmationPlaybackMarkName = markName;
+      }
       twilioWs.send(JSON.stringify({
         event: "mark",
         streamSid,
@@ -1920,14 +2168,17 @@ RULES:
       }
 
       const toProcess = bufferedCallerTranscript;
+      const bufferedPriority = bufferedCallerTranscriptPriority;
 
       bufferedCallerTranscript = null;
       bufferedCallerTranscriptAt = null;
+      bufferedCallerTranscriptPriority = "";
       isProcessingBufferedTranscript = true;
 
       console.log("[BUFFERED_TRANSCRIPT_PROCESSING]", {
         reason,
         transcript: toProcess,
+        priority: bufferedPriority,
       });
 
       try {
@@ -1947,15 +2198,37 @@ RULES:
         return;
       }
 
+      const confirmationPromptActiveAtTranscriptStart =
+        bookingState.askedConfirm === true ||
+        bookingState.confirmationPromptRequested === true;
+      if (
+        !isBuffered &&
+        assistantPlaybackActive === true &&
+        confirmationPromptActiveAtTranscriptStart &&
+        (isConfirmationYes(transcriptText) || isNo(transcriptText))
+      ) {
+        bufferCallerTranscript(
+          transcriptText,
+          "confirmation_response_during_assistant_playback",
+          "confirmation_response"
+        );
+        await finishCallerTranscriptHandling("confirmation_response_buffered_during_playback");
+        return;
+      }
+
       if (!readyForCallerInput && !isBuffered) {
         const normalizedTranscript = String(transcriptText || "").toLowerCase();
         const readyForNameContext =
-          bookingState.awaitingName === true ||
-          Boolean(
-            bookingState.service &&
-            bookingState.parsedDate &&
-            bookingState.parsedTime &&
-            !bookingState.name
+          bookingState.awaitingAlternativeSelection !== true &&
+          slotAvailable === true &&
+          (
+            bookingState.awaitingName === true ||
+            Boolean(
+              bookingState.service &&
+              bookingState.parsedDate &&
+              bookingState.parsedTime &&
+              !bookingState.name
+            )
           );
 
         const hasBookingSignal =
@@ -1964,7 +2237,7 @@ RULES:
           bookingState.askedConfirm === true ||
           bookingState.confirmationPromptRequested === true;
         const isConfirmationResponse =
-          isInConfirmationContext && (isYes(transcriptText) || isNo(transcriptText));
+          isInConfirmationContext && (isConfirmationYes(transcriptText) || isNo(transcriptText));
         const isServiceResponse =
           bookingState.intent === "BOOK" &&
           !bookingState.service &&
@@ -1984,9 +2257,32 @@ RULES:
           hasAlternativeSelectionContext &&
           isLikelyAlternativeSelectionResponse(transcriptText, alternativeOptions);
 
-        if (readyForNameContext && isClearNameResponse(transcriptText)) {
-          bufferedCallerTranscript = transcriptText;
-          bufferedCallerTranscriptAt = Date.now();
+        if (isConfirmationResponse) {
+          bufferCallerTranscript(
+            transcriptText,
+            "confirmation_response_not_ready",
+            "confirmation_response"
+          );
+
+          console.log("[TRANSCRIPT_BUFFERED_CALLER_INPUT_NOT_READY]", {
+            transcript: transcriptText,
+            hasBookingSignal,
+            isConfirmationResponse,
+            isServiceResponse,
+            isAlternativeSelectionResponse,
+            awaitingAlternativeSelection: bookingState.awaitingAlternativeSelection,
+            alternativesCount,
+            askedConfirm: bookingState.askedConfirm,
+            confirmationPromptRequested: bookingState.confirmationPromptRequested,
+            readyForCallerInput,
+            assistantPlaybackActive,
+            pendingAssistantMarkName,
+            responseActive,
+            assistantSpeaking,
+            responseInFlightId,
+          });
+        } else if (readyForNameContext && isClearNameResponse(transcriptText)) {
+          bufferCallerTranscript(transcriptText, "expected_name_not_ready");
 
           console.log("[TRANSCRIPT_BUFFERED_EXPECTED_NAME_NOT_READY]", {
             transcript: transcriptText,
@@ -2002,8 +2298,7 @@ RULES:
             parsedTime: bookingState.parsedTime,
           });
         } else if (isAlternativeSelectionResponse) {
-          bufferedCallerTranscript = transcriptText;
-          bufferedCallerTranscriptAt = Date.now();
+          bufferCallerTranscript(transcriptText, "alternative_selection_not_ready");
 
           console.log("[TRANSCRIPT_BUFFERED_ALTERNATIVE_SELECTION_NOT_READY]", {
             transcript: transcriptText,
@@ -2023,8 +2318,7 @@ RULES:
             responseInFlightId,
           });
         } else if (hasBookingSignal || isConfirmationResponse || isServiceResponse || isAlternativeSelectionResponse) {
-          bufferedCallerTranscript = transcriptText;
-          bufferedCallerTranscriptAt = Date.now();
+          bufferCallerTranscript(transcriptText, "caller_input_not_ready");
 
           console.log("[TRANSCRIPT_BUFFERED_CALLER_INPUT_NOT_READY]", {
             transcript: transcriptText,
@@ -2107,7 +2401,7 @@ RULES:
         isLikelyAlternativeSelectionResponse(transcriptText, alternativeOptions);
       const isConfirmationResponse =
         (bookingState.askedConfirm === true || bookingState.confirmationPromptRequested === true) &&
-        (isYes(transcriptText) || isNo(transcriptText));
+        (isConfirmationYes(transcriptText) || isNo(transcriptText));
 
       if (
         bookingState.awaitingAlternativeSelection === true &&
@@ -2295,12 +2589,16 @@ RULES:
       // Global name extraction — capture obvious names even out of order
       if (!bookingState.name && bookingState.intent === "BOOK") {
         const canAcceptBareNameContext =
-          bookingState.awaitingName === true ||
-          Boolean(
-            bookingState.service &&
-            bookingState.parsedDate &&
-            bookingState.parsedTime &&
-            !bookingState.name
+          bookingState.awaitingAlternativeSelection !== true &&
+          slotAvailable === true &&
+          (
+            bookingState.awaitingName === true ||
+            Boolean(
+              bookingState.service &&
+              bookingState.parsedDate &&
+              bookingState.parsedTime &&
+              !bookingState.name
+            )
           );
         const confusionWords = [
           "what", "who", "where", "why", "when", "how", "huh", "sorry",
@@ -2345,13 +2643,21 @@ RULES:
         const hasExplicitPhrase = explicitPhrases.some(p => lower.includes(p));
 
         if (hasExplicitPhrase) {
-          const extracted = cleanClientName(transcriptText);
-          if (isClearNameResponse(extracted)) {
-            bookingState.name = extracted;
-            bookingState.awaitingName = false;
-            bookingState.awaitingCorrection = false;
-            await updateTranscriptFields({ clientName: bookingState.name });
-            console.log("[NAME_EXTRACTED]", { name: bookingState.name, method: "explicit_phrase" });
+          if (!canAcceptBareNameContext) {
+            console.log("[NAME_REJECTED]", {
+              transcript: transcriptText,
+              reason: "not_ready_for_name",
+              state: bookingStateSnapshotForLog(),
+            });
+          } else {
+            const extracted = cleanClientName(transcriptText);
+            if (isClearNameResponse(extracted)) {
+              bookingState.name = extracted;
+              bookingState.awaitingName = false;
+              bookingState.awaitingCorrection = false;
+              await updateTranscriptFields({ clientName: bookingState.name });
+              console.log("[NAME_EXTRACTED]", { name: bookingState.name, method: "explicit_phrase" });
+            }
           }
         } else if (isClearNameResponse(transcriptText)) {
           // Bare name candidate — only capture if transcript is 1-3 words
@@ -2444,6 +2750,7 @@ RULES:
             bookingState.confirmationPromptRequested = false;
             bookingState.confirmed = false;
             bookingState.bookingAttempted = false;
+            normalizeBookingState("service_changed_slot_reset");
           }
           bookingState.awaitingCorrection = false;
           await updateTranscriptFields({ serviceRequested: bookingState.service });
@@ -2514,6 +2821,7 @@ RULES:
               bookingState.confirmationPromptRequested = false;
               bookingState.confirmed = false;
               bookingState.awaitingCorrection = false;
+              normalizeBookingState("date_time_changed_slot_reset");
             }
           }
           await updateTranscriptFields({ requestedDateTimeText: bookingState.dateTimeText });
@@ -2545,7 +2853,10 @@ RULES:
           });
           const reply = getDeterministicBookingReply();
           await finishCallerTranscriptHandling("requested_name_after_slot_available");
-          const sent = speakExact(reply, { reason: "request_name_after_slot_available" });
+          const sent = speakExact(reply, {
+            reason: "request_name_after_slot_available",
+            promptType: "name",
+          });
           console.log("[DETERMINISTIC_REPLY_DECISION]", {
             reason: "request_name_after_slot_available",
             phase: "sent",
@@ -2569,7 +2880,11 @@ RULES:
         return;
       }
 
-      if (bookingState.intent === "BOOK" && bookingState.askedConfirm && isNo(transcriptText)) {
+      const awaitingConfirmationResponse =
+        bookingState.intent === "BOOK" &&
+        (bookingState.askedConfirm === true || bookingState.confirmationPromptRequested === true);
+
+      if (awaitingConfirmationResponse && isNo(transcriptText)) {
         bookingState.confirmed = false;
         bookingState.askedConfirm = false;
         bookingState.confirmationPromptRequested = false;
@@ -2590,7 +2905,7 @@ RULES:
         // If not, deterministic reply will ask what they want to change.
       }
 
-      if (bookingState.intent === "BOOK" && bookingState.askedConfirm && isConfirmationYes(transcriptText)) {
+      if (awaitingConfirmationResponse && isConfirmationYes(transcriptText)) {
         bookingState.confirmed = true;
         console.log("[CONFIRMATION_ACCEPTED]", {
           transcript: transcriptText,
@@ -2664,6 +2979,10 @@ RULES:
         if (evt.type === "response.created") {
           responseActive = true;
           responseInFlightId = evt.response?.id || evt.response_id || responseInFlightId;
+          if (finalConfirmationAwaitingResponseCreated) {
+            finalConfirmationResponseId = responseInFlightId || "";
+            finalConfirmationAwaitingResponseCreated = false;
+          }
         } else if (evt.response?.id) {
           responseInFlightId = evt.response.id;
         } else if (evt.response_id) {
@@ -2827,7 +3146,18 @@ RULES:
                 responseLower.includes("su nombre") ||
                 responseLower.includes("me puedes decir"))
             ) {
-              bookingState.awaitingName = true;
+              if (
+                bookingState.awaitingAlternativeSelection === true ||
+                slotAvailable === false
+              ) {
+                console.log("[REQUEST_NAME_BLOCKED_AWAITING_ALTERNATIVE]", {
+                  reason: "assistant_transcript_name_prompt_blocked",
+                  state: bookingStateSnapshotForLog(),
+                });
+                normalizeBookingState("assistant_transcript_name_prompt_blocked");
+              } else {
+                bookingState.awaitingName = true;
+              }
             }
             assistantTranscriptLines.push(assistantResponseText.trim());
             await appendMessage({
@@ -2840,11 +3170,13 @@ RULES:
           aiResponseInProgress = false;
           hasCommittedUserAudioForTurn = false;
 
-          if (pendingEndCallAfterResponse) {
+          if (pendingEndCallAfterResponse && !finalConfirmationCallEndArmed) {
             pendingEndCallAfterResponse = false;
             setTimeout(() => {
               void requestCallEnd("booking_flow_complete");
             }, 1200);
+          } else if (pendingEndCallAfterResponse && finalConfirmationCallEndArmed) {
+            pendingEndCallAfterResponse = false;
           }
 
           // Detect SETUP_DATA from conversational onboarding call
@@ -2931,6 +3263,23 @@ RULES:
           if (assistantAudioSentThisResponse) {
             sendAssistantPlaybackMark("terminal_response_event");
           } else {
+            if (
+              finalConfirmationCallEndArmed &&
+              (!finalConfirmationResponseId || responseInFlightId === finalConfirmationResponseId)
+            ) {
+              finalConfirmationCallEndArmed = false;
+              finalConfirmationAwaitingResponseCreated = false;
+              finalConfirmationResponseId = "";
+              finalConfirmationPlaybackMarkName = "";
+              console.log("[CALL_END_AFTER_FINAL_CONFIRMATION_PLAYBACK]", {
+                reason: "final_confirmation_no_audio_mark",
+                callSid: callSid || "",
+                barberId: barberId || "",
+              });
+              setTimeout(() => {
+                void requestCallEnd("final_confirmation_no_audio_mark");
+              }, 200);
+            }
             assistantSpeaking = false;
             responseInFlightId = "";
             readyForCallerInput = true;
@@ -2976,6 +3325,22 @@ RULES:
           assistantPlaybackActive,
           assistantSpeaking,
         });
+
+        if (finalConfirmationPlaybackMarkName && markName === finalConfirmationPlaybackMarkName) {
+          finalConfirmationCallEndArmed = false;
+          finalConfirmationAwaitingResponseCreated = false;
+          finalConfirmationResponseId = "";
+          finalConfirmationPlaybackMarkName = "";
+          console.log("[CALL_END_AFTER_FINAL_CONFIRMATION_PLAYBACK]", {
+            markName,
+            callSid: callSid || "",
+            barberId: barberId || "",
+          });
+          setTimeout(() => {
+            void requestCallEnd("final_confirmation_playback_complete");
+          }, 200);
+          return;
+        }
 
         const processedBuffered = await processBufferedCallerTranscript("twilio_playback_mark_acked");
         if (processedBuffered) {
