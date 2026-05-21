@@ -72,6 +72,7 @@ const buildInitialPrompt = (barberName, options = {}) => {
     `- Say: "Thanks for calling ${barberName}'s. This is Glo, the AI receptionist. How can I help you today?"\n` +
     `- Be natural and brief (1 sentence + a question).\n` +
     `- NEVER invent dates or times.\n` +
+    `- The barber is already assigned from the phone routing. Never ask which barber, stylist, provider, or person the caller wants to book with.\n` +
     `- If booking: require BOTH date and time, repeat back EXACTLY, then confirm YES before finalizing.\n` +
     servicesText +
     hoursText

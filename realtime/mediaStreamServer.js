@@ -83,17 +83,31 @@ const detectLanguageMode = (text) => {
   return "auto";
 };
 
-const isYes = (text) => {
-  // Normalize: lowercase, strip accents
-  const t = String(text || "")
+const normalizeYesNoText = (text) =>
+  String(text || "")
     .toLowerCase()
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[.?!,]+$/g, "")
     .trim();
+
+const isYes = (text) => {
+  const t = normalizeYesNoText(text);
+  const neverConfirm = [
+    "first available",
+    "earliest",
+    "next available",
+    "first one",
+    "second one",
+    "third one",
+  ];
+
+  if (neverConfirm.some((n) => t.includes(n))) return false;
 
   const yesPatterns = [
     "yes", "yep", "yup", "yeah", "sure", "correct", "confirm", "confirmed",
     "ok", "okay", "alright", "sounds good", "perfect", "great",
+    "si por favor", "confirmalo", "finalizalo",
     "si", "sí confirma", "si confirma", "dale", "claro", "correcto", "confirma", "confirmar", "perfecto", "exacto", "adelante",
     "si dale", "yes please", "go ahead", "that works", "that's right",
     "listo", "por favor", "va", "va bien", "está bien", "esta bien",
@@ -101,18 +115,18 @@ const isYes = (text) => {
   ];
 
   return yesPatterns.some((p) => {
-    const pattern = p.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+    const pattern = normalizeYesNoText(p);
+    if (!pattern) return false;
+    if (pattern.length <= 4) {
+      const escaped = pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      return t === pattern || new RegExp(`\\b${escaped}\\b`).test(t);
+    }
     return t === pattern || t.includes(pattern);
   });
 };
 
 const isConfirmationYes = (text) => {
-  const t = String(text || "")
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/[.?!,]+$/g, "")
-    .trim();
+  const t = normalizeYesNoText(text);
 
   if (isYes(text)) return true;
 
@@ -653,6 +667,7 @@ export const attachMediaWebSocketServer = (server) => {
     let assistantAudioSentThisResponse = false;
     let assistantPlaybackWatchdogTimer = null;
     let responseCreateSendReason = null;
+    let approvedResponseCreateSendInProgress = false;
     let pendingAssistantResponse = null;
     let lastSpeakExactStatus = null;
     let lastUserSpokeAt = 0;
@@ -688,6 +703,8 @@ export const attachMediaWebSocketServer = (server) => {
     };
     let pendingEndCallAfterResponse = false;
     let finalConfirmationCallEndArmed = false;
+    let finalConfirmationQueuedForPlayback = false;
+    let finalConfirmationSentOnce = false;
     let finalConfirmationAwaitingResponseCreated = false;
     let finalConfirmationResponseId = "";
     let finalConfirmationPlaybackMarkName = "";
@@ -740,6 +757,20 @@ export const attachMediaWebSocketServer = (server) => {
       }
 
       return corrections.length > 0;
+    };
+
+    const setAwaitingNameIfValid = (reason = "unknown") => {
+      if (bookingState.awaitingAlternativeSelection || slotAvailable !== true) {
+        console.log("[NAME_PROMPT_STATE_MISMATCH]", {
+          reason,
+          awaitingAlternativeSelection: bookingState.awaitingAlternativeSelection,
+          slotAvailable,
+        });
+        return false;
+      }
+
+      bookingState.awaitingName = true;
+      return true;
     };
 
     const isAssistantIdle = (reason = "unknown") => {
@@ -943,8 +974,14 @@ export const attachMediaWebSocketServer = (server) => {
       const previousReadyForCallerInput = readyForCallerInput;
       readyForCallerInput = false;
       responseCreateSendReason = reason;
-      const sent = sendToAI(payload);
-      responseCreateSendReason = null;
+      approvedResponseCreateSendInProgress = true;
+      let sent = false;
+      try {
+        sent = sendToAI(payload);
+      } finally {
+        approvedResponseCreateSendInProgress = false;
+        responseCreateSendReason = null;
+      }
       if (!sent) {
         readyForCallerInput = previousReadyForCallerInput;
         return false;
@@ -970,7 +1007,11 @@ export const attachMediaWebSocketServer = (server) => {
           }
         }
 
-        if (payload?.type === "response.create" && !isAssistantIdle(responseCreateSendReason || "ai_send_guard")) {
+        if (
+          payload?.type === "response.create" &&
+          !approvedResponseCreateSendInProgress &&
+          !isAssistantIdle(responseCreateSendReason || "ai_send_guard")
+        ) {
           logResponseCreateBlockedNotIdle(responseCreateSendReason || "ai_send_guard");
           return false;
         }
@@ -1112,10 +1153,16 @@ export const attachMediaWebSocketServer = (server) => {
         console.log("[SLOT_CHECK]", parsedDate, parsedTime, service, "available:", available);
 
         if (!available) {
+          console.log("[AVAILABILITY_SCAN_PARAMS]", {
+            limit: 3,
+            startAfterTime: bookingState.parsedTime,
+          });
           const alternatives = await getAvailableSlots({
             barber: barberDoc,
             date: parsedDate,
             durationMinutes,
+            limit: 3,
+            startAfterTime: bookingState.parsedTime,
           });
           slotAlternatives = alternatives.slice(0, 3);
           bookingState.alternatives = slotAlternatives;
@@ -1223,7 +1270,39 @@ export const attachMediaWebSocketServer = (server) => {
       }
     };
 
+    const clearQueuedFinalConfirmation = (reason = "unknown") => {
+      const queued = pendingAssistantResponse;
+      const clearedPending = queued?.finalConfirmation === true;
+      const hadQueuedFlag = finalConfirmationQueuedForPlayback;
+
+      if (clearedPending) {
+        pendingAssistantResponse = null;
+      }
+
+      finalConfirmationQueuedForPlayback = false;
+
+      if (clearedPending || hadQueuedFlag) {
+        console.log("[FINAL_CONFIRMATION_QUEUE_CLEARED]", {
+          reason,
+          clearedPending,
+          queuedReason: queued?.reason || "",
+        });
+      }
+    };
+
     const markFinalConfirmationSent = (reason = "final_confirmation") => {
+      if (finalConfirmationSentOnce) {
+        console.log("[FINAL_CONFIRMATION_DUPLICATE_SUPPRESSED]", {
+          reason,
+          stage: "mark_final_confirmation_sent",
+          ...responseIdleState(),
+        });
+        clearQueuedFinalConfirmation("duplicate_final_confirmation_sent");
+        return;
+      }
+
+      finalConfirmationSentOnce = true;
+      clearQueuedFinalConfirmation("final_confirmation_sent");
       finalConfirmationCallEndArmed = true;
       finalConfirmationAwaitingResponseCreated = true;
       finalConfirmationResponseId = "";
@@ -1255,6 +1334,25 @@ export const attachMediaWebSocketServer = (server) => {
       lastSpeakExactStatus = status;
 
       if (!text || !canSendAI()) return false;
+      if (isFinalConfirmation && (finalConfirmationSentOnce || finalConfirmationCallEndArmed)) {
+        status.sent = true;
+        console.log("[FINAL_CONFIRMATION_DUPLICATE_SUPPRESSED]", {
+          reason,
+          stage: "speak_exact_already_sent",
+          ...responseIdleState(),
+        });
+        clearQueuedFinalConfirmation("duplicate_final_confirmation_speak_exact");
+        return true;
+      }
+      if (isFinalConfirmation && finalConfirmationQueuedForPlayback) {
+        status.queued = true;
+        console.log("[FINAL_CONFIRMATION_DUPLICATE_SUPPRESSED]", {
+          reason,
+          stage: "speak_exact_already_queued",
+          ...responseIdleState(),
+        });
+        return true;
+      }
 
       const exactInstructions = `Say this exactly, with no extra words: "${text}"`;
       const queueExactForPlayback = (queueReason) => {
@@ -1267,6 +1365,7 @@ export const attachMediaWebSocketServer = (server) => {
           finalConfirmation: isFinalConfirmation,
         }, queueReason);
         status.queued = true;
+        if (isFinalConfirmation) finalConfirmationQueuedForPlayback = true;
         if (isFinalConfirmation) {
           console.log("[FINAL_CONFIRMATION_QUEUED_FOR_PLAYBACK]", {
             reason: queueReason,
@@ -1630,7 +1729,11 @@ RULES:
       }
 
       if (shouldRequestNameAfterAvailableSlot()) {
-        bookingState.awaitingName = true;
+        if (!setAwaitingNameIfValid("request_name_after_slot_available")) {
+          return isSpanish
+            ? "Perfecto, dejame verificar ese horario."
+            : "Perfect, let me check that time for you.";
+        }
 
         console.log("[REQUEST_NAME_AFTER_SLOT_AVAILABLE]", {
           service: bookingState.service,
@@ -1938,7 +2041,7 @@ RULES:
         bookingState.alternatives = [];
         slotAlternatives = [];
         if (!bookingState.name) {
-          bookingState.awaitingName = true;
+          setAwaitingNameIfValid("alternative_selection_after_recheck");
         }
       } else {
         normalizeBookingState("alternative_selection_after_recheck");
@@ -2023,6 +2126,17 @@ RULES:
         return true;
       }
 
+      if (queued.finalConfirmation === true && (finalConfirmationSentOnce || finalConfirmationCallEndArmed)) {
+        console.log("[FINAL_CONFIRMATION_DUPLICATE_SUPPRESSED]", {
+          reason,
+          stage: "flush_queued_already_sent",
+          queuedReason: queued.reason,
+          ...responseIdleState(),
+        });
+        clearQueuedFinalConfirmation("duplicate_queued_final_confirmation");
+        return true;
+      }
+
       if (!isAssistantIdle()) {
         deferFlushUntilCallerStops = true;
         pendingAssistantResponse = queued;
@@ -2051,6 +2165,7 @@ RULES:
         const sent = sendResponseCreate(payload, queued.reason || reason);
         if (!sent) {
           pendingAssistantResponse = queued;
+          if (queued.finalConfirmation === true) finalConfirmationQueuedForPlayback = true;
           return false;
         }
         if (queued.finalConfirmation === true) {
@@ -3210,7 +3325,7 @@ RULES:
                 });
                 normalizeBookingState("assistant_transcript_name_prompt_blocked");
               } else {
-                bookingState.awaitingName = true;
+                setAwaitingNameIfValid("assistant_transcript_name_prompt");
               }
             }
             assistantTranscriptLines.push(assistantResponseText.trim());

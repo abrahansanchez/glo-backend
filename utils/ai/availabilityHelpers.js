@@ -102,7 +102,13 @@ export async function isSlotAvailable({ barber, date, time, durationMinutes, exc
  * Get all available slots for a given date.
  * Steps by 30 minutes regardless of duration.
  */
-export async function getAvailableSlots({ barber, date, durationMinutes }) {
+export async function getAvailableSlots({
+  barber,
+  date,
+  durationMinutes,
+  limit = null,
+  startAfterTime = null,
+}) {
   const tz = barber.availability?.timezone || "America/New_York";
   const duration = durationMinutes || barber.availability?.defaultServiceDurationMinutes || 30;
 
@@ -126,6 +132,16 @@ export async function getAvailableSlots({ barber, date, durationMinutes }) {
     }
 
     const formattedTime = cursor.format("h:mm A");
+    if (startAfterTime) {
+      const slotMoment = moment.tz(`${date} ${formattedTime}`, "YYYY-MM-DD h:mm A", tz);
+      const afterMoment = moment.tz(`${date} ${startAfterTime}`, "YYYY-MM-DD h:mm A", tz);
+
+      if (afterMoment.isValid() && slotMoment.isSameOrBefore(afterMoment)) {
+        cursor.add(30, "minutes");
+        continue;
+      }
+    }
+
     const available = await isSlotAvailable({
       barber,
       date,
@@ -134,6 +150,7 @@ export async function getAvailableSlots({ barber, date, durationMinutes }) {
     });
     if (available) {
       slots.push({ date, time: formattedTime });
+      if (limit && slots.length >= limit) break;
     }
     cursor.add(30, "minutes"); // always step by 30 min
   }
@@ -151,7 +168,12 @@ export async function suggestClosestSlots({ barber, date, durationMinutes }) {
 
   for (let dayOffset = 0; dayOffset < 7; dayOffset++) {
     const checkDate = moment.tz(date, tz).add(dayOffset, "days").format("YYYY-MM-DD");
-    const slots = await getAvailableSlots({ barber, date: checkDate, durationMinutes: duration });
+    const slots = await getAvailableSlots({
+      barber,
+      date: checkDate,
+      durationMinutes: duration,
+      limit: 3 - suggestions.length,
+    });
     for (const slot of slots) {
       suggestions.push(slot);
       if (suggestions.length >= 3) return suggestions;
