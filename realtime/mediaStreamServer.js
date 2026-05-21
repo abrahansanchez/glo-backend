@@ -654,6 +654,7 @@ export const attachMediaWebSocketServer = (server) => {
     let assistantPlaybackWatchdogTimer = null;
     let responseCreateSendReason = null;
     let pendingAssistantResponse = null;
+    let lastSpeakExactStatus = null;
     let lastUserSpokeAt = 0;
     let assistantResponseText = "";
     let currentLanguage = "en";
@@ -1242,21 +1243,44 @@ export const attachMediaWebSocketServer = (server) => {
     };
 
     const speakExact = (text, options = {}) => {
-      if (!text || !canSendAI()) return false;
       const reason = options.reason || "speak_exact";
+      const isFinalConfirmation = options.finalConfirmation === true;
+      const promptType = isFinalConfirmation ? "final_confirmation" : options.promptType || null;
+      const status = {
+        reason,
+        sent: false,
+        queued: false,
+        finalConfirmation: isFinalConfirmation,
+      };
+      lastSpeakExactStatus = status;
+
+      if (!text || !canSendAI()) return false;
+
       const exactInstructions = `Say this exactly, with no extra words: "${text}"`;
-      if (!isAssistantIdle()) {
+      const queueExactForPlayback = (queueReason) => {
         queueAssistantResponse({
           exactInstructions,
-          reason,
+          reason: isFinalConfirmation ? "final_confirmation" : reason,
           lang: currentLanguage,
           immediate: true,
-          promptType: options.promptType || null,
-          finalConfirmation: options.finalConfirmation === true,
-        }, reason);
+          promptType,
+          finalConfirmation: isFinalConfirmation,
+        }, queueReason);
+        status.queued = true;
+        if (isFinalConfirmation) {
+          console.log("[FINAL_CONFIRMATION_QUEUED_FOR_PLAYBACK]", {
+            reason: queueReason,
+            ...responseIdleState(),
+          });
+        }
         console.log("[SPEAK_EXACT_QUEUED]", { reason, text: text?.slice(0, 60) });
         return true;
+      };
+
+      if (!isAssistantIdle()) {
+        return queueExactForPlayback(reason);
       }
+
       const responseCreatePayload = {
         type: "response.create",
         response: {
@@ -1265,8 +1289,16 @@ export const attachMediaWebSocketServer = (server) => {
         },
       };
       const sent = sendResponseCreate(responseCreatePayload, reason);
-      if (sent && options.finalConfirmation === true) {
-        markFinalConfirmationSent(reason);
+      status.sent = Boolean(sent);
+      if (sent && isFinalConfirmation) {
+        console.log("[FINAL_CONFIRMATION_SENT_IMMEDIATE]", {
+          reason,
+          ...responseIdleState(),
+        });
+        markFinalConfirmationSent("final_confirmation");
+      }
+      if (!sent && isFinalConfirmation && canSendAI()) {
+        return queueExactForPlayback("final_confirmation_send_blocked");
       }
       return sent;
     };
@@ -1311,13 +1343,30 @@ export const attachMediaWebSocketServer = (server) => {
           });
           await setTranscriptIntentOutcome({ intent: "BOOK", outcome: "BOOKED" });
           const confirmMsg = currentLanguage === "es"
-            ? `Tu cita ha sido confirmada para ${result.spoken}. ¡Gracias, hasta luego!`
+            ? `Tu cita ha sido confirmada para el ${bookingState.parsedDate} a las ${bookingState.parsedTime}. ¡Gracias, hasta luego!`
             : `Your appointment is confirmed for ${result.spoken}. Thank you, goodbye.`;
           const ok = speakExact(confirmMsg, {
             reason: "final_confirmation",
             finalConfirmation: true,
           });
-          if (!ok) await requestCallEnd("booking_success_no_ai_response");
+          const finalConfirmationStatus =
+            lastSpeakExactStatus?.finalConfirmation === true &&
+            lastSpeakExactStatus?.reason === "final_confirmation"
+              ? lastSpeakExactStatus
+              : { sent: Boolean(ok), queued: false };
+          console.log("[FINAL_CONFIRMATION_SEND_STATUS]", {
+            sent: Boolean(finalConfirmationStatus.sent),
+            queued: Boolean(finalConfirmationStatus.queued),
+            finalConfirmationCallEndArmed,
+            responseActive,
+            assistantSpeaking,
+            responseInFlightId,
+            assistantPlaybackActive,
+            pendingAssistantMarkName,
+          });
+          if (!finalConfirmationStatus.sent && !finalConfirmationStatus.queued) {
+            await requestCallEnd("booking_success_no_ai_response");
+          }
           return true;
         }
 
@@ -1384,7 +1433,7 @@ export const attachMediaWebSocketServer = (server) => {
       `4) Never say a booking is confirmed, booked, locked in, scheduled, or finalized. The backend will say final confirmation after it creates the appointment.\n` +
       `5) If caller says yes, say only: "One moment while I finalize that."\n` +
       `6) Start in the barber's preferred language and follow the active language rules.\n\n` +
-      `The barber is already assigned from the phone number. Never ask which barber, stylist, provider, or person the caller wants to book with.\n\n` +
+      `The barber is already assigned from the phone routing. Never ask which barber, stylist, provider, or person the caller wants to book with.\n\n` +
       `SERVICE OPTIONS:\n` +
       `- haircut\n` +
       `- beard\n` +
@@ -2005,7 +2054,11 @@ RULES:
           return false;
         }
         if (queued.finalConfirmation === true) {
-          markFinalConfirmationSent(queued.reason || reason);
+          console.log("[FINAL_CONFIRMATION_SENT_FROM_QUEUE]", {
+            reason: queued.reason || reason,
+            ...responseIdleState(),
+          });
+          markFinalConfirmationSent("final_confirmation");
         }
         return true;
       }
@@ -2090,16 +2143,11 @@ RULES:
           finalConfirmationCallEndArmed &&
           (!finalConfirmationResponseId || responseInFlightId === finalConfirmationResponseId)
         ) {
-          finalConfirmationCallEndArmed = false;
-          finalConfirmationAwaitingResponseCreated = false;
-          finalConfirmationResponseId = "";
-          finalConfirmationPlaybackMarkName = "";
-          console.log("[CALL_END_AFTER_FINAL_CONFIRMATION_PLAYBACK]", {
+          console.log("[FINAL_CONFIRMATION_PLAYBACK_MARK_UNAVAILABLE]", {
             reason: "playback_mark_unavailable",
             callSid: callSid || "",
             barberId: barberId || "",
           });
-          void requestCallEnd("final_confirmation_playback_mark_unavailable");
         }
         clearAssistantPlaybackState();
         scheduleQueuedAssistantFlush("twilio_playback_mark_unavailable");
@@ -2195,6 +2243,12 @@ RULES:
 
       if (!transcriptText) {
         await finishCallerTranscriptHandling("empty_transcript");
+        return;
+      }
+
+      if (bookingState.bookingFinalized) {
+        console.log("[TRANSCRIPT_IGNORED_BOOKING_FINALIZED]", { transcript: transcriptText });
+        await finishCallerTranscriptHandling("booking_finalized");
         return;
       }
 
@@ -3170,13 +3224,23 @@ RULES:
           aiResponseInProgress = false;
           hasCommittedUserAudioForTurn = false;
 
-          if (pendingEndCallAfterResponse && !finalConfirmationCallEndArmed) {
+          if (
+            pendingEndCallAfterResponse &&
+            !finalConfirmationCallEndArmed &&
+            bookingState.bookingFinalized !== true
+          ) {
             pendingEndCallAfterResponse = false;
             setTimeout(() => {
               void requestCallEnd("booking_flow_complete");
             }, 1200);
           } else if (pendingEndCallAfterResponse && finalConfirmationCallEndArmed) {
             pendingEndCallAfterResponse = false;
+          } else if (pendingEndCallAfterResponse && bookingState.bookingFinalized === true) {
+            console.log("[FINAL_CONFIRMATION_WAITING_FOR_PLAYBACK_MARK]", {
+              reason: "pending_end_call_after_finalized_response_done",
+              callSid: callSid || "",
+              barberId: barberId || "",
+            });
           }
 
           // Detect SETUP_DATA from conversational onboarding call
@@ -3267,18 +3331,11 @@ RULES:
               finalConfirmationCallEndArmed &&
               (!finalConfirmationResponseId || responseInFlightId === finalConfirmationResponseId)
             ) {
-              finalConfirmationCallEndArmed = false;
-              finalConfirmationAwaitingResponseCreated = false;
-              finalConfirmationResponseId = "";
-              finalConfirmationPlaybackMarkName = "";
-              console.log("[CALL_END_AFTER_FINAL_CONFIRMATION_PLAYBACK]", {
+              console.log("[FINAL_CONFIRMATION_WAITING_FOR_PLAYBACK_MARK]", {
                 reason: "final_confirmation_no_audio_mark",
                 callSid: callSid || "",
                 barberId: barberId || "",
               });
-              setTimeout(() => {
-                void requestCallEnd("final_confirmation_no_audio_mark");
-              }, 200);
             }
             assistantSpeaking = false;
             responseInFlightId = "";
@@ -3326,7 +3383,13 @@ RULES:
           assistantSpeaking,
         });
 
-        if (finalConfirmationPlaybackMarkName && markName === finalConfirmationPlaybackMarkName) {
+        const shouldEndAfterFinalConfirmationPlayback =
+          bookingState.bookingFinalized === true &&
+          (pendingEndCallAfterResponse || finalConfirmationCallEndArmed) &&
+          (!finalConfirmationPlaybackMarkName || markName === finalConfirmationPlaybackMarkName);
+
+        if (shouldEndAfterFinalConfirmationPlayback) {
+          pendingEndCallAfterResponse = false;
           finalConfirmationCallEndArmed = false;
           finalConfirmationAwaitingResponseCreated = false;
           finalConfirmationResponseId = "";
