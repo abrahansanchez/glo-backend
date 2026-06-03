@@ -1,7 +1,6 @@
 // utils/ai/openaiSession.js
 
 import WebSocket from "ws";
-import { SYSTEM_PERSONALITY } from "./aiPersonality.js";
 
 /**
  * Create OpenAI Realtime session.
@@ -35,8 +34,12 @@ export function createOpenAISession() {
         type: "realtime",
         model,
         instructions:
-          `You are a phone receptionist. Be brief. Ask one question at a time.\n\n` +
-          `${SYSTEM_PERSONALITY}`,
+          "You are Glō, a professional AI phone receptionist for a barbershop.\n" +
+          "Be brief, warm, neutral, and clear.\n" +
+          "Ask one question at a time.\n" +
+          "The barber is already assigned from the phone routing. " +
+          "Never ask which barber, stylist, provider, or person the caller wants to book with.\n" +
+          "Never say an appointment is confirmed until the backend creates it.",
         output_modalities: ["audio"],
         audio: {
           input: {

@@ -42,6 +42,7 @@ const NEUTRAL_INITIAL_SESSION_INSTRUCTIONS = [
   "Match only the caller's language, English or Spanish.",
   "Do not mimic accent, slang, dialect, or regional expressions.",
   "Never invent appointment details.",
+  "The barber is already assigned from the phone routing. Never ask which barber, stylist, provider, or person the caller wants to book with.",
   "Never say an appointment is confirmed until the backend creates it.",
 ].join("\n");
 
@@ -2234,6 +2235,15 @@ RULES:
           readyForCallerInput,
         });
 
+        if (finalConfirmationCallEndArmed && bookingState.bookingFinalized) {
+          console.log("[FINAL_CONFIRMATION_HANGUP_WATCHDOG_FIRED]", {
+            callSid,
+            barberId,
+          });
+          void requestCallEnd("final_confirmation_playback_watchdog_timeout");
+          return;
+        }
+
         clearAssistantPlaybackState();
         processBufferedCallerTranscript("playback_watchdog_reset").then((processedBuffered) => {
           if (!processedBuffered) {
@@ -3099,11 +3109,22 @@ RULES:
 
       const scheduledDeferredResponse = await finishCallerTranscriptHandling("transcript_completed");
 
-      if (pendingResponseAfterTranscript) {
-        pendingResponseAfterTranscript = false;
-        if (scheduledDeferredResponse) return;
-        await requestAssistantResponse({ immediate: true, reason: "transcript_ready" });
+      const hadPendingResponseAfterTranscript = pendingResponseAfterTranscript;
+      pendingResponseAfterTranscript = false;
+      if (scheduledDeferredResponse) return;
+      if (!hadPendingResponseAfterTranscript) {
+        console.log("[RESPONSE_REQUESTED_WITHOUT_VAD_GATE]", {
+          transcript: transcriptText,
+          buffered: isBuffered,
+          reason: options.reason || "transcript_completed",
+        });
       }
+      await requestAssistantResponse({
+        immediate: true,
+        reason: hadPendingResponseAfterTranscript
+          ? "transcript_ready"
+          : "transcript_ready_without_vad_gate",
+      });
     }
 
     // ----------------------------
@@ -3290,11 +3311,17 @@ RULES:
                       threshold: 0.6,
                       prefix_padding_ms: 400,
                       silence_duration_ms: 1200,
+                      create_response: false,
+                      interrupt_response: false,
                     },
                   },
                 },
               },
             };
+            console.log("[OPENAI_AUTO_RESPONSE_DISABLED]", {
+              create_response: false,
+              interrupt_response: false,
+            });
             console.log("[TRANSCRIPTION_CONFIG]", {
               model: vadUpdatePayload?.session?.audio?.input?.transcription?.model,
               language: vadUpdatePayload?.session?.audio?.input?.transcription?.language || null,
