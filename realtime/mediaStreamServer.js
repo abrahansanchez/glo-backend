@@ -818,45 +818,78 @@ export const attachMediaWebSocketServer = (server) => {
 
     console.log("[REALTIME_GUARD_AUDIT] all commit/cancel sends should use safe helpers");
 
-    // Silence injection state
+    // Outbound keepalive state
     let silenceInterval = null;
     let sendingSilence = false;
-    let silenceStopped = false;
+    const outboundSilenceB64 = Buffer.alloc(SILENCE_FRAME_SIZE, 0xff).toString("base64");
 
     // ----------------------------
-    // Silence Injection
+    // Outbound Keepalive
     // ----------------------------
-    const startSilence = () => {
-      if (sendingSilence) return;
-      sendingSilence = true;
-      console.log("🔇 Starting silence injection...");
+    const stopOutboundKeepalive = (reason = "unknown") => {
+      if (!sendingSilence && !silenceInterval) return false;
 
-      const silenceBuffer = Buffer.alloc(SILENCE_FRAME_SIZE, 0xff);
-      const silenceB64 = silenceBuffer.toString("base64");
-
-      silenceInterval = setInterval(() => {
-        if (twilioWs.readyState === twilioWs.OPEN && streamSid) {
-          twilioWs.send(
-            JSON.stringify({
-              event: "media",
-              streamSid,
-              media: { payload: silenceB64 },
-            })
-          );
-        }
-      }, TWILIO_FRAME_MS);
-    };
-
-    const stopSilence = () => {
-      if (silenceStopped) return;
-      silenceStopped = true;
-      sendingSilence = false;
       if (silenceInterval) {
         clearInterval(silenceInterval);
         silenceInterval = null;
       }
-      console.log("🔇 Silence injection stopped (AI audio started)");
+      sendingSilence = false;
+      console.log("[OUTBOUND_KEEPALIVE_STOPPED]", { reason });
+      return true;
     };
+
+    const startOutboundKeepalive = (reason = "unknown") => {
+      if (sendingSilence || silenceInterval) {
+        console.log("[OUTBOUND_KEEPALIVE_SKIPPED]", {
+          reason,
+          status: "already_active",
+        });
+        return false;
+      }
+      if (assistantPlaybackActive || assistantSpeaking) {
+        console.log("[OUTBOUND_KEEPALIVE_SKIPPED]", {
+          reason,
+          status: "assistant_audio_active",
+          assistantPlaybackActive,
+          assistantSpeaking,
+        });
+        return false;
+      }
+      if (twilioWs.readyState !== twilioWs.OPEN || !streamSid) {
+        console.log("[OUTBOUND_KEEPALIVE_SKIPPED]", {
+          reason,
+          status: "twilio_unavailable",
+          hasStreamSid: Boolean(streamSid),
+          twilioReadyState: twilioWs.readyState,
+        });
+        return false;
+      }
+
+      sendingSilence = true;
+      silenceInterval = setInterval(() => {
+        if (twilioWs.readyState !== twilioWs.OPEN || !streamSid) {
+          stopOutboundKeepalive("twilio_unavailable");
+          return;
+        }
+        if (assistantPlaybackActive || assistantSpeaking) {
+          stopOutboundKeepalive("assistant_audio_active");
+          return;
+        }
+        twilioWs.send(
+          JSON.stringify({
+            event: "media",
+            streamSid,
+            media: { payload: outboundSilenceB64 },
+          })
+        );
+      }, TWILIO_FRAME_MS);
+
+      console.log("[OUTBOUND_KEEPALIVE_STARTED]", { reason });
+      return true;
+    };
+
+    const startSilence = () => startOutboundKeepalive("initial_stream_start");
+    const stopSilence = (reason = "unknown") => stopOutboundKeepalive(reason);
 
     // ----------------------------
     // Helpers
@@ -1127,6 +1160,7 @@ export const attachMediaWebSocketServer = (server) => {
           parsedTime,
           barberId,
         });
+        startOutboundKeepalive("availability_check");
 
         if (!barberDoc) {
           barberDoc = await Barber.findById(barberId).lean();
@@ -1158,6 +1192,7 @@ export const attachMediaWebSocketServer = (server) => {
             limit: 3,
             startAfterTime: bookingState.parsedTime,
           });
+          startOutboundKeepalive("availability_scan");
           const alternatives = await getAvailableSlots({
             barber: barberDoc,
             date: parsedDate,
@@ -1412,6 +1447,7 @@ export const attachMediaWebSocketServer = (server) => {
         `[BOOKING_READY] callSid=${callSid || ""} barberId=${barberId} phone=${callerNumber} name=${bookingState.name} date=${bookingState.parsedDate} time=${bookingState.parsedTime} service=${bookingState.service}`
       );
       console.log(`[BOOKING_EXECUTE] callSid=${callSid || ""} barberId=${barberId}`);
+      startOutboundKeepalive("booking_execution");
 
       try {
         const result = await bookAppointment({
@@ -2063,6 +2099,12 @@ RULES:
       "response.audio.done",
       "response.output_item.done",
       "response.cancelled",
+    ]);
+    const playbackCompleteEvents = new Set([
+      "response.done",
+      "response.completed",
+      "response.output_audio.done",
+      "response.audio.done",
     ]);
 
     const flushQueuedAssistantResponse = async (reason = "unknown") => {
@@ -3437,7 +3479,7 @@ RULES:
           evt.type === "response.audio.delta" ||
           evt.type === "response.output_audio.delta"
         ) {
-          stopSilence();
+          stopOutboundKeepalive("assistant_audio_started");
 
           if (twilioWs.readyState === twilioWs.OPEN && streamSid) {
             twilioWs.send(
@@ -3466,9 +3508,9 @@ RULES:
         if (isTerminalResponseEvent) {
           responseActive = false;
           aiResponseInProgress = false;
-          if (assistantAudioSentThisResponse) {
+          if (assistantAudioSentThisResponse && playbackCompleteEvents.has(evt.type)) {
             sendAssistantPlaybackMark("terminal_response_event");
-          } else {
+          } else if (!assistantAudioSentThisResponse) {
             if (
               finalConfirmationCallEndArmed &&
               (!finalConfirmationResponseId || responseInFlightId === finalConfirmationResponseId)
@@ -3629,7 +3671,7 @@ RULES:
     twilioWs.on("close", () => {
       console.log("📴 Twilio WebSocket closed");
       clearAssistantPlaybackWatchdog();
-      stopSilence();
+      stopSilence("twilio_ws_closed");
       if (ai && ai.readyState === ai.OPEN) ai.close();
       aiSessionStarted = false;
 
