@@ -187,7 +187,7 @@ const isNoisyTranscript = (text, bookingState) => {
     return false;
   }
 
-  if (bookingState?.awaitingAlternativeSelection && (["ok", "okay"].includes(t) || /\d/.test(t))) {
+  if (bookingState?.awaitingAlternativeSelection && /\d/.test(t)) {
     return false;
   }
 
@@ -326,17 +326,77 @@ const normalizeAlternativeSelectionText = (text) =>
     .replace(/\s+/g, " ")
     .trim();
 
+const EN_HOUR_WORDS = {
+  one: "1",
+  two: "2",
+  three: "3",
+  four: "4",
+  five: "5",
+  six: "6",
+  seven: "7",
+  eight: "8",
+  nine: "9",
+  ten: "10",
+  eleven: "11",
+  twelve: "12",
+};
+
+const ES_HOUR_WORDS = {
+  uno: "1",
+  una: "1",
+  dos: "2",
+  tres: "3",
+  cuatro: "4",
+  cinco: "5",
+  seis: "6",
+  siete: "7",
+  ocho: "8",
+  nueve: "9",
+  diez: "10",
+  once: "11",
+  doce: "12",
+};
+
+const ALT_SELECTION_FILLERS = new Set([
+  "ok",
+  "okay",
+  "alright",
+  "yes",
+  "yeah",
+  "yep",
+  "dale",
+  "esta bien",
+  "all right",
+  "perfect",
+  "perfecto",
+]);
+
+const replaceHourWords = (text) => {
+  let normalized = String(text || "");
+  for (const [word, digit] of Object.entries({ ...EN_HOUR_WORDS, ...ES_HOUR_WORDS })) {
+    normalized = normalized.replace(new RegExp(`\\b${word}\\b`, "g"), digit);
+  }
+  return normalized;
+};
+
 const normalizeSpokenAlternativeTimeText = (text) =>
-  normalizeAlternativeSelectionText(text)
-    .replace(/\bten\s+thirty\b/g, "10:30")
-    .replace(/\beleven\s+thirty\b/g, "11:30")
-    .replace(/\btwelve\s+thirty\b/g, "12:30")
-    .replace(/\bten\s+o(?:'|\u2019|\s+)?clock\b/g, "10")
-    .replace(/\beleven\s+o(?:'|\u2019|\s+)?clock\b/g, "11")
-    .replace(/\btwelve\s+o(?:'|\u2019|\s+)?clock\b/g, "12")
-    .replace(/\bten\b/g, "10")
-    .replace(/\beleven\b/g, "11")
-    .replace(/\btwelve\b/g, "12")
+  replaceHourWords(normalizeAlternativeSelectionText(text))
+    .replace(/\btenian\b/g, "10")
+    .replace(/\btenia\b/g, "10")
+    .replace(/\bo(?:'|\u2019|\s+)?clock\b/g, "")
+    .replace(/\b(\d{1,2})\s+thirty\b/g, "$1:30")
+    .replace(/\b(\d{1,2})\s+treinta\b/g, "$1:30")
+    .replace(/\b(\d{1,2})\s+y\s+media\b/g, "$1:30")
+    .replace(/\bin the morning\b/g, "am")
+    .replace(/\bin morning\b/g, "am")
+    .replace(/\bin the afternoon\b/g, "pm")
+    .replace(/\bin afternoon\b/g, "pm")
+    .replace(/\bin the evening\b/g, "pm")
+    .replace(/\bin evening\b/g, "pm")
+    .replace(/\bde la manana\b/g, "am")
+    .replace(/\bde la mañana\b/g, "am")
+    .replace(/\bde la tarde\b/g, "pm")
+    .replace(/\bde la noche\b/g, "pm")
     .replace(/\s+/g, " ")
     .trim();
 
@@ -368,60 +428,148 @@ const parseSlotTimeParts = (time) => {
   };
 };
 
-const alternativeTimeMatches = (text, slotTime) => {
+const hourWordAliases = (hour) => {
+  const aliases = [];
+  for (const [word, digit] of Object.entries(EN_HOUR_WORDS)) {
+    if (Number(digit) === hour) aliases.push(word);
+  }
+  for (const [word, digit] of Object.entries(ES_HOUR_WORDS)) {
+    if (Number(digit) === hour) aliases.push(word);
+  }
+  return aliases;
+};
+
+const addNormalizedAlias = (aliases, alias) => {
+  const normalized = normalizeSpokenAlternativeTimeText(alias);
+  if (normalized && !ALT_SELECTION_FILLERS.has(normalized)) aliases.add(normalized);
+};
+
+const alternativeTimeAliasesFor = (slotTime) => {
   const slot = parseSlotTimeParts(slotTime);
-  if (!slot) return false;
+  const aliases = new Set();
+  if (!slot) return aliases;
 
-  const match = text.match(/\b(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/);
-  if (!match) return false;
+  const suffix = slot.suffix;
+  const suffixUpper = suffix.toUpperCase();
+  const minute = slot.minute || "00";
+  const colonTime = `${slot.hour}:${minute}`;
+  const spacedTime = `${slot.hour} ${minute}`;
+  const isHalfHour = minute === "30";
+  const isOnHour = minute === "00";
+  const englishPeriod = suffix === "am" ? "in the morning" : "in the afternoon";
+  const spanishPeriod = suffix === "am" ? "de la manana" : "de la tarde";
 
-  const hour = Number(match[1]);
-  const minute = match[2] || "00";
-  const suffix = match[3] || "";
+  addNormalizedAlias(aliases, colonTime);
+  addNormalizedAlias(aliases, `${colonTime} ${suffix}`);
+  addNormalizedAlias(aliases, `${colonTime} ${suffixUpper}`);
+  addNormalizedAlias(aliases, spacedTime);
+  addNormalizedAlias(aliases, `${spacedTime} ${suffix}`);
 
-  if (hour !== slot.hour) return false;
-  if (suffix && suffix !== slot.suffix) return false;
-  if (match[2]) return minute === slot.minute;
-  return slot.minute === "00";
+  if (isOnHour) {
+    addNormalizedAlias(aliases, String(slot.hour));
+    addNormalizedAlias(aliases, `${slot.hour} ${suffix}`);
+    addNormalizedAlias(aliases, `${slot.hour} ${suffixUpper}`);
+  }
+
+  for (const word of hourWordAliases(slot.hour)) {
+    if (isOnHour) {
+      addNormalizedAlias(aliases, word);
+      addNormalizedAlias(aliases, `${word} ${suffix}`);
+      addNormalizedAlias(aliases, `${word} ${suffixUpper}`);
+      addNormalizedAlias(aliases, `${word} ${englishPeriod}`);
+      addNormalizedAlias(aliases, `${word} ${spanishPeriod}`);
+      addNormalizedAlias(aliases, `${word} o'clock`);
+    }
+    if (isHalfHour) {
+      addNormalizedAlias(aliases, `${word} thirty`);
+      addNormalizedAlias(aliases, `${word} thirty ${suffix}`);
+      addNormalizedAlias(aliases, `${word} thirty ${englishPeriod}`);
+      addNormalizedAlias(aliases, `${word} y media`);
+      addNormalizedAlias(aliases, `${word} treinta`);
+      addNormalizedAlias(aliases, `${word} y media ${spanishPeriod}`);
+    }
+  }
+
+  return aliases;
+};
+
+const ordinalAliasesForAlternative = (index, total) => {
+  const aliases = new Set();
+  const isFirst = index === 0;
+  const isSecond = index === 1;
+  const isThird = index === 2;
+  const isLast = index === total - 1;
+
+  if (isFirst) {
+    ["first", "first one", "first option", "the first", "the first one", "the first option", "earliest", "next", "next one", "la primera", "primera", "primera opcion"].forEach((alias) => addNormalizedAlias(aliases, alias));
+  }
+  if (isSecond) {
+    ["second", "second one", "second option", "the second", "the second one", "the second option", "la segunda", "segunda", "segunda opcion"].forEach((alias) => addNormalizedAlias(aliases, alias));
+    if (total === 3) {
+      ["middle", "middle one", "middle option", "the middle", "the middle one", "the middle option"].forEach((alias) => addNormalizedAlias(aliases, alias));
+    }
+  }
+  if (isThird) {
+    ["third", "third one", "third option", "the third", "the third one", "the third option", "la tercera", "tercera", "tercera opcion"].forEach((alias) => addNormalizedAlias(aliases, alias));
+  }
+  if (isLast && total > 1) {
+    ["last", "last one", "last option", "the last", "the last one", "the last option", "ultima", "la ultima", "ultima opcion"].forEach((alias) => addNormalizedAlias(aliases, alias));
+  }
+
+  return aliases;
+};
+
+const selectAlternativeFromTranscript = (transcript, alternatives = [], language = "en") => {
+  if (!Array.isArray(alternatives) || alternatives.length === 0) {
+    return { matched: false, reason: "no_alternatives" };
+  }
+
+  const normalized = normalizeSpokenAlternativeTimeText(transcript);
+  if (!normalized) return { matched: false, reason: "empty_transcript" };
+  if (ALT_SELECTION_FILLERS.has(normalized)) {
+    return { matched: false, reason: "filler_word" };
+  }
+
+  for (let index = 0; index < alternatives.length; index += 1) {
+    const alternative = alternatives[index];
+    const aliases = new Set([
+      ...alternativeTimeAliasesFor(alternative?.time),
+      ...ordinalAliasesForAlternative(index, alternatives.length),
+    ]);
+
+    if (aliases.has(normalized)) {
+      return {
+        matched: true,
+        alternative,
+        selectedTime: alternative?.time || "",
+        selectedDate: alternative?.date || "",
+        reason: "alias_match",
+        language,
+      };
+    }
+  }
+
+  return { matched: false, reason: "no_alias_match" };
+};
+
+const alternativeTimeMatches = (text, slotTime) => {
+  const aliases = alternativeTimeAliasesFor(slotTime);
+  return aliases.has(normalizeSpokenAlternativeTimeText(text));
 };
 
 const findSelectedAlternativeSlot = (text, alternatives = []) => {
-  if (!alternatives.length) return null;
-
-  const t = normalizeSpokenAlternativeTimeText(text);
-  if (
-    /^(ok|okay)$/.test(t) ||
-    /^(?:the\s+)?(?:first|earliest|next)(?:\s+one)?$/.test(t) ||
-    /^(that one|that works|yes that works|works for me|sounds good|perfect|go ahead|la primera|primera|esa|esa esta bien|dale)$/.test(t)
-  ) {
-    return alternatives[0];
-  }
-  if (/^(?:the\s+)?second(?:\s+one)?$/.test(t) || /^(segunda|la segunda)$/.test(t)) {
-    return alternatives[1] || null;
-  }
-  if (/^(?:the\s+)?third(?:\s+one)?$/.test(t) || /^(tercera|la tercera)$/.test(t)) {
-    return alternatives[2] || null;
-  }
-
-  return alternatives.find((slot) => alternativeTimeMatches(t, slot.time)) || null;
+  const selection = selectAlternativeFromTranscript(text, alternatives);
+  return selection.matched ? selection.alternative : null;
 };
 
-const hasAlternativeSelectionReplyShape = (text) => {
-  const t = normalizeSpokenAlternativeTimeText(text);
-  return (
-    /^(ok|okay)$/.test(t) ||
-    /^(?:the\s+)?(?:first|second|third|earliest|next)(?:\s+one)?$/.test(t) ||
-    /^(la primera|primera|la segunda|segunda|la tercera|tercera)$/.test(t) ||
-    /^(that one|that works|yes that works|works for me|sounds good|perfect|go ahead|esa|esa esta bien|dale)$/.test(t) ||
-    /\b(?:10|11|12)(?::(?:00|30))?\s*(?:am|pm)?\b/.test(t)
-  );
-};
+const hasAlternativeSelectionReplyShape = (text, alternatives = []) =>
+  selectAlternativeFromTranscript(text, alternatives).matched;
 
 const isLikelyAlternativeSelectionResponse = (text, alternatives = []) =>
   Boolean(
     isAlternativeSelectionGoodbye(text) ||
       isOriginalUnavailableConfirmRequest(text) ||
-      hasAlternativeSelectionReplyShape(text) ||
+      hasAlternativeSelectionReplyShape(text, alternatives) ||
       findSelectedAlternativeSlot(text, alternatives)
   );
 
@@ -484,6 +632,49 @@ const extractSpokenTimeForBooking = (text) => {
   }
 
   return "";
+};
+
+const parseContextualTimeOnly = (transcript, { parsedDate, language = "en" } = {}) => {
+  if (!parsedDate) return null;
+
+  const raw = String(transcript || "").trim();
+  if (!raw) return null;
+
+  const normalized = normalizeSpokenAlternativeTimeText(raw)
+    .replace(/\ba\s+las\b/g, "")
+    .replace(/\blas\b/g, "")
+    .replace(/\bat\b/g, "")
+    .replace(/\bfor\b/g, "")
+    .replace(/\bplease\b/g, "")
+    .replace(/\bpor\s+favor\b/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!normalized) return null;
+  if (ALT_SELECTION_FILLERS.has(normalized)) return null;
+
+  const timeOnlyMatch = normalized.match(/^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$/i);
+  if (!timeOnlyMatch) {
+    return null;
+  }
+
+  const hour = Number(timeOnlyMatch[1]);
+  const minute = timeOnlyMatch[2] || "00";
+  const explicitSuffix = timeOnlyMatch[3]?.toUpperCase() || "";
+
+  if (hour < 1 || hour > 12 || !/^(00|15|30|45)$/.test(minute)) {
+    return null;
+  }
+
+  const suffix = explicitSuffix || (hour >= 7 && hour <= 11 ? "AM" : "PM");
+
+  return {
+    matched: true,
+    time: `${hour}:${minute} ${suffix}`,
+    parsedDate,
+    language,
+    reason: explicitSuffix ? "explicit_time_only" : "business_hours_default",
+  };
 };
 
 const buildTwilioClient = () => {
@@ -760,6 +951,106 @@ export const attachMediaWebSocketServer = (server) => {
       return corrections.length > 0;
     };
 
+    let lastLoggedBookingPhase = "";
+
+    const buildBookingStateKey = () =>
+      JSON.stringify({
+        intent: bookingState.intent,
+        service: bookingState.service,
+        name: bookingState.name,
+        parsedDate: bookingState.parsedDate,
+        parsedTime: bookingState.parsedTime,
+        awaitingName: bookingState.awaitingName,
+        awaitingAlternativeSelection: bookingState.awaitingAlternativeSelection,
+        askedConfirm: bookingState.askedConfirm,
+        confirmationPromptRequested: bookingState.confirmationPromptRequested,
+        confirmed: bookingState.confirmed,
+        bookingAttempted: bookingState.bookingAttempted,
+        bookingFinalized: bookingState.bookingFinalized,
+        alternativesCount: bookingState.alternatives?.length || 0,
+        slotChecked,
+        slotAvailable,
+      });
+
+    const getBookingPhase = () => {
+      if (bookingState.bookingFinalized) return "finalized";
+      if (bookingState.intent === "CANCEL") return "cancelled";
+      if (bookingState.bookingAttempted) return "booking";
+      if (bookingState.awaitingAlternativeSelection || (slotChecked && slotAvailable === false)) {
+        return "awaiting_alternative";
+      }
+      if (
+        bookingState.awaitingName ||
+        (
+          bookingState.intent === "BOOK" &&
+          bookingState.service &&
+          bookingState.parsedDate &&
+          bookingState.parsedTime &&
+          slotChecked &&
+          slotAvailable === true &&
+          !bookingState.name
+        )
+      ) {
+        return "awaiting_name";
+      }
+      if (bookingState.awaitingCorrection) return "collecting_service";
+      if (
+        bookingState.askedConfirm ||
+        bookingState.confirmationPromptRequested ||
+        (
+          bookingState.intent === "BOOK" &&
+          bookingState.service &&
+          bookingState.name &&
+          bookingState.parsedDate &&
+          bookingState.parsedTime &&
+          slotChecked &&
+          slotAvailable === true &&
+          bookingState.confirmed !== true
+        )
+      ) {
+        return "awaiting_confirmation";
+      }
+      if (
+        bookingState.intent === "BOOK" &&
+        bookingState.service &&
+        bookingState.parsedDate &&
+        bookingState.parsedTime &&
+        !slotChecked
+      ) {
+        return "checking_availability";
+      }
+      if (bookingState.intent === "BOOK" && bookingState.service && bookingState.parsedDate && !bookingState.parsedTime) {
+        return "collecting_time";
+      }
+      if (bookingState.intent === "BOOK" && bookingState.service && !bookingState.parsedDate) {
+        return "collecting_date";
+      }
+      if (bookingState.intent === "BOOK" && !bookingState.service) {
+        return "collecting_service";
+      }
+      return "idle";
+    };
+
+    const logBookingPhase = (reason = "unknown") => {
+      const phase = getBookingPhase();
+      if (!lastLoggedBookingPhase) {
+        console.log("[BOOKING_PHASE]", {
+          reason,
+          phase,
+          stateKey: buildBookingStateKey(),
+        });
+      } else if (phase !== lastLoggedBookingPhase) {
+        console.log("[BOOKING_PHASE_CHANGED]", {
+          reason,
+          from: lastLoggedBookingPhase,
+          to: phase,
+          stateKey: buildBookingStateKey(),
+        });
+      }
+      lastLoggedBookingPhase = phase;
+      return phase;
+    };
+
     const setAwaitingNameIfValid = (reason = "unknown") => {
       if (bookingState.awaitingAlternativeSelection || slotAvailable !== true) {
         console.log("[NAME_PROMPT_STATE_MISMATCH]", {
@@ -984,10 +1275,29 @@ export const attachMediaWebSocketServer = (server) => {
     };
 
     const queueAssistantResponse = (queued, reason) => {
-      pendingAssistantResponse = queued;
+      const shouldStampDeterministicBooking =
+        queued?.deterministicBooking === true ||
+        (
+          bookingState.intent === "BOOK" &&
+          queued?.finalConfirmation !== true &&
+          Boolean(queued?.promptType)
+        );
+      const queuedWithPhase = shouldStampDeterministicBooking
+        ? {
+            ...queued,
+            deterministicBooking: true,
+            bookingPhase: queued.bookingPhase || getBookingPhase(),
+            stateKey: queued.stateKey || buildBookingStateKey(),
+          }
+        : queued;
+
+      pendingAssistantResponse = queuedWithPhase;
       console.log("[QUEUE_RESPONSE_OWNER]", {
         reason,
-        queuedInstructionPreview: queuedInstructionPreviewFor(queued),
+        queuedInstructionPreview: queuedInstructionPreviewFor(queuedWithPhase),
+        deterministicBooking: queuedWithPhase?.deterministicBooking === true,
+        bookingPhase: queuedWithPhase?.bookingPhase || null,
+        stateKey: queuedWithPhase?.stateKey || null,
         ...responseIdleState(),
       });
     };
@@ -1528,7 +1838,8 @@ export const attachMediaWebSocketServer = (server) => {
                 : "Esa hora no está disponible. ¿Qué otro día u hora te funciona?"
               : alternatives
                 ? `That time is not available. I can offer ${alternatives}. Which one works for you?`
-                : "That time is not available. What other day or time works for you?"
+                : "That time is not available. What other day or time works for you?",
+            { reason: "booking_unavailable", promptType: "alternative" }
           );
           return true;
         }
@@ -1675,6 +1986,7 @@ RULES:
     };
 
     const bookingDecisionState = () => ({
+      phase: getBookingPhase(),
       intent: bookingState.intent,
       name: bookingState.name,
       service: bookingState.service,
@@ -1816,6 +2128,8 @@ RULES:
       if (!greetingComplete) return;
       if (!canSendAI()) return;
 
+      logBookingPhase(`request_assistant_response:${reason}`);
+
       if (bookingState.intent === "BOOK") {
         console.log("[DETERMINISTIC_REPLY_DECISION]", {
           reason,
@@ -1887,6 +2201,9 @@ RULES:
             lang: currentLanguage,
             immediate,
             promptType: isConfirmationPrompt ? "confirmation" : isNamePrompt ? "name" : null,
+            deterministicBooking: true,
+            bookingPhase: getBookingPhase(),
+            stateKey: buildBookingStateKey(),
           }, reason);
 
           console.log("[QUEUE_DETERMINISTIC_BOOKING_REPLY]", {
@@ -1894,6 +2211,7 @@ RULES:
             responseActive,
             assistantSpeaking,
             responseInFlightId,
+            bookingPhase: getBookingPhase(),
           });
 
           return;
@@ -2019,10 +2337,17 @@ RULES:
         return true;
       }
 
-      const selectedAlternative = findSelectedAlternativeSlot(transcriptText, alternatives);
-      if (!selectedAlternative) {
+      const selection = selectAlternativeFromTranscript(transcriptText, alternatives, currentLanguage);
+      if (!selection.matched) {
+        console.log("[ALTERNATIVE_SELECTION_NO_MATCH]", {
+          transcript: transcriptText,
+          alternativesCount: alternatives.length,
+          reason: selection.reason,
+          phase: getBookingPhase(),
+        });
         return false;
       }
+      const selectedAlternative = selection.alternative;
 
       const previousDate = bookingState.parsedDate;
       const previousTime = bookingState.parsedTime;
@@ -2054,6 +2379,7 @@ RULES:
         previousTime,
         selectedDate: bookingState.parsedDate,
         selectedTime: bookingState.parsedTime,
+        reason: selection.reason,
       });
 
       try {
@@ -2138,6 +2464,40 @@ RULES:
       const queued = queuedAssistantResponse;
       pendingAssistantResponse = null;
       deferFlushUntilCallerStops = false;
+
+      if (queued.deterministicBooking === true && queued.bookingPhase) {
+        const currentPhase = getBookingPhase();
+        const currentStateKey = buildBookingStateKey();
+        if (queued.bookingPhase !== currentPhase) {
+          console.log("[QUEUED_RESPONSE_DROPPED_PHASE_CHANGED]", {
+            reason,
+            queuedReason: queued.reason,
+            queuedPhase: queued.bookingPhase,
+            currentPhase,
+            queuedStateKey: queued.stateKey || "",
+            currentStateKey,
+            queuedInstructionPreview: queuedInstructionPreviewFor(queued),
+          });
+
+          const canRederive =
+            bookingState.intent === "BOOK" &&
+            queued.finalConfirmation !== true &&
+            !["finalized", "booking", "cancelled"].includes(currentPhase);
+          if (canRederive) {
+            console.log("[QUEUED_RESPONSE_REDERIVED_PHASE_CHANGED]", {
+              reason,
+              queuedReason: queued.reason,
+              currentPhase,
+              currentStateKey,
+            });
+            await requestAssistantResponse({
+              immediate: true,
+              reason: "queued_response_phase_changed",
+            });
+          }
+          return true;
+        }
+      }
 
       if (
         isQueuedNamePrompt(queued) &&
@@ -2727,6 +3087,7 @@ RULES:
         askedConfirm: bookingState.askedConfirm,
         confirmed: bookingState.confirmed,
       }));
+      logBookingPhase("transcript_received");
 
       const text = String(transcriptText || "").toLowerCase();
       const inferredServiceFromTranscript = normalizeServiceName(transcriptText);
@@ -2988,8 +3349,61 @@ RULES:
       try {
         const hasDate = containsDateSignal(transcriptText);
         const hasTime = containsTimeSignal(transcriptText) || containsLooseTimeSignal(transcriptText);
+        const phaseBeforeDateTimeParse = getBookingPhase();
+        const contextualTimeOnly =
+          !hasDate && !hasTime && phaseBeforeDateTimeParse === "collecting_time"
+            ? parseContextualTimeOnly(transcriptText, {
+                parsedDate: bookingState.parsedDate,
+                language: currentLanguage,
+              })
+            : null;
         let shouldCheckAvailabilityAfterParse = true;
-        if (hasDate || hasTime) {
+        if (contextualTimeOnly) {
+          const previousTime = bookingState.parsedTime;
+          bookingState.requestedTimeText = transcriptText;
+          bookingState.dateTimeText = [
+            bookingState.requestedDateText || bookingState.parsedDate,
+            bookingState.requestedTimeText,
+          ]
+            .filter(Boolean)
+            .join(" ");
+
+          if (contextualTimeOnly.time !== bookingState.parsedTime) {
+            bookingState.parsedTime = contextualTimeOnly.time;
+            slotChecked = false;
+            slotAvailable = false;
+            slotAlternatives = [];
+            lastAvailabilityCheckKey = "";
+            lastUnavailableInjectionKey = "";
+            bookingState.awaitingAlternativeSelection = false;
+            bookingState.alternatives = [];
+            bookingState.askedConfirm = false;
+            bookingState.confirmationPromptRequested = false;
+            bookingState.confirmed = false;
+            bookingState.awaitingCorrection = false;
+            normalizeBookingState("contextual_time_only_slot_reset");
+          }
+
+          await updateTranscriptFields({ requestedDateTimeText: `${bookingState.parsedDate} ${bookingState.parsedTime}` });
+          console.log("[CONTEXTUAL_TIME_ONLY_PARSED]", {
+            transcript: transcriptText,
+            previousTime,
+            parsedDate: bookingState.parsedDate,
+            parsedTime: bookingState.parsedTime,
+            reason: contextualTimeOnly.reason,
+            language: currentLanguage,
+          });
+        } else {
+          if (phaseBeforeDateTimeParse === "collecting_time" && !hasDate && !hasTime) {
+            console.log("[CONTEXTUAL_TIME_ONLY_NO_MATCH]", {
+              transcript: transcriptText,
+              parsedDate: bookingState.parsedDate,
+              language: currentLanguage,
+            });
+          }
+        }
+
+        if (!contextualTimeOnly && (hasDate || hasTime)) {
           if (hasDate && !bookingState.requestedDateText) bookingState.requestedDateText = transcriptText;
           if (hasTime && !bookingState.requestedTimeText) bookingState.requestedTimeText = transcriptText;
           bookingState.dateTimeText = [bookingState.requestedDateText, bookingState.requestedTimeText]
@@ -3334,6 +3748,17 @@ RULES:
             responseActive = false;
             console.log("✅ Greeting complete - enabling VAD and audio forwarding");
 
+            const transcriptionLanguageMode = (() => {
+              const lang = String(currentLanguage || barberPreferredLang || "").toLowerCase();
+              if (lang.startsWith("es")) return "es";
+              if (lang.startsWith("en")) return "en";
+              return "";
+            })();
+            const transcriptionConfig = {
+              model: "gpt-realtime-whisper",
+              ...(transcriptionLanguageMode ? { language: transcriptionLanguageMode } : {}),
+            };
+
             // ✅ FIX #4: Better VAD settings
             const vadUpdatePayload = {
               type: "session.update",
@@ -3344,10 +3769,7 @@ RULES:
                     format: {
                       type: "audio/pcmu",
                     },
-                    transcription: {
-                      model: "gpt-realtime-whisper",
-                      language: "es",
-                    },
+                    transcription: transcriptionConfig,
                     turn_detection: {
                       type: "server_vad",
                       threshold: 0.6,
