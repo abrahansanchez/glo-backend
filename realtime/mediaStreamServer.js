@@ -18,6 +18,7 @@ const DAY_MAP = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
 const TWILIO_FRAME_MS = 20;
 const MIN_COMMIT_MS = 100;
 const MIN_COMMIT_FRAMES = Math.ceil(MIN_COMMIT_MS / TWILIO_FRAME_MS); // 5
+const MIN_BARGE_IN_CLEAR_MS = 900;
 
 // Silence injection constants
 const SILENCE_FRAME_SIZE = 160; // 20ms of μ-law audio at 8kHz
@@ -915,6 +916,10 @@ export const attachMediaWebSocketServer = (server) => {
     let isProcessingBufferedTranscript = false;
     let assistantTurnSeq = 0;
     let assistantAudioSentThisResponse = false;
+    let assistantAudioDeltaCount = 0;
+    let pendingBargeInStartedAt = null;
+    let pendingBargeInAudioStartMs = null;
+    let pendingBargeInWhilePlayback = false;
     let assistantPlaybackWatchdogTimer = null;
     let responseCreateSendReason = null;
     let approvedResponseCreateSendInProgress = false;
@@ -1392,6 +1397,10 @@ export const attachMediaWebSocketServer = (server) => {
       responseActive = true;
       aiResponseInProgress = true;
       assistantResponseText = "";
+      assistantAudioDeltaCount = 0;
+      pendingBargeInStartedAt = null;
+      pendingBargeInAudioStartMs = null;
+      pendingBargeInWhilePlayback = false;
       return true;
     };
 
@@ -2760,8 +2769,6 @@ RULES:
       "response.cancelled",
     ]);
     const playbackCompleteEvents = new Set([
-      "response.done",
-      "response.completed",
       "response.output_audio.done",
       "response.audio.done",
     ]);
@@ -2959,8 +2966,47 @@ RULES:
       assistantSpeaking = false;
       pendingAssistantMarkName = null;
       assistantAudioSentThisResponse = false;
+      assistantAudioDeltaCount = 0;
+      pendingBargeInStartedAt = null;
+      pendingBargeInAudioStartMs = null;
+      pendingBargeInWhilePlayback = false;
       responseInFlightId = "";
       readyForCallerInput = true;
+    };
+
+    const clearTwilioPlaybackForBargeIn = async (reason, details = {}) => {
+      if (!(assistantPlaybackActive || pendingAssistantMarkName)) return false;
+
+      if (twilioWs.readyState === twilioWs.OPEN && streamSid) {
+        twilioWs.send(JSON.stringify({
+          event: "clear",
+          streamSid,
+        }));
+      }
+      clearAssistantPlaybackWatchdog();
+      assistantPlaybackActive = false;
+      assistantSpeaking = false;
+      pendingAssistantMarkName = null;
+      assistantAudioSentThisResponse = false;
+      assistantAudioDeltaCount = 0;
+      pendingBargeInStartedAt = null;
+      pendingBargeInAudioStartMs = null;
+      pendingBargeInWhilePlayback = false;
+      readyForCallerInput = true;
+      console.log("[TWILIO_PLAYBACK_CLEARED_ON_BARGE_IN_CALLER_INPUT_READY]", {
+        reason,
+        responseActive,
+        responseInFlightId,
+        readyForCallerInput,
+        ...details,
+      });
+      const processedBuffered = await processBufferedCallerTranscript(reason);
+      if (processedBuffered) {
+        console.log("[FLUSH_DEFERRED_PENDING_CALLER_TRANSCRIPT]", {
+          reason,
+        });
+      }
+      return true;
     };
 
     const startAssistantPlaybackWatchdog = () => {
@@ -3985,6 +4031,7 @@ RULES:
 
         if (evt.type === "response.created") {
           responseActive = true;
+          assistantAudioDeltaCount = 0;
           responseInFlightId = evt.response?.id || evt.response_id || responseInFlightId;
           if (finalConfirmationAwaitingResponseCreated) {
             finalConfirmationResponseId = responseInFlightId || "";
@@ -4002,6 +4049,14 @@ RULES:
         ) {
           assistantSpeaking = true;
           responseActive = true;
+          assistantAudioDeltaCount += 1;
+          if (assistantAudioDeltaCount === 1 || assistantAudioDeltaCount % 25 === 0) {
+            console.log("[OPENAI_AUDIO_DELTA_COUNT]", {
+              responseInFlightId,
+              assistantAudioDeltaCount,
+              eventType: evt.type,
+            });
+          }
         }
 
         if (
@@ -4028,6 +4083,11 @@ RULES:
             transcript: evt.transcript,
           });
           const transcriptText = (evt.transcript || "").trim();
+          if (pendingBargeInWhilePlayback && transcriptText) {
+            await clearTwilioPlaybackForBargeIn("barge_in_transcript_confirmed", {
+              transcriptPreview: transcriptText.slice(0, 80),
+            });
+          }
           currentCallerTranscriptId = evt.item_id || evt.event_id || evt.id || transcriptText;
           try {
             await handleCallerTranscript(transcriptText);
@@ -4053,29 +4113,20 @@ RULES:
           callerSpeaking = true;
           console.log("[CALLER_SPEAKING_STARTED]");
           if (assistantPlaybackActive || pendingAssistantMarkName) {
-            if (twilioWs.readyState === twilioWs.OPEN && streamSid) {
-              twilioWs.send(JSON.stringify({
-                event: "clear",
-                streamSid,
-              }));
-            }
-            clearAssistantPlaybackWatchdog();
-            assistantPlaybackActive = false;
-            assistantSpeaking = false;
-            pendingAssistantMarkName = null;
-            assistantAudioSentThisResponse = false;
-            readyForCallerInput = true;
-            console.log("[TWILIO_PLAYBACK_CLEARED_ON_BARGE_IN_CALLER_INPUT_READY]", {
+            pendingBargeInStartedAt = Date.now();
+            pendingBargeInAudioStartMs = Number.isFinite(Number(evt.audio_start_ms))
+              ? Number(evt.audio_start_ms)
+              : null;
+            pendingBargeInWhilePlayback = true;
+            console.log("[BARGE_IN_CLEAR_SUPPRESSED_FALSE_START]", {
+              reason: "awaiting_transcript_or_duration",
+              audioStartMs: pendingBargeInAudioStartMs,
+              assistantPlaybackActive,
+              pendingAssistantMarkName,
               responseActive,
               responseInFlightId,
               readyForCallerInput,
             });
-            const processedBuffered = await processBufferedCallerTranscript("barge_in_clear");
-            if (processedBuffered) {
-              console.log("[FLUSH_DEFERRED_PENDING_CALLER_TRANSCRIPT]", {
-                reason: "barge_in_clear",
-              });
-            }
           }
           if (!assistantSpeaking) {
             console.log("[BARGE_IN_IGNORED_NO_ACTIVE_ASSISTANT]");
@@ -4091,6 +4142,44 @@ RULES:
 
         if (evt.type === "input_audio_buffer.speech_stopped") {
           console.log("[SERVER_VAD_SPEECH_STOPPED]", evt);
+          if (pendingBargeInWhilePlayback) {
+            const audioEndMs = Number.isFinite(Number(evt.audio_end_ms))
+              ? Number(evt.audio_end_ms)
+              : null;
+            const audioDurationMs =
+              pendingBargeInAudioStartMs !== null && audioEndMs !== null
+                ? Math.max(0, audioEndMs - pendingBargeInAudioStartMs)
+                : null;
+            const wallClockDurationMs = pendingBargeInStartedAt
+              ? Date.now() - pendingBargeInStartedAt
+              : 0;
+            const bargeInDurationMs = audioDurationMs ?? wallClockDurationMs;
+            const shouldClearForDuration =
+              greetingComplete &&
+              bargeInDurationMs >= MIN_BARGE_IN_CLEAR_MS &&
+              (assistantPlaybackActive || pendingAssistantMarkName);
+
+            if (shouldClearForDuration) {
+              await clearTwilioPlaybackForBargeIn("barge_in_duration_confirmed", {
+                bargeInDurationMs,
+                audioDurationMs,
+                wallClockDurationMs,
+              });
+            } else {
+              console.log("[BARGE_IN_CLEAR_SUPPRESSED_FALSE_START]", {
+                reason: greetingComplete ? "duration_too_short" : "greeting_not_complete",
+                bargeInDurationMs,
+                audioDurationMs,
+                wallClockDurationMs,
+                minBargeInClearMs: MIN_BARGE_IN_CLEAR_MS,
+                assistantPlaybackActive,
+                pendingAssistantMarkName,
+              });
+              pendingBargeInStartedAt = null;
+              pendingBargeInAudioStartMs = null;
+              pendingBargeInWhilePlayback = false;
+            }
+          }
           if (!greetingComplete) return;
           if (aiResponseInProgress) return;
 
@@ -4101,6 +4190,17 @@ RULES:
             console.log("[GATE] waiting for transcript completion before response");
           }
           return;
+        }
+
+        if (evt.type === "response.done" || evt.type === "response.completed") {
+          console.log("[OPENAI_RESPONSE_DONE]", {
+            type: evt.type,
+            responseInFlightId,
+            assistantAudioDeltaCount,
+            assistantAudioSentThisResponse,
+            assistantPlaybackActive,
+            pendingAssistantMarkName,
+          });
         }
 
         if (evt.type === "response.done") {
@@ -4288,10 +4388,33 @@ RULES:
           }
         }
 
+        if (playbackCompleteEvents.has(evt.type)) {
+          console.log("[OPENAI_AUDIO_DONE]", {
+            type: evt.type,
+            responseInFlightId,
+            assistantAudioDeltaCount,
+            assistantAudioSentThisResponse,
+            assistantPlaybackActive,
+            pendingAssistantMarkName,
+          });
+          console.log("[OPENAI_AUDIO_DELTA_COUNT]", {
+            responseInFlightId,
+            assistantAudioDeltaCount,
+            final: true,
+          });
+        }
+
         if (isTerminalResponseEvent) {
           responseActive = false;
           aiResponseInProgress = false;
           if (assistantAudioSentThisResponse && playbackCompleteEvents.has(evt.type)) {
+            console.log("[PLAYBACK_MARK_SENT_AFTER_AUDIO_DONE]", {
+              eventType: evt.type,
+              responseInFlightId,
+              assistantAudioDeltaCount,
+              assistantPlaybackActive,
+              pendingAssistantMarkName,
+            });
             sendAssistantPlaybackMark("terminal_response_event");
           } else if (!assistantAudioSentThisResponse) {
             if (
@@ -4340,6 +4463,10 @@ RULES:
         assistantSpeaking = false;
         pendingAssistantMarkName = null;
         assistantAudioSentThisResponse = false;
+        assistantAudioDeltaCount = 0;
+        pendingBargeInStartedAt = null;
+        pendingBargeInAudioStartMs = null;
+        pendingBargeInWhilePlayback = false;
         responseInFlightId = "";
         readyForCallerInput = true;
 
