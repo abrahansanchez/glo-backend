@@ -303,26 +303,58 @@ const isClearNameResponse = (text) => {
   return words.every((word) => /^[\p{L}'-]{2,}$/u.test(word));
 };
 
-const formatAlternativeSlots = (alternatives = []) => {
-  if (!alternatives.length) return "";
-  return alternatives
-    .slice(0, 3)
-    .map((slot) => `${slot.date} at ${slot.time}`)
-    .join(", ");
+const formatSpokenWeekday = (date) => {
+  const parsed = new Date(`${date}T12:00:00.000Z`);
+  if (Number.isNaN(parsed.getTime())) return "";
+  return new Intl.DateTimeFormat("en-US", { weekday: "long", timeZone: "UTC" }).format(parsed);
 };
 
-const formatAlternativeChoiceTimes = (alternatives = [], requestedDate = "") =>
-  alternatives
-    .slice(0, 3)
-    .map((slot) => {
-      if (!slot?.time) return "";
-      if (requestedDate && slot.date && slot.date !== requestedDate) {
-        return `${slot.date} at ${slot.time}`;
-      }
-      return slot.time;
-    })
-    .filter(Boolean)
-    .join(", ");
+const stripAmPmForGroupedTime = (time) =>
+  String(time || "").trim().replace(/\s*(AM|PM)\s*$/i, "");
+
+const joinSpokenList = (items = []) => {
+  const values = items.map((item) => String(item || "").trim()).filter(Boolean);
+  if (values.length <= 2) return values.join(values.length === 2 ? " or " : "");
+  return `${values.slice(0, -1).join(", ")}, or ${values[values.length - 1]}`;
+};
+
+const formatSpokenAlternativeChoices = (alternatives = [], requestedDate = "") => {
+  const slots = alternatives.slice(0, 3).filter((slot) => slot?.time);
+  if (!slots.length) return "";
+
+  const grouped = new Map();
+  for (const slot of slots) {
+    const dateKey = slot.date || requestedDate || "";
+    const existing = grouped.get(dateKey) || [];
+    existing.push(slot.time);
+    grouped.set(dateKey, existing);
+  }
+
+  const parts = [];
+  for (const [dateKey, times] of grouped.entries()) {
+    const suffixes = new Set(
+      times
+        .map((time) => String(time || "").trim().match(/\b(AM|PM)\b/i)?.[1]?.toUpperCase())
+        .filter(Boolean)
+    );
+    const spokenTimes = suffixes.size === 1
+      ? times.map(stripAmPmForGroupedTime)
+      : times;
+    const timesText = joinSpokenList(spokenTimes);
+    const dayText = dateKey && dateKey !== requestedDate ? formatSpokenWeekday(dateKey) : "";
+    parts.push(dayText ? `${dayText} at ${timesText}` : timesText);
+  }
+
+  return joinSpokenList(parts);
+};
+
+const closedDayAlternativeReply = ({ requestedDate, alternativesText, isSpanish = false }) => {
+  const requestedDay = formatSpokenWeekday(requestedDate);
+  if (!requestedDay || !alternativesText) return "";
+  return isSpanish
+    ? `${requestedDay} está cerrado. Tengo ${alternativesText}. ¿Cuál te funciona?`
+    : `${requestedDay} is closed. I have ${alternativesText}. Which works?`;
+};
 
 const addCalendarDays = (date, days) => {
   const parsed = new Date(`${date}T12:00:00.000Z`);
@@ -1854,15 +1886,8 @@ export const attachMediaWebSocketServer = (server) => {
         lastUnavailableInjectionKey = injectionKey;
 
         const altText = slotAlternatives.length > 0
-          ? slotAlternatives
-              .map((s) =>
-                s?.date && s.date !== bookingState.parsedDate
-                  ? `${s.date} at ${s.time}`
-                  : s.time
-              )
-              .filter(Boolean)
-              .join(", ")
-          : "no other slots today";
+          ? formatSpokenAlternativeChoices(slotAlternatives, bookingState.parsedDate)
+          : "no other slots available";
 
         const unavailableMsg = currentLanguage === "es"
           ? `[SYSTEM: That slot is NOT available in the database. Do NOT confirm it. Tell the caller it's taken and offer these alternatives: ${altText}]`
@@ -2076,9 +2101,10 @@ export const attachMediaWebSocketServer = (server) => {
             requestedDateTimeText: `${bookingState.parsedDate} ${bookingState.parsedTime}`,
           });
           await setTranscriptIntentOutcome({ intent: "BOOK", outcome: "BOOKED" });
+          const spokenDate = formatSpokenWeekday(bookingState.parsedDate) || bookingState.parsedDate;
           const confirmMsg = currentLanguage === "es"
-            ? `Tu cita ha sido confirmada para el ${bookingState.parsedDate} a las ${bookingState.parsedTime}. ¡Gracias, hasta luego!`
-            : `Your appointment is confirmed for ${result.spoken}. Thank you, goodbye.`;
+            ? `Tu cita está confirmada para ${spokenDate} a las ${bookingState.parsedTime}. Gracias, hasta luego.`
+            : `Your appointment is confirmed for ${spokenDate} at ${bookingState.parsedTime}. Thank you, goodbye.`;
           const ok = speakExact(confirmMsg, {
             reason: "final_confirmation",
             finalConfirmation: true,
@@ -2115,17 +2141,17 @@ export const attachMediaWebSocketServer = (server) => {
           bookingState.alternatives = slotAlternatives;
           bookingState.awaitingAlternativeSelection = slotAlternatives.length > 0;
           normalizeBookingState("booking_engine_unavailable");
-          const alternatives = formatAlternativeSlots(result.alternatives);
+          const alternatives = formatSpokenAlternativeChoices(result.alternatives, bookingState.parsedDate);
           console.log(
             `[BOOKING_UNAVAILABLE] callSid=${callSid || ""} barberId=${barberId} alternatives=${alternatives || "none"}`
           );
           speakExact(
             currentLanguage === "es"
               ? alternatives
-                ? `Esa hora no está disponible. Puedo ofrecerte ${alternatives}. ¿Cuál te funciona?`
+                ? `Esa hora no está disponible. Tengo ${alternatives}. ¿Cuál te funciona?`
                 : "Esa hora no está disponible. ¿Qué otro día u hora te funciona?"
               : alternatives
-                ? `That time is not available. I can offer ${alternatives}. Which one works for you?`
+                ? `That time isn't available. I have ${alternatives}. Which works?`
                 : "That time is not available. What other day or time works for you?",
             { reason: "booking_unavailable", promptType: "alternative" }
           );
@@ -2348,15 +2374,27 @@ RULES:
         }
 
         const alternatives = alternativesSource?.length
-          ? formatAlternativeChoiceTimes(alternativesSource, bookingState.parsedDate)
+          ? formatSpokenAlternativeChoices(alternativesSource, bookingState.parsedDate)
+          : "";
+        const dayKey = dayKeyForDate(bookingState.parsedDate);
+        const requestedDayClosed = Boolean(
+          dayKey &&
+          barberDoc?.availability?.businessHours?.[dayKey]?.isClosed
+        );
+        const closedReply = requestedDayClosed
+          ? closedDayAlternativeReply({
+              requestedDate: bookingState.parsedDate,
+              alternativesText: alternatives,
+              isSpanish,
+            })
           : "";
 
         return isSpanish
           ? alternatives
-            ? `Esa hora no está disponible. Puedo ofrecerte ${alternatives}. ¿Cuál te funciona?`
+            ? closedReply || `Esa hora no está disponible. Tengo ${alternatives}. ¿Cuál te funciona?`
             : "Esa hora no está disponible. ¿Qué otro día u hora te funciona?"
           : alternatives
-            ? `That time is not available. I can offer ${alternatives}. Which one works for you?`
+            ? closedReply || `That time isn't available. I have ${alternatives}. Which works?`
             : "That time is not available. What other day or time works for you?";
       }
 
@@ -2403,9 +2441,10 @@ RULES:
         bookingState.awaitingAlternativeSelection !== true &&
         !bookingState.confirmationPromptRequested
       ) {
+        const spokenDate = formatSpokenWeekday(bookingState.parsedDate) || bookingState.parsedDate;
         return isSpanish
-          ? `Perfecto, tengo ${bookingState.name} para ${bookingState.service} el ${bookingState.parsedDate} a las ${bookingState.parsedTime}. ¿Quieres que confirme esa cita?`
-          : `Perfect, I have ${bookingState.name} for ${bookingState.service} on ${bookingState.parsedDate} at ${bookingState.parsedTime}. Should I confirm that appointment?`;
+          ? `Perfecto, tengo ${bookingState.name} para ${bookingState.service} el ${spokenDate} a las ${bookingState.parsedTime}. ¿Confirmo esa cita?`
+          : `Perfect, I have ${bookingState.name} for ${bookingState.service} on ${spokenDate} at ${bookingState.parsedTime}. Should I confirm it?`;
       }
 
       return isSpanish
@@ -2451,6 +2490,13 @@ RULES:
           !bookingState.name &&
           bookingState.awaitingName === true &&
           (reply.includes("May I have your name") || reply.toLowerCase().includes("nombre"));
+        const isAlternativePrompt =
+          bookingState.intent === "BOOK" &&
+          (
+            bookingState.awaitingAlternativeSelection === true ||
+            (slotChecked && slotAvailable === false)
+          );
+        const deterministicMaxTokens = isAlternativePrompt ? 80 : 120;
 
         console.log("[DETERMINISTIC_BOOKING_REPLY]", {
           reply,
@@ -2493,6 +2539,7 @@ RULES:
             deterministicBooking: true,
             bookingPhase: getBookingPhase(),
             stateKey: buildBookingStateKey(),
+            maxOutputTokens: deterministicMaxTokens,
           }, reason);
 
           console.log("[QUEUE_DETERMINISTIC_BOOKING_REPLY]", {
@@ -2524,7 +2571,7 @@ RULES:
           type: "response.create",
           response: {
             instructions: exactInstructions,
-            max_output_tokens: 120,
+            max_output_tokens: deterministicMaxTokens,
           },
         };
 
@@ -2851,7 +2898,7 @@ RULES:
           type: "response.create",
           response: {
             instructions: queued.exactInstructions,
-            max_output_tokens: 250,
+            max_output_tokens: queued.maxOutputTokens || 250,
           },
         };
         console.log("[FLUSH_QUEUED_SPEAK_EXACT]", { reason: queued.reason });
