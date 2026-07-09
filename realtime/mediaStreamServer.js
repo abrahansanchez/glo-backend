@@ -9,9 +9,11 @@ import {
   isSlotAvailable,
   getAvailableSlots,
   getServiceDurationMinutes,
+  suggestClosestSlots,
 } from "../utils/ai/availabilityHelpers.js";
 
 const WS_PATH = "/ws/media";
+const DAY_MAP = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
 
 const TWILIO_FRAME_MS = 20;
 const MIN_COMMIT_MS = 100;
@@ -309,12 +311,36 @@ const formatAlternativeSlots = (alternatives = []) => {
     .join(", ");
 };
 
-const formatAlternativeChoiceTimes = (alternatives = []) =>
+const formatAlternativeChoiceTimes = (alternatives = [], requestedDate = "") =>
   alternatives
     .slice(0, 3)
-    .map((slot) => slot.time)
+    .map((slot) => {
+      if (!slot?.time) return "";
+      if (requestedDate && slot.date && slot.date !== requestedDate) {
+        return `${slot.date} at ${slot.time}`;
+      }
+      return slot.time;
+    })
     .filter(Boolean)
     .join(", ");
+
+const addCalendarDays = (date, days) => {
+  const parsed = new Date(`${date}T12:00:00.000Z`);
+  if (Number.isNaN(parsed.getTime())) return "";
+  parsed.setUTCDate(parsed.getUTCDate() + days);
+  return parsed.toISOString().slice(0, 10);
+};
+
+const dayKeyForDate = (date) => {
+  const parsed = new Date(`${date}T12:00:00.000Z`);
+  if (Number.isNaN(parsed.getTime())) return "";
+  return DAY_MAP[parsed.getUTCDay()] || "";
+};
+
+const shouldPreserveExistingTimeForDateOnlyReplacement = (text) => {
+  const t = normalizeAlternativeSelectionText(text);
+  return /\b(same time|that time|same hour|misma hora|esa hora|esa misma hora)\b/.test(t);
+};
 
 const normalizeAlternativeSelectionText = (text) =>
   normalizeSpanishDateTimeText(text)
@@ -1382,15 +1408,19 @@ export const attachMediaWebSocketServer = (server) => {
       ai.__gloSendGuardInstalled = true;
     };
 
-    const parseBookingDateTime = async () => {
-      const dateSource = [bookingState.requestedDateText, bookingState.dateTimeText]
+    const parseBookingDateTime = async (sources = {}) => {
+      const requestedDateText = sources.requestedDateText ?? bookingState.requestedDateText;
+      const requestedTimeText = sources.requestedTimeText ?? bookingState.requestedTimeText;
+      const dateTimeText = sources.dateTimeText ?? bookingState.dateTimeText;
+
+      const dateSource = [requestedDateText, dateTimeText]
         .filter(Boolean)
         .join(" ");
-      const timeSource = [bookingState.requestedTimeText, bookingState.dateTimeText]
+      const timeSource = [requestedTimeText, dateTimeText]
         .filter(Boolean)
         .join(" ");
       const combined = normalizeSpanishDateTimeText(
-        [bookingState.requestedDateText, bookingState.requestedTimeText, bookingState.dateTimeText]
+        [requestedDateText, requestedTimeText, dateTimeText]
           .filter(Boolean)
           .join(" ")
       );
@@ -1428,6 +1458,232 @@ export const attachMediaWebSocketServer = (server) => {
       };
     };
 
+    const resetAvailabilityCache = (reason = "unknown", details = {}) => {
+      const previous = {
+        slotChecked,
+        slotAvailable,
+        alternativesCount: slotAlternatives.length,
+        lastAvailabilityCheckKey,
+        lastUnavailableInjectionKey,
+      };
+
+      slotChecked = false;
+      slotAvailable = false;
+      slotAlternatives = [];
+      lastAvailabilityCheckKey = "";
+      lastUnavailableInjectionKey = "";
+      bookingState.alternatives = [];
+      bookingState.awaitingAlternativeSelection = false;
+      bookingState.askedConfirm = false;
+      bookingState.confirmationPromptRequested = false;
+      bookingState.confirmed = false;
+      bookingState.bookingAttempted = false;
+
+      console.log("[AVAILABILITY_CACHE_RESET]", {
+        reason,
+        previous,
+        next: {
+          slotChecked,
+          slotAvailable,
+          alternativesCount: slotAlternatives.length,
+          lastAvailabilityCheckKey,
+          lastUnavailableInjectionKey,
+        },
+        ...details,
+      });
+
+      normalizeBookingState(reason);
+    };
+
+    const isUnavailableOrAlternativeState = (phase = getBookingPhase()) =>
+      phase === "awaiting_alternative" ||
+      bookingState.awaitingAlternativeSelection === true ||
+      (slotChecked && slotAvailable === false);
+
+    const buildReplacementParseSources = ({ transcriptText, hasDate, hasTime, contextualTimeOnly }) => {
+      const dateText = hasDate
+        ? transcriptText
+        : bookingState.parsedDate || bookingState.requestedDateText || "";
+      const timeText = hasTime || contextualTimeOnly
+        ? transcriptText
+        : shouldPreserveExistingTimeForDateOnlyReplacement(transcriptText)
+          ? bookingState.parsedTime || bookingState.requestedTimeText || ""
+          : "";
+
+      return {
+        requestedDateText: dateText,
+        requestedTimeText: timeText,
+        dateTimeText: [dateText, timeText].filter(Boolean).join(" "),
+      };
+    };
+
+    async function applySlotReplacementFromTranscript({
+      transcriptText,
+      hasDate,
+      hasTime,
+      contextualTimeOnly,
+      phaseBeforeDateTimeParse,
+    }) {
+      const previous = {
+        requestedDateText: bookingState.requestedDateText,
+        requestedTimeText: bookingState.requestedTimeText,
+        dateTimeText: bookingState.dateTimeText,
+        parsedDate: bookingState.parsedDate,
+        parsedTime: bookingState.parsedTime,
+        slotChecked,
+        slotAvailable,
+        awaitingAlternativeSelection: bookingState.awaitingAlternativeSelection,
+        alternativesCount: bookingState.alternatives?.length || 0,
+      };
+
+      const preserveExistingTime =
+        hasDate &&
+        !hasTime &&
+        !contextualTimeOnly &&
+        Boolean(bookingState.parsedTime) &&
+        shouldPreserveExistingTimeForDateOnlyReplacement(transcriptText);
+
+      console.log("[SLOT_REPLACEMENT_STARTED]", {
+        transcript: transcriptText,
+        phaseBeforeDateTimeParse,
+        hasDate,
+        hasTime,
+        contextualTimeOnly: Boolean(contextualTimeOnly),
+        preserveExistingTime,
+        previous,
+      });
+
+      const parseSources = buildReplacementParseSources({
+        transcriptText,
+        hasDate,
+        hasTime,
+        contextualTimeOnly,
+      });
+      const parsedBookingTime = contextualTimeOnly
+        ? {
+            date: bookingState.parsedDate || "",
+            time: contextualTimeOnly.time,
+          }
+        : await parseBookingDateTime(parseSources);
+
+      const nextDate = hasDate
+        ? parsedBookingTime?.date || ""
+        : bookingState.parsedDate || parsedBookingTime?.date || "";
+      const nextTime = contextualTimeOnly
+        ? contextualTimeOnly.time
+        : hasTime
+          ? parsedBookingTime?.time || ""
+          : preserveExistingTime
+            ? bookingState.parsedTime
+            : "";
+
+      if (hasDate) {
+        bookingState.requestedDateText = transcriptText;
+        bookingState.parsedDate = nextDate;
+      }
+
+      if (!hasDate && nextDate && !bookingState.parsedDate) {
+        bookingState.parsedDate = nextDate;
+      }
+
+      if (hasTime || contextualTimeOnly) {
+        bookingState.requestedTimeText = transcriptText;
+        bookingState.parsedTime = nextTime;
+      } else if (hasDate) {
+        if (preserveExistingTime) {
+          bookingState.requestedTimeText = bookingState.requestedTimeText || bookingState.parsedTime;
+          bookingState.parsedTime = nextTime;
+        } else {
+          bookingState.requestedTimeText = "";
+          bookingState.parsedTime = "";
+        }
+      }
+
+      bookingState.dateTimeText = [bookingState.requestedDateText, bookingState.requestedTimeText]
+        .filter(Boolean)
+        .join(" ");
+
+      resetAvailabilityCache("slot_replacement", {
+        transcript: transcriptText,
+        phaseBeforeDateTimeParse,
+      });
+
+      await updateTranscriptFields({ requestedDateTimeText: bookingState.dateTimeText });
+
+      console.log("[SLOT_REPLACEMENT_APPLIED]", {
+        transcript: transcriptText,
+        parsedFromCurrentTranscript: parsedBookingTime,
+        previous,
+        next: {
+          requestedDateText: bookingState.requestedDateText,
+          requestedTimeText: bookingState.requestedTimeText,
+          dateTimeText: bookingState.dateTimeText,
+          parsedDate: bookingState.parsedDate,
+          parsedTime: bookingState.parsedTime,
+          slotChecked,
+          slotAvailable,
+          awaitingAlternativeSelection: bookingState.awaitingAlternativeSelection,
+          alternativesCount: bookingState.alternatives?.length || 0,
+        },
+      });
+
+      return Boolean(bookingState.parsedDate && bookingState.parsedTime);
+    }
+
+    async function generateAlternativesForUnavailableSlot({ barber, date, time, durationMinutes }) {
+      const dayKey = dayKeyForDate(date);
+      const dayHours = dayKey ? barber?.availability?.businessHours?.[dayKey] : null;
+      const sameDaySlots = await getAvailableSlots({
+        barber,
+        date,
+        durationMinutes,
+        limit: 3,
+        startAfterTime: time,
+      });
+
+      let alternatives = sameDaySlots.slice(0, 3);
+      let source = alternatives.length ? "same_day" : "none";
+
+      if (alternatives.length < 3) {
+        const futureStartDate = addCalendarDays(date, 1);
+        const futureSlots = futureStartDate
+          ? await suggestClosestSlots({
+              barber,
+              date: futureStartDate,
+              durationMinutes,
+            })
+          : [];
+        const existingKeys = new Set(alternatives.map((slot) => `${slot.date}|${slot.time}`));
+        for (const slot of futureSlots) {
+          const key = `${slot.date}|${slot.time}`;
+          if (!existingKeys.has(key)) {
+            alternatives.push(slot);
+            existingKeys.add(key);
+          }
+          if (alternatives.length >= 3) break;
+        }
+
+        if (!sameDaySlots.length && alternatives.length) {
+          source = "future_day";
+        } else if (sameDaySlots.length && alternatives.length > sameDaySlots.length) {
+          source = "same_day_plus_future";
+        }
+      }
+
+      console.log("[ALTERNATIVES_GENERATED]", {
+        requestedDate: date,
+        requestedTime: time,
+        dayKey,
+        dayClosed: Boolean(dayHours?.isClosed),
+        sameDayCount: sameDaySlots.length,
+        alternativesCount: alternatives.length,
+        source,
+        alternatives,
+      });
+
+      return alternatives.slice(0, 3);
+    }
+
     const isBookingReady = () =>
       bookingState.intent === "BOOK" &&
       Boolean(bookingState.name) &&
@@ -1464,6 +1720,13 @@ export const attachMediaWebSocketServer = (server) => {
       lastAvailabilityCheckKey = checkKey;
 
       try {
+        console.log("[FRESH_AVAILABILITY_CHECK_STARTED]", {
+          service,
+          parsedDate,
+          parsedTime,
+          barberId,
+          checkKey,
+        });
         console.log("[AVAILABILITY_CHECK_STARTED]", {
           service,
           parsedDate,
@@ -1481,6 +1744,14 @@ export const attachMediaWebSocketServer = (server) => {
             service,
             parsedDate,
             parsedTime,
+          });
+          console.log("[FRESH_AVAILABILITY_CHECK_RESULT]", {
+            status: "no_barber_doc",
+            service,
+            parsedDate,
+            parsedTime,
+            slotChecked,
+            slotAvailable,
           });
           return;
         }
@@ -1503,16 +1774,15 @@ export const attachMediaWebSocketServer = (server) => {
             startAfterTime: bookingState.parsedTime,
           });
           startOutboundKeepalive("availability_scan");
-          const alternatives = await getAvailableSlots({
+          const alternatives = await generateAlternativesForUnavailableSlot({
             barber: barberDoc,
             date: parsedDate,
+            time: parsedTime,
             durationMinutes,
-            limit: 3,
-            startAfterTime: bookingState.parsedTime,
           });
           slotAlternatives = alternatives.slice(0, 3);
           bookingState.alternatives = slotAlternatives;
-          bookingState.awaitingAlternativeSelection = true;
+          bookingState.awaitingAlternativeSelection = slotAlternatives.length > 0;
           normalizeBookingState("slot_unavailable");
           console.log("[SLOT_ALTERNATIVES]", JSON.stringify(slotAlternatives));
           console.log("[ALTERNATIVE_SELECTION_STATE_SET]", {
@@ -1533,6 +1803,17 @@ export const attachMediaWebSocketServer = (server) => {
           slotChecked,
           slotAvailable,
           alternativesCount: slotAlternatives.length,
+        });
+        console.log("[FRESH_AVAILABILITY_CHECK_RESULT]", {
+          status: "checked",
+          service,
+          parsedDate,
+          parsedTime,
+          checkKey,
+          slotChecked,
+          slotAvailable,
+          alternativesCount: slotAlternatives.length,
+          awaitingAlternativeSelection: bookingState.awaitingAlternativeSelection,
         });
       } catch (err) {
         console.error("[AVAILABILITY_CHECK_ERROR]", {
@@ -1573,7 +1854,14 @@ export const attachMediaWebSocketServer = (server) => {
         lastUnavailableInjectionKey = injectionKey;
 
         const altText = slotAlternatives.length > 0
-          ? slotAlternatives.map((s) => s.time).join(", ")
+          ? slotAlternatives
+              .map((s) =>
+                s?.date && s.date !== bookingState.parsedDate
+                  ? `${s.date} at ${s.time}`
+                  : s.time
+              )
+              .filter(Boolean)
+              .join(", ")
           : "no other slots today";
 
         const unavailableMsg = currentLanguage === "es"
@@ -1825,7 +2113,7 @@ export const attachMediaWebSocketServer = (server) => {
           slotAvailable = false;
           slotAlternatives = Array.isArray(result.alternatives) ? result.alternatives.slice(0, 3) : [];
           bookingState.alternatives = slotAlternatives;
-          bookingState.awaitingAlternativeSelection = true;
+          bookingState.awaitingAlternativeSelection = slotAlternatives.length > 0;
           normalizeBookingState("booking_engine_unavailable");
           const alternatives = formatAlternativeSlots(result.alternatives);
           console.log(
@@ -2046,7 +2334,11 @@ RULES:
         (slotChecked && slotAvailable === false)
       ) {
         const blockedNamePrompt = !bookingState.name || bookingState.awaitingName === true;
-        bookingState.awaitingAlternativeSelection = true;
+        const alternativesSource = bookingState.alternatives?.length
+          ? bookingState.alternatives
+          : slotAlternatives;
+        const hasAlternatives = Boolean(alternativesSource?.length);
+        bookingState.awaitingAlternativeSelection = hasAlternatives;
         normalizeBookingState("deterministic_alternative_before_name");
         if (blockedNamePrompt) {
           console.log("[REQUEST_NAME_BLOCKED_AWAITING_ALTERNATIVE]", {
@@ -2055,11 +2347,8 @@ RULES:
           });
         }
 
-        const alternativesSource = bookingState.alternatives?.length
-          ? bookingState.alternatives
-          : slotAlternatives;
         const alternatives = alternativesSource?.length
-          ? formatAlternativeChoiceTimes(alternativesSource)
+          ? formatAlternativeChoiceTimes(alternativesSource, bookingState.parsedDate)
           : "";
 
         return isSpanish
@@ -2359,17 +2648,14 @@ RULES:
       bookingState.awaitingAlternativeSelection = false;
       bookingState.alternatives = [];
 
-      slotChecked = false;
-      slotAvailable = false;
-      slotAlternatives = [];
-      lastAvailabilityCheckKey = "";
-      lastUnavailableInjectionKey = "";
-      bookingState.askedConfirm = false;
-      bookingState.confirmationPromptRequested = false;
-      bookingState.confirmed = false;
-      bookingState.bookingAttempted = false;
+      resetAvailabilityCache("alternative_selection_slot_reset", {
+        transcript: transcriptText,
+        previousDate,
+        previousTime,
+        selectedDate: bookingState.parsedDate,
+        selectedTime: bookingState.parsedTime,
+      });
       bookingState.awaitingCorrection = false;
-      normalizeBookingState("alternative_selection_slot_reset");
 
       await updateTranscriptFields({ requestedDateTimeText: bookingState.dateTimeText });
 
@@ -2468,12 +2754,16 @@ RULES:
       if (queued.deterministicBooking === true && queued.bookingPhase) {
         const currentPhase = getBookingPhase();
         const currentStateKey = buildBookingStateKey();
-        if (queued.bookingPhase !== currentPhase) {
-          console.log("[QUEUED_RESPONSE_DROPPED_PHASE_CHANGED]", {
+        const phaseChanged = queued.bookingPhase !== currentPhase;
+        const stateChanged = Boolean(queued.stateKey) && queued.stateKey !== currentStateKey;
+        if (phaseChanged || stateChanged) {
+          console.log("[QUEUED_RESPONSE_DROPPED_STATE_CHANGED]", {
             reason,
             queuedReason: queued.reason,
             queuedPhase: queued.bookingPhase,
             currentPhase,
+            phaseChanged,
+            stateChanged,
             queuedStateKey: queued.stateKey || "",
             currentStateKey,
             queuedInstructionPreview: queuedInstructionPreviewFor(queued),
@@ -2484,7 +2774,7 @@ RULES:
             queued.finalConfirmation !== true &&
             !["finalized", "booking", "cancelled"].includes(currentPhase);
           if (canRederive) {
-            console.log("[QUEUED_RESPONSE_REDERIVED_PHASE_CHANGED]", {
+            console.log("[QUEUED_RESPONSE_REDERIVED_STATE_CHANGED]", {
               reason,
               queuedReason: queued.reason,
               currentPhase,
@@ -2492,7 +2782,7 @@ RULES:
             });
             await requestAssistantResponse({
               immediate: true,
-              reason: "queued_response_phase_changed",
+              reason: "queued_response_state_changed",
             });
           }
           return true;
@@ -3350,15 +3640,51 @@ RULES:
         const hasDate = containsDateSignal(transcriptText);
         const hasTime = containsTimeSignal(transcriptText) || containsLooseTimeSignal(transcriptText);
         const phaseBeforeDateTimeParse = getBookingPhase();
+        const unavailableOrAlternativeAtParse = isUnavailableOrAlternativeState(phaseBeforeDateTimeParse);
         const contextualTimeOnly =
-          !hasDate && !hasTime && phaseBeforeDateTimeParse === "collecting_time"
+          !hasDate &&
+          !hasTime &&
+          (
+            phaseBeforeDateTimeParse === "collecting_time" ||
+            (unavailableOrAlternativeAtParse && Boolean(bookingState.parsedDate))
+          )
             ? parseContextualTimeOnly(transcriptText, {
                 parsedDate: bookingState.parsedDate,
                 language: currentLanguage,
               })
             : null;
         let shouldCheckAvailabilityAfterParse = true;
-        if (contextualTimeOnly) {
+        const hasSlotReplacementSignal = Boolean(hasDate || hasTime || contextualTimeOnly);
+        let slotInputHandled = false;
+
+        console.log("[SLOT_UPDATE_DECISION]", {
+          transcript: transcriptText,
+          phaseBeforeDateTimeParse,
+          unavailableOrAlternativeAtParse,
+          hasDate,
+          hasTime,
+          contextualTimeOnly: Boolean(contextualTimeOnly),
+          parsedDate: bookingState.parsedDate,
+          parsedTime: bookingState.parsedTime,
+          slotChecked,
+          slotAvailable,
+          awaitingAlternativeSelection: bookingState.awaitingAlternativeSelection,
+          alternativesCount: bookingState.alternatives?.length || 0,
+        });
+
+        if (unavailableOrAlternativeAtParse && hasSlotReplacementSignal) {
+          const readyForFreshAvailability = await applySlotReplacementFromTranscript({
+            transcriptText,
+            hasDate,
+            hasTime,
+            contextualTimeOnly,
+            phaseBeforeDateTimeParse,
+          });
+          shouldCheckAvailabilityAfterParse = readyForFreshAvailability;
+          slotInputHandled = true;
+        }
+
+        if (!slotInputHandled && contextualTimeOnly) {
           const previousTime = bookingState.parsedTime;
           bookingState.requestedTimeText = transcriptText;
           bookingState.dateTimeText = [
@@ -3370,18 +3696,12 @@ RULES:
 
           if (contextualTimeOnly.time !== bookingState.parsedTime) {
             bookingState.parsedTime = contextualTimeOnly.time;
-            slotChecked = false;
-            slotAvailable = false;
-            slotAlternatives = [];
-            lastAvailabilityCheckKey = "";
-            lastUnavailableInjectionKey = "";
-            bookingState.awaitingAlternativeSelection = false;
-            bookingState.alternatives = [];
-            bookingState.askedConfirm = false;
-            bookingState.confirmationPromptRequested = false;
-            bookingState.confirmed = false;
+            resetAvailabilityCache("contextual_time_only_slot_reset", {
+              transcript: transcriptText,
+              previousTime,
+              parsedTime: bookingState.parsedTime,
+            });
             bookingState.awaitingCorrection = false;
-            normalizeBookingState("contextual_time_only_slot_reset");
           }
 
           await updateTranscriptFields({ requestedDateTimeText: `${bookingState.parsedDate} ${bookingState.parsedTime}` });
@@ -3403,7 +3723,7 @@ RULES:
           }
         }
 
-        if (!contextualTimeOnly && (hasDate || hasTime)) {
+        if (!slotInputHandled && !contextualTimeOnly && (hasDate || hasTime)) {
           if (hasDate && !bookingState.requestedDateText) bookingState.requestedDateText = transcriptText;
           if (hasTime && !bookingState.requestedTimeText) bookingState.requestedTimeText = transcriptText;
           bookingState.dateTimeText = [bookingState.requestedDateText, bookingState.requestedTimeText]
@@ -3445,18 +3765,12 @@ RULES:
             }
             if (slotChanged) {
               // Reset slot check when slot changes
-              slotChecked = false;
-              slotAvailable = false;
-              slotAlternatives = [];
-              lastAvailabilityCheckKey = "";
-              lastUnavailableInjectionKey = "";
-              bookingState.awaitingAlternativeSelection = false;
-              bookingState.alternatives = [];
-              bookingState.askedConfirm = false;
-              bookingState.confirmationPromptRequested = false;
-              bookingState.confirmed = false;
+              resetAvailabilityCache("date_time_changed_slot_reset", {
+                transcript: transcriptText,
+                newDate,
+                newTime,
+              });
               bookingState.awaitingCorrection = false;
-              normalizeBookingState("date_time_changed_slot_reset");
             }
           }
           await updateTranscriptFields({ requestedDateTimeText: bookingState.dateTimeText });
