@@ -1,4 +1,5 @@
 import { WebSocketServer } from "ws";
+import { randomUUID } from "node:crypto";
 import twilio from "twilio";
 import { createOpenAISession } from "../utils/ai/openaiSession.js";
 import CallTranscript from "../models/CallTranscript.js";
@@ -22,6 +23,33 @@ const MIN_BARGE_IN_CLEAR_MS = 900;
 
 // Silence injection constants
 const SILENCE_FRAME_SIZE = 160; // 20ms of μ-law audio at 8kHz
+const PCMU_BYTES_PER_SECOND = 8000;
+
+const decodedBase64Length = (value) => {
+  if (typeof value !== "string" || !value) return 0;
+  try {
+    return Buffer.byteLength(value, "base64");
+  } catch {
+    return 0;
+  }
+};
+
+const extractExpectedResponseText = (instructions) => {
+  const text = String(instructions || "");
+  const quoted = text.match(/(?:exactly(?: and only this)?|word for word):\s*"([\s\S]*)"\s*$/i);
+  return quoted?.[1] || text.slice(0, 500);
+};
+
+const redactTraceText = (value, customerName = "") => {
+  let text = String(value || "")
+    .replace(/\+?\d[\d\s().-]{7,}\d/g, "[REDACTED_PHONE]");
+  const name = String(customerName || "").trim();
+  if (name) {
+    const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    text = text.replace(new RegExp(escaped, "gi"), "[REDACTED_NAME]");
+  }
+  return text;
+};
 
 // Helper to extract the exact greeting phrase from initialPrompt
 const extractGreetingPhrase = (prompt) => {
@@ -805,6 +833,60 @@ export const attachMediaWebSocketServer = (server) => {
 
   wss.on("connection", (twilioWs) => {
     console.log("═══════════════════════════════════════════════════");
+
+    const traceId = randomUUID();
+    const traceStartedAt = new Date();
+    let openAiSessionId = "";
+    let sessionUpdateSequence = 0;
+    let twilioMediaSequence = 0;
+    let lastOpenAiItemId = "";
+    let lastOpenAiResponseId = "";
+    let pendingExpectedResponseText = "";
+    let twilioBytesSentTotal = 0;
+    let twilioBytesReceivedTotal = 0;
+    let openAiMessageBytesReceivedTotal = 0;
+    let maxTwilioBufferedAmount = 0;
+    const responseTraces = new Map();
+    const markCorrelations = new Map();
+
+    const traceLog = (eventType, fields = {}) => {
+      console.log("[CONTROLLED_AUDIO_TRACE]", JSON.stringify({
+        timestamp: new Date().toISOString(),
+        traceId,
+        callSid: callSid || null,
+        streamSid: streamSid || null,
+        openAiSessionId: openAiSessionId || null,
+        eventType,
+        ...fields,
+      }));
+    };
+
+    const responseTraceFor = (responseId, itemId = "") => {
+      const key = responseId || lastOpenAiResponseId || "unassigned";
+      if (!responseTraces.has(key)) {
+        responseTraces.set(key, {
+          responseId: key,
+          itemId: itemId || "",
+          expectedText: "",
+          generatedTranscript: "",
+          openAiDeltaCount: 0,
+          openAiBytes: 0,
+          twilioMediaCount: 0,
+          twilioBytes: 0,
+          failedSends: 0,
+          skippedSends: 0,
+          maxBufferedAmount: 0,
+          clearOccurred: false,
+          firstMediaAt: null,
+          finalStatus: null,
+          statusType: null,
+          statusReason: null,
+        });
+      }
+      const record = responseTraces.get(key);
+      if (itemId && !record.itemId) record.itemId = itemId;
+      return record;
+    };
     console.log("🔗 TWILIO MEDIA WEBSOCKET CONNECTED");
     console.log("═══════════════════════════════════════════════════");
 
@@ -833,6 +915,12 @@ export const attachMediaWebSocketServer = (server) => {
     const userTranscriptLines = [];
     const assistantTranscriptLines = [];
     let transcriptFinalized = false;
+
+    traceLog("twilio.websocket.open", {
+      openedAt: traceStartedAt.toISOString(),
+      readyState: twilioWs.readyState,
+      bufferedAmount: twilioWs.bufferedAmount,
+    });
 
     async function setTranscriptIntentOutcome({ intent, outcome }) {
       if (!barberId || !callSid) return;
@@ -1378,6 +1466,17 @@ export const attachMediaWebSocketServer = (server) => {
       });
       console.log("[OPENAI_RESPONSE_CREATE]", JSON.stringify(payload));
 
+      const expectedText = redactTraceText(
+        extractExpectedResponseText(payload?.response?.instructions),
+        bookingState.name
+      );
+      pendingExpectedResponseText = expectedText;
+      traceLog("openai.response.create.requested", {
+        reason,
+        expectedText,
+        maxOutputTokens: payload?.response?.max_output_tokens || null,
+      });
+
       const previousReadyForCallerInput = readyForCallerInput;
       readyForCallerInput = false;
       responseCreateSendReason = reason;
@@ -1439,8 +1538,35 @@ export const attachMediaWebSocketServer = (server) => {
               },
             };
             console.log("[SESSION_UPDATE_STALE_PROMPT_SANITIZED]");
+            sessionUpdateSequence += 1;
+            traceLog("openai.session.update.outbound", {
+              sessionUpdateSequence,
+              sanitizedStalePrompt: true,
+              model: payload.session?.model || null,
+              voice: payload.session?.audio?.output?.voice || null,
+              inputAudioFormat: payload.session?.audio?.input?.format || null,
+              outputAudioFormat: payload.session?.audio?.output?.format || null,
+              transcription: payload.session?.audio?.input?.transcription || null,
+              turnDetection: payload.session?.audio?.input?.turn_detection || null,
+              outputModalities: payload.session?.output_modalities || null,
+            });
             return originalSend(JSON.stringify(payload), ...args);
           }
+        }
+
+        if (payload?.type === "session.update") {
+          sessionUpdateSequence += 1;
+          const session = payload.session || {};
+          traceLog("openai.session.update.outbound", {
+            sessionUpdateSequence,
+            model: session.model || null,
+            voice: session.audio?.output?.voice || null,
+            inputAudioFormat: session.audio?.input?.format || null,
+            outputAudioFormat: session.audio?.output?.format || null,
+            transcription: session.audio?.input?.transcription || null,
+            turnDetection: session.audio?.input?.turn_detection || null,
+            outputModalities: session.output_modalities || null,
+          });
         }
 
         return originalSend(data, ...args);
@@ -2978,6 +3104,29 @@ RULES:
       if (!(assistantPlaybackActive || pendingAssistantMarkName)) return false;
 
       if (twilioWs.readyState === twilioWs.OPEN && streamSid) {
+        const responseTrace = responseTraceFor(responseInFlightId || lastOpenAiResponseId, lastOpenAiItemId);
+        responseTrace.clearOccurred = true;
+        const elapsedPlaybackSeconds = responseTrace.firstMediaAt
+          ? Math.max(0, (Date.now() - responseTrace.firstMediaAt) / 1000)
+          : 0;
+        const estimatedOutstandingPlaybackSeconds = Math.max(
+          0,
+          responseTrace.twilioBytes / PCMU_BYTES_PER_SECOND - elapsedPlaybackSeconds
+        );
+        traceLog("twilio.clear.sent", {
+          responseId: responseTrace.responseId || null,
+          itemId: responseTrace.itemId || null,
+          markName: pendingAssistantMarkName || null,
+          reason,
+          triggeringEvent: details.triggeringEvent || reason,
+          callerSpeaking,
+          assistantGenerationActive: responseActive,
+          assistantPlaybackActive,
+          cumulativeAudioBytesSent: responseTrace.twilioBytes,
+          estimatedOutstandingPlaybackSeconds,
+          readyState: twilioWs.readyState,
+          bufferedAmount: twilioWs.bufferedAmount,
+        });
         twilioWs.send(JSON.stringify({
           event: "clear",
           streamSid,
@@ -3067,6 +3216,19 @@ RULES:
       assistantTurnSeq += 1;
       const markName = `assistant-playback-${assistantTurnSeq}`;
       pendingAssistantMarkName = markName;
+      const responseTrace = responseTraceFor(responseInFlightId || lastOpenAiResponseId, lastOpenAiItemId);
+      const markRecord = Object.freeze({
+        markName,
+        responseId: responseTrace.responseId || null,
+        itemId: responseTrace.itemId || null,
+        callSid: callSid || null,
+        streamSid: streamSid || null,
+        sentAtMs: Date.now(),
+        totalBytesSubmitted: responseTrace.twilioBytes,
+        estimatedDurationSeconds: responseTrace.twilioBytes / PCMU_BYTES_PER_SECOND,
+        clearOccurredBeforeMark: responseTrace.clearOccurred,
+      });
+      markCorrelations.set(markName, markRecord);
       if (
         finalConfirmationCallEndArmed &&
         !finalConfirmationPlaybackMarkName &&
@@ -3081,6 +3243,16 @@ RULES:
           name: markName,
         },
       }));
+      traceLog("twilio.mark.sent", {
+        responseId: markRecord.responseId,
+        itemId: markRecord.itemId,
+        markName,
+        totalBytesSubmitted: markRecord.totalBytesSubmitted,
+        estimatedDurationSeconds: markRecord.estimatedDurationSeconds,
+        clearOccurredDuringResponse: markRecord.clearOccurredBeforeMark,
+        readyState: twilioWs.readyState,
+        bufferedAmount: twilioWs.bufferedAmount,
+      });
       console.log("[TWILIO_PLAYBACK_MARK_SENT]", {
         markName,
         responseInFlightId,
@@ -4009,11 +4181,16 @@ RULES:
       ai.on("open", () => {
         console.log("🤖 OpenAI Realtime Connected");
         aiReady = true;
+        traceLog("openai.websocket.open", {
+          readyState: ai.readyState,
+          bufferedAmount: ai.bufferedAmount,
+        });
 
         console.log("[SESSION_UPDATE_PATH_AUDIT] using only GA-compatible session.update payloads");
       });
 
       ai.on("message", async (raw) => {
+        openAiMessageBytesReceivedTotal += Buffer.byteLength(raw);
         let evt;
         try {
           evt = JSON.parse(Buffer.from(raw).toString("utf8"));
@@ -4021,7 +4198,21 @@ RULES:
           return;
         }
 
+        if (evt.session?.id) openAiSessionId = evt.session.id;
+        if (evt.item_id) lastOpenAiItemId = evt.item_id;
+
         if (evt.type === "session.updated") {
+          const session = evt.session || {};
+          traceLog("openai.session.updated.effective", {
+            sessionUpdateSequence,
+            model: session.model || null,
+            voice: session.audio?.output?.voice || null,
+            inputAudioFormat: session.audio?.input?.format || null,
+            outputAudioFormat: session.audio?.output?.format || null,
+            transcription: session.audio?.input?.transcription || null,
+            turnDetection: session.audio?.input?.turn_detection || null,
+            outputModalities: session.output_modalities || null,
+          });
           console.log("📋 OpenAI session updated");
           sessionUpdated = true;
           trySendGreeting();
@@ -4033,14 +4224,26 @@ RULES:
           responseActive = true;
           assistantAudioDeltaCount = 0;
           responseInFlightId = evt.response?.id || evt.response_id || responseInFlightId;
+          lastOpenAiResponseId = responseInFlightId || lastOpenAiResponseId;
+          const responseTrace = responseTraceFor(responseInFlightId);
+          responseTrace.expectedText = pendingExpectedResponseText;
+          pendingExpectedResponseText = "";
+          traceLog("openai.response.created", {
+            responseId: responseInFlightId || null,
+            itemId: responseTrace.itemId || null,
+            expectedText: responseTrace.expectedText,
+            responseStatus: evt.response?.status || null,
+          });
           if (finalConfirmationAwaitingResponseCreated) {
             finalConfirmationResponseId = responseInFlightId || "";
             finalConfirmationAwaitingResponseCreated = false;
           }
         } else if (evt.response?.id) {
           responseInFlightId = evt.response.id;
+          lastOpenAiResponseId = responseInFlightId;
         } else if (evt.response_id) {
           responseInFlightId = evt.response_id;
+          lastOpenAiResponseId = responseInFlightId;
         }
 
         if (
@@ -4050,6 +4253,26 @@ RULES:
           assistantSpeaking = true;
           responseActive = true;
           assistantAudioDeltaCount += 1;
+          const responseId = evt.response_id || evt.response?.id || responseInFlightId || lastOpenAiResponseId;
+          const itemId = evt.item_id || lastOpenAiItemId;
+          const responseTrace = responseTraceFor(responseId, itemId);
+          const base64Length = typeof evt.delta === "string" ? evt.delta.length : 0;
+          const decodedBytes = decodedBase64Length(evt.delta);
+          responseTrace.openAiDeltaCount += 1;
+          responseTrace.openAiBytes += decodedBytes;
+          traceLog("openai.audio.delta", {
+            responseId: responseId || null,
+            itemId: itemId || null,
+            openAiEventType: evt.type,
+            eventId: evt.event_id || evt.id || null,
+            outputIndex: evt.output_index ?? null,
+            contentIndex: evt.content_index ?? null,
+            deltaSequence: responseTrace.openAiDeltaCount,
+            base64Length,
+            decodedBytes,
+            cumulativeDecodedBytes: responseTrace.openAiBytes,
+            estimatedDurationSeconds: responseTrace.openAiBytes / PCMU_BYTES_PER_SECOND,
+          });
           if (assistantAudioDeltaCount === 1 || assistantAudioDeltaCount % 25 === 0) {
             console.log("[OPENAI_AUDIO_DELTA_COUNT]", {
               responseInFlightId,
@@ -4067,12 +4290,77 @@ RULES:
           responseActive = false;
         }
 
+        if (evt.type === "error") {
+          traceLog("openai.error", {
+            responseId: evt.response_id || responseInFlightId || lastOpenAiResponseId || null,
+            itemId: evt.item_id || lastOpenAiItemId || null,
+            errorCode: evt.error?.code || null,
+            errorType: evt.error?.type || null,
+            errorMessage: evt.error?.message || null,
+          });
+        }
+
+        if (evt.type === "response.output_item.done") {
+          traceLog("openai.response.output_item.done", {
+            responseId: evt.response_id || responseInFlightId || lastOpenAiResponseId || null,
+            itemId: evt.item?.id || evt.item_id || lastOpenAiItemId || null,
+            outputIndex: evt.output_index ?? null,
+            outputItemStatus: evt.item?.status || null,
+            outputItemType: evt.item?.type || null,
+          });
+        }
+
         if (
           evt.type === "response.audio_transcript.delta" ||
           evt.type === "response.output_text.delta"
         ) {
           const deltaText = String(evt.delta || "");
           if (deltaText) assistantResponseText += deltaText;
+          const responseId = evt.response_id || responseInFlightId || lastOpenAiResponseId;
+          const itemId = evt.item_id || lastOpenAiItemId;
+          const responseTrace = responseTraceFor(responseId, itemId);
+          if (deltaText) responseTrace.generatedTranscript += deltaText;
+          traceLog("openai.output_transcript.delta", {
+            responseId: responseId || null,
+            itemId: itemId || null,
+            openAiEventType: evt.type,
+            eventId: evt.event_id || evt.id || null,
+            outputIndex: evt.output_index ?? null,
+            contentIndex: evt.content_index ?? null,
+            deltaText: redactTraceText(deltaText, bookingState.name),
+          });
+        }
+        if (evt.type === "response.output_audio_transcript.delta") {
+          const responseId = evt.response_id || responseInFlightId || lastOpenAiResponseId;
+          const itemId = evt.item_id || lastOpenAiItemId;
+          const responseTrace = responseTraceFor(responseId, itemId);
+          const deltaText = String(evt.delta || "");
+          if (deltaText) responseTrace.generatedTranscript += deltaText;
+          traceLog("openai.output_transcript.delta", {
+            responseId: responseId || null,
+            itemId: itemId || null,
+            openAiEventType: evt.type,
+            eventId: evt.event_id || evt.id || null,
+            outputIndex: evt.output_index ?? null,
+            contentIndex: evt.content_index ?? null,
+            deltaText: redactTraceText(deltaText, bookingState.name),
+          });
+        }
+        if (
+          evt.type === "response.output_audio_transcript.done" ||
+          evt.type === "response.audio_transcript.done"
+        ) {
+          const responseId = evt.response_id || responseInFlightId || lastOpenAiResponseId;
+          const itemId = evt.item_id || lastOpenAiItemId;
+          const responseTrace = responseTraceFor(responseId, itemId);
+          const finalTranscript = String(evt.transcript || responseTrace.generatedTranscript || "");
+          responseTrace.generatedTranscript = finalTranscript;
+          traceLog("openai.output_transcript.done", {
+            responseId: responseId || null,
+            itemId: itemId || null,
+            openAiEventType: evt.type,
+            finalTranscript: redactTraceText(finalTranscript, bookingState.name),
+          });
         }
         if (
           evt.type === "conversation.item.input_audio_transcription.completed" ||
@@ -4193,6 +4481,44 @@ RULES:
         }
 
         if (evt.type === "response.done" || evt.type === "response.completed") {
+          const response = evt.response || {};
+          const responseId = response.id || evt.response_id || responseInFlightId || lastOpenAiResponseId;
+          const responseTrace = responseTraceFor(responseId, lastOpenAiItemId);
+          responseTrace.finalStatus = response.status || null;
+          responseTrace.statusType = response.status_details?.type || null;
+          responseTrace.statusReason = response.status_details?.reason || null;
+          const outputItems = Array.isArray(response.output)
+            ? response.output.map((item) => ({ id: item?.id || null, status: item?.status || null, type: item?.type || null }))
+            : [];
+          traceLog("openai.response.done", {
+            responseId: responseId || null,
+            itemId: responseTrace.itemId || null,
+            responseStatus: responseTrace.finalStatus,
+            statusDetailsType: responseTrace.statusType,
+            statusDetailsReason: responseTrace.statusReason,
+            outputItems,
+          });
+          traceLog("openai.response.audio_accounting.summary_at_response_done", {
+            responseId: responseTrace.responseId || null,
+            itemId: responseTrace.itemId || null,
+            expectedText: responseTrace.expectedText,
+            finalGeneratedTranscript: redactTraceText(responseTrace.generatedTranscript, bookingState.name),
+            finalResponseStatus: responseTrace.finalStatus,
+            statusDetailsType: responseTrace.statusType,
+            statusDetailsReason: responseTrace.statusReason,
+            totalOpenAiDeltas: responseTrace.openAiDeltaCount,
+            totalOpenAiDecodedBytes: responseTrace.openAiBytes,
+            estimatedGeneratedAudioDurationSeconds:
+              responseTrace.openAiBytes / PCMU_BYTES_PER_SECOND,
+            totalTwilioMediaMessages: responseTrace.twilioMediaCount,
+            totalTwilioSubmittedBytes: responseTrace.twilioBytes,
+            receivedSubmittedByteDifference:
+              responseTrace.openAiBytes - responseTrace.twilioBytes,
+            failedSends: responseTrace.failedSends,
+            skippedSends: responseTrace.skippedSends,
+            maximumObservedBufferedAmount: responseTrace.maxBufferedAmount,
+            clearOccurred: responseTrace.clearOccurred,
+          });
           console.log("[OPENAI_RESPONSE_DONE]", {
             type: evt.type,
             responseInFlightId,
@@ -4365,13 +4691,52 @@ RULES:
           stopOutboundKeepalive("assistant_audio_started");
 
           if (twilioWs.readyState === twilioWs.OPEN && streamSid) {
+            const responseId = evt.response_id || responseInFlightId || lastOpenAiResponseId;
+            const itemId = evt.item_id || lastOpenAiItemId;
+            const responseTrace = responseTraceFor(responseId, itemId);
+            const base64Length = typeof evt.delta === "string" ? evt.delta.length : 0;
+            const decodedBytes = decodedBase64Length(evt.delta);
+            const bufferedAmountBefore = twilioWs.bufferedAmount;
+            twilioMediaSequence += 1;
+            responseTrace.twilioMediaCount += 1;
+            responseTrace.twilioBytes += decodedBytes;
+            responseTrace.firstMediaAt ||= Date.now();
+            twilioBytesSentTotal += decodedBytes;
+            responseTrace.maxBufferedAmount = Math.max(responseTrace.maxBufferedAmount, bufferedAmountBefore);
+            maxTwilioBufferedAmount = Math.max(maxTwilioBufferedAmount, bufferedAmountBefore);
+            const mediaSequence = twilioMediaSequence;
             twilioWs.send(
               JSON.stringify({
                 event: "media",
                 streamSid,
                 media: { payload: evt.delta },
-              })
+              }),
+              (sendError) => {
+                const bufferedAmountAfter = twilioWs.bufferedAmount;
+                responseTrace.maxBufferedAmount = Math.max(responseTrace.maxBufferedAmount, bufferedAmountAfter);
+                maxTwilioBufferedAmount = Math.max(maxTwilioBufferedAmount, bufferedAmountAfter);
+                if (sendError) responseTrace.failedSends += 1;
+                traceLog("twilio.media.send.callback", {
+                  responseId: responseTrace.responseId || null,
+                  itemId: responseTrace.itemId || null,
+                  mediaSequence,
+                  success: !sendError,
+                  sendError: sendError?.message || null,
+                  bufferedAmountAfter,
+                  readyState: twilioWs.readyState,
+                });
+              }
             );
+            traceLog("twilio.media.submitted", {
+              responseId: responseTrace.responseId || null,
+              itemId: responseTrace.itemId || null,
+              mediaSequence,
+              base64Length,
+              decodedBytes,
+              cumulativeSubmittedBytes: responseTrace.twilioBytes,
+              readyState: twilioWs.readyState,
+              bufferedAmountBefore,
+            });
             const shouldLogPlaybackActive = !assistantPlaybackActive || !assistantAudioSentThisResponse;
             assistantPlaybackActive = true;
             assistantSpeaking = true;
@@ -4385,10 +4750,29 @@ RULES:
                 readyForCallerInput,
               });
             }
+          } else {
+            const responseTrace = responseTraceFor(
+              evt.response_id || responseInFlightId || lastOpenAiResponseId,
+              evt.item_id || lastOpenAiItemId
+            );
+            responseTrace.skippedSends += 1;
+            traceLog("twilio.media.skipped", {
+              responseId: responseTrace.responseId || null,
+              itemId: responseTrace.itemId || null,
+              reason: !streamSid ? "missing_stream_sid" : "websocket_not_open",
+              readyState: twilioWs.readyState,
+              bufferedAmount: twilioWs.bufferedAmount,
+              decodedBytes: decodedBase64Length(evt.delta),
+            });
           }
         }
 
         if (playbackCompleteEvents.has(evt.type)) {
+          traceLog("openai.audio.done", {
+            responseId: evt.response_id || responseInFlightId || lastOpenAiResponseId || null,
+            itemId: evt.item_id || lastOpenAiItemId || null,
+            openAiEventType: evt.type,
+          });
           console.log("[OPENAI_AUDIO_DONE]", {
             type: evt.type,
             responseInFlightId,
@@ -4436,10 +4820,27 @@ RULES:
       });
 
       ai.on("error", (err) => {
+        traceLog("openai.websocket.error", {
+          errorMessage: err.message,
+          readyState: ai.readyState,
+          bufferedAmount: ai.bufferedAmount,
+          lastResponseId: lastOpenAiResponseId || null,
+          lastItemId: lastOpenAiItemId || null,
+          totalMessageBytesReceived: openAiMessageBytesReceivedTotal,
+        });
         console.error("❌ OpenAI WS Error:", err.message);
       });
 
-      ai.on("close", () => {
+      ai.on("close", (code, reasonBuffer) => {
+        traceLog("openai.websocket.close", {
+          closeCode: code ?? null,
+          closeReason: reasonBuffer?.toString?.() || "",
+          readyState: ai.readyState,
+          bufferedAmount: ai.bufferedAmount,
+          lastResponseId: lastOpenAiResponseId || null,
+          lastItemId: lastOpenAiItemId || null,
+          totalMessageBytesReceived: openAiMessageBytesReceivedTotal,
+        });
         aiSessionStarted = false;
         console.log("📴 OpenAI WebSocket closed");
       });
@@ -4449,6 +4850,7 @@ RULES:
     // Twilio → OpenAI
     // ----------------------------
     twilioWs.on("message", async (msgData) => {
+      twilioBytesReceivedTotal += Buffer.byteLength(msgData);
       let msg;
       try {
         msg = JSON.parse(Buffer.from(msgData).toString("utf8"));
@@ -4456,8 +4858,61 @@ RULES:
         return;
       }
 
+      if (msg.event === "mark" && msg.mark?.name !== pendingAssistantMarkName) {
+        const markName = msg.mark?.name || "";
+        const markRecord = markCorrelations.get(markName) || null;
+        traceLog("twilio.mark.acknowledged.unmatched", {
+          responseId: markRecord?.responseId || null,
+          itemId: markRecord?.itemId || null,
+          markName: markName || null,
+          pendingMarkName: pendingAssistantMarkName || null,
+          markRoundTripMs: markRecord ? Date.now() - markRecord.sentAtMs : null,
+          correlationSucceededUniquely: Boolean(markRecord),
+          staleOrUnknown: true,
+        });
+      }
+
       if (msg.event === "mark" && msg.mark?.name === pendingAssistantMarkName) {
         const markName = msg.mark?.name;
+        const markRecord = markCorrelations.get(markName) || null;
+        const correlatedResponse = markRecord
+          ? responseTraces.get(markRecord.responseId || "") || null
+          : null;
+        traceLog("twilio.mark.acknowledged", {
+          responseId: markRecord?.responseId || null,
+          itemId: markRecord?.itemId || null,
+          markName,
+          markRoundTripMs: markRecord ? Date.now() - markRecord.sentAtMs : null,
+          clearOccurredAfterMarkSent: Boolean(
+            correlatedResponse?.clearOccurred && !markRecord?.clearOccurredBeforeMark
+          ),
+          correlationSucceededUniquely: Boolean(markRecord),
+          staleOrUnknown: !markRecord,
+        });
+        if (correlatedResponse) {
+          traceLog("openai.response.audio_accounting.summary", {
+            responseId: correlatedResponse.responseId || null,
+            itemId: correlatedResponse.itemId || null,
+            markName,
+            expectedText: correlatedResponse.expectedText,
+            finalGeneratedTranscript: redactTraceText(correlatedResponse.generatedTranscript, bookingState.name),
+            finalResponseStatus: correlatedResponse.finalStatus,
+            statusDetailsType: correlatedResponse.statusType,
+            statusDetailsReason: correlatedResponse.statusReason,
+            totalOpenAiDeltas: correlatedResponse.openAiDeltaCount,
+            totalOpenAiDecodedBytes: correlatedResponse.openAiBytes,
+            estimatedGeneratedAudioDurationSeconds:
+              correlatedResponse.openAiBytes / PCMU_BYTES_PER_SECOND,
+            totalTwilioMediaMessages: correlatedResponse.twilioMediaCount,
+            totalTwilioSubmittedBytes: correlatedResponse.twilioBytes,
+            receivedSubmittedByteDifference:
+              correlatedResponse.openAiBytes - correlatedResponse.twilioBytes,
+            failedSends: correlatedResponse.failedSends,
+            skippedSends: correlatedResponse.skippedSends,
+            maximumObservedBufferedAmount: correlatedResponse.maxBufferedAmount,
+            clearOccurred: correlatedResponse.clearOccurred,
+          });
+        }
         clearAssistantPlaybackWatchdog();
         assistantPlaybackActive = false;
         assistantSpeaking = false;
@@ -4525,6 +4980,13 @@ RULES:
         isSetupCall = custom.isSetupCall === "true";
         setupLanguage = custom.language || "en";
 
+        traceLog("twilio.stream.start", {
+          readyState: twilioWs.readyState,
+          bufferedAmount: twilioWs.bufferedAmount,
+          mediaFormat: msg.start?.mediaFormat || null,
+          tracks: msg.start?.tracks || null,
+        });
+
         console.log(
           `[STREAM_META_WS] callSid=${callSid} from=${callerNumber} to=${toNumber} barberId=${barberId}`
         );
@@ -4576,9 +5038,31 @@ RULES:
           if (appended) openAiInputFramesSinceLastCommit++;
         }
       }
+
+      if (msg.event === "stop") {
+        traceLog("twilio.stream.stop", {
+          readyState: twilioWs.readyState,
+          bufferedAmount: twilioWs.bufferedAmount,
+          lastResponseId: lastOpenAiResponseId || null,
+          lastMediaSequence: twilioMediaSequence,
+          twilioBytesReceivedTotal,
+          twilioBytesSentTotal,
+        });
+      }
     });
 
-    twilioWs.on("close", () => {
+    twilioWs.on("close", (code, reasonBuffer) => {
+      traceLog("twilio.websocket.close", {
+        closeCode: code ?? null,
+        closeReason: reasonBuffer?.toString?.() || "",
+        readyState: twilioWs.readyState,
+        bufferedAmount: twilioWs.bufferedAmount,
+        lastResponseId: lastOpenAiResponseId || null,
+        lastMediaSequence: twilioMediaSequence,
+        twilioBytesReceivedTotal,
+        twilioBytesSentTotal,
+        maximumObservedBufferedAmount: maxTwilioBufferedAmount,
+      });
       console.log("📴 Twilio WebSocket closed");
       clearAssistantPlaybackWatchdog();
       stopSilence("twilio_ws_closed");
@@ -4675,6 +5159,13 @@ RULES:
     });
 
     twilioWs.on("error", (err) => {
+      traceLog("twilio.websocket.error", {
+        errorMessage: err.message,
+        readyState: twilioWs.readyState,
+        bufferedAmount: twilioWs.bufferedAmount,
+        lastResponseId: lastOpenAiResponseId || null,
+        lastMediaSequence: twilioMediaSequence,
+      });
       console.error("❌ Twilio WS Error:", err.message);
     });
   });
