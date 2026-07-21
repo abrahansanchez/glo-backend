@@ -30,10 +30,59 @@ const MAX_TRACE_RESPONSES_PER_CALL = 32;
 const MAX_TRACE_MARKS_PER_CALL = 32;
 const MAX_TRACE_TRANSCRIPT_CHARS = 4000;
 export const RESPONSE_PURPOSE = Object.freeze({
+  GREETING: "greeting",
+  SERVICE_COLLECTION: "service_collection",
+  DATE_COLLECTION: "date_collection",
+  TIME_COLLECTION: "time_collection",
+  NAME_COLLECTION: "name_collection",
+  ALTERNATIVE_SELECTION: "alternative_selection",
+  UNAVAILABLE: "unavailable",
   PRE_BOOKING_CONFIRMATION: "pre_booking_confirmation",
+  FINAL_SUCCESS: "final_success",
+  RECOVERY: "deterministic_recovery",
+  ORDINARY_DETERMINISTIC: "ordinary_deterministic",
+  GENERATIVE: "generative",
+  SETUP: "setup",
 });
-export const CONFIRMATION_MAX_OUTPUT_TOKENS = 320;
+export const DETERMINISTIC_RESPONSE_POLICY = Object.freeze({
+  [RESPONSE_PURPOSE.GREETING]: 1024,
+  [RESPONSE_PURPOSE.SERVICE_COLLECTION]: 1024,
+  [RESPONSE_PURPOSE.DATE_COLLECTION]: 1024,
+  [RESPONSE_PURPOSE.TIME_COLLECTION]: 1024,
+  [RESPONSE_PURPOSE.NAME_COLLECTION]: 1024,
+  [RESPONSE_PURPOSE.ALTERNATIVE_SELECTION]: 1536,
+  [RESPONSE_PURPOSE.UNAVAILABLE]: 1536,
+  [RESPONSE_PURPOSE.PRE_BOOKING_CONFIRMATION]: 1536,
+  [RESPONSE_PURPOSE.FINAL_SUCCESS]: 1024,
+  [RESPONSE_PURPOSE.RECOVERY]: 1024,
+  [RESPONSE_PURPOSE.ORDINARY_DETERMINISTIC]: 1024,
+  [RESPONSE_PURPOSE.GENERATIVE]: 1024,
+  [RESPONSE_PURPOSE.SETUP]: 1536,
+});
+export const CONFIRMATION_MAX_OUTPUT_TOKENS =
+  DETERMINISTIC_RESPONSE_POLICY[RESPONSE_PURPOSE.PRE_BOOKING_CONFIRMATION];
 const MAX_CONFIRMATION_RETRIES = 1;
+const MAX_DETERMINISTIC_RETRIES = 1;
+const DEFAULT_DETERMINISTIC_COMPLETION_TIMEOUT_MS = 20000;
+
+export const normalizeDeterministicSpeech = (value) => String(value || "")
+  .normalize("NFKD")
+  .replace(/[\u0300-\u036f]/g, "")
+  .toLowerCase()
+  .replace(/[\u2018\u2019]/g, "'")
+  .replace(/[^a-z0-9'\s]/g, " ")
+  .replace(/\s+/g, " ")
+  .trim();
+
+export const extractIntendedSpeech = (instructions) => {
+  const text = String(instructions || "");
+  const matches = [...text.matchAll(/[\"“]([^\"”]+)[\"”]/g)];
+  return (matches.at(-1)?.[1] || text).trim();
+};
+
+export const deterministicPurposeBudget = (purpose) =>
+  DETERMINISTIC_RESPONSE_POLICY[purpose] ||
+  DETERMINISTIC_RESPONSE_POLICY[RESPONSE_PURPOSE.ORDINARY_DETERMINISTIC];
 
 export const isConfirmationPromptText = (value) => {
   const text = String(value || "").toLowerCase();
@@ -61,11 +110,8 @@ export const confirmationLifecycleCanAdvance = (record) => Boolean(
 );
 
 export const deterministicResponseBudget = ({ isAlternative = false, purpose = null } = {}) => {
-  if (isAlternative) return 80;
-  if (purpose === RESPONSE_PURPOSE.PRE_BOOKING_CONFIRMATION) {
-    return CONFIRMATION_MAX_OUTPUT_TOKENS;
-  }
-  return 120;
+  if (isAlternative) return deterministicPurposeBudget(RESPONSE_PURPOSE.ALTERNATIVE_SELECTION);
+  return deterministicPurposeBudget(purpose || RESPONSE_PURPOSE.ORDINARY_DETERMINISTIC);
 };
 
 export const confirmationLifecycleAction = (record) => {
@@ -137,11 +183,16 @@ export const buildDeterministicResponseRequest = ({
       maxOutputTokens,
       retryCount,
       bookingSnapshot,
+      deterministic: true,
+      intendedSpeech: extractIntendedSpeech(exactInstructions),
     },
   };
 };
 
-export const buildExactResponseRequest = (exactInstructions, maxOutputTokens = 160) => ({
+export const buildExactResponseRequest = (
+  exactInstructions,
+  maxOutputTokens = deterministicPurposeBudget(RESPONSE_PURPOSE.ORDINARY_DETERMINISTIC)
+) => ({
   type: "response.create",
   response: {
     instructions: exactInstructions,
@@ -154,7 +205,7 @@ export const materializeQueuedExactResponse = (queued) => ({
     type: "response.create",
     response: {
       instructions: queued.exactInstructions,
-      max_output_tokens: queued.maxOutputTokens || 250,
+      max_output_tokens: queued.maxOutputTokens || deterministicPurposeBudget(queued.purpose),
     },
   },
   metadata: {
@@ -162,6 +213,10 @@ export const materializeQueuedExactResponse = (queued) => ({
     retryCount: queued.retryCount || 0,
     exactInstructions: queued.exactInstructions,
     bookingSnapshot: queued.bookingSnapshot || null,
+    deterministic: queued.deterministic === true,
+    intendedSpeech: queued.intendedSpeech || extractIntendedSpeech(queued.exactInstructions),
+    finalConfirmation: queued.finalConfirmation === true,
+    terminateAfterPlayback: queued.terminateAfterPlayback === true,
   },
 });
 
@@ -401,17 +456,11 @@ const decodedBase64Length = (value) => {
 };
 
 const extractExpectedResponseText = (instructions) => {
-  const text = String(instructions || "");
-  const quoted = text.match(/(?:exactly(?: and only this)?|word for word):\s*"([\s\S]*)"\s*$/i);
-  return quoted?.[1] || text.slice(0, 500);
+  return extractIntendedSpeech(instructions).slice(0, 500);
 };
 
 const normalizeDiagnosticText = (value) =>
-  String(value || "")
-    .toLowerCase()
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, MAX_TRACE_TRANSCRIPT_CHARS);
+  normalizeDeterministicSpeech(value).slice(0, MAX_TRACE_TRANSCRIPT_CHARS);
 
 const diagnosticTextLooksComplete = (value) =>
   /[.!?¿¡]["')\]]?\s*$/.test(String(value || "").trim());
@@ -1334,7 +1383,7 @@ export const attachMediaWebSocketServer = (server, dependencies = {}) => {
           twilioBytesSubmittedTotal += decodedBytes;
           responseTrace.maxBufferedAmount = Math.max(responseTrace.maxBufferedAmount, bufferedAmount);
           maxTwilioBufferedAmount = Math.max(maxTwilioBufferedAmount, bufferedAmount);
-        } else {
+        } else if (submissionOutcome !== "buffered") {
           responseTrace.skippedDeltaCount += 1;
           responseTrace.skippedBytes += decodedBytes;
         }
@@ -1511,9 +1560,16 @@ export const attachMediaWebSocketServer = (server, dependencies = {}) => {
     let pendingAssistantResponse = null;
     let pendingResponsePurposeMetadata = null;
     const responseLifecycleById = new Map();
+    const deterministicCompletionTimers = new Map();
+    const deterministicCompletionTimeoutMs =
+      Number.isFinite(Number(dependencies.deterministicCompletionTimeoutMs)) &&
+      Number(dependencies.deterministicCompletionTimeoutMs) > 0
+        ? Number(dependencies.deterministicCompletionTimeoutMs)
+        : DEFAULT_DETERMINISTIC_COMPLETION_TIMEOUT_MS;
     const playbackMarkToResponseId = new Map();
     let confirmationDeliveryReady = false;
     let activeConfirmationLifecycleId = "";
+    let activeDeterministicLifecycleId = "";
     let lastSpeakExactStatus = null;
     let lastUserSpokeAt = 0;
     let assistantResponseText = "";
@@ -1746,7 +1802,9 @@ export const attachMediaWebSocketServer = (server, dependencies = {}) => {
       const inputReady =
         readyForCallerInput ||
         reason === "greeting" ||
-        reason === "confirmation_max_output_tokens_retry";
+        reason === "confirmation_max_output_tokens_retry" ||
+        reason === "deterministic_retry" ||
+        reason === "deterministic_recovery";
       return (
         inputReady &&
         !callerSpeaking &&
@@ -1854,6 +1912,7 @@ export const attachMediaWebSocketServer = (server, dependencies = {}) => {
           })
         );
       }, TWILIO_FRAME_MS);
+      silenceInterval.unref?.();
 
       console.log("[OUTBOUND_KEEPALIVE_STARTED]", { reason });
       return true;
@@ -2011,6 +2070,11 @@ export const attachMediaWebSocketServer = (server, dependencies = {}) => {
         retryCount: Number(metadata.retryCount || 0),
         exactInstructions: metadata.exactInstructions || payload?.response?.instructions || "",
         bookingSnapshot: metadata.bookingSnapshot || null,
+        deterministic: metadata.deterministic === true,
+        intendedSpeech:
+          metadata.intendedSpeech || extractIntendedSpeech(metadata.exactInstructions || payload?.response?.instructions),
+        finalConfirmation: metadata.finalConfirmation === true,
+        terminateAfterPlayback: metadata.terminateAfterPlayback === true,
       };
       if (CONTROLLED_AUDIO_TRACE_ENABLED) {
         pendingExpectedResponseMetadata = diagnosticAttempt(() => {
@@ -2647,6 +2711,18 @@ export const attachMediaWebSocketServer = (server, dependencies = {}) => {
     const speakExact = (text, options = {}) => {
       const reason = options.reason || "speak_exact";
       const isFinalConfirmation = options.finalConfirmation === true;
+      const purpose = options.purpose || (
+        isFinalConfirmation
+          ? RESPONSE_PURPOSE.FINAL_SUCCESS
+          : reason.includes("unavailable")
+            ? RESPONSE_PURPOSE.UNAVAILABLE
+            : reason.includes("alternative")
+              ? RESPONSE_PURPOSE.ALTERNATIVE_SELECTION
+              : reason.includes("recovery")
+                ? RESPONSE_PURPOSE.RECOVERY
+                : RESPONSE_PURPOSE.ORDINARY_DETERMINISTIC
+      );
+      const maxOutputTokens = deterministicPurposeBudget(purpose);
       const promptType = isFinalConfirmation ? "final_confirmation" : options.promptType || null;
       const status = {
         reason,
@@ -2686,7 +2762,12 @@ export const attachMediaWebSocketServer = (server, dependencies = {}) => {
           immediate: true,
           promptType,
           finalConfirmation: isFinalConfirmation,
-          maxOutputTokens: isFinalConfirmation ? 160 : undefined,
+          purpose,
+          maxOutputTokens,
+          deterministic: true,
+          intendedSpeech: text,
+          retryCount: Number(options.retryCount || 0),
+          terminateAfterPlayback: options.terminateAfterPlayback === true,
         }, queueReason);
         status.queued = true;
         if (isFinalConfirmation) finalConfirmationQueuedForPlayback = true;
@@ -2704,8 +2785,16 @@ export const attachMediaWebSocketServer = (server, dependencies = {}) => {
         return queueExactForPlayback(reason);
       }
 
-      const responseCreatePayload = buildExactResponseRequest(exactInstructions);
-      const sent = sendResponseCreate(responseCreatePayload, reason);
+      const responseCreatePayload = buildExactResponseRequest(exactInstructions, maxOutputTokens);
+      const sent = sendResponseCreate(responseCreatePayload, reason, {
+        purpose,
+        retryCount: Number(options.retryCount || 0),
+        exactInstructions,
+        deterministic: true,
+        intendedSpeech: text,
+        finalConfirmation: isFinalConfirmation,
+        terminateAfterPlayback: options.terminateAfterPlayback === true,
+      });
       status.sent = Boolean(sent);
       if (sent && isFinalConfirmation) {
         console.log("[FINAL_CONFIRMATION_SENT_IMMEDIATE]", {
@@ -2930,12 +3019,17 @@ RULES:
         type: "response.create",
         response: {
           instructions: greetingInstruction,
-          max_output_tokens: 250, // ✅ FIX #2: Increased from 150 to 250
+          max_output_tokens: deterministicPurposeBudget(RESPONSE_PURPOSE.GREETING),
         },
       };
       readyForCallerInput = false;
       console.log("[CALLER_INPUT_DISABLED_GREETING]");
-      const ok = sendResponseCreate(responseCreatePayload, "greeting");
+      const ok = sendResponseCreate(responseCreatePayload, "greeting", {
+        purpose: RESPONSE_PURPOSE.GREETING,
+        deterministic: true,
+        intendedSpeech: extractIntendedSpeech(greetingInstruction),
+        exactInstructions: greetingInstruction,
+      });
 
       if (ok) {
         greetingSent = true;
@@ -3163,7 +3257,17 @@ RULES:
           );
         const responsePurpose = isConfirmationPrompt
           ? RESPONSE_PURPOSE.PRE_BOOKING_CONFIRMATION
-          : null;
+          : isNamePrompt
+            ? RESPONSE_PURPOSE.NAME_COLLECTION
+            : isAlternativePrompt
+              ? (slotAvailable === false ? RESPONSE_PURPOSE.UNAVAILABLE : RESPONSE_PURPOSE.ALTERNATIVE_SELECTION)
+              : !bookingState.service
+                ? RESPONSE_PURPOSE.SERVICE_COLLECTION
+                : !bookingState.parsedDate
+                  ? RESPONSE_PURPOSE.DATE_COLLECTION
+                  : !bookingState.parsedTime
+                    ? RESPONSE_PURPOSE.TIME_COLLECTION
+                    : RESPONSE_PURPOSE.ORDINARY_DETERMINISTIC;
         const deterministicMaxTokens = deterministicResponseBudget({
           isAlternative: isAlternativePrompt,
           purpose: responsePurpose,
@@ -3223,6 +3327,8 @@ RULES:
             maxOutputTokens: deterministicRequest.queued.maxOutputTokens,
             retryCount: 0,
             bookingSnapshot,
+            deterministic: true,
+            intendedSpeech: reply,
           }, reason);
 
           console.log("[QUEUE_DETERMINISTIC_BOOKING_REPLY]", {
@@ -3258,6 +3364,8 @@ RULES:
           retryCount: 0,
           exactInstructions,
           bookingSnapshot,
+          deterministic: true,
+          intendedSpeech: reply,
         });
         if (!sent) return;
 
@@ -3303,10 +3411,14 @@ RULES:
         type: "response.create",
         response: {
           instructions,
-          max_output_tokens: isSetupCall ? 800 : 220,
+          max_output_tokens: deterministicPurposeBudget(
+            isSetupCall ? RESPONSE_PURPOSE.SETUP : RESPONSE_PURPOSE.GENERATIVE
+          ),
         },
       };
-      const sent = sendResponseCreate(responseCreatePayload, reason);
+      const sent = sendResponseCreate(responseCreatePayload, reason, {
+        purpose: isSetupCall ? RESPONSE_PURPOSE.SETUP : RESPONSE_PURPOSE.GENERATIVE,
+      });
       if (!sent) return;
 
       console.log(
@@ -3449,8 +3561,12 @@ RULES:
 
     const flushQueuedAssistantResponse = async (reason = "unknown") => {
       const queuedAssistantResponse = pendingAssistantResponse;
-      const idleReason = queuedAssistantResponse?.reason === "confirmation_max_output_tokens_retry"
-        ? "confirmation_max_output_tokens_retry"
+      const idleReason = [
+        "confirmation_max_output_tokens_retry",
+        "deterministic_retry",
+        "deterministic_recovery",
+      ].includes(queuedAssistantResponse?.reason)
+        ? queuedAssistantResponse.reason
         : reason;
       if (!isAssistantIdle(idleReason)) {
         deferFlushUntilCallerStops = true;
@@ -3550,7 +3666,11 @@ RULES:
         return true;
       }
 
-      if (queued.finalConfirmation === true && (finalConfirmationSentOnce || finalConfirmationCallEndArmed)) {
+      if (
+        queued.finalConfirmation === true &&
+        queued.deterministicRetry !== true &&
+        (finalConfirmationSentOnce || finalConfirmationCallEndArmed)
+      ) {
         console.log("[FINAL_CONFIRMATION_DUPLICATE_SUPPRESSED]", {
           reason,
           stage: "flush_queued_already_sent",
@@ -3587,7 +3707,7 @@ RULES:
           if (queued.finalConfirmation === true) finalConfirmationQueuedForPlayback = true;
           return false;
         }
-        if (queued.finalConfirmation === true) {
+        if (queued.finalConfirmation === true && queued.deterministicRetry !== true) {
           console.log("[FINAL_CONFIRMATION_SENT_FROM_QUEUE]", {
             reason: queued.reason || reason,
             ...responseIdleState(),
@@ -3603,10 +3723,14 @@ RULES:
         type: "response.create",
         response: {
           instructions: queued.instructions,
-          max_output_tokens: isSetupCall ? 800 : 220,
+          max_output_tokens: deterministicPurposeBudget(
+            isSetupCall ? RESPONSE_PURPOSE.SETUP : RESPONSE_PURPOSE.GENERATIVE
+          ),
         },
       };
-      const sent = sendResponseCreate(payload, queued.reason || reason);
+      const sent = sendResponseCreate(payload, queued.reason || reason, {
+        purpose: isSetupCall ? RESPONSE_PURPOSE.SETUP : RESPONSE_PURPOSE.GENERATIVE,
+      });
       if (!sent) {
         pendingAssistantResponse = queued;
         return false;
@@ -3623,6 +3747,7 @@ RULES:
         flushDelayTimer = null;
         void flushQueuedAssistantResponse(reason);
       }, 250);
+      flushDelayTimer.unref?.();
     };
 
     const clearAssistantPlaybackWatchdog = () => {
@@ -3717,9 +3842,9 @@ RULES:
         pendingBargeInAudioStartMs = null;
         pendingBargeInWhilePlayback = false;
         if (responseInFlightId === clearedResponseId) responseInFlightId = "";
-        readyForCallerInput = lifecycleRecord?.purpose === RESPONSE_PURPOSE.PRE_BOOKING_CONFIRMATION
-          ? false
-          : true;
+        readyForCallerInput =
+          lifecycleRecord?.purpose !== RESPONSE_PURPOSE.PRE_BOOKING_CONFIRMATION &&
+          lifecycleRecord?.openAiStatus === "completed";
         console.log("[TWILIO_PLAYBACK_CLEARED_ON_BARGE_IN_CALLER_INPUT_READY]", {
           reason,
           responseActive,
@@ -3760,6 +3885,18 @@ RULES:
         }
 
         const lifecycleRecord = responseLifecycleById.get(responseInFlightId);
+        if (lifecycleRecord?.deterministic === true) {
+          lifecycleRecord.audioInvalidated = true;
+          lifecycleRecord.transportAvailable = false;
+          lifecycleRecord.transportFailureReason = "playback_watchdog_expired";
+          clearAssistantPlaybackState();
+          readyForCallerInput = false;
+          await invalidateDeterministicPlaybackTransport(
+            lifecycleRecord,
+            "playback_watchdog_expired"
+          );
+          return;
+        }
         if (lifecycleRecord?.purpose === RESPONSE_PURPOSE.PRE_BOOKING_CONFIRMATION) {
           lifecycleRecord.audioInvalidated = true;
           lifecycleRecord.transportFailureReason = "playback_watchdog_expired";
@@ -3785,13 +3922,14 @@ RULES:
       assistantPlaybackWatchdogTimer = setTimeout(() => {
         void handleAssistantPlaybackWatchdogExpiry();
       }, 12000);
+      assistantPlaybackWatchdogTimer.unref?.();
     };
 
     const sendAssistantPlaybackMark = (reason = "unknown") => {
       if (!assistantAudioSentThisResponse || pendingAssistantMarkName) return false;
       if (twilioWs.readyState !== twilioWs.OPEN || !streamSid) {
         const lifecycleRecord = responseLifecycleById.get(responseInFlightId);
-        if (lifecycleRecord?.purpose === RESPONSE_PURPOSE.PRE_BOOKING_CONFIRMATION) {
+        if (lifecycleRecord?.deterministic === true) {
           lifecycleRecord.audioInvalidated = true;
           lifecycleRecord.transportAvailable = false;
           lifecycleRecord.transportFailureReason = "playback_mark_transport_unavailable";
@@ -3812,9 +3950,12 @@ RULES:
           });
         }
         clearAssistantPlaybackState();
-        if (lifecycleRecord?.purpose === RESPONSE_PURPOSE.PRE_BOOKING_CONFIRMATION) {
+        if (lifecycleRecord?.deterministic === true) {
           readyForCallerInput = false;
-          void applyConfirmationLifecycle(lifecycleRecord);
+          void invalidateDeterministicPlaybackTransport(
+            lifecycleRecord,
+            "playback_mark_transport_unavailable"
+          );
           return false;
         }
         scheduleQueuedAssistantFlush("twilio_playback_mark_unavailable");
@@ -3846,13 +3987,17 @@ RULES:
         }));
         if (lifecycleRecord) lifecycleRecord.markSent = true;
       } catch (markSendError) {
-        if (lifecycleRecord?.purpose === RESPONSE_PURPOSE.PRE_BOOKING_CONFIRMATION) {
+        if (lifecycleRecord?.deterministic === true) {
           lifecycleRecord.audioInvalidated = true;
+          lifecycleRecord.transportAvailable = false;
           lifecycleRecord.transportFailureReason = "playback_mark_send_failed";
           playbackMarkToResponseId.delete(markName);
           clearAssistantPlaybackState();
           readyForCallerInput = false;
-          void applyConfirmationLifecycle(lifecycleRecord);
+          void invalidateDeterministicPlaybackTransport(
+            lifecycleRecord,
+            "playback_mark_send_failed"
+          );
         }
         return false;
       }
@@ -4876,6 +5021,211 @@ RULES:
       return "recover";
     };
 
+    const resetDeterministicGenerationState = (record) => {
+      const completionTimer = deterministicCompletionTimers.get(record?.responseId);
+      if (completionTimer) clearTimeout(completionTimer);
+      deterministicCompletionTimers.delete(record?.responseId);
+      if (responseInFlightId === record?.responseId) responseInFlightId = "";
+      if (activeDeterministicLifecycleId === record?.responseId) {
+        activeDeterministicLifecycleId = "";
+      }
+      if (activeConfirmationLifecycleId === record?.responseId) {
+        activeConfirmationLifecycleId = "";
+      }
+      responseActive = false;
+      aiResponseInProgress = false;
+      assistantSpeaking = false;
+      assistantAudioSentThisResponse = false;
+      assistantAudioDeltaCount = 0;
+      readyForCallerInput = false;
+    };
+
+    const armDeterministicCompletionTimeout = (record) => {
+      if (record?.deterministic !== true || !record.responseId) return;
+      const existingTimer = deterministicCompletionTimers.get(record.responseId);
+      if (existingTimer) clearTimeout(existingTimer);
+      const timer = setTimeout(() => {
+        deterministicCompletionTimers.delete(record.responseId);
+        if (record.lifecycleActionHandled || record.deterministicDelivered) return;
+        record.openAiStatus ||= "failed";
+        record.statusReason ||= "deterministic_completion_timeout";
+        record.outputAudioEnded = true;
+        record.outputTranscriptEnded = true;
+        void reconcileDeterministicResponse(record);
+      }, deterministicCompletionTimeoutMs);
+      timer.unref?.();
+      deterministicCompletionTimers.set(record.responseId, timer);
+    };
+
+    const queueDeterministicAttempt = (record, { recovery = false } = {}) => {
+      const purpose = recovery ? RESPONSE_PURPOSE.RECOVERY : record.purpose;
+      const recoveryText = currentLanguage === "es"
+        ? "Lo siento, no pude reproducir la respuesta correctamente. Terminaremos esta llamada; por favor, intenta de nuevo."
+        : "I'm sorry, I couldn't play the response correctly. We'll end this call now; please try again.";
+      const intendedSpeech = recovery ? recoveryText : record.intendedSpeech;
+      const exactInstructions = recovery
+        ? `Say this exactly and only this: "${recoveryText}"`
+        : record.exactInstructions;
+      const retryCount = recovery ? 0 : Number(record.retryCount || 0) + 1;
+      const finalConfirmationRetry = !recovery && record.finalConfirmation === true;
+
+      if (finalConfirmationRetry) {
+        finalConfirmationAwaitingResponseCreated = true;
+        finalConfirmationResponseId = "";
+        finalConfirmationPlaybackMarkName = "";
+      }
+
+      queueAssistantResponse({
+        exactInstructions,
+        reason: recovery ? "deterministic_recovery" : "deterministic_retry",
+        lang: currentLanguage,
+        immediate: true,
+        purpose,
+        maxOutputTokens: deterministicPurposeBudget(purpose),
+        retryCount,
+        bookingSnapshot: record.bookingSnapshot,
+        deterministic: true,
+        intendedSpeech,
+        deterministicRetry: !recovery,
+        deterministicBooking:
+          !recovery && !record.finalConfirmation && record.purpose !== RESPONSE_PURPOSE.GREETING,
+        finalConfirmation: finalConfirmationRetry,
+        terminateAfterPlayback: recovery || record.terminateAfterPlayback === true,
+      }, recovery ? "deterministic_recovery" : "deterministic_retry");
+      scheduleQueuedAssistantFlush(recovery ? "deterministic_recovery" : "deterministic_retry");
+    };
+
+    const reconcileDeterministicResponse = async (record) => {
+      if (!record?.deterministic || record.lifecycleActionHandled || record.deterministicDelivered) {
+        return "handled";
+      }
+      if (record.transportAvailable === false) {
+        record.lifecycleActionHandled = true;
+        record.bufferedAudioDeltas = [];
+        resetDeterministicGenerationState(record);
+        await requestCallEnd("deterministic_transport_unavailable");
+        return "terminate";
+      }
+      if (!record.openAiStatus || !record.outputAudioEnded || !record.outputTranscriptEnded) {
+        return "wait";
+      }
+
+      const ownsLifecycle = activeDeterministicLifecycleId === record.responseId;
+      const completedAndMatched =
+        record.openAiStatus === "completed" &&
+        record.transcriptMatches === true &&
+        ownsLifecycle &&
+        record.audioInvalidated !== true &&
+        record.transportAvailable !== false;
+
+      if (!completedAndMatched) {
+        record.lifecycleActionHandled = true;
+        record.bufferedAudioDeltas = [];
+        resetDeterministicGenerationState(record);
+        if (record.purpose === RESPONSE_PURPOSE.PRE_BOOKING_CONFIRMATION) {
+          confirmationDeliveryReady = false;
+          bufferedCallerTranscript = null;
+          bufferedCallerTranscriptAt = null;
+          bufferedCallerTranscriptPriority = "";
+        }
+        if (record.transportAvailable === false) {
+          await requestCallEnd("deterministic_transport_unavailable");
+          return "terminate";
+        }
+        if (record.purpose !== RESPONSE_PURPOSE.RECOVERY && Number(record.retryCount || 0) < MAX_DETERMINISTIC_RETRIES) {
+          if (record.purpose === RESPONSE_PURPOSE.PRE_BOOKING_CONFIRMATION && record.bookingSnapshot) {
+            restoreBookingSnapshot(record.bookingSnapshot);
+          }
+          queueDeterministicAttempt(record);
+          return "retry";
+        }
+        if (record.purpose === RESPONSE_PURPOSE.RECOVERY) {
+          await requestCallEnd("deterministic_recovery_failed");
+          return "terminate";
+        }
+        queueDeterministicAttempt(record, { recovery: true });
+        return "recover";
+      }
+
+      if (twilioWs.readyState !== twilioWs.OPEN || !streamSid) {
+        record.transportAvailable = false;
+        record.audioInvalidated = true;
+        record.transportFailureReason = "transport_unavailable";
+        return reconcileDeterministicResponse(record);
+      }
+
+      try {
+        for (const delta of record.bufferedAudioDeltas) {
+          twilioWs.send(JSON.stringify({
+            event: "media",
+            streamSid,
+            media: { payload: delta },
+          }));
+        }
+        if (CONTROLLED_AUDIO_TRACE_ENABLED) diagnosticAttempt(() => {
+          const responseTrace = responseTraceFor(record.responseId);
+          if (!responseTrace) return;
+          const submittedBytes = record.bufferedAudioDeltas.reduce(
+            (sum, delta) => sum + decodedBase64Length(delta),
+            0
+          );
+          responseTrace.submittedDeltaCount += record.bufferedAudioDeltas.length;
+          responseTrace.submittedBytes += submittedBytes;
+          responseTrace.firstMediaAt ||= Date.now();
+          twilioBytesSubmittedTotal += submittedBytes;
+        });
+      } catch {
+        record.transportAvailable = false;
+        record.audioInvalidated = true;
+        record.transportFailureReason = "media_send_failed";
+        return reconcileDeterministicResponse(record);
+      }
+
+      record.audioSubmitted = record.bufferedAudioDeltas.length > 0;
+      record.bufferedAudioDeltas = [];
+      record.deterministicDelivered = true;
+      const completionTimer = deterministicCompletionTimers.get(record.responseId);
+      if (completionTimer) clearTimeout(completionTimer);
+      deterministicCompletionTimers.delete(record.responseId);
+      assistantPlaybackActive = record.audioSubmitted;
+      assistantSpeaking = record.audioSubmitted;
+      assistantAudioSentThisResponse = record.audioSubmitted;
+      readyForCallerInput = false;
+      if (!record.audioSubmitted) {
+        record.lifecycleActionHandled = true;
+        resetDeterministicGenerationState(record);
+        queueDeterministicAttempt(record, { recovery: Number(record.retryCount || 0) >= MAX_DETERMINISTIC_RETRIES });
+        return "recover";
+      }
+      sendAssistantPlaybackMark("deterministic_validated_delivery");
+      return "delivered";
+    };
+
+    const reconcileNonDeterministicResponse = async (record) => {
+      if (!record || record.deterministic === true || record.lifecycleActionHandled === true) {
+        return "handled";
+      }
+      if (!record.openAiStatus) return "wait";
+      if (record.openAiStatus === "completed") {
+        if (!record.playbackMarkAcknowledged) return "wait";
+        record.lifecycleActionHandled = true;
+        readyForCallerInput = true;
+        return "advance";
+      }
+      if (record.audioSubmitted === true && record.markSent !== true) return "wait";
+      if (record.markSent === true && record.playbackMarkAcknowledged !== true) return "wait";
+
+      record.lifecycleActionHandled = true;
+      readyForCallerInput = false;
+      resetDeterministicGenerationState(record);
+      if (record.transportAvailable === false || twilioWs.readyState !== twilioWs.OPEN) {
+        await requestCallEnd("generative_response_transport_unavailable");
+        return "terminate";
+      }
+      queueDeterministicAttempt(record, { recovery: true });
+      return "recover";
+    };
+
     const invalidateActiveConfirmationTransport = async (reason) => {
       const activeResponseId =
         responseInFlightId ||
@@ -4891,6 +5241,40 @@ RULES:
       bufferedCallerTranscriptAt = null;
       bufferedCallerTranscriptPriority = "";
       await applyConfirmationLifecycle(record);
+      return true;
+    };
+
+    const invalidateActiveDeterministicTransport = async (reason) => {
+      const activeResponseId = activeDeterministicLifecycleId || responseInFlightId;
+      const record = responseLifecycleById.get(activeResponseId);
+      if (record?.deterministic !== true || record.lifecycleActionHandled === true) return false;
+      record.audioInvalidated = true;
+      record.transportAvailable = false;
+      record.transportFailureReason = reason;
+      await reconcileDeterministicResponse(record);
+      return true;
+    };
+
+    const invalidateDeterministicPlaybackTransport = async (record, reason) => {
+      if (record?.deterministic !== true || record.lifecycleActionHandled === true) return false;
+      record.audioInvalidated = true;
+      record.transportAvailable = false;
+      record.transportFailureReason = reason;
+      record.lifecycleActionHandled = true;
+      record.bufferedAudioDeltas = [];
+      resetDeterministicGenerationState(record);
+      await requestCallEnd("deterministic_playback_transport_unavailable");
+      return true;
+    };
+
+    const invalidateActiveDeterministicGeneration = async (reason) => {
+      const record = responseLifecycleById.get(activeDeterministicLifecycleId || responseInFlightId);
+      if (record?.deterministic !== true || record.lifecycleActionHandled === true) return false;
+      record.lifecycleActionHandled = true;
+      record.bufferedAudioDeltas = [];
+      record.statusReason = reason;
+      resetDeterministicGenerationState(record);
+      await requestCallEnd("deterministic_openai_unavailable");
       return true;
     };
 
@@ -4982,9 +5366,22 @@ RULES:
               lifecycleActionHandled: false,
               exactInstructions: metadata.exactInstructions || "",
               bookingSnapshot: metadata.bookingSnapshot || null,
+              deterministic: metadata.deterministic === true,
+              intendedSpeech: metadata.intendedSpeech || extractIntendedSpeech(metadata.exactInstructions),
+              completedOutputTranscript: "",
+              outputTranscriptEnded: false,
+              transcriptMatches: false,
+              bufferedAudioDeltas: [],
+              deterministicDelivered: false,
+              finalConfirmation: metadata.finalConfirmation === true,
+              terminateAfterPlayback: metadata.terminateAfterPlayback === true,
             });
             if (metadata.purpose === RESPONSE_PURPOSE.PRE_BOOKING_CONFIRMATION) {
               activeConfirmationLifecycleId = responseInFlightId;
+            }
+            if (metadata.deterministic === true) {
+              activeDeterministicLifecycleId = responseInFlightId;
+              armDeterministicCompletionTimeout(responseLifecycleById.get(responseInFlightId));
             }
             pendingResponsePurposeMetadata = null;
           }
@@ -5026,7 +5423,8 @@ RULES:
           evt.type === "response.audio.delta" ||
           evt.type === "response.output_audio.delta"
         ) {
-          assistantSpeaking = true;
+          const deltaLifecycle = responseLifecycleById.get(evt.response_id || responseInFlightId);
+          if (deltaLifecycle?.deterministic !== true) assistantSpeaking = true;
           responseActive = true;
           assistantAudioDeltaCount += 1;
         }
@@ -5068,6 +5466,21 @@ RULES:
             if (!deltaText || !responseTrace) return;
             responseTrace.transcriptCharCount += deltaText.length;
           });
+        }
+        if (
+          evt.type === "response.output_audio_transcript.done" ||
+          evt.type === "response.audio_transcript.done"
+        ) {
+          const transcriptResponseId = evt.response_id || responseInFlightId;
+          const transcriptLifecycle = responseLifecycleById.get(transcriptResponseId);
+          if (transcriptLifecycle?.deterministic === true) {
+            transcriptLifecycle.completedOutputTranscript = String(evt.transcript || "");
+            transcriptLifecycle.outputTranscriptEnded = true;
+            transcriptLifecycle.transcriptMatches =
+              normalizeDeterministicSpeech(transcriptLifecycle.intendedSpeech) ===
+              normalizeDeterministicSpeech(transcriptLifecycle.completedOutputTranscript);
+            await reconcileDeterministicResponse(transcriptLifecycle);
+          }
         }
         if (CONTROLLED_AUDIO_TRACE_ENABLED && (
           evt.type === "response.output_audio_transcript.done" ||
@@ -5221,7 +5634,12 @@ RULES:
             if (completedLifecycle) {
               completedLifecycle.openAiStatus = response.status || null;
               completedLifecycle.statusReason = response.status_details?.reason || null;
-              await applyConfirmationLifecycle(completedLifecycle);
+              if (completedLifecycle.deterministic === true) {
+                await reconcileDeterministicResponse(completedLifecycle);
+              } else {
+                await applyConfirmationLifecycle(completedLifecycle);
+                await reconcileNonDeterministicResponse(completedLifecycle);
+              }
             }
           }
           if (CONTROLLED_AUDIO_TRACE_ENABLED) diagnosticAttempt(() => {
@@ -5303,7 +5721,13 @@ RULES:
             cancelledLifecycle.openAiStatus = "cancelled";
             cancelledLifecycle.statusReason =
               evt.reason || evt.status_details?.reason || evt.response?.status_details?.reason || "cancelled";
-            await applyConfirmationLifecycle(cancelledLifecycle);
+            if (cancelledLifecycle.deterministic === true) {
+              cancelledLifecycle.outputAudioEnded = true;
+              cancelledLifecycle.outputTranscriptEnded = true;
+              await reconcileDeterministicResponse(cancelledLifecycle);
+            } else {
+              await applyConfirmationLifecycle(cancelledLifecycle);
+            }
           }
         }
 
@@ -5311,7 +5735,11 @@ RULES:
           evt.type === "response.done" &&
           terminalEventBelongsToActiveResponse(responseInFlightId, eventResponseId)
         ) {
-          if (greetingSent && !greetingComplete) {
+          const greetingLifecycle = responseLifecycleById.get(eventResponseId || responseInFlightId);
+          const greetingDeliveryValidated =
+            greetingLifecycle?.purpose !== RESPONSE_PURPOSE.GREETING ||
+            greetingLifecycle?.deterministicDelivered === true;
+          if (greetingSent && !greetingComplete && greetingDeliveryValidated) {
             greetingComplete = true;
             responseActive = false;
             console.log("✅ Greeting complete - enabling VAD and audio forwarding");
@@ -5469,7 +5897,12 @@ RULES:
           evt.type === "response.audio.delta" ||
           evt.type === "response.output_audio.delta"
         ) {
-          stopOutboundKeepalive("assistant_audio_started");
+          const deltaLifecycle = responseLifecycleById.get(evt.response_id || responseInFlightId);
+          if (deltaLifecycle?.deterministic === true) {
+            deltaLifecycle.bufferedAudioDeltas.push(evt.delta);
+            accountAudioDelta(evt, "buffered");
+          } else {
+            stopOutboundKeepalive("assistant_audio_started");
 
           if (twilioWs.readyState === twilioWs.OPEN && streamSid) {
             let submissionReturned = false;
@@ -5518,12 +5951,18 @@ RULES:
               await applyConfirmationLifecycle(lifecycleRecord);
             }
           }
+          }
         }
 
         if (playbackCompleteEvents.has(evt.type)) {
           const audioResponseId = evt.response_id || responseInFlightId;
           const audioLifecycle = responseLifecycleById.get(audioResponseId);
-          if (audioLifecycle) audioLifecycle.outputAudioEnded = true;
+          if (audioLifecycle) {
+            audioLifecycle.outputAudioEnded = true;
+            if (audioLifecycle.deterministic === true) {
+              await reconcileDeterministicResponse(audioLifecycle);
+            }
+          }
           traceLog("openai.audio.done", {
             responseId: evt.response_id || responseInFlightId || lastOpenAiResponseId || null,
             itemId: evt.item_id || lastOpenAiItemId || null,
@@ -5549,7 +5988,12 @@ RULES:
           responseInFlightId,
           terminalResponseId
         );
-        if (isTerminalResponseEvent && terminalBelongsToActiveResponse) {
+        const terminalLifecycle = responseLifecycleById.get(terminalResponseId);
+        if (
+          isTerminalResponseEvent &&
+          terminalBelongsToActiveResponse &&
+          terminalLifecycle?.deterministic !== true
+        ) {
           responseActive = false;
           aiResponseInProgress = false;
           if (assistantAudioSentThisResponse && playbackCompleteEvents.has(evt.type)) {
@@ -5581,6 +6025,7 @@ RULES:
       });
 
       ai.on("error", (err) => {
+        void invalidateActiveDeterministicGeneration("openai_websocket_error");
         traceLog("openai.websocket.error", {
           errorMessagePresent: Boolean(err.message),
           readyState: ai.readyState,
@@ -5593,6 +6038,7 @@ RULES:
       });
 
       ai.on("close", (code, reasonBuffer) => {
+        void invalidateActiveDeterministicGeneration("openai_websocket_closed");
         aiSessionStarted = false;
         console.log("📴 OpenAI WebSocket closed");
         traceLog("openai.websocket.close", {
@@ -5665,13 +6111,24 @@ RULES:
         pendingBargeInAudioStartMs = null;
         pendingBargeInWhilePlayback = false;
         responseInFlightId = "";
-        readyForCallerInput = lifecycleRecord?.purpose === RESPONSE_PURPOSE.PRE_BOOKING_CONFIRMATION
-          ? false
-          : true;
+        responseActive = false;
+        aiResponseInProgress = false;
+        readyForCallerInput =
+          lifecycleRecord?.purpose !== RESPONSE_PURPOSE.PRE_BOOKING_CONFIRMATION &&
+          lifecycleRecord?.openAiStatus === "completed";
 
         if (lifecycleRecord?.purpose === RESPONSE_PURPOSE.PRE_BOOKING_CONFIRMATION) {
           playbackMarkToResponseId.delete(markName);
           await applyConfirmationLifecycle(lifecycleRecord);
+        } else if (lifecycleRecord?.deterministic === true) {
+          lifecycleRecord.lifecycleActionHandled = true;
+          playbackMarkToResponseId.delete(markName);
+        } else if (lifecycleRecord) {
+          playbackMarkToResponseId.delete(markName);
+          await reconcileNonDeterministicResponse(lifecycleRecord);
+        }
+        if (activeDeterministicLifecycleId === lifecycleRecord?.responseId) {
+          activeDeterministicLifecycleId = "";
         }
 
         console.log("[TWILIO_PLAYBACK_MARK_ACKED_CALLER_INPUT_READY]", {
@@ -5686,9 +6143,11 @@ RULES:
         }
 
         const shouldEndAfterFinalConfirmationPlayback =
-          bookingState.bookingFinalized === true &&
-          (pendingEndCallAfterResponse || finalConfirmationCallEndArmed) &&
-          (!finalConfirmationPlaybackMarkName || markName === finalConfirmationPlaybackMarkName);
+          (
+            bookingState.bookingFinalized === true &&
+            (pendingEndCallAfterResponse || finalConfirmationCallEndArmed) &&
+            (!finalConfirmationPlaybackMarkName || markName === finalConfirmationPlaybackMarkName)
+          ) || lifecycleRecord?.terminateAfterPlayback === true;
 
         if (shouldEndAfterFinalConfirmationPlayback) {
           pendingEndCallAfterResponse = false;
@@ -5800,8 +6259,11 @@ RULES:
 
     twilioWs.on("close", (code, reasonBuffer) => {
       console.log("📴 Twilio WebSocket closed");
+      void invalidateActiveDeterministicTransport("twilio_websocket_closed");
       void invalidateActiveConfirmationTransport("twilio_websocket_closed");
       clearAssistantPlaybackWatchdog();
+      for (const timer of deterministicCompletionTimers.values()) clearTimeout(timer);
+      deterministicCompletionTimers.clear();
       stopSilence("twilio_ws_closed");
       if (ai && ai.readyState === ai.OPEN) ai.close();
       aiSessionStarted = false;
@@ -5912,6 +6374,7 @@ RULES:
     });
 
     twilioWs.on("error", (err) => {
+      void invalidateActiveDeterministicTransport("twilio_websocket_error");
       void invalidateActiveConfirmationTransport("twilio_websocket_error");
       traceLog("twilio.websocket.error", {
         errorMessagePresent: Boolean(err.message),
@@ -5967,8 +6430,10 @@ RULES:
           callerSpeaking,
           pendingAssistantMarkName,
           pendingAssistantResponse: structuredClone(pendingAssistantResponse),
+          readyForCallerInput,
           confirmationDeliveryReady,
           activeConfirmationLifecycleId,
+          activeDeterministicLifecycleId,
           finalConfirmationCallEndArmed,
           finalConfirmationSentOnce,
           finalConfirmationPlaybackMarkName,
