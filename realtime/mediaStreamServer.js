@@ -29,6 +29,367 @@ const CONTROLLED_AUDIO_TRACE_ENABLED =
 const MAX_TRACE_RESPONSES_PER_CALL = 32;
 const MAX_TRACE_MARKS_PER_CALL = 32;
 const MAX_TRACE_TRANSCRIPT_CHARS = 4000;
+export const RESPONSE_PURPOSE = Object.freeze({
+  PRE_BOOKING_CONFIRMATION: "pre_booking_confirmation",
+});
+export const CONFIRMATION_MAX_OUTPUT_TOKENS = 320;
+const MAX_CONFIRMATION_RETRIES = 1;
+
+export const isConfirmationPromptText = (value) => {
+  const text = String(value || "").toLowerCase();
+  return [
+    "should i confirm",
+    "confirm that appointment",
+    "quieres que confirme",
+    "confirmo esa cita",
+    "dime sí para confirmar",
+    "dime si para confirmar",
+  ].some((phrase) => text.includes(phrase));
+};
+
+export const confirmationLifecycleCanAdvance = (record) => Boolean(
+  record?.purpose === RESPONSE_PURPOSE.PRE_BOOKING_CONFIRMATION &&
+  record?.lifecycleActionHandled !== true &&
+  record?.openAiStatus === "completed" &&
+  record?.outputAudioEnded === true &&
+  record?.audioSubmitted === true &&
+  record?.playbackMark &&
+  record?.markSent === true &&
+  record?.playbackMarkAcknowledged === true &&
+  record?.transportAvailable !== false &&
+  record?.audioInvalidated !== true
+);
+
+export const deterministicResponseBudget = ({ isAlternative = false, purpose = null } = {}) => {
+  if (isAlternative) return 80;
+  if (purpose === RESPONSE_PURPOSE.PRE_BOOKING_CONFIRMATION) {
+    return CONFIRMATION_MAX_OUTPUT_TOKENS;
+  }
+  return 120;
+};
+
+export const confirmationLifecycleAction = (record) => {
+  if (record?.lifecycleActionHandled === true) return "handled";
+  if (record?.transportAvailable === false) return "recover";
+  if (record?.audioInvalidated === true && record?.openAiStatus) {
+    return Number(record.retryCount || 0) < MAX_CONFIRMATION_RETRIES ? "retry" : "recover";
+  }
+  if (confirmationLifecycleCanAdvance(record)) return "advance";
+
+  if (!record?.openAiStatus) return "wait";
+
+  const boundaryCanStillArrive = Boolean(
+    record.audioSubmitted === true &&
+    record.transportAvailable !== false &&
+    record.markSent === true
+  );
+
+  if (record.openAiStatus === "completed") {
+    if (boundaryCanStillArrive && !record.playbackMarkAcknowledged) return "wait";
+    return Number(record.retryCount || 0) < MAX_CONFIRMATION_RETRIES ? "retry" : "recover";
+  }
+
+  if (record.openAiStatus === "incomplete" && record.statusReason === "max_output_tokens") {
+    if (boundaryCanStillArrive && !record.playbackMarkAcknowledged) return "wait";
+    return Number(record.retryCount || 0) < MAX_CONFIRMATION_RETRIES ? "retry" : "recover";
+  }
+
+  if (boundaryCanStillArrive && !record.playbackMarkAcknowledged) return "wait";
+  return "recover";
+};
+
+export const cloneBookingDomainSnapshot = ({ bookingState, barberId, availability }) => ({
+  bookingState: structuredClone(bookingState || {}),
+  barberId: barberId ?? null,
+  availability: structuredClone(availability || {}),
+});
+
+export const restoreBookingDomainSnapshot = ({ targetBookingState, snapshot }) => {
+  const protectedExecutionState = {
+    bookingAttempted: targetBookingState.bookingAttempted,
+    bookingFinalized: targetBookingState.bookingFinalized,
+  };
+  for (const key of Object.keys(targetBookingState)) delete targetBookingState[key];
+  Object.assign(targetBookingState, structuredClone(snapshot?.bookingState || {}));
+  Object.assign(targetBookingState, protectedExecutionState);
+  return {
+    barberId: snapshot?.barberId ?? null,
+    availability: structuredClone(snapshot?.availability || {}),
+  };
+};
+
+export const buildDeterministicResponseRequest = ({
+  exactInstructions,
+  purpose = null,
+  isAlternative = false,
+  retryCount = 0,
+  bookingSnapshot = null,
+} = {}) => {
+  const maxOutputTokens = deterministicResponseBudget({ isAlternative, purpose });
+  return {
+    payload: {
+      type: "response.create",
+      response: { instructions: exactInstructions, max_output_tokens: maxOutputTokens },
+    },
+    queued: {
+      exactInstructions,
+      purpose,
+      maxOutputTokens,
+      retryCount,
+      bookingSnapshot,
+    },
+  };
+};
+
+export const buildExactResponseRequest = (exactInstructions, maxOutputTokens = 160) => ({
+  type: "response.create",
+  response: {
+    instructions: exactInstructions,
+    max_output_tokens: maxOutputTokens,
+  },
+});
+
+export const materializeQueuedExactResponse = (queued) => ({
+  payload: {
+    type: "response.create",
+    response: {
+      instructions: queued.exactInstructions,
+      max_output_tokens: queued.maxOutputTokens || 250,
+    },
+  },
+  metadata: {
+    purpose: queued.purpose || null,
+    retryCount: queued.retryCount || 0,
+    exactInstructions: queued.exactInstructions,
+    bookingSnapshot: queued.bookingSnapshot || null,
+  },
+});
+
+export const terminalEventBelongsToActiveResponse = (activeResponseId, eventResponseId) => Boolean(
+  activeResponseId && eventResponseId && activeResponseId === eventResponseId
+);
+
+export const createConfirmationLifecycleTestHarness = ({
+  bookingState = {},
+  barberId = null,
+  availability = {},
+  bookAppointment: bookAppointmentImpl = async () => ({ success: true }),
+} = {}) => {
+  const state = structuredClone(bookingState);
+  let selectedBarberId = barberId;
+  let availabilityState = structuredClone(availability);
+  let bufferedTranscript = null;
+  let deliveryReady = false;
+  let bookingAttempted = false;
+  let bookingFinalized = false;
+  let recoveryCount = 0;
+  let ordinaryResponsesProcessed = 0;
+  let competingQueuedResponses = 0;
+  let activeResponseId = null;
+  let responseActive = false;
+  const records = new Map();
+  const marks = new Map();
+  const createdResponses = [];
+
+  const snapshot = () => cloneBookingDomainSnapshot({
+    bookingState: state,
+    barberId: selectedBarberId,
+    availability: availabilityState,
+  });
+
+  const restore = (value) => {
+    const restored = restoreBookingDomainSnapshot({ targetBookingState: state, snapshot: value });
+    selectedBarberId = restored.barberId;
+    availabilityState = restored.availability;
+  };
+
+  const executeBooking = async () => {
+    if (bookingAttempted || bookingFinalized || !deliveryReady) return false;
+    bookingAttempted = true;
+    const result = await bookAppointmentImpl({
+      barberId: selectedBarberId,
+      phone: state.phone || "",
+      name: state.name,
+      date: state.parsedDate,
+      time: state.parsedTime,
+      service: state.service,
+    });
+    if (result?.success) {
+      bookingFinalized = true;
+    }
+    return result?.success === true;
+  };
+
+  const sayYes = async () => {
+    if (!deliveryReady) {
+      bufferedTranscript = "yes";
+      return false;
+    }
+    return executeBooking();
+  };
+
+  const reconcile = async (record) => {
+    const action = confirmationLifecycleAction(record);
+    if (!["advance", "retry", "recover"].includes(action)) return action;
+    record.lifecycleActionHandled = true;
+    deliveryReady = false;
+
+    if (action === "advance") {
+      deliveryReady = true;
+      if (bufferedTranscript === "yes") {
+        bufferedTranscript = null;
+        await sayYes();
+      }
+      return action;
+    }
+
+    bufferedTranscript = null;
+    if (action === "retry") {
+      restore(record.bookingSnapshot);
+      state.askedConfirm = true;
+      state.confirmationPromptRequested = true;
+      state.confirmed = false;
+      const request = buildDeterministicResponseRequest({
+        exactInstructions: record.exactInstructions,
+        purpose: RESPONSE_PURPOSE.PRE_BOOKING_CONFIRMATION,
+        retryCount: record.retryCount + 1,
+        bookingSnapshot: snapshot(),
+      });
+      createdResponses.push(request);
+      return action;
+    }
+
+    recoveryCount += 1;
+    return action;
+  };
+
+  const createConfirmation = ({ responseId, queued = false, language = "en", retryCount = 0 } = {}) => {
+    const exactInstructions = language === "es"
+      ? 'Say this exactly and only this: "¿Confirmo esa cita?"'
+      : 'Say this exactly and only this: "Should I confirm it?"';
+    const request = buildDeterministicResponseRequest({
+      exactInstructions,
+      purpose: RESPONSE_PURPOSE.PRE_BOOKING_CONFIRMATION,
+      retryCount,
+      bookingSnapshot: snapshot(),
+    });
+    createdResponses.push({ ...request, queued });
+    records.set(responseId, {
+      responseId,
+      purpose: RESPONSE_PURPOSE.PRE_BOOKING_CONFIRMATION,
+      maxOutputTokens: request.payload.response.max_output_tokens,
+      openAiStatus: null,
+      statusReason: null,
+      outputAudioEnded: false,
+      audioSubmitted: false,
+      playbackMark: null,
+      markSent: false,
+      playbackMarkAcknowledged: false,
+      retryCount,
+      audioInvalidated: false,
+      transportAvailable: true,
+      lifecycleActionHandled: false,
+      exactInstructions,
+      bookingSnapshot: snapshot(),
+    });
+    activeResponseId = responseId;
+    responseActive = true;
+    return request;
+  };
+
+  return {
+    state,
+    createConfirmation,
+    outputAudioDone: async (responseId) => {
+      const record = records.get(responseId);
+      if (record) record.outputAudioEnded = true;
+      return record ? reconcile(record) : "unknown_response";
+    },
+    submitAudio: (responseId) => {
+      const record = records.get(responseId);
+      if (!record) return false;
+      record.audioSubmitted = true;
+      return true;
+    },
+    responseDone: async (responseId, status, reason = null) => {
+      const record = records.get(responseId);
+      if (!record) return "unknown_response";
+      record.openAiStatus = status;
+      record.statusReason = reason;
+      const action = await reconcile(record);
+      if (terminalEventBelongsToActiveResponse(activeResponseId, responseId)) responseActive = false;
+      return action;
+    },
+    responseCancelled: async (responseId, reason = "cancelled") => {
+      const record = records.get(responseId);
+      if (!record) return "unknown_response";
+      record.openAiStatus = "cancelled";
+      record.statusReason = reason;
+      const action = await reconcile(record);
+      if (terminalEventBelongsToActiveResponse(activeResponseId, responseId)) responseActive = false;
+      return action;
+    },
+    attachMark: (responseId, markName) => {
+      const record = records.get(responseId);
+      if (!record) return false;
+      record.playbackMark = markName;
+      record.markSent = true;
+      marks.set(markName, responseId);
+      return true;
+    },
+    acknowledgeMark: async (markName) => {
+      const responseId = marks.get(markName);
+      const record = records.get(responseId);
+      if (!record || record.playbackMark !== markName) return "stale_mark";
+      record.playbackMarkAcknowledged = true;
+      marks.delete(markName);
+      return reconcile(record);
+    },
+    clear: async (responseId) => {
+      const record = records.get(responseId);
+      if (!record) return "unknown_response";
+      record.audioInvalidated = true;
+      return reconcile(record);
+    },
+    transportFailure: async (responseId, reason = "transport_failure") => {
+      const record = records.get(responseId);
+      if (!record) return "unknown_response";
+      record.audioInvalidated = true;
+      record.transportAvailable = false;
+      record.transportFailureReason = reason;
+      bufferedTranscript = null;
+      return reconcile(record);
+    },
+    watchdogExpired: async (responseId) => {
+      const record = records.get(responseId);
+      if (!record) return "unknown_response";
+      record.audioInvalidated = true;
+      record.transportFailureReason = "playback_watchdog_expired";
+      bufferedTranscript = null;
+      return reconcile(record);
+    },
+    sayYes,
+    queueOrdinaryResponse: () => { competingQueuedResponses += 1; },
+    mutateAvailability: (value) => { availabilityState = structuredClone(value); },
+    setBarberId: (value) => { selectedBarberId = value; },
+    snapshot,
+    getState: () => ({
+      bookingState: structuredClone(state),
+      barberId: selectedBarberId,
+      availability: structuredClone(availabilityState),
+      bufferedTranscript,
+      deliveryReady,
+      bookingAttempted,
+      bookingFinalized,
+      recoveryCount,
+      ordinaryResponsesProcessed,
+      competingQueuedResponses,
+      activeResponseId,
+      responseActive,
+      createdResponses: structuredClone(createdResponses),
+    }),
+  };
+};
 
 const decodedBase64Length = (value) => {
   if (typeof value !== "string" || !value) return 0;
@@ -811,7 +1172,7 @@ const detectCallerLanguagePreference = (text, currentLanguage) => {
   return Math.abs(spanishScore - englishScore) >= 2 ? preferredLanguage : null;
 };
 
-export const attachMediaWebSocketServer = (server) => {
+export const attachMediaWebSocketServer = (server, dependencies = {}) => {
   console.log("🔰 attachMediaWebSocketServer() called");
 
   const wss = new WebSocketServer({ noServer: true });
@@ -1148,6 +1509,11 @@ export const attachMediaWebSocketServer = (server) => {
     let responseCreateSendReason = null;
     let approvedResponseCreateSendInProgress = false;
     let pendingAssistantResponse = null;
+    let pendingResponsePurposeMetadata = null;
+    const responseLifecycleById = new Map();
+    const playbackMarkToResponseId = new Map();
+    let confirmationDeliveryReady = false;
+    let activeConfirmationLifecycleId = "";
     let lastSpeakExactStatus = null;
     let lastUserSpokeAt = 0;
     let assistantResponseText = "";
@@ -1188,6 +1554,30 @@ export const attachMediaWebSocketServer = (server) => {
     let finalConfirmationResponseId = "";
     let finalConfirmationPlaybackMarkName = "";
     let endingCall = false;
+
+    const captureBookingSnapshot = () => cloneBookingDomainSnapshot({
+      bookingState,
+      barberId,
+      availability: {
+        slotChecked,
+        slotAvailable,
+        slotAlternatives,
+        lastAvailabilityCheckKey,
+        lastUnavailableInjectionKey,
+      },
+    });
+
+    const restoreBookingSnapshot = (snapshot) => {
+      const restored = restoreBookingDomainSnapshot({ targetBookingState: bookingState, snapshot });
+      barberId = restored.barberId;
+      slotChecked = restored.availability.slotChecked === true;
+      slotAvailable = restored.availability.slotAvailable ?? false;
+      slotAlternatives = Array.isArray(restored.availability.slotAlternatives)
+        ? restored.availability.slotAlternatives
+        : [];
+      lastAvailabilityCheckKey = restored.availability.lastAvailabilityCheckKey || "";
+      lastUnavailableInjectionKey = restored.availability.lastUnavailableInjectionKey || "";
+    };
 
     const bookingStateSnapshotForLog = () => ({
       intent: bookingState.intent,
@@ -1353,7 +1743,10 @@ export const attachMediaWebSocketServer = (server) => {
     };
 
     const isAssistantIdle = (reason = "unknown") => {
-      const inputReady = readyForCallerInput || reason === "greeting";
+      const inputReady =
+        readyForCallerInput ||
+        reason === "greeting" ||
+        reason === "confirmation_max_output_tokens_retry";
       return (
         inputReady &&
         !callerSpeaking &&
@@ -1508,14 +1901,9 @@ export const attachMediaWebSocketServer = (server) => {
     };
 
     const isQueuedConfirmationPrompt = (queued) => {
+      if (queued?.purpose === RESPONSE_PURPOSE.PRE_BOOKING_CONFIRMATION) return true;
       if (queued?.promptType === "confirmation") return true;
-      const text = queuedInstructionTextFor(queued);
-      return (
-        text.includes("should i confirm") ||
-        text.includes("confirm that appointment") ||
-        text.includes("quieres que confirme") ||
-        text.includes("dime si para confirmar")
-      );
+      return isConfirmationPromptText(queuedInstructionTextFor(queued));
     };
 
     const hasConfirmationPromptState = () =>
@@ -1589,7 +1977,7 @@ export const attachMediaWebSocketServer = (server) => {
       });
     };
 
-    const sendResponseCreate = (payload, reason = "unknown") => {
+    const sendResponseCreate = (payload, reason = "unknown", metadata = {}) => {
       if (!canSendAI()) return false;
       if (!isAssistantIdle(reason)) {
         logResponseCreateBlockedNotIdle(reason);
@@ -1617,6 +2005,13 @@ export const attachMediaWebSocketServer = (server) => {
         readyForCallerInput = previousReadyForCallerInput;
         return false;
       }
+      pendingResponsePurposeMetadata = {
+        purpose: metadata.purpose || null,
+        maxOutputTokens: payload?.response?.max_output_tokens ?? null,
+        retryCount: Number(metadata.retryCount || 0),
+        exactInstructions: metadata.exactInstructions || payload?.response?.instructions || "",
+        bookingSnapshot: metadata.bookingSnapshot || null,
+      };
       if (CONTROLLED_AUDIO_TRACE_ENABLED) {
         pendingExpectedResponseMetadata = diagnosticAttempt(() => {
           const expected = extractExpectedResponseText(payload?.response?.instructions);
@@ -2308,13 +2703,7 @@ export const attachMediaWebSocketServer = (server) => {
         return queueExactForPlayback(reason);
       }
 
-      const responseCreatePayload = {
-        type: "response.create",
-        response: {
-          instructions: exactInstructions,
-          max_output_tokens: 160,
-        },
-      };
+      const responseCreatePayload = buildExactResponseRequest(exactInstructions);
       const sent = sendResponseCreate(responseCreatePayload, reason);
       status.sent = Boolean(sent);
       if (sent && isFinalConfirmation) {
@@ -2342,7 +2731,7 @@ export const attachMediaWebSocketServer = (server) => {
       startOutboundKeepalive("booking_execution");
 
       try {
-        const result = await bookAppointment({
+        const result = await (dependencies.bookAppointment || bookAppointment)({
           barberId,
           phone: callerNumber,
           name: bookingState.name,
@@ -2740,7 +3129,7 @@ RULES:
           reply,
           state: bookingDecisionState(),
         });
-        const isConfirmationPrompt =
+        const shouldSpeakPreBookingConfirmation =
           bookingState.intent === "BOOK" &&
           bookingState.service &&
           bookingState.name &&
@@ -2748,12 +3137,18 @@ RULES:
           bookingState.parsedTime &&
           slotChecked &&
           slotAvailable === true &&
-          bookingState.awaitingAlternativeSelection !== true &&
-          !bookingState.confirmationPromptRequested &&
+          bookingState.confirmed !== true &&
+          bookingState.bookingAttempted !== true &&
+          bookingState.bookingFinalized !== true &&
+          bookingState.awaitingAlternativeSelection !== true;
+        const isConfirmationPrompt = Boolean(
+          shouldSpeakPreBookingConfirmation ||
           (
             reply.includes("¿Quieres que confirme") ||
+            isConfirmationPromptText(reply) ||
             reply.includes("Should I confirm")
-          );
+          )
+        );
         const isNamePrompt =
           bookingState.intent === "BOOK" &&
           !bookingState.name &&
@@ -2765,7 +3160,13 @@ RULES:
             bookingState.awaitingAlternativeSelection === true ||
             (slotChecked && slotAvailable === false)
           );
-        const deterministicMaxTokens = isAlternativePrompt ? 80 : 120;
+        const responsePurpose = isConfirmationPrompt
+          ? RESPONSE_PURPOSE.PRE_BOOKING_CONFIRMATION
+          : null;
+        const deterministicMaxTokens = deterministicResponseBudget({
+          isAlternative: isAlternativePrompt,
+          purpose: responsePurpose,
+        });
 
         console.log("[DETERMINISTIC_BOOKING_REPLY]", {
           reply,
@@ -2785,9 +3186,18 @@ RULES:
         });
 
         const exactInstructions = `Say this exactly and only this: "${reply}"`;
+        const bookingSnapshot = isConfirmationPrompt ? captureBookingSnapshot() : null;
+        const deterministicRequest = buildDeterministicResponseRequest({
+          exactInstructions,
+          purpose: responsePurpose,
+          isAlternative: isAlternativePrompt,
+          retryCount: 0,
+          bookingSnapshot,
+        });
 
         if (responseActive === true || assistantSpeaking === true || responseInFlightId) {
           if (isConfirmationPrompt) {
+            confirmationDeliveryReady = false;
             bookingState.confirmationPromptRequested = true;
             bookingState.askedConfirm = true;
             console.log("[CONFIRMATION_PROMPT_QUEUED]", {
@@ -2805,10 +3215,13 @@ RULES:
             lang: currentLanguage,
             immediate,
             promptType: isConfirmationPrompt ? "confirmation" : isNamePrompt ? "name" : null,
+            purpose: responsePurpose,
             deterministicBooking: true,
             bookingPhase: getBookingPhase(),
             stateKey: buildBookingStateKey(),
-            maxOutputTokens: deterministicMaxTokens,
+            maxOutputTokens: deterministicRequest.queued.maxOutputTokens,
+            retryCount: 0,
+            bookingSnapshot,
           }, reason);
 
           console.log("[QUEUE_DETERMINISTIC_BOOKING_REPLY]", {
@@ -2825,6 +3238,7 @@ RULES:
         if (aiResponseInProgress) return;
 
         if (isConfirmationPrompt) {
+          confirmationDeliveryReady = false;
           bookingState.confirmationPromptRequested = true;
           bookingState.askedConfirm = true;
           console.log("[CONFIRMATION_PROMPT_REQUESTED]", {
@@ -2836,15 +3250,14 @@ RULES:
           });
         }
 
-        const responseCreatePayload = {
-          type: "response.create",
-          response: {
-            instructions: exactInstructions,
-            max_output_tokens: deterministicMaxTokens,
-          },
-        };
+        const responseCreatePayload = deterministicRequest.payload;
 
-        const sent = sendResponseCreate(responseCreatePayload, reason);
+        const sent = sendResponseCreate(responseCreatePayload, reason, {
+          purpose: responsePurpose,
+          retryCount: 0,
+          exactInstructions,
+          bookingSnapshot,
+        });
         if (!sent) return;
 
         console.log(
@@ -3035,7 +3448,10 @@ RULES:
 
     const flushQueuedAssistantResponse = async (reason = "unknown") => {
       const queuedAssistantResponse = pendingAssistantResponse;
-      if (!isAssistantIdle()) {
+      const idleReason = queuedAssistantResponse?.reason === "confirmation_max_output_tokens_retry"
+        ? "confirmation_max_output_tokens_retry"
+        : reason;
+      if (!isAssistantIdle(idleReason)) {
         deferFlushUntilCallerStops = true;
         console.log("[FLUSH_DEFERRED_NOT_IDLE]", {
           reason,
@@ -3144,7 +3560,7 @@ RULES:
         return true;
       }
 
-      if (!isAssistantIdle()) {
+      if (!isAssistantIdle(idleReason)) {
         deferFlushUntilCallerStops = true;
         pendingAssistantResponse = queued;
         console.log("[FLUSH_ABORTED_NOT_IDLE_AT_SEND]", {
@@ -3161,15 +3577,10 @@ RULES:
 
       // If queued response has exact instructions (e.g. from speakExact), use them directly
       if (queued.exactInstructions) {
-        const payload = {
-          type: "response.create",
-          response: {
-            instructions: queued.exactInstructions,
-            max_output_tokens: queued.maxOutputTokens || 250,
-          },
-        };
+        const queuedResponse = materializeQueuedExactResponse(queued);
+        const payload = queuedResponse.payload;
         console.log("[FLUSH_QUEUED_SPEAK_EXACT]", { reason: queued.reason });
-        const sent = sendResponseCreate(payload, queued.reason || reason);
+        const sent = sendResponseCreate(payload, queued.reason || reason, queuedResponse.metadata);
         if (!sent) {
           pendingAssistantResponse = queued;
           if (queued.finalConfirmation === true) finalConfirmationQueuedForPlayback = true;
@@ -3237,62 +3648,89 @@ RULES:
     const clearTwilioPlaybackForBargeIn = async (reason, details = {}) => {
       if (!(assistantPlaybackActive || pendingAssistantMarkName)) return false;
 
-      if (twilioWs.readyState === twilioWs.OPEN && streamSid) {
-        twilioWs.send(JSON.stringify({
-          event: "clear",
-          streamSid,
-        }));
-        diagnosticAttempt(() => {
-          const responseTrace = responseTraceFor(responseInFlightId, lastOpenAiItemId, {
-            responseCorrelation: responseInFlightId ? "direct_in_flight" : "fallback_or_unassigned",
-            itemCorrelation: lastOpenAiItemId ? "last_item_fallback" : "unassigned",
-          });
-          if (responseTrace) responseTrace.clearOccurred = true;
-          const elapsedPlaybackSeconds = responseTrace?.firstMediaAt
-            ? Math.max(0, (Date.now() - responseTrace.firstMediaAt) / 1000)
-            : 0;
-          const estimatedOutstandingPlaybackSeconds = Math.max(
-            0,
-            (responseTrace?.submittedBytes || 0) / PCMU_BYTES_PER_SECOND - elapsedPlaybackSeconds
-          );
-          traceLog("twilio.clear.submitted", {
-            responseId: responseTrace?.responseId || null,
-            itemId: responseTrace?.itemId || null,
-            correlationUniquelyProven: responseTrace?.correlationUniquelyProven === true,
-            markName: pendingAssistantMarkName || null,
-            reason,
-            triggeringEvent: details.triggeringEvent || reason,
-            callerSpeaking,
-            assistantGenerationActive: responseActive,
-            assistantPlaybackActive,
-            cumulativeAudioBytesSubmitted: responseTrace?.submittedBytes || 0,
-            estimatedOutstandingSubmittedAudioSeconds: estimatedOutstandingPlaybackSeconds,
-            asynchronousDeliveryStatus: "unknown",
-            readyState: twilioWs.readyState,
-            bufferedAmount: twilioWs.bufferedAmount,
-          });
-          if (pendingAssistantMarkName && markCorrelations) {
-            markCorrelations.delete(pendingAssistantMarkName);
-          }
-        });
+      const clearedMarkName = pendingAssistantMarkName;
+      const clearedResponseId =
+        responseInFlightId ||
+        playbackMarkToResponseId.get(clearedMarkName) ||
+        activeConfirmationLifecycleId;
+      const lifecycleRecord = responseLifecycleById.get(clearedResponseId);
+      if (lifecycleRecord) {
+        lifecycleRecord.audioInvalidated = true;
+        lifecycleRecord.transportFailureReason = reason || "explicit_clear";
       }
-      clearAssistantPlaybackWatchdog();
-      assistantPlaybackActive = false;
-      assistantSpeaking = false;
-      pendingAssistantMarkName = null;
-      assistantAudioSentThisResponse = false;
-      assistantAudioDeltaCount = 0;
-      pendingBargeInStartedAt = null;
-      pendingBargeInAudioStartMs = null;
-      pendingBargeInWhilePlayback = false;
-      readyForCallerInput = true;
-      console.log("[TWILIO_PLAYBACK_CLEARED_ON_BARGE_IN_CALLER_INPUT_READY]", {
-        reason,
-        responseActive,
-        responseInFlightId,
-        readyForCallerInput,
-        ...details,
-      });
+
+      try {
+        if (twilioWs.readyState === twilioWs.OPEN && streamSid) {
+          twilioWs.send(JSON.stringify({
+            event: "clear",
+            streamSid,
+          }));
+          diagnosticAttempt(() => {
+            const responseTrace = responseTraceFor(responseInFlightId, lastOpenAiItemId, {
+              responseCorrelation: responseInFlightId ? "direct_in_flight" : "fallback_or_unassigned",
+              itemCorrelation: lastOpenAiItemId ? "last_item_fallback" : "unassigned",
+            });
+            if (responseTrace) responseTrace.clearOccurred = true;
+            const elapsedPlaybackSeconds = responseTrace?.firstMediaAt
+              ? Math.max(0, (Date.now() - responseTrace.firstMediaAt) / 1000)
+              : 0;
+            const estimatedOutstandingPlaybackSeconds = Math.max(
+              0,
+              (responseTrace?.submittedBytes || 0) / PCMU_BYTES_PER_SECOND - elapsedPlaybackSeconds
+            );
+            traceLog("twilio.clear.submitted", {
+              responseId: responseTrace?.responseId || null,
+              itemId: responseTrace?.itemId || null,
+              correlationUniquelyProven: responseTrace?.correlationUniquelyProven === true,
+              markName: pendingAssistantMarkName || null,
+              reason,
+              triggeringEvent: details.triggeringEvent || reason,
+              callerSpeaking,
+              assistantGenerationActive: responseActive,
+              assistantPlaybackActive,
+              cumulativeAudioBytesSubmitted: responseTrace?.submittedBytes || 0,
+              estimatedOutstandingSubmittedAudioSeconds: estimatedOutstandingPlaybackSeconds,
+              asynchronousDeliveryStatus: "unknown",
+              readyState: twilioWs.readyState,
+              bufferedAmount: twilioWs.bufferedAmount,
+            });
+            if (pendingAssistantMarkName && markCorrelations) {
+              markCorrelations.delete(pendingAssistantMarkName);
+            }
+          });
+        }
+      } catch (clearSendError) {
+        if (lifecycleRecord?.purpose === RESPONSE_PURPOSE.PRE_BOOKING_CONFIRMATION) {
+          lifecycleRecord.transportAvailable = false;
+          lifecycleRecord.transportFailureReason = "twilio_clear_send_failed";
+        }
+      } finally {
+        clearAssistantPlaybackWatchdog();
+        assistantPlaybackActive = false;
+        assistantSpeaking = false;
+        pendingAssistantMarkName = null;
+        if (clearedMarkName) playbackMarkToResponseId.delete(clearedMarkName);
+        assistantAudioSentThisResponse = false;
+        assistantAudioDeltaCount = 0;
+        pendingBargeInStartedAt = null;
+        pendingBargeInAudioStartMs = null;
+        pendingBargeInWhilePlayback = false;
+        if (responseInFlightId === clearedResponseId) responseInFlightId = "";
+        readyForCallerInput = lifecycleRecord?.purpose === RESPONSE_PURPOSE.PRE_BOOKING_CONFIRMATION
+          ? false
+          : true;
+        console.log("[TWILIO_PLAYBACK_CLEARED_ON_BARGE_IN_CALLER_INPUT_READY]", {
+          reason,
+          responseActive,
+          responseInFlightId,
+          readyForCallerInput,
+          ...details,
+        });
+        if (lifecycleRecord?.purpose === RESPONSE_PURPOSE.PRE_BOOKING_CONFIRMATION) {
+          await applyConfirmationLifecycle(lifecycleRecord);
+        }
+      }
+      if (lifecycleRecord?.purpose === RESPONSE_PURPOSE.PRE_BOOKING_CONFIRMATION) return true;
       const processedBuffered = await processBufferedCallerTranscript(reason);
       if (processedBuffered) {
         console.log("[FLUSH_DEFERRED_PENDING_CALLER_TRANSCRIPT]", {
@@ -3302,9 +3740,7 @@ RULES:
       return true;
     };
 
-    const startAssistantPlaybackWatchdog = () => {
-      clearAssistantPlaybackWatchdog();
-      assistantPlaybackWatchdogTimer = setTimeout(() => {
+    const handleAssistantPlaybackWatchdogExpiry = async () => {
         console.log("[TWILIO_PLAYBACK_WATCHDOG_RESET_CALLER_INPUT_READY]", {
           assistantPlaybackActive,
           pendingAssistantMarkName,
@@ -3322,6 +3758,16 @@ RULES:
           return;
         }
 
+        const lifecycleRecord = responseLifecycleById.get(responseInFlightId);
+        if (lifecycleRecord?.purpose === RESPONSE_PURPOSE.PRE_BOOKING_CONFIRMATION) {
+          lifecycleRecord.audioInvalidated = true;
+          lifecycleRecord.transportFailureReason = "playback_watchdog_expired";
+          clearAssistantPlaybackState();
+          readyForCallerInput = false;
+          await applyConfirmationLifecycle(lifecycleRecord);
+          return;
+        }
+
         clearAssistantPlaybackState();
         processBufferedCallerTranscript("playback_watchdog_reset").then((processedBuffered) => {
           if (!processedBuffered) {
@@ -3331,12 +3777,24 @@ RULES:
           console.error("[BUFFERED_TRANSCRIPT_PROCESSING_ERROR]", err);
           scheduleQueuedAssistantFlush("twilio_playback_watchdog_reset");
         });
+    };
+
+    const startAssistantPlaybackWatchdog = () => {
+      clearAssistantPlaybackWatchdog();
+      assistantPlaybackWatchdogTimer = setTimeout(() => {
+        void handleAssistantPlaybackWatchdogExpiry();
       }, 12000);
     };
 
     const sendAssistantPlaybackMark = (reason = "unknown") => {
       if (!assistantAudioSentThisResponse || pendingAssistantMarkName) return false;
       if (twilioWs.readyState !== twilioWs.OPEN || !streamSid) {
+        const lifecycleRecord = responseLifecycleById.get(responseInFlightId);
+        if (lifecycleRecord?.purpose === RESPONSE_PURPOSE.PRE_BOOKING_CONFIRMATION) {
+          lifecycleRecord.audioInvalidated = true;
+          lifecycleRecord.transportAvailable = false;
+          lifecycleRecord.transportFailureReason = "playback_mark_transport_unavailable";
+        }
         console.log("[TWILIO_PLAYBACK_MARK_SKIPPED]", {
           reason,
           hasStreamSid: Boolean(streamSid),
@@ -3353,6 +3811,11 @@ RULES:
           });
         }
         clearAssistantPlaybackState();
+        if (lifecycleRecord?.purpose === RESPONSE_PURPOSE.PRE_BOOKING_CONFIRMATION) {
+          readyForCallerInput = false;
+          void applyConfirmationLifecycle(lifecycleRecord);
+          return false;
+        }
         scheduleQueuedAssistantFlush("twilio_playback_mark_unavailable");
         return false;
       }
@@ -3360,6 +3823,11 @@ RULES:
       assistantTurnSeq += 1;
       const markName = `assistant-playback-${assistantTurnSeq}`;
       pendingAssistantMarkName = markName;
+      const lifecycleRecord = responseLifecycleById.get(responseInFlightId);
+      if (lifecycleRecord) {
+        lifecycleRecord.playbackMark = markName;
+        playbackMarkToResponseId.set(markName, lifecycleRecord.responseId);
+      }
       if (
         finalConfirmationCallEndArmed &&
         !finalConfirmationPlaybackMarkName &&
@@ -3367,13 +3835,26 @@ RULES:
       ) {
         finalConfirmationPlaybackMarkName = markName;
       }
-      twilioWs.send(JSON.stringify({
-        event: "mark",
-        streamSid,
-        mark: {
-          name: markName,
-        },
-      }));
+      try {
+        twilioWs.send(JSON.stringify({
+          event: "mark",
+          streamSid,
+          mark: {
+            name: markName,
+          },
+        }));
+        if (lifecycleRecord) lifecycleRecord.markSent = true;
+      } catch (markSendError) {
+        if (lifecycleRecord?.purpose === RESPONSE_PURPOSE.PRE_BOOKING_CONFIRMATION) {
+          lifecycleRecord.audioInvalidated = true;
+          lifecycleRecord.transportFailureReason = "playback_mark_send_failed";
+          playbackMarkToResponseId.delete(markName);
+          clearAssistantPlaybackState();
+          readyForCallerInput = false;
+          void applyConfirmationLifecycle(lifecycleRecord);
+        }
+        return false;
+      }
       diagnosticAttempt(() => {
         const responseTrace = responseTraceFor(responseInFlightId, lastOpenAiItemId, {
           responseCorrelation: responseInFlightId ? "direct_in_flight" : "fallback_or_unassigned",
@@ -4248,7 +4729,8 @@ RULES:
 
       const awaitingConfirmationResponse =
         bookingState.intent === "BOOK" &&
-        (bookingState.askedConfirm === true || bookingState.confirmationPromptRequested === true);
+        (bookingState.askedConfirm === true || bookingState.confirmationPromptRequested === true) &&
+        confirmationDeliveryReady === true;
 
       if (awaitingConfirmationResponse && isNo(transcriptText)) {
         bookingState.confirmed = false;
@@ -4314,6 +4796,91 @@ RULES:
       });
     }
 
+    const applyConfirmationLifecycle = async (record) => {
+      if (record?.purpose !== RESPONSE_PURPOSE.PRE_BOOKING_CONFIRMATION) return "not_confirmation";
+
+      const action = confirmationLifecycleAction(record);
+      if (!["advance", "retry", "recover"].includes(action)) return action;
+
+      record.lifecycleActionHandled = true;
+      if (activeConfirmationLifecycleId === record.responseId) {
+        activeConfirmationLifecycleId = "";
+      }
+      confirmationDeliveryReady = false;
+      readyForCallerInput = false;
+
+      if (action === "advance") {
+        confirmationDeliveryReady = true;
+        readyForCallerInput = true;
+        await processBufferedCallerTranscript("confirmation_delivery_completed");
+        return "advance";
+      }
+
+      // Speech associated with an unsuccessful delivery can never confirm the booking.
+      bufferedCallerTranscript = null;
+      bufferedCallerTranscriptAt = null;
+      bufferedCallerTranscriptPriority = "";
+
+      if (action === "retry") {
+        restoreBookingSnapshot(record.bookingSnapshot);
+        bookingState.askedConfirm = true;
+        bookingState.confirmationPromptRequested = true;
+        bookingState.confirmed = false;
+        const retrySnapshot = captureBookingSnapshot();
+        const retryRequest = buildDeterministicResponseRequest({
+          exactInstructions: record.exactInstructions,
+          purpose: RESPONSE_PURPOSE.PRE_BOOKING_CONFIRMATION,
+          retryCount: record.retryCount + 1,
+          bookingSnapshot: retrySnapshot,
+        });
+
+        queueAssistantResponse({
+          ...retryRequest.queued,
+          reason: "confirmation_max_output_tokens_retry",
+          lang: currentLanguage,
+          immediate: true,
+          promptType: "confirmation",
+          deterministicBooking: true,
+          bookingPhase: getBookingPhase(),
+          stateKey: buildBookingStateKey(),
+        }, "confirmation_max_output_tokens_retry");
+        scheduleQueuedAssistantFlush("confirmation_max_output_tokens_retry");
+        return "retry";
+      }
+
+      bookingState.askedConfirm = false;
+      bookingState.confirmationPromptRequested = false;
+      if (record.transportAvailable === false) {
+        bufferedCallerTranscript = null;
+        return "recover";
+      }
+      speakExact(
+        currentLanguage === "es"
+          ? "No pude completar la confirmación. Repasemos la cita otra vez."
+          : "I couldn't complete the confirmation. Let's review the appointment again.",
+        { reason: "confirmation_retry_failed_recovery" }
+      );
+      return "recover";
+    };
+
+    const invalidateActiveConfirmationTransport = async (reason) => {
+      const activeResponseId =
+        responseInFlightId ||
+        playbackMarkToResponseId.get(pendingAssistantMarkName) ||
+        activeConfirmationLifecycleId;
+      const record = responseLifecycleById.get(activeResponseId);
+      if (record?.purpose !== RESPONSE_PURPOSE.PRE_BOOKING_CONFIRMATION) return false;
+      record.audioInvalidated = true;
+      record.transportAvailable = false;
+      record.transportFailureReason = reason;
+      clearAssistantPlaybackWatchdog();
+      bufferedCallerTranscript = null;
+      bufferedCallerTranscriptAt = null;
+      bufferedCallerTranscriptPriority = "";
+      await applyConfirmationLifecycle(record);
+      return true;
+    };
+
     // ----------------------------
     // Create AI Session (with strict guard)
     // ----------------------------
@@ -4327,7 +4894,7 @@ RULES:
       aiSessionCreated = true;
       console.log("🔄 Creating OpenAI session...");
 
-      ai = createOpenAISession();
+      ai = (dependencies.createOpenAISession || createOpenAISession)();
       installAISendGuards();
 
       ai.on("open", () => {
@@ -4377,11 +4944,37 @@ RULES:
         }
 
         const isTerminalResponseEvent = terminalResponseEvents.has(evt.type);
+        const eventResponseId = evt.response?.id || evt.response_id || "";
 
         if (evt.type === "response.created") {
           responseActive = true;
           assistantAudioDeltaCount = 0;
           responseInFlightId = evt.response?.id || evt.response_id || responseInFlightId;
+          if (responseInFlightId) {
+            const metadata = pendingResponsePurposeMetadata || {};
+            responseLifecycleById.set(responseInFlightId, {
+              responseId: responseInFlightId,
+              purpose: metadata.purpose || null,
+              maxOutputTokens: metadata.maxOutputTokens ?? null,
+              openAiStatus: null,
+              statusReason: null,
+              outputAudioEnded: false,
+              audioSubmitted: false,
+              playbackMark: null,
+              markSent: false,
+              playbackMarkAcknowledged: false,
+              retryCount: metadata.retryCount || 0,
+              audioInvalidated: false,
+              transportAvailable: true,
+              lifecycleActionHandled: false,
+              exactInstructions: metadata.exactInstructions || "",
+              bookingSnapshot: metadata.bookingSnapshot || null,
+            });
+            if (metadata.purpose === RESPONSE_PURPOSE.PRE_BOOKING_CONFIRMATION) {
+              activeConfirmationLifecycleId = responseInFlightId;
+            }
+            pendingResponsePurposeMetadata = null;
+          }
           if (CONTROLLED_AUDIO_TRACE_ENABLED) diagnosticAttempt(() => {
             lastOpenAiResponseId = responseInFlightId || lastOpenAiResponseId;
             const directResponseId = evt.response?.id || evt.response_id || "";
@@ -4408,10 +5001,10 @@ RULES:
             finalConfirmationResponseId = responseInFlightId || "";
             finalConfirmationAwaitingResponseCreated = false;
           }
-        } else if (evt.response?.id) {
+        } else if (!isTerminalResponseEvent && evt.response?.id) {
           responseInFlightId = evt.response.id;
           if (CONTROLLED_AUDIO_TRACE_ENABLED) lastOpenAiResponseId = responseInFlightId;
-        } else if (evt.response_id) {
+        } else if (!isTerminalResponseEvent && evt.response_id) {
           responseInFlightId = evt.response_id;
           if (CONTROLLED_AUDIO_TRACE_ENABLED) lastOpenAiResponseId = responseInFlightId;
         }
@@ -4609,6 +5202,15 @@ RULES:
 
         if (evt.type === "response.done" || evt.type === "response.completed") {
           const response = evt.response || {};
+          if (evt.type === "response.done") {
+            const completedResponseId = response.id || evt.response_id || responseInFlightId;
+            const completedLifecycle = responseLifecycleById.get(completedResponseId);
+            if (completedLifecycle) {
+              completedLifecycle.openAiStatus = response.status || null;
+              completedLifecycle.statusReason = response.status_details?.reason || null;
+              await applyConfirmationLifecycle(completedLifecycle);
+            }
+          }
           if (CONTROLLED_AUDIO_TRACE_ENABLED) diagnosticAttempt(() => {
           const directResponseId = response.id || evt.response_id || "";
           const responseId = directResponseId || responseInFlightId || lastOpenAiResponseId;
@@ -4681,7 +5283,21 @@ RULES:
           });
         }
 
-        if (evt.type === "response.done") {
+        if (evt.type === "response.cancelled") {
+          const cancelledResponseId = eventResponseId || responseInFlightId;
+          const cancelledLifecycle = responseLifecycleById.get(cancelledResponseId);
+          if (cancelledLifecycle) {
+            cancelledLifecycle.openAiStatus = "cancelled";
+            cancelledLifecycle.statusReason =
+              evt.reason || evt.status_details?.reason || evt.response?.status_details?.reason || "cancelled";
+            await applyConfirmationLifecycle(cancelledLifecycle);
+          }
+        }
+
+        if (
+          evt.type === "response.done" &&
+          terminalEventBelongsToActiveResponse(responseInFlightId, eventResponseId)
+        ) {
           if (greetingSent && !greetingComplete) {
             greetingComplete = true;
             responseActive = false;
@@ -4853,6 +5469,16 @@ RULES:
                 })
               );
               submissionReturned = true;
+              const lifecycleRecord = responseLifecycleById.get(evt.response_id || responseInFlightId);
+              if (lifecycleRecord) lifecycleRecord.audioSubmitted = true;
+            } catch (sendError) {
+              const lifecycleRecord = responseLifecycleById.get(evt.response_id || responseInFlightId);
+              if (lifecycleRecord?.purpose === RESPONSE_PURPOSE.PRE_BOOKING_CONFIRMATION) {
+                lifecycleRecord.audioInvalidated = true;
+                lifecycleRecord.transportFailureReason = "media_send_failed";
+                await applyConfirmationLifecycle(lifecycleRecord);
+              }
+              return;
             } finally {
               accountAudioDelta(evt, submissionReturned ? "submitted" : "send_threw");
             }
@@ -4871,10 +5497,20 @@ RULES:
             }
           } else {
             accountAudioDelta(evt, "twilio_unavailable");
+            const lifecycleRecord = responseLifecycleById.get(evt.response_id || responseInFlightId);
+            if (lifecycleRecord?.purpose === RESPONSE_PURPOSE.PRE_BOOKING_CONFIRMATION) {
+              lifecycleRecord.audioInvalidated = true;
+              lifecycleRecord.transportAvailable = false;
+              lifecycleRecord.transportFailureReason = "media_transport_unavailable";
+              await applyConfirmationLifecycle(lifecycleRecord);
+            }
           }
         }
 
         if (playbackCompleteEvents.has(evt.type)) {
+          const audioResponseId = evt.response_id || responseInFlightId;
+          const audioLifecycle = responseLifecycleById.get(audioResponseId);
+          if (audioLifecycle) audioLifecycle.outputAudioEnded = true;
           traceLog("openai.audio.done", {
             responseId: evt.response_id || responseInFlightId || lastOpenAiResponseId || null,
             itemId: evt.item_id || lastOpenAiItemId || null,
@@ -4895,7 +5531,12 @@ RULES:
           });
         }
 
-        if (isTerminalResponseEvent) {
+        const terminalResponseId = eventResponseId || responseInFlightId;
+        const terminalBelongsToActiveResponse = terminalEventBelongsToActiveResponse(
+          responseInFlightId,
+          terminalResponseId
+        );
+        if (isTerminalResponseEvent && terminalBelongsToActiveResponse) {
           responseActive = false;
           aiResponseInProgress = false;
           if (assistantAudioSentThisResponse && playbackCompleteEvents.has(evt.type)) {
@@ -4987,6 +5628,9 @@ RULES:
 
       if (msg.event === "mark" && msg.mark?.name === pendingAssistantMarkName) {
         const markName = msg.mark?.name;
+        const markedResponseId = playbackMarkToResponseId.get(markName);
+        const lifecycleRecord = responseLifecycleById.get(markedResponseId);
+        if (lifecycleRecord) lifecycleRecord.playbackMarkAcknowledged = true;
         const markRecord = diagnosticAttempt(() => markCorrelations?.get(markName) || null, null);
         traceLog("twilio.mark.acknowledged", {
           responseId: markRecord?.responseId || null,
@@ -5008,7 +5652,14 @@ RULES:
         pendingBargeInAudioStartMs = null;
         pendingBargeInWhilePlayback = false;
         responseInFlightId = "";
-        readyForCallerInput = true;
+        readyForCallerInput = lifecycleRecord?.purpose === RESPONSE_PURPOSE.PRE_BOOKING_CONFIRMATION
+          ? false
+          : true;
+
+        if (lifecycleRecord?.purpose === RESPONSE_PURPOSE.PRE_BOOKING_CONFIRMATION) {
+          playbackMarkToResponseId.delete(markName);
+          await applyConfirmationLifecycle(lifecycleRecord);
+        }
 
         console.log("[TWILIO_PLAYBACK_MARK_ACKED_CALLER_INPUT_READY]", {
           markName,
@@ -5016,6 +5667,10 @@ RULES:
           assistantPlaybackActive,
           assistantSpeaking,
         });
+
+        if (lifecycleRecord?.purpose === RESPONSE_PURPOSE.PRE_BOOKING_CONFIRMATION) {
+          return;
+        }
 
         const shouldEndAfterFinalConfirmationPlayback =
           bookingState.bookingFinalized === true &&
@@ -5132,6 +5787,7 @@ RULES:
 
     twilioWs.on("close", (code, reasonBuffer) => {
       console.log("📴 Twilio WebSocket closed");
+      void invalidateActiveConfirmationTransport("twilio_websocket_closed");
       clearAssistantPlaybackWatchdog();
       stopSilence("twilio_ws_closed");
       if (ai && ai.readyState === ai.OPEN) ai.close();
@@ -5243,6 +5899,7 @@ RULES:
     });
 
     twilioWs.on("error", (err) => {
+      void invalidateActiveConfirmationTransport("twilio_websocket_error");
       traceLog("twilio.websocket.error", {
         errorMessagePresent: Boolean(err.message),
         readyState: twilioWs.readyState,
@@ -5252,9 +5909,59 @@ RULES:
       });
       console.error("❌ Twilio WS Error:", err.message);
     });
+
+    if (typeof dependencies.onSessionReady === "function") {
+      dependencies.onSessionReady({
+        ensureAISession,
+        requestAssistantResponse,
+        flushQueuedAssistantResponse,
+        clearTwilioPlaybackForBargeIn,
+        handleAssistantPlaybackWatchdogExpiry,
+        handleCallerTranscript,
+        executeBookingIfReady,
+        restoreBookingSnapshot,
+        seedBookingState: ({ state = {}, availability = {}, context = {} } = {}) => {
+          Object.assign(bookingState, structuredClone(state));
+          slotChecked = availability.slotChecked === true;
+          slotAvailable = availability.slotAvailable ?? false;
+          slotAlternatives = structuredClone(availability.slotAlternatives || []);
+          barberId = context.barberId ?? barberId;
+          callerNumber = context.callerNumber ?? callerNumber;
+          streamSid = context.streamSid ?? streamSid;
+          currentLanguage = context.currentLanguage || currentLanguage;
+        },
+        setResponseState: (state = {}) => {
+          if (Object.hasOwn(state, "responseInFlightId")) responseInFlightId = state.responseInFlightId;
+          if (Object.hasOwn(state, "responseActive")) responseActive = state.responseActive;
+          if (Object.hasOwn(state, "aiResponseInProgress")) aiResponseInProgress = state.aiResponseInProgress;
+          if (Object.hasOwn(state, "assistantSpeaking")) assistantSpeaking = state.assistantSpeaking;
+          if (Object.hasOwn(state, "assistantPlaybackActive")) assistantPlaybackActive = state.assistantPlaybackActive;
+          if (Object.hasOwn(state, "greetingComplete")) greetingComplete = state.greetingComplete;
+          if (Object.hasOwn(state, "readyForCallerInput")) readyForCallerInput = state.readyForCallerInput;
+          if (Object.hasOwn(state, "pendingAssistantMarkName")) pendingAssistantMarkName = state.pendingAssistantMarkName;
+          if (Object.hasOwn(state, "assistantAudioSentThisResponse")) {
+            assistantAudioSentThisResponse = state.assistantAudioSentThisResponse;
+          }
+        },
+        getState: () => ({
+          bookingState: structuredClone(bookingState),
+          responseInFlightId,
+          responseActive,
+          aiResponseInProgress,
+          assistantSpeaking,
+          assistantPlaybackActive,
+          pendingAssistantMarkName,
+          pendingAssistantResponse: structuredClone(pendingAssistantResponse),
+          confirmationDeliveryReady,
+          activeConfirmationLifecycleId,
+          lifecycleRecords: structuredClone([...responseLifecycleById.entries()]),
+        }),
+      });
+    }
   });
 
   console.log(`🎧 Media WebSocket Ready → ${WS_PATH}`);
+  return wss;
 };
 
 

@@ -13,30 +13,38 @@ import { sendAppointmentConfirmationSms } from "../utils/appointments/appointmen
 /**
  * BOOK an appointment with full availability validation
  */
-export async function bookAppointment({ barberId, phone, name, date, time, service }) {
-  const barber = await Barber.findById(barberId);
+export async function bookAppointment(
+  { barberId, phone, name, date, time, service },
+  dependencies = {}
+) {
+  const BarberModel = dependencies.BarberModel || Barber;
+  const AppointmentModel = dependencies.AppointmentModel || Appointment;
+  const checkSlotAvailable = dependencies.isSlotAvailable || isSlotAvailable;
+  const suggestSlots = dependencies.suggestClosestSlots || suggestClosestSlots;
+  const sendConfirmationSms = dependencies.sendAppointmentConfirmationSms || sendAppointmentConfirmationSms;
+  const barber = await BarberModel.findById(barberId);
   if (!barber) return { error: "Barber not found" };
 
   const tz = barber.availability?.timezone || "America/New_York";
   const durationMinutes = getServiceDurationMinutes(barber, service);
 
-  const available = await isSlotAvailable({ barber, date, time, durationMinutes });
+  const available = await checkSlotAvailable({ barber, date, time, durationMinutes });
   if (!available) {
-    const alternatives = await suggestClosestSlots({ barber, date, durationMinutes });
+    const alternatives = await suggestSlots({ barber, date, durationMinutes });
     return { unavailable: true, alternatives };
   }
 
   // Race condition guard
-  const doubleCheck = await isSlotAvailable({ barber, date, time, durationMinutes });
+  const doubleCheck = await checkSlotAvailable({ barber, date, time, durationMinutes });
   if (!doubleCheck) {
-    const alternatives = await suggestClosestSlots({ barber, date, durationMinutes });
+    const alternatives = await suggestSlots({ barber, date, durationMinutes });
     return { unavailable: true, alternatives };
   }
 
   const startAt = moment.tz(`${date} ${time}`, "YYYY-MM-DD h:mm A", tz).toDate();
   const endAt = moment(startAt).add(durationMinutes, "minutes").toDate();
 
-  const appt = await Appointment.create({
+  const appt = await AppointmentModel.create({
     barberId,
     clientPhone: phone,
     clientName: name,
@@ -49,7 +57,7 @@ export async function bookAppointment({ barberId, phone, name, date, time, servi
     source: "ai",
   });
 
-  await sendAppointmentConfirmationSms(appt);
+  await sendConfirmationSms(appt);
 
   return {
     success: true,
