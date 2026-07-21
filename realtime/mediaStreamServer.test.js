@@ -49,6 +49,7 @@ class FakeSocket extends EventEmitter {
     this.readyState = 1;
     this.sent = [];
     this.throwOn = null;
+    this.closeCount = 0;
   }
 
   send(value) {
@@ -59,6 +60,7 @@ class FakeSocket extends EventEmitter {
   }
 
   close() {
+    this.closeCount += 1;
     this.readyState = 3;
   }
 }
@@ -719,4 +721,111 @@ test("production confirmation path sets guards before await and remains idempote
   assert.equal(controls.getState().bookingState.bookingAttempted, true);
   assert.equal(controls.getState().bookingState.bookingFinalized, true);
   assert.equal(controls.getState().lifecycleRecords.length, lifecycleCountAfterFinalization);
+});
+
+test("production queued final confirmation flushes after completed yes and ends after its mark", async () => {
+  let bookingInvocations = 0;
+  let appointments = 0;
+  let sms = 0;
+  let signalAppointmentCreateStarted;
+  let releaseAppointmentCreate;
+  const appointmentCreateStarted = new Promise((resolve) => { signalAppointmentCreateStarted = resolve; });
+  const appointmentCreateRelease = new Promise((resolve) => { releaseAppointmentCreate = resolve; });
+  const bookingBoundary = (request) => {
+    bookingInvocations += 1;
+    return productionBookAppointment(request, {
+      BarberModel: { findById: async () => ({ availability: { timezone: "America/New_York" } }) },
+      AppointmentModel: {
+        create: async (appointment) => {
+          appointments += 1;
+          signalAppointmentCreateStarted();
+          await appointmentCreateRelease;
+          return { ...appointment, _id: "appt-final-queue" };
+        },
+      },
+      isSlotAvailable: async () => true,
+      sendAppointmentConfirmationSms: async () => { sms += 1; },
+    });
+  };
+  const { ai, twilio, controls } = createProductionSession({ bookAppointment: bookingBoundary });
+
+  await controls.requestAssistantResponse({ immediate: true, reason: "final_queue_confirmation" });
+  await emitOpenAi(ai, { type: "response.created", response: { id: "resp-pre-booking" } });
+  await emitOpenAi(ai, {
+    type: "response.output_audio.delta",
+    response_id: "resp-pre-booking",
+    delta: "AA==",
+  });
+  await emitOpenAi(ai, { type: "response.output_audio.done", response_id: "resp-pre-booking" });
+  await emitOpenAi(ai, {
+    type: "response.done",
+    response: { id: "resp-pre-booking", status: "completed" },
+  });
+  const preBookingMark = controls.getState().pendingAssistantMarkName;
+  await emitTwilio(twilio, { event: "mark", mark: { name: preBookingMark } });
+
+  controls.setResponseState({ callerSpeaking: true });
+  const bookingPromise = controls.handleCallerTranscript("yes");
+  await appointmentCreateStarted;
+  assert.equal(controls.getState().callerSpeaking, true);
+  assert.equal(bookingInvocations, 1);
+  assert.equal(appointments, 1);
+  assert.equal(sms, 0);
+
+  releaseAppointmentCreate();
+  await bookingPromise;
+  const afterTranscript = controls.getState();
+  assert.equal(afterTranscript.callerSpeaking, false);
+  assert.equal(afterTranscript.lastSpeakExactStatus?.queued, true);
+  assert.equal(afterTranscript.pendingAssistantResponse, null);
+  assert.equal(afterTranscript.finalConfirmationSentOnce, true);
+  assert.equal(afterTranscript.finalConfirmationCallEndArmed, true);
+  assert.equal(bookingInvocations, 1);
+  assert.equal(appointments, 1);
+  assert.equal(sms, 1);
+
+  const responseCreates = ai.sent.filter((message) => message.type === "response.create");
+  assert.equal(responseCreates.length, 2);
+  assert.equal(responseCreates.at(-1).response.max_output_tokens, 160);
+
+  await emitOpenAi(ai, { type: "response.created", response: { id: "resp-final-confirmation" } });
+  await emitOpenAi(ai, {
+    type: "response.output_audio.delta",
+    response_id: "resp-final-confirmation",
+    delta: "AA==",
+  });
+  await emitOpenAi(ai, {
+    type: "response.output_audio.done",
+    response_id: "resp-final-confirmation",
+  });
+  await emitOpenAi(ai, {
+    type: "response.done",
+    response: { id: "resp-final-confirmation", status: "completed" },
+  });
+  const finalMark = controls.getState().pendingAssistantMarkName;
+  assert.equal(finalMark, controls.getState().finalConfirmationPlaybackMarkName);
+  assert.equal(twilio.closeCount, 0);
+  await emitTwilio(twilio, { event: "mark", mark: { name: finalMark } });
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  assert.equal(twilio.closeCount, 1);
+
+  await controls.handleCallerTranscript("yes again");
+  await emitTwilio(twilio, { event: "mark", mark: { name: finalMark } });
+  await emitOpenAi(ai, {
+    type: "response.done",
+    response: { id: "resp-pre-booking", status: "completed" },
+  });
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  assert.equal(ai.sent.filter((message) => message.type === "response.create").length, 2);
+  assert.equal(twilio.closeCount, 1);
+  assert.equal(bookingInvocations, 1);
+  assert.equal(appointments, 1);
+  assert.equal(sms, 1);
+  assert.equal(controls.getState().bookingState.bookingFinalized, true);
+  twilio.emit("close", 1000, Buffer.alloc(0));
+  await settle();
+  assert.equal(bookingInvocations, 1);
+  assert.equal(appointments, 1);
+  assert.equal(sms, 1);
+  assert.equal(twilio.closeCount, 1);
 });

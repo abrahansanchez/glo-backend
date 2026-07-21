@@ -2686,6 +2686,7 @@ export const attachMediaWebSocketServer = (server, dependencies = {}) => {
           immediate: true,
           promptType,
           finalConfirmation: isFinalConfirmation,
+          maxOutputTokens: isFinalConfirmation ? 160 : undefined,
         }, queueReason);
         status.queued = true;
         if (isFinalConfirmation) finalConfirmationQueuedForPlayback = true;
@@ -3899,6 +3900,18 @@ RULES:
       if (callerSpeaking) {
         callerSpeaking = false;
         console.log("[CALLER_SPEAKING_STOPPED_AFTER_TRANSCRIPT]", { reason });
+      }
+
+      if (pendingAssistantResponse?.finalConfirmation === true) {
+        const finalConfirmationDispatched = await flushQueuedAssistantResponse(
+          "final_confirmation_after_caller_stopped"
+        );
+        if (finalConfirmationDispatched) return true;
+        if (pendingAssistantResponse?.finalConfirmation === true) {
+          deferFlushUntilCallerStops = true;
+          scheduleQueuedAssistantFlush("final_confirmation_after_caller_stopped_delayed");
+          return true;
+        }
       }
 
       if (deferFlushUntilCallerStops && pendingAssistantResponse) {
@@ -5936,6 +5949,7 @@ RULES:
           if (Object.hasOwn(state, "aiResponseInProgress")) aiResponseInProgress = state.aiResponseInProgress;
           if (Object.hasOwn(state, "assistantSpeaking")) assistantSpeaking = state.assistantSpeaking;
           if (Object.hasOwn(state, "assistantPlaybackActive")) assistantPlaybackActive = state.assistantPlaybackActive;
+          if (Object.hasOwn(state, "callerSpeaking")) callerSpeaking = state.callerSpeaking;
           if (Object.hasOwn(state, "greetingComplete")) greetingComplete = state.greetingComplete;
           if (Object.hasOwn(state, "readyForCallerInput")) readyForCallerInput = state.readyForCallerInput;
           if (Object.hasOwn(state, "pendingAssistantMarkName")) pendingAssistantMarkName = state.pendingAssistantMarkName;
@@ -5950,10 +5964,15 @@ RULES:
           aiResponseInProgress,
           assistantSpeaking,
           assistantPlaybackActive,
+          callerSpeaking,
           pendingAssistantMarkName,
           pendingAssistantResponse: structuredClone(pendingAssistantResponse),
           confirmationDeliveryReady,
           activeConfirmationLifecycleId,
+          finalConfirmationCallEndArmed,
+          finalConfirmationSentOnce,
+          finalConfirmationPlaybackMarkName,
+          lastSpeakExactStatus: structuredClone(lastSpeakExactStatus),
           lifecycleRecords: structuredClone([...responseLifecycleById.entries()]),
         }),
       });

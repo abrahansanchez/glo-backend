@@ -50,19 +50,26 @@ export async function sendAppointmentConfirmationSms(appointment) {
 
       const confirmationMsg = `Hi ${appointment.clientName || "there"}, your ${service} with ${barberDisplayName} is confirmed for ${formattedDate}${formattedTime ? " at " + formattedTime : ""}. Reply CANCEL to cancel.`;
 
-      await twilioClient.messages.create({
+      const message = await twilioClient.messages.create({
         to: clientPhone,
         from: fromNumber,
         body: confirmationMsg,
       });
-      console.log(`[CONFIRMATION_SMS] sent to ${clientPhone} for barberId=${getBarberId(appointment)}`);
+      console.log("[CONFIRMATION_SMS_SUBMITTED]", {
+        messageSid: message?.sid || null,
+        initialStatus: message?.status || null,
+      });
     } else {
-      console.log(
-        `[CONFIRMATION_SMS] skipped - missing clientPhone=${clientPhone} or fromNumber=${fromNumber}`
-      );
+      console.log("[CONFIRMATION_SMS_SKIPPED]", {
+        hasClientPhone: Boolean(clientPhone),
+        hasFromNumber: Boolean(fromNumber),
+      });
     }
   } catch (smsErr) {
-    console.error("[CONFIRMATION_SMS] failed:", smsErr?.message);
+    console.error("[CONFIRMATION_SMS_FAILED]", {
+      errorCode: smsErr?.code ?? null,
+      errorMessage: smsErr?.message || "Unknown Twilio submission error",
+    });
   }
 }
 
