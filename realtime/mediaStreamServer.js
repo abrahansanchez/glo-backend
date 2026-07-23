@@ -542,6 +542,12 @@ const normalizeYesNoText = (text) =>
     .replace(/[.?!,]+$/g, "")
     .trim();
 
+const SPANISH_CONFIRMATION_ALIASES = Object.freeze([
+  "sí", "si", "claro", "correcto", "confirmo", "adelante",
+]);
+
+const isBareSeeAsrArtifact = (text) => normalizeYesNoText(text) === "see";
+
 const isYes = (text) => {
   const t = normalizeYesNoText(text);
   const neverConfirm = [
@@ -559,7 +565,8 @@ const isYes = (text) => {
     "yes", "yep", "yup", "yeah", "sure", "correct", "confirm", "confirmed",
     "ok", "okay", "alright", "sounds good", "perfect", "great",
     "si por favor", "confirmalo", "finalizalo",
-    "si", "sí confirma", "si confirma", "dale", "claro", "correcto", "confirma", "confirmar", "perfecto", "exacto", "adelante",
+    ...SPANISH_CONFIRMATION_ALIASES,
+    "sí confirma", "si confirma", "dale", "confirma", "confirmar", "perfecto", "exacto",
     "si dale", "yes please", "go ahead", "that works", "that's right",
     "listo", "por favor", "va", "va bien", "está bien", "esta bien",
     "sounds right", "do it", "book it", "let's do it"
@@ -751,22 +758,47 @@ const isClearNameResponse = (text) => {
   return words.every((word) => /^[\p{L}'-]{2,}$/u.test(word));
 };
 
-const formatSpokenWeekday = (date) => {
+const SPANISH_SERVICE_NAMES = Object.freeze({
+  Haircut: "corte de pelo",
+  Beard: "barba",
+  "Haircut + Beard": "corte de pelo y barba",
+});
+
+const formatCustomerService = (service, language = "en") =>
+  language === "es" ? SPANISH_SERVICE_NAMES[service] || service : service;
+
+const formatSpokenWeekday = (date, language = "en") => {
   const parsed = new Date(`${date}T12:00:00.000Z`);
   if (Number.isNaN(parsed.getTime())) return "";
-  return new Intl.DateTimeFormat("en-US", { weekday: "long", timeZone: "UTC" }).format(parsed);
+  return new Intl.DateTimeFormat(language === "es" ? "es-ES" : "en-US", {
+    weekday: "long",
+    timeZone: "UTC",
+  }).format(parsed);
+};
+
+const formatCustomerTime = (time, language = "en") => {
+  if (language !== "es") return String(time || "").trim();
+  const match = String(time || "").trim().match(/^(\d{1,2})(?::(\d{2}))?\s*(AM|PM)$/i);
+  if (!match) return String(time || "").trim();
+  const hour = Number(match[1]);
+  const clock = `${hour}:${match[2] || "00"}`;
+  const suffix = match[3].toUpperCase();
+  if (hour === 12 && suffix === "AM") return `${clock} de la medianoche`;
+  if (hour === 12 && suffix === "PM") return `${clock} del mediodía`;
+  return `${clock} de la ${suffix === "AM" ? "mañana" : "tarde"}`;
 };
 
 const stripAmPmForGroupedTime = (time) =>
   String(time || "").trim().replace(/\s*(AM|PM)\s*$/i, "");
 
-const joinSpokenList = (items = []) => {
+const joinSpokenList = (items = [], language = "en") => {
   const values = items.map((item) => String(item || "").trim()).filter(Boolean);
-  if (values.length <= 2) return values.join(values.length === 2 ? " or " : "");
-  return `${values.slice(0, -1).join(", ")}, or ${values[values.length - 1]}`;
+  const conjunction = language === "es" ? " o " : " or ";
+  if (values.length <= 2) return values.join(values.length === 2 ? conjunction : "");
+  return `${values.slice(0, -1).join(", ")},${conjunction}${values[values.length - 1]}`;
 };
 
-const formatSpokenAlternativeChoices = (alternatives = [], requestedDate = "") => {
+const formatSpokenAlternativeChoices = (alternatives = [], requestedDate = "", language = "en") => {
   const slots = alternatives.slice(0, 3).filter((slot) => slot?.time);
   if (!slots.length) return "";
 
@@ -785,19 +817,21 @@ const formatSpokenAlternativeChoices = (alternatives = [], requestedDate = "") =
         .map((time) => String(time || "").trim().match(/\b(AM|PM)\b/i)?.[1]?.toUpperCase())
         .filter(Boolean)
     );
-    const spokenTimes = suffixes.size === 1
-      ? times.map(stripAmPmForGroupedTime)
-      : times;
-    const timesText = joinSpokenList(spokenTimes);
-    const dayText = dateKey && dateKey !== requestedDate ? formatSpokenWeekday(dateKey) : "";
-    parts.push(dayText ? `${dayText} at ${timesText}` : timesText);
+    const spokenTimes = language === "es"
+      ? times.map((time) => formatCustomerTime(time, language))
+      : suffixes.size === 1
+        ? times.map(stripAmPmForGroupedTime)
+        : times;
+    const timesText = joinSpokenList(spokenTimes, language);
+    const dayText = dateKey && dateKey !== requestedDate ? formatSpokenWeekday(dateKey, language) : "";
+    parts.push(dayText ? `${dayText}${language === "es" ? " a las " : " at "}${timesText}` : timesText);
   }
 
-  return joinSpokenList(parts);
+  return joinSpokenList(parts, language);
 };
 
 const closedDayAlternativeReply = ({ requestedDate, alternativesText, isSpanish = false }) => {
-  const requestedDay = formatSpokenWeekday(requestedDate);
+  const requestedDay = formatSpokenWeekday(requestedDate, isSpanish ? "es" : "en");
   if (!requestedDay || !alternativesText) return "";
   return isSpanish
     ? `${requestedDay} está cerrado. Tengo ${alternativesText}. ¿Cuál te funciona?`
@@ -1461,6 +1495,7 @@ export const attachMediaWebSocketServer = (server, dependencies = {}) => {
     const userTranscriptLines = [];
     const assistantTranscriptLines = [];
     let transcriptFinalized = false;
+    const CallTranscriptModel = dependencies.CallTranscriptModel || CallTranscript;
 
     diagnosticAttempt(() => traceLog("twilio.websocket.open", {
       openedAt: traceStartedAt.toISOString(),
@@ -1472,7 +1507,7 @@ export const attachMediaWebSocketServer = (server, dependencies = {}) => {
       if (!barberId || !callSid) return;
 
       try {
-        await CallTranscript.findOneAndUpdate(
+        await CallTranscriptModel.findOneAndUpdate(
           { barberId: String(barberId), callSid: String(callSid) },
           { $set: { intent, outcome } },
           { upsert: true }
@@ -1489,7 +1524,7 @@ export const attachMediaWebSocketServer = (server, dependencies = {}) => {
     async function updateTranscriptFields(fields) {
       if (!barberId || !callSid) return;
       try {
-        await CallTranscript.findOneAndUpdate(
+        await CallTranscriptModel.findOneAndUpdate(
           { barberId: String(barberId), callSid: String(callSid) },
           { $set: fields },
           { upsert: true }
@@ -1505,7 +1540,7 @@ export const attachMediaWebSocketServer = (server, dependencies = {}) => {
     async function appendMessage({ role, text, lang }) {
       if (!barberId || !callSid || !text) return;
       try {
-        await CallTranscript.findOneAndUpdate(
+        await CallTranscriptModel.findOneAndUpdate(
           { barberId: String(barberId), callSid: String(callSid) },
           {
             $push: {
@@ -1577,6 +1612,12 @@ export const attachMediaWebSocketServer = (server, dependencies = {}) => {
     let hasSwitchedLanguage = false;
     let languageLocked = false;
     let lockedLanguage = null;
+    let pendingLanguageUpdate = null;
+    const languageUpdateTimeoutMs =
+      Number.isFinite(Number(dependencies.languageUpdateTimeoutMs)) &&
+      Number(dependencies.languageUpdateTimeoutMs) > 0
+        ? Number(dependencies.languageUpdateTimeoutMs)
+        : 3000;
     let slotChecked = false;
     let slotAvailable = false;
     let slotAlternatives = [];
@@ -1804,7 +1845,8 @@ export const attachMediaWebSocketServer = (server, dependencies = {}) => {
         reason === "greeting" ||
         reason === "confirmation_max_output_tokens_retry" ||
         reason === "deterministic_retry" ||
-        reason === "deterministic_recovery";
+        reason === "deterministic_recovery" ||
+        reason === "language_update_recovery";
       return (
         inputReady &&
         !callerSpeaking &&
@@ -2614,7 +2656,7 @@ export const attachMediaWebSocketServer = (server, dependencies = {}) => {
         lastUnavailableInjectionKey = injectionKey;
 
         const altText = slotAlternatives.length > 0
-          ? formatSpokenAlternativeChoices(slotAlternatives, bookingState.parsedDate)
+          ? formatSpokenAlternativeChoices(slotAlternatives, bookingState.parsedDate, currentLanguage)
           : "no other slots available";
 
         const unavailableMsg = currentLanguage === "es"
@@ -2636,6 +2678,7 @@ export const attachMediaWebSocketServer = (server, dependencies = {}) => {
     const requestCallEnd = async (reason) => {
       if (endingCall) return;
       endingCall = true;
+      cancelPendingLanguageUpdate(`call_end:${reason}`);
       console.log(`[CALL_END_REQUESTED] callSid=${callSid || ""} barberId=${barberId || ""} reason=${reason}`);
 
       try {
@@ -2849,9 +2892,11 @@ export const attachMediaWebSocketServer = (server, dependencies = {}) => {
             requestedDateTimeText: `${bookingState.parsedDate} ${bookingState.parsedTime}`,
           });
           await setTranscriptIntentOutcome({ intent: "BOOK", outcome: "BOOKED" });
-          const spokenDate = formatSpokenWeekday(bookingState.parsedDate) || bookingState.parsedDate;
+          const spokenDate = formatSpokenWeekday(bookingState.parsedDate, currentLanguage) || bookingState.parsedDate;
+          const spokenService = formatCustomerService(bookingState.service, currentLanguage);
+          const spokenTime = formatCustomerTime(bookingState.parsedTime, currentLanguage);
           const confirmMsg = currentLanguage === "es"
-            ? `Tu cita está confirmada para ${spokenDate} a las ${bookingState.parsedTime}. Gracias, hasta luego.`
+            ? `Tu cita para ${spokenService} está confirmada para el ${spokenDate} a las ${spokenTime}. Gracias, hasta luego.`
             : `Your appointment is confirmed for ${spokenDate} at ${bookingState.parsedTime}. Thank you, goodbye.`;
           const ok = speakExact(confirmMsg, {
             reason: "final_confirmation",
@@ -2889,7 +2934,7 @@ export const attachMediaWebSocketServer = (server, dependencies = {}) => {
           bookingState.alternatives = slotAlternatives;
           bookingState.awaitingAlternativeSelection = slotAlternatives.length > 0;
           normalizeBookingState("booking_engine_unavailable");
-          const alternatives = formatSpokenAlternativeChoices(result.alternatives, bookingState.parsedDate);
+          const alternatives = formatSpokenAlternativeChoices(result.alternatives, bookingState.parsedDate, currentLanguage);
           console.log(
             `[BOOKING_UNAVAILABLE] callSid=${callSid || ""} barberId=${barberId} alternatives=${alternatives || "none"}`
           );
@@ -2969,21 +3014,133 @@ RULES:
 `.trim();
     };
 
+    const realtimeInputAudioConfig = (language) => ({
+      format: { type: "audio/pcmu" },
+      transcription: {
+        model: "gpt-realtime-whisper",
+        language,
+      },
+      turn_detection: {
+        type: "server_vad",
+        threshold: 0.6,
+        prefix_padding_ms: 400,
+        silence_duration_ms: 1200,
+        create_response: false,
+        interrupt_response: false,
+      },
+    });
+
+    const languageUpdateTransportIsActive = () => Boolean(
+      !endingCall &&
+      twilioWs.readyState === twilioWs.OPEN &&
+      aiReady &&
+      ai?.readyState === ai.OPEN
+    );
+
+    const settlePendingLanguageUpdate = ({
+      pending = pendingLanguageUpdate,
+      result = false,
+      reopenInput = false,
+      reason = "unknown",
+    } = {}) => {
+      if (!pending || pending !== pendingLanguageUpdate || pending.settled) return false;
+      pending.settled = true;
+      clearTimeout(pending.timer);
+      pendingLanguageUpdate = null;
+      readyForCallerInput = Boolean(
+        result === true &&
+        reopenInput === true &&
+        languageUpdateTransportIsActive()
+      ) && pending.previousReadyForCallerInput;
+      pending.resolve(result === true);
+      console.log("[LANGUAGE_UPDATE_SETTLED]", {
+        reason,
+        result: result === true,
+        readyForCallerInput,
+        eventId: pending.eventId,
+      });
+      return true;
+    };
+
+    const cancelPendingLanguageUpdate = (reason = "transport_cleanup") =>
+      settlePendingLanguageUpdate({ result: false, reopenInput: false, reason });
+
+    const failPendingLanguageUpdate = async (reason, pending = pendingLanguageUpdate) => {
+      if (!pending || pending !== pendingLanguageUpdate || pending.settled) return false;
+      if (!languageUpdateTransportIsActive()) {
+        return cancelPendingLanguageUpdate(`${reason}_transport_inactive`);
+      }
+      if (!settlePendingLanguageUpdate({ pending, result: false, reason })) return false;
+      console.error("[LANGUAGE_UPDATE_FAILED]", { reason, targetLanguage: pending.targetLanguage });
+      const recoveryText = "No pude cambiar el idioma correctamente. Terminaremos esta llamada; por favor, intenta de nuevo.";
+      const recoverySent = speakExact(recoveryText, {
+        reason: "language_update_recovery",
+        terminateAfterPlayback: true,
+      });
+      const recoveryQueued =
+        lastSpeakExactStatus?.queued === true &&
+        pendingAssistantResponse?.reason === "language_update_recovery";
+      if (recoveryQueued) {
+        const recoveryFlushed = await flushQueuedAssistantResponse("language_update_recovery");
+        if (!recoveryFlushed) scheduleQueuedAssistantFlush("language_update_recovery");
+      }
+      if (!recoverySent && !recoveryQueued) {
+        await requestCallEnd("language_update_recovery_unavailable");
+      }
+      return true;
+    };
+
     const applyLanguageToSession = async () => {
       const instruction = languageInstructionFor();
+      if (pendingLanguageUpdate) return pendingLanguageUpdate.promise;
       try {
         const payload = {
           type: "session.update",
+          event_id: `glo-language-update-${randomUUID()}`,
           session: {
             type: "realtime",
             instructions: `${baseInstructions}\n\n${instruction}`,
+            audio: {
+              input: realtimeInputAudioConfig(currentLanguage),
+            },
           },
         };
-        console.log("[OPENAI_SESSION_UPDATE]", JSON.stringify(payload));
-        sendToAI(payload);
-        console.log(`[LANG_APPLIED] mode=${currentLanguage || barberPreferredLang || "en"}`);
+        const expectedSequence = sessionUpdateSequence + 1;
+        const previousReadyForCallerInput = readyForCallerInput;
+        readyForCallerInput = false;
+        let resolveUpdate;
+        const promise = new Promise((resolve) => { resolveUpdate = resolve; });
+        pendingLanguageUpdate = {
+          targetLanguage: currentLanguage,
+          eventId: payload.event_id,
+          expectedSequence,
+          previousReadyForCallerInput,
+          resolve: resolveUpdate,
+          promise,
+          settled: false,
+          timer: null,
+        };
+        const pendingForTimer = pendingLanguageUpdate;
+        pendingLanguageUpdate.timer = setTimeout(() => {
+          void failPendingLanguageUpdate("session_updated_timeout", pendingForTimer);
+        }, languageUpdateTimeoutMs);
+        console.log("[OPENAI_LANGUAGE_SESSION_UPDATE]", {
+          eventId: payload.event_id,
+          language: payload.session.audio.input.transcription.language,
+          transcriptionModel: payload.session.audio.input.transcription.model,
+          inputFormat: payload.session.audio.input.format,
+          turnDetection: payload.session.audio.input.turn_detection,
+        });
+        if (!sendToAI(payload)) {
+          await failPendingLanguageUpdate("session_update_send_failed");
+          return false;
+        }
+        console.log(`[LANG_UPDATE_SENT] mode=${currentLanguage || barberPreferredLang || "en"}`);
+        return await promise;
       } catch (e) {
         console.error("[LANG_APPLIED] error:", e?.message || e);
+        await failPendingLanguageUpdate("session_update_exception");
+        return false;
       }
     };
 
@@ -3127,7 +3284,7 @@ RULES:
         }
 
         const alternatives = alternativesSource?.length
-          ? formatSpokenAlternativeChoices(alternativesSource, bookingState.parsedDate)
+          ? formatSpokenAlternativeChoices(alternativesSource, bookingState.parsedDate, currentLanguage)
           : "";
         const dayKey = dayKeyForDate(bookingState.parsedDate);
         const requestedDayClosed = Boolean(
@@ -3194,9 +3351,11 @@ RULES:
         bookingState.awaitingAlternativeSelection !== true &&
         !bookingState.confirmationPromptRequested
       ) {
-        const spokenDate = formatSpokenWeekday(bookingState.parsedDate) || bookingState.parsedDate;
+        const spokenDate = formatSpokenWeekday(bookingState.parsedDate, currentLanguage) || bookingState.parsedDate;
+        const spokenService = formatCustomerService(bookingState.service, currentLanguage);
+        const spokenTime = formatCustomerTime(bookingState.parsedTime, currentLanguage);
         return isSpanish
-          ? `Perfecto, tengo ${bookingState.name} para ${bookingState.service} el ${spokenDate} a las ${bookingState.parsedTime}. ¿Confirmo esa cita?`
+          ? `Perfecto, tengo ${bookingState.name} para ${spokenService} el ${spokenDate} a las ${spokenTime}. ¿Confirmo esa cita?`
           : `Perfect, I have ${bookingState.name} for ${bookingState.service} on ${spokenDate} at ${bookingState.parsedTime}. Should I confirm it?`;
       }
 
@@ -4110,12 +4269,30 @@ RULES:
       }
     }
 
+    const isContextualConfirmationYes = (text) =>
+      isConfirmationYes(text) || Boolean(
+        currentLanguage === "es" &&
+        getBookingPhase() === "awaiting_confirmation" &&
+        confirmationDeliveryReady === true &&
+        readyForCallerInput === true &&
+        isBareSeeAsrArtifact(text)
+      );
+
     async function handleCallerTranscript(transcriptText, options = {}) {
       const isBuffered = options.buffered === true;
       transcriptText = String(transcriptText || "").trim();
 
       if (!transcriptText) {
         await finishCallerTranscriptHandling("empty_transcript");
+        return;
+      }
+
+      if (pendingLanguageUpdate && !isBuffered) {
+        console.log("[TRANSCRIPT_IGNORED_LANGUAGE_UPDATE_PENDING]", {
+          transcript: transcriptText,
+          targetLanguage: pendingLanguageUpdate.targetLanguage,
+        });
+        await finishCallerTranscriptHandling("language_update_pending");
         return;
       }
 
@@ -4132,7 +4309,7 @@ RULES:
         !isBuffered &&
         assistantPlaybackActive === true &&
         confirmationPromptActiveAtTranscriptStart &&
-        (isConfirmationYes(transcriptText) || isNo(transcriptText))
+        (isContextualConfirmationYes(transcriptText) || isNo(transcriptText))
       ) {
         bufferCallerTranscript(
           transcriptText,
@@ -4164,7 +4341,7 @@ RULES:
           bookingState.askedConfirm === true ||
           bookingState.confirmationPromptRequested === true;
         const isConfirmationResponse =
-          isInConfirmationContext && (isConfirmationYes(transcriptText) || isNo(transcriptText));
+          isInConfirmationContext && (isContextualConfirmationYes(transcriptText) || isNo(transcriptText));
         const isServiceResponse =
           bookingState.intent === "BOOK" &&
           !bookingState.service &&
@@ -4328,7 +4505,7 @@ RULES:
         isLikelyAlternativeSelectionResponse(transcriptText, alternativeOptions);
       const isConfirmationResponse =
         (bookingState.askedConfirm === true || bookingState.confirmationPromptRequested === true) &&
-        (isConfirmationYes(transcriptText) || isNo(transcriptText));
+        (isContextualConfirmationYes(transcriptText) || isNo(transcriptText));
 
       if (
         bookingState.awaitingAlternativeSelection === true &&
@@ -4364,6 +4541,7 @@ RULES:
       // Confirmation-stage filter — when waiting for yes/no, ignore unrelated noise
       if (bookingState.askedConfirm && !bookingState.confirmed) {
         const confirmationWords = [
+          ...SPANISH_CONFIRMATION_ALIASES,
           "si", "sí", "yes", "yeah", "yep",
           "claro", "correcto", "confirma", "confirmar",
           "that works", "go ahead", "correct",
@@ -4387,6 +4565,7 @@ RULES:
         const hasService = ["haircut", "beard", "barba", "corte", "pelo", "cabello", "fade"].some(kw => t.includes(kw));
 
         const isConfirmationRelevant =
+          isContextualConfirmationYes(transcriptText) ||
           confirmationWords.some(w =>
             t.includes(
               w.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "")
@@ -4420,7 +4599,11 @@ RULES:
       if (effectiveLang && effectiveLang !== currentLanguage) {
         currentLanguage = effectiveLang;
         hasSwitchedLanguage = true;
-        await applyLanguageToSession();
+        const languageApplied = await applyLanguageToSession();
+        if (!languageApplied) {
+          await finishCallerTranscriptHandling("language_update_failed");
+          return;
+        }
       }
 
       console.log("TRANSCRIPT:", transcriptText, `(${currentLanguage})`);
@@ -4911,7 +5094,7 @@ RULES:
         // If not, deterministic reply will ask what they want to change.
       }
 
-      if (awaitingConfirmationResponse && isConfirmationYes(transcriptText)) {
+      if (awaitingConfirmationResponse && isContextualConfirmationYes(transcriptText)) {
         bookingState.confirmed = true;
         console.log("[CONFIRMATION_ACCEPTED]", {
           transcript: transcriptText,
@@ -5305,6 +5488,22 @@ RULES:
         console.log("[SESSION_UPDATE_PATH_AUDIT] using only GA-compatible session.update payloads");
       });
 
+      ai.on("close", () => {
+        aiReady = false;
+        cancelPendingLanguageUpdate("openai_websocket_closed");
+        if (!endingCall && twilioWs.readyState === twilioWs.OPEN) {
+          void requestCallEnd("openai_websocket_closed");
+        }
+      });
+
+      ai.on("error", () => {
+        aiReady = false;
+        cancelPendingLanguageUpdate("openai_websocket_error");
+        if (!endingCall && twilioWs.readyState === twilioWs.OPEN) {
+          void requestCallEnd("openai_websocket_error");
+        }
+      });
+
       ai.on("message", async (raw) => {
         if (CONTROLLED_AUDIO_TRACE_ENABLED) {
           diagnosticAttempt(() => {
@@ -5325,6 +5524,8 @@ RULES:
 
         if (evt.type === "session.updated") {
           const session = evt.session || {};
+          const effectiveTranscriptionLanguage =
+            session.audio?.input?.transcription?.language || "";
           traceLog("openai.session.updated.effective", {
             sessionUpdateSequence,
             model: session.model || null,
@@ -5336,6 +5537,26 @@ RULES:
             outputModalities: session.output_modalities || null,
           });
           console.log("📋 OpenAI session updated");
+          if (
+            pendingLanguageUpdate &&
+            !pendingLanguageUpdate.settled &&
+            sessionUpdateSequence >= pendingLanguageUpdate.expectedSequence &&
+            effectiveTranscriptionLanguage === pendingLanguageUpdate.targetLanguage
+          ) {
+            const pending = pendingLanguageUpdate;
+            if (settlePendingLanguageUpdate({
+              pending,
+              result: true,
+              reopenInput: true,
+              reason: "session_updated_effective_language",
+            })) {
+              console.log("[LANGUAGE_UPDATE_ACKNOWLEDGED]", {
+                language: effectiveTranscriptionLanguage,
+                sessionUpdateSequence,
+                eventId: pending.eventId,
+              });
+            }
+          }
           sessionUpdated = true;
           trySendGreeting();
         }
@@ -5445,6 +5666,17 @@ RULES:
             errorType: evt.error?.type || null,
             errorMessagePresent: Boolean(evt.error?.message),
           });
+          const correlatedClientEventId = evt.error?.event_id || "";
+          if (
+            pendingLanguageUpdate &&
+            correlatedClientEventId &&
+            correlatedClientEventId === pendingLanguageUpdate.eventId
+          ) {
+            await failPendingLanguageUpdate(
+              evt.error?.code || "correlated_openai_error",
+              pendingLanguageUpdate
+            );
+          }
         }
 
         if (
@@ -5761,20 +5993,7 @@ RULES:
               session: {
                 type: "realtime",
                 audio: {
-                  input: {
-                    format: {
-                      type: "audio/pcmu",
-                    },
-                    transcription: transcriptionConfig,
-                    turn_detection: {
-                      type: "server_vad",
-                      threshold: 0.6,
-                      prefix_padding_ms: 400,
-                      silence_duration_ms: 1200,
-                      create_response: false,
-                      interrupt_response: false,
-                    },
-                  },
+                  input: realtimeInputAudioConfig(transcriptionLanguageMode),
                 },
               },
             };
@@ -6207,8 +6426,13 @@ RULES:
           `[STREAM_META_WS] callSid=${callSid} from=${callerNumber} to=${toNumber} barberId=${barberId}`
         );
         try {
-          const barber = await Barber.findById(barberId).select("preferredLanguage");
-          barberPreferredLang = barber?.preferredLanguage || "en";
+          if (typeof dependencies.findBarberPreferredLanguage === "function") {
+            barberPreferredLang =
+              await dependencies.findBarberPreferredLanguage(barberId) || "en";
+          } else {
+            const barber = await Barber.findById(barberId).select("preferredLanguage");
+            barberPreferredLang = barber?.preferredLanguage || "en";
+          }
         } catch (e) {
           barberPreferredLang = "en";
         }
@@ -6259,6 +6483,8 @@ RULES:
 
     twilioWs.on("close", (code, reasonBuffer) => {
       console.log("📴 Twilio WebSocket closed");
+      endingCall = true;
+      cancelPendingLanguageUpdate("twilio_websocket_closed");
       void invalidateActiveDeterministicTransport("twilio_websocket_closed");
       void invalidateActiveConfirmationTransport("twilio_websocket_closed");
       clearAssistantPlaybackWatchdog();
@@ -6295,14 +6521,14 @@ RULES:
 
           let transcriptDoc = null;
           if (safeCallSid) {
-            transcriptDoc = await CallTranscript.findOne({
+            transcriptDoc = await CallTranscriptModel.findOne({
               callSid: safeCallSid,
               barberId: safeBarberId,
             });
           }
 
           if (!transcriptDoc) {
-            transcriptDoc = new CallTranscript({
+            transcriptDoc = new CallTranscriptModel({
               barberId: safeBarberId,
               callSid: callSid || "",
               callerNumber: finalCallerNumber,
@@ -6374,6 +6600,10 @@ RULES:
     });
 
     twilioWs.on("error", (err) => {
+      const cancelledLanguageUpdate = cancelPendingLanguageUpdate("twilio_websocket_error");
+      if (cancelledLanguageUpdate && !endingCall) {
+        void requestCallEnd("twilio_websocket_error");
+      }
       void invalidateActiveDeterministicTransport("twilio_websocket_error");
       void invalidateActiveConfirmationTransport("twilio_websocket_error");
       traceLog("twilio.websocket.error", {
@@ -6395,6 +6625,7 @@ RULES:
         handleAssistantPlaybackWatchdogExpiry,
         handleCallerTranscript,
         executeBookingIfReady,
+        requestCallEnd,
         restoreBookingSnapshot,
         seedBookingState: ({ state = {}, availability = {}, context = {} } = {}) => {
           Object.assign(bookingState, structuredClone(state));
@@ -6402,6 +6633,8 @@ RULES:
           slotAvailable = availability.slotAvailable ?? false;
           slotAlternatives = structuredClone(availability.slotAlternatives || []);
           barberId = context.barberId ?? barberId;
+          callSid = context.callSid ?? callSid;
+          barberDoc = context.barberDoc ?? barberDoc;
           callerNumber = context.callerNumber ?? callerNumber;
           streamSid = context.streamSid ?? streamSid;
           currentLanguage = context.currentLanguage || currentLanguage;
@@ -6431,6 +6664,17 @@ RULES:
           pendingAssistantMarkName,
           pendingAssistantResponse: structuredClone(pendingAssistantResponse),
           readyForCallerInput,
+          currentLanguage,
+          barberPreferredLang,
+          pendingLanguageUpdate: pendingLanguageUpdate
+            ? {
+                targetLanguage: pendingLanguageUpdate.targetLanguage,
+                expectedSequence: pendingLanguageUpdate.expectedSequence,
+                eventId: pendingLanguageUpdate.eventId,
+                timerActive: Boolean(pendingLanguageUpdate.timer),
+              }
+            : null,
+          endingCall,
           confirmationDeliveryReady,
           activeConfirmationLifecycleId,
           activeDeterministicLifecycleId,
