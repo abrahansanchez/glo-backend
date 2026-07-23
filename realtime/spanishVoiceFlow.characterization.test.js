@@ -215,26 +215,33 @@ const createConfirmationSafetySession = async ({
   language = "es",
   deliverPrompt = true,
   isSlotAvailableResult = true,
+  service = "Haircut",
+  parsedDate = "2026-08-01",
+  parsedTime = "11:00 AM",
 } = {}) => {
   let bookings = 0;
   let availabilityChecks = 0;
+  const availabilityPayloads = [];
+  const bookingPayloads = [];
   const session = createSession({
     language,
-    isSlotAvailable: async () => {
+    isSlotAvailable: async (payload) => {
       availabilityChecks += 1;
+      availabilityPayloads.push(structuredClone(payload));
       return isSlotAvailableResult;
     },
-    bookAppointment: async () => {
+    bookAppointment: async (payload) => {
       bookings += 1;
+      bookingPayloads.push(structuredClone(payload));
       return { success: true, appointment: { _id: `appt-confirmation-safety-${language}` } };
     },
   });
   session.controls.seedBookingState({
     state: baseState({
       name: "Abraham",
-      service: "Haircut",
-      parsedDate: "2026-08-01",
-      parsedTime: "11:00 AM",
+      service,
+      parsedDate,
+      parsedTime,
       askedConfirm: false,
       confirmationPromptRequested: false,
       confirmed: false,
@@ -265,6 +272,8 @@ const createConfirmationSafetySession = async ({
     ...session,
     get bookings() { return bookings; },
     get availabilityChecks() { return availabilityChecks; },
+    get availabilityPayloads() { return structuredClone(availabilityPayloads); },
+    get bookingPayloads() { return structuredClone(bookingPayloads); },
   };
 };
 
@@ -906,7 +915,7 @@ test("Spanish and English date clarifications preserve canonical state and requi
       language: "es",
       question: "¿Es el veinticinco o el primero?",
       yes: "Sí",
-      datePattern: /1 de agosto de 2026/i,
+      datePattern: /primero de agosto de 2026/i,
       weekdayPattern: /sábado/i,
       confirmPattern: /¿Quieres que confirme la cita\?/i,
     },
@@ -946,6 +955,337 @@ test("Spanish and English date clarifications preserve canonical state and requi
     await session.controls.handleCallerTranscript(scenario.yes);
     await session.controls.handleCallerTranscript(scenario.yes);
     assert.equal(session.bookings, 1);
+  }
+});
+
+test("semantic date comparison classifier preserves comma boundaries and normalizes word hyphens", () => {
+  for (const transcript of [
+    "Veinticinco, el primero de agosto.",
+    "July twenty-fifth or August first.",
+    "July twenty-fifth or August first",
+  ]) {
+    assert.deepEqual(classifyConfirmationResponse(transcript), {
+      kind: "clarification",
+      reason: "competing_date_candidates",
+    }, transcript);
+  }
+});
+
+test("ASR-shaped punctuationless date alternatives use canonical clarification without side effects", async () => {
+  for (const scenario of [
+    {
+      language: "es",
+      transcript: "Es el veinticinco de julio o el primero de agosto.",
+      datePattern: /sábado, primero de agosto de 2026/i,
+      confirmPattern: /¿Quieres que confirme la cita\?/i,
+    },
+    {
+      language: "es",
+      transcript: "Es el veinticinco de julio o el primero de agosto",
+      datePattern: /sábado, primero de agosto de 2026/i,
+      confirmPattern: /¿Quieres que confirme la cita\?/i,
+    },
+    {
+      language: "es",
+      transcript: "25 de julio o 1 de agosto.",
+      datePattern: /sábado, primero de agosto de 2026/i,
+      confirmPattern: /¿Quieres que confirme la cita\?/i,
+    },
+    {
+      language: "es",
+      transcript: "El sábado vendría siendo el veinticinco, el primero de agosto.",
+      datePattern: /sábado, primero de agosto de 2026/i,
+      confirmPattern: /¿Quieres que confirme la cita\?/i,
+    },
+    {
+      language: "es",
+      transcript: "Veinticinco, el primero de agosto.",
+      datePattern: /sábado, primero de agosto de 2026/i,
+      confirmPattern: /¿Quieres que confirme la cita\?/i,
+    },
+    {
+      language: "en",
+      transcript: "Is that July twenty fifth or August first.",
+      datePattern: /Saturday, August 1, 2026/i,
+      confirmPattern: /Would you like me to confirm the appointment\?/i,
+    },
+    {
+      language: "en",
+      transcript: "July twenty fifth or August first.",
+      datePattern: /Saturday, August 1, 2026/i,
+      confirmPattern: /Would you like me to confirm the appointment\?/i,
+    },
+    {
+      language: "en",
+      transcript: "July twenty-fifth or August first.",
+      datePattern: /Saturday, August 1, 2026/i,
+      confirmPattern: /Would you like me to confirm the appointment\?/i,
+    },
+  ]) {
+    const session = await createConfirmationSafetySession({ language: scenario.language });
+    const before = session.controls.getState();
+
+    await session.controls.handleCallerTranscript(scenario.transcript);
+
+    const after = session.controls.getState();
+    assert.equal(session.bookings, 0, scenario.transcript);
+    assert.equal(session.availabilityChecks, 0, scenario.transcript);
+    assert.equal(after.bookingPhase, "awaiting_confirmation", scenario.transcript);
+    assert.equal(after.bookingState.name, before.bookingState.name, scenario.transcript);
+    assert.equal(after.bookingState.service, before.bookingState.service, scenario.transcript);
+    assert.equal(after.bookingState.parsedDate, before.bookingState.parsedDate, scenario.transcript);
+    assert.equal(after.bookingState.parsedTime, before.bookingState.parsedTime, scenario.transcript);
+    assert.equal(after.barberId, before.barberId, scenario.transcript);
+    assert.equal(after.bookingState.confirmed, false, scenario.transcript);
+    assert.match(latestSpeech(session.ai), scenario.datePattern, scenario.transcript);
+    assert.match(latestSpeech(session.ai), scenario.confirmPattern, scenario.transcript);
+  }
+});
+
+test("exact production ASR clarification requires a new delivered affirmative and remains exactly once", async () => {
+  const session = await createConfirmationSafetySession({
+    language: "es",
+    service: "Haircut + Beard",
+    parsedTime: "12:00 PM",
+  });
+  const deliveredState = session.controls.getState();
+  session.controls.seedBookingState({
+    state: {
+      ...deliveredState.bookingState,
+      askedConfirm: false,
+      confirmationPromptRequested: false,
+    },
+    availability: { slotChecked: true, slotAvailable: true, slotAlternatives: [] },
+    context: {
+      currentLanguage: "es",
+      barberId: deliveredState.barberId,
+    },
+  });
+  const before = session.controls.getState();
+  assert.equal(before.bookingPhase, "awaiting_confirmation");
+  assert.equal(before.confirmationDeliveryReady, true);
+  assert.equal(before.bookingState.askedConfirm, false);
+  assert.equal(before.bookingState.confirmationPromptRequested, false);
+
+  await session.controls.handleCallerTranscript(
+    "Es el veinticinco de julio o el primero de agosto."
+  );
+
+  const afterClarification = session.controls.getState();
+  const clarificationSpeech = latestSpeech(session.ai);
+  assert.equal(session.bookings, 0);
+  assert.equal(session.availabilityChecks, 0);
+  assert.equal(afterClarification.bookingState.name, before.bookingState.name);
+  assert.equal(afterClarification.bookingState.service, before.bookingState.service);
+  assert.equal(afterClarification.bookingState.parsedDate, before.bookingState.parsedDate);
+  assert.equal(afterClarification.bookingState.parsedTime, before.bookingState.parsedTime);
+  assert.equal(afterClarification.barberId, before.barberId);
+  assert.equal(afterClarification.bookingPhase, "awaiting_confirmation");
+  assert.match(clarificationSpeech, /sábado, primero de agosto de 2026/i);
+  assert.match(clarificationSpeech, /12:00 del mediodía/i);
+  assert.match(clarificationSpeech, /corte de pelo y barba/i);
+  assert.match(clarificationSpeech, /Abraham/i);
+  assert.match(clarificationSpeech, /¿Quieres que confirme la cita\?/i);
+
+  await deliverLatestExactResponse(session, "resp-production-asr-clarification");
+  await session.controls.handleCallerTranscript("Sí", {
+    transcriptId: "production-asr-postmark-si",
+  });
+  assert.equal(session.bookings, 1);
+  await session.controls.handleCallerTranscript("Sí", {
+    transcriptId: "production-asr-postmark-si",
+  });
+  await session.controls.handleCallerTranscript("Sí", {
+    transcriptId: "production-asr-postmark-si-repeat",
+  });
+  assert.equal(session.bookings, 1);
+});
+
+test("bare comma and hyphenated comparisons require clarification playback and a new affirmative", async () => {
+  for (const scenario of [
+    {
+      language: "es",
+      transcript: "Veinticinco, el primero de agosto.",
+      affirmative: "Sí",
+      datePattern: /sábado, primero de agosto de 2026/i,
+      confirmPattern: /¿Quieres que confirme la cita\?/i,
+    },
+    {
+      language: "en",
+      transcript: "July twenty-fifth or August first.",
+      affirmative: "Yes",
+      datePattern: /Saturday, August 1, 2026/i,
+      confirmPattern: /Would you like me to confirm the appointment\?/i,
+    },
+  ]) {
+    const session = await createConfirmationSafetySession({ language: scenario.language });
+    const before = session.controls.getState();
+
+    await session.controls.handleCallerTranscript(scenario.transcript);
+    const after = session.controls.getState();
+    assert.equal(session.bookings, 0);
+    assert.equal(session.availabilityChecks, 0);
+    assert.equal(after.bookingPhase, "awaiting_confirmation");
+    assert.equal(after.bookingState.name, before.bookingState.name);
+    assert.equal(after.bookingState.service, before.bookingState.service);
+    assert.equal(after.bookingState.parsedDate, "2026-08-01");
+    assert.equal(after.bookingState.parsedTime, before.bookingState.parsedTime);
+    assert.equal(after.barberId, before.barberId);
+    assert.match(latestSpeech(session.ai), scenario.datePattern);
+    assert.match(latestSpeech(session.ai), scenario.confirmPattern);
+
+    await session.controls.handleCallerTranscript(scenario.affirmative, {
+      transcriptId: `semantic-premark-${scenario.language}`,
+    });
+    if (scenario.language === "es") {
+      await session.controls.handleCallerTranscript("See", {
+        transcriptId: "semantic-premark-see-es",
+      });
+    }
+    assert.equal(session.bookings, 0);
+
+    await deliverLatestExactResponse(
+      session,
+      `resp-semantic-clarification-${scenario.language}`
+    );
+    assert.equal(session.bookings, 0);
+    await session.controls.handleCallerTranscript(scenario.affirmative, {
+      transcriptId: `semantic-postmark-${scenario.language}`,
+    });
+    assert.equal(session.bookings, 1);
+    await session.controls.handleCallerTranscript(scenario.affirmative, {
+      transcriptId: `semantic-postmark-${scenario.language}`,
+    });
+    await session.controls.handleCallerTranscript(scenario.affirmative, {
+      transcriptId: `semantic-postmark-repeat-${scenario.language}`,
+    });
+    assert.equal(session.bookings, 1);
+  }
+});
+
+test("explicit date modifications remain distinct from punctuationless clarification", async () => {
+  for (const [index, scenario] of [
+    {
+      language: "es",
+      transcript: "Cámbiala para el 25 de julio.",
+      expectedDate: "2026-07-25",
+      datePattern: /sábado, veinticinco de julio de 2026/i,
+      confirmationPattern: /¿Quieres que confirme la cita\?/i,
+      affirmative: "Sí",
+    },
+    {
+      language: "es",
+      transcript: "Mejor el primero de agosto.",
+      expectedDate: "2026-08-01",
+      datePattern: /sábado, primero de agosto de 2026/i,
+      confirmationPattern: /¿Quieres que confirme la cita\?/i,
+      affirmative: "Sí",
+    },
+    {
+      language: "es",
+      transcript: "Cámbiala del 25 de julio al primero de agosto.",
+      expectedDate: "2026-08-01",
+      datePattern: /sábado, primero de agosto de 2026/i,
+      confirmationPattern: /¿Quieres que confirme la cita\?/i,
+      affirmative: "Sí",
+    },
+    {
+      language: "en",
+      transcript: "Change it to July twenty-fifth.",
+      expectedDate: "2026-07-25",
+      datePattern: /Saturday, July 25, 2026/i,
+      confirmationPattern: /Would you like me to confirm the appointment\?/i,
+      affirmative: "Yes",
+    },
+    {
+      language: "en",
+      transcript: "Change it from July twenty-fifth to August first.",
+      expectedDate: "2026-08-01",
+      datePattern: /Saturday, August 1, 2026/i,
+      confirmationPattern: /Would you like me to confirm the appointment\?/i,
+      affirmative: "Yes",
+    },
+    {
+      language: "es",
+      transcript: "Cámbiala para el 29 de julio.",
+      expectedDate: "2026-07-29",
+      datePattern: /miércoles, veintinueve de julio de 2026/i,
+      confirmationPattern: /¿Quieres que confirme la cita\?/i,
+      affirmative: "Sí",
+    },
+    {
+      language: "en",
+      transcript: "Change it to August second.",
+      expectedDate: "2026-08-02",
+      datePattern: /Sunday, August 2, 2026/i,
+      confirmationPattern: /Would you like me to confirm the appointment\?/i,
+      affirmative: "Yes",
+    },
+  ].entries()) {
+    assert.equal(
+      classifyConfirmationResponse(scenario.transcript).kind,
+      "modification",
+      scenario.transcript
+    );
+
+    const initialDate =
+      scenario.expectedDate === "2026-08-01" ? "2026-07-25" : "2026-08-01";
+    const session = await createConfirmationSafetySession({
+      language: scenario.language,
+      parsedDate: initialDate,
+    });
+    const before = session.controls.getState();
+    assert.notEqual(before.bookingState.parsedDate, scenario.expectedDate, scenario.transcript);
+    await session.controls.handleCallerTranscript(scenario.transcript, {
+      transcriptId: `exact-modification-${index}`,
+    });
+
+    const modified = session.controls.getState();
+    const renewedConfirmation = latestSpeech(session.ai);
+    assert.equal(session.bookings, 0, scenario.transcript);
+    assert.equal(session.availabilityChecks, 1, scenario.transcript);
+    assert.deepEqual(
+      session.availabilityPayloads.map(({ date, time }) => ({ date, time })),
+      [{ date: scenario.expectedDate, time: before.bookingState.parsedTime }],
+      scenario.transcript
+    );
+    assert.equal(modified.bookingState.confirmed, false, scenario.transcript);
+    assert.equal(modified.bookingState.parsedDate, scenario.expectedDate, scenario.transcript);
+    assert.equal(modified.bookingState.name, before.bookingState.name, scenario.transcript);
+    assert.equal(modified.bookingState.service, before.bookingState.service, scenario.transcript);
+    assert.equal(modified.bookingState.parsedTime, before.bookingState.parsedTime, scenario.transcript);
+    assert.equal(modified.barberId, before.barberId, scenario.transcript);
+    assert.equal(modified.bookingPhase, "awaiting_confirmation", scenario.transcript);
+    assert.match(renewedConfirmation, scenario.datePattern, scenario.transcript);
+    assert.match(renewedConfirmation, /Abraham/i, scenario.transcript);
+    assert.match(
+      renewedConfirmation,
+      scenario.language === "es" ? /corte de pelo/i : /Haircut/i,
+      scenario.transcript
+    );
+    assert.match(
+      renewedConfirmation,
+      scenario.language === "es" ? /11:00 de la mañana/i : /11:00 AM/i,
+      scenario.transcript
+    );
+    assert.match(renewedConfirmation, scenario.confirmationPattern, scenario.transcript);
+
+    await deliverLatestExactResponse(session, `resp-exact-modification-${index}`);
+    assert.equal(session.bookings, 0, scenario.transcript);
+    await session.controls.handleCallerTranscript(scenario.affirmative, {
+      transcriptId: `exact-modification-affirmative-${index}`,
+    });
+
+    assert.equal(session.bookings, 1, scenario.transcript);
+    assert.equal(session.availabilityChecks, 1, scenario.transcript);
+    assert.deepEqual(session.bookingPayloads, [{
+      barberId: before.barberId,
+      phone: "+15555550100",
+      name: before.bookingState.name,
+      date: scenario.expectedDate,
+      time: before.bookingState.parsedTime,
+      service: before.bookingState.service,
+    }], scenario.transcript);
   }
 });
 

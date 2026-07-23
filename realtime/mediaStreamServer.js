@@ -553,6 +553,29 @@ const normalizeConfirmationDecisionText = (text) =>
     .replace(/!+$/g, "")
     .trim();
 
+const normalizeSemanticDateComparisonText = (text) =>
+  String(text || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/(\p{L})-(?=\p{L})/gu, "$1 ")
+    .replace(/[^\p{L}\p{N}\s,]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+const isSemanticDateComparison = (text) => {
+  const dayCandidates = String(text || "").match(
+    /\b(?:\d{1,2}|primero|veinticinco|first|twenty first|twenty fifth)\b/g
+  ) || [];
+  const hasCalendarMonth =
+    /\b(?:january|february|march|april|may|june|july|august|september|october|november|december|enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre)\b/.test(text);
+  const hasComparisonJoiner =
+    /\b(?:or|o)\b/.test(text) ||
+    /,\s*(?:el|the)?\s*(?:\d{1,2}|primero|veinticinco|first|twenty first|twenty fifth)\b/.test(text);
+
+  return dayCandidates.length >= 2 && hasCalendarMonth && hasComparisonJoiner;
+};
+
 export const classifyConfirmationResponse = (text, { language = "auto" } = {}) => {
   const raw = String(text || "").trim();
   const normalized = normalizeConfirmationDecisionText(raw);
@@ -577,6 +600,10 @@ export const classifyConfirmationResponse = (text, { language = "auto" } = {}) =
   ];
   if (modificationPatterns.some((pattern) => pattern.test(normalized))) {
     return { kind: "modification", reason: "requested_change" };
+  }
+
+  if (isSemanticDateComparison(normalizeSemanticDateComparisonText(raw))) {
+    return { kind: "clarification", reason: "competing_date_candidates" };
   }
 
   const clarificationPatterns = [
@@ -792,6 +819,52 @@ const normalizeSpanishDateTimeText = (text) => {
     .replace(/(\d{1,2})\s*y media/gi, (_, h) => `${h}:30`);
 };
 
+const normalizeModificationDateTargetText = (text) => {
+  const spanishDays = {
+    primero: "1st", uno: "1st", dos: "2nd", tres: "3rd", cuatro: "4th",
+    cinco: "5th", seis: "6th", siete: "7th", ocho: "8th", nueve: "9th",
+    diez: "10th", once: "11th", doce: "12th", trece: "13th", catorce: "14th",
+    quince: "15th", dieciseis: "16th", diecisiete: "17th", dieciocho: "18th",
+    diecinueve: "19th", veinte: "20th", veintiuno: "21st", veintidos: "22nd",
+    veintitres: "23rd", veinticuatro: "24th", veinticinco: "25th",
+    veintiseis: "26th", veintisiete: "27th", veintiocho: "28th",
+    veintinueve: "29th", treinta: "30th", "treinta y uno": "31st",
+  };
+  const spanishMonths = {
+    enero: "January", febrero: "February", marzo: "March", abril: "April",
+    mayo: "May", junio: "June", julio: "July", agosto: "August",
+    septiembre: "September", octubre: "October", noviembre: "November",
+    diciembre: "December",
+  };
+  let normalized = String(text || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
+
+  const destination =
+    normalized.match(/\b(?:from|del)\b[\s\S]*\b(?:to|al)\s+(.+)$/)?.[1] ||
+    normalized.match(/\b(?:to|para)\s+(.+)$/)?.[1] ||
+    normalized;
+  normalized = destination;
+
+  for (const [word, value] of Object.entries(spanishMonths)) {
+    normalized = normalized.replace(new RegExp(`\\b${word}\\b`, "g"), value);
+  }
+  for (const [word, value] of Object.entries(spanishDays).sort(
+    ([left], [right]) => right.length - left.length
+  )) {
+    normalized = normalized.replace(new RegExp(`\\b${word}\\b`, "g"), value);
+  }
+
+  return normalized
+    .replace(
+      /\b(\d{1,2}(?:st|nd|rd|th)?)\s+de\s+(January|February|March|April|May|June|July|August|September|October|November|December)\b/gi,
+      "$2 $1"
+    )
+    .replace(/[.?!,]+$/g, "")
+    .trim();
+};
+
 const cleanClientName = (text) => {
   const raw = String(text || "").trim();
   if (!raw) return "";
@@ -858,6 +931,26 @@ const formatSpokenWeekday = (date, language = "en") => {
 const formatFullCalendarDate = (date, language = "en") => {
   const parsed = new Date(`${date}T12:00:00.000Z`);
   if (Number.isNaN(parsed.getTime())) return String(date || "").trim();
+  if (language === "es") {
+    const weekday = new Intl.DateTimeFormat("es-ES", {
+      weekday: "long",
+      timeZone: "UTC",
+    }).format(parsed);
+    const month = new Intl.DateTimeFormat("es-ES", {
+      month: "long",
+      timeZone: "UTC",
+    }).format(parsed);
+    const spanishCalendarDays = [
+      "", "primero", "dos", "tres", "cuatro", "cinco", "seis", "siete",
+      "ocho", "nueve", "diez", "once", "doce", "trece", "catorce", "quince",
+      "dieciséis", "diecisiete", "dieciocho", "diecinueve", "veinte",
+      "veintiuno", "veintidós", "veintitrés", "veinticuatro", "veinticinco",
+      "veintiséis", "veintisiete", "veintiocho", "veintinueve", "treinta",
+      "treinta y uno",
+    ];
+    const day = spanishCalendarDays[parsed.getUTCDate()] || String(parsed.getUTCDate());
+    return `${weekday}, ${day} de ${month} de ${parsed.getUTCFullYear()}`;
+  }
   return new Intl.DateTimeFormat(language === "es" ? "es-ES" : "en-US", {
     weekday: "long",
     year: "numeric",
@@ -4469,7 +4562,11 @@ RULES:
 
       const confirmationPromptActiveAtTranscriptStart =
         bookingState.askedConfirm === true ||
-        bookingState.confirmationPromptRequested === true;
+        bookingState.confirmationPromptRequested === true ||
+        (
+          bookingState.intent === "BOOK" &&
+          getBookingPhase() === "awaiting_confirmation"
+        );
       const confirmationDecisionAtTranscriptStart = confirmationPromptActiveAtTranscriptStart
         ? classifyConfirmationResponse(transcriptText, { language: currentLanguage })
         : null;
@@ -4861,6 +4958,7 @@ RULES:
         return;
       }
 
+      let explicitModificationTargetDate = "";
       if (confirmationDecision?.kind === "modification") {
         bookingState.confirmed = false;
         bookingState.askedConfirm = false;
@@ -4868,9 +4966,36 @@ RULES:
         bookingState.bookingAttempted = false;
         bookingState.awaitingCorrection = true;
         confirmationDeliveryReady = false;
+        const normalizedTarget = normalizeModificationDateTargetText(transcriptText);
+        const hasExplicitDateTarget =
+          /\b(?:january|february|march|april|may|june|july|august|september|october|november|december|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/i.test(normalizedTarget) ||
+          /\b\d{1,2}[/-]\d{1,2}\b/.test(normalizedTarget);
+        if (hasExplicitDateTarget) {
+          const parsedTarget = await parseNaturalDateTime(normalizedTarget);
+          explicitModificationTargetDate = parsedTarget?.date || "";
+        }
+        if (explicitModificationTargetDate) {
+          const previousDate = bookingState.parsedDate;
+          bookingState.requestedDateText = transcriptText;
+          bookingState.dateTimeText = [
+            bookingState.requestedDateText,
+            bookingState.requestedTimeText || bookingState.parsedTime,
+          ].filter(Boolean).join(" ");
+          bookingState.parsedDate = explicitModificationTargetDate;
+          resetAvailabilityCache("explicit_modification_date_target", {
+            transcript: transcriptText,
+            previousDate,
+            newDate: explicitModificationTargetDate,
+          });
+          bookingState.awaitingCorrection = false;
+          await updateTranscriptFields({
+            requestedDateTimeText: bookingState.dateTimeText,
+          });
+        }
         console.log("[CONFIRMATION_INVALIDATED_FOR_MODIFICATION]", {
           transcript: transcriptText,
           reason: confirmationDecision.reason,
+          explicitModificationTargetDate,
           state: bookingDecisionState(),
         });
       }
@@ -5284,6 +5409,20 @@ RULES:
           bookingState.parsedTime
         ) {
           await injectUnavailableSlotContextIfNeeded();
+          if (
+            explicitModificationTargetDate &&
+            slotChecked === true &&
+            slotAvailable === true &&
+            bookingState.name
+          ) {
+            pendingConfirmationSafetyReply = confirmationClarificationReply({
+              name: bookingState.name,
+              service: bookingState.service,
+              date: bookingState.parsedDate,
+              time: bookingState.parsedTime,
+              language: currentLanguage,
+            });
+          }
           console.log("[POST_AVAILABILITY_BOOKING_STATE]", {
             transcript: transcriptText,
             state: bookingDecisionState(),
