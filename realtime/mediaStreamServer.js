@@ -542,6 +542,84 @@ const normalizeYesNoText = (text) =>
     .replace(/[.?!,]+$/g, "")
     .trim();
 
+const normalizeConfirmationDecisionText = (text) =>
+  String(text || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[’']/g, "'")
+    .replace(/[^\p{L}\p{N}\s?'!-]/gu, " ")
+    .replace(/\s+/g, " ")
+    .replace(/!+$/g, "")
+    .trim();
+
+export const classifyConfirmationResponse = (text, { language = "auto" } = {}) => {
+  const raw = String(text || "").trim();
+  const normalized = normalizeConfirmationDecisionText(raw);
+  if (!normalized) return { kind: "unclear", reason: "empty" };
+
+  const rejectionPatterns = [
+    /^(?:no|nope|nah)$/,
+    /\b(?:do not|don't|dont)\s+(?:book|confirm|schedule)\b/,
+    /\bno\s+(?:la|lo)\s+confirmes\b/,
+    /\bno\s+quiero\s+(?:esa|esta|la)\s+cita\b/,
+    /\b(?:cancel|cancela|cancelar)\b/,
+  ];
+  if (rejectionPatterns.some((pattern) => pattern.test(normalized))) {
+    return { kind: "rejection", reason: "explicit_rejection" };
+  }
+
+  const modificationPatterns = [
+    /\b(?:change|move|switch|make)\s+(?:it|the appointment)\b/,
+    /\b(?:instead|different time|different day|different service)\b/,
+    /\b(?:cambia|cambiala|cambialo|mueve|muevela|mejor)\b/,
+    /\bquiero\s+(?:corte|barba|otro|otra).*\b(?:en vez|instead)?\b/,
+  ];
+  if (modificationPatterns.some((pattern) => pattern.test(normalized))) {
+    return { kind: "modification", reason: "requested_change" };
+  }
+
+  const clarificationPatterns = [
+    /\?/,
+    /^(?:is|are|was|does|do|what|which|when|where|who|how)\b/,
+    /^(?:es|son|cual|cuales|cuando|donde|quien|como|que)\b/,
+    /\b(?:exact|exacta|exacto|correct date|fecha correcta|what date|que fecha)\b/,
+    /\b(?:need|necesito|quiero)\s+(?:to know|saber)\b/,
+    /\b(?:before confirming|before i confirm|antes de confirmar)\b/,
+    /\b(?:or|o)\b.*\b(?:july|august|julio|agosto|first|primero|veinticinco|twenty fifth)\b/,
+  ];
+  if (clarificationPatterns.some((pattern) => pattern.test(normalized))) {
+    return { kind: "clarification", reason: "question_or_detail_request" };
+  }
+
+  const uncertaintyPatterns = [
+    /\b(?:maybe|perhaps|possibly|probably|i think so|i guess|not sure|unsure)\b/,
+    /\b(?:creo que si|quizas|tal vez|supongo|no estoy segur[oa])\b/,
+  ];
+  if (uncertaintyPatterns.some((pattern) => pattern.test(normalized))) {
+    return { kind: "unclear", reason: "uncertain" };
+  }
+
+  const affirmativePatterns = [
+    /^(?:yes|yep|yup)$/,
+    /^yes(?: please)?[, ]+(?:confirm(?: it| the appointment)?|book it)$/,
+    /^(?:correct|that's right|thats right|sure|go ahead)$/,
+    /^(?:confirm|confirm it|confirm the appointment|please confirm(?: it| the appointment)?)$/,
+    /^(?:si|sí)$/,
+    /^(?:si|sí)(?: por favor)?[, ]+(?:confirmala|confirmalo|confirma la cita)$/,
+    /^(?:claro|correcto|correcta|exacto|exacta|confirmo|adelante)$/,
+    /^(?:confirma la cita|confirmala|confirmalo)$/,
+  ];
+  if (language === "es" && normalized === "see") {
+    return { kind: "affirmative", reason: "spanish_asr_si_artifact" };
+  }
+  if (affirmativePatterns.some((pattern) => pattern.test(normalized))) {
+    return { kind: "affirmative", reason: "explicit_affirmative" };
+  }
+
+  return { kind: "unclear", reason: "not_explicit" };
+};
+
 const SPANISH_CONFIRMATION_ALIASES = Object.freeze([
   "sí", "si", "claro", "correcto", "confirmo", "adelante",
 ]);
@@ -669,7 +747,8 @@ const containsTimeSignal = (text) => {
   return (
     /\b\d{1,2}\s*(:\d{2})?\s*(am|pm)\b/.test(t) ||
     /\b\d{1,2}\s*(de la ma[ñn]ana|de la tarde|de la noche)\b/.test(t) ||
-    /\b(noon|morning|afternoon|evening|ma[ñn]ana|tarde|noche)\b/.test(t)
+    /\ba las (?:una|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez|once|doce)\b/.test(t) ||
+    /\b(noon|midnight|morning|afternoon|evening|mediodia|medianoche|ma[ñn]ana|tarde|noche)\b/.test(t)
   );
 };
 
@@ -776,6 +855,18 @@ const formatSpokenWeekday = (date, language = "en") => {
   }).format(parsed);
 };
 
+const formatFullCalendarDate = (date, language = "en") => {
+  const parsed = new Date(`${date}T12:00:00.000Z`);
+  if (Number.isNaN(parsed.getTime())) return String(date || "").trim();
+  return new Intl.DateTimeFormat(language === "es" ? "es-ES" : "en-US", {
+    weekday: "long",
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+    timeZone: "UTC",
+  }).format(parsed);
+};
+
 const formatCustomerTime = (time, language = "en") => {
   if (language !== "es") return String(time || "").trim();
   const match = String(time || "").trim().match(/^(\d{1,2})(?::(\d{2}))?\s*(AM|PM)$/i);
@@ -786,6 +877,15 @@ const formatCustomerTime = (time, language = "en") => {
   if (hour === 12 && suffix === "AM") return `${clock} de la medianoche`;
   if (hour === 12 && suffix === "PM") return `${clock} del mediodía`;
   return `${clock} de la ${suffix === "AM" ? "mañana" : "tarde"}`;
+};
+
+const confirmationClarificationReply = ({ name, service, date, time, language = "en" }) => {
+  const spokenDate = formatFullCalendarDate(date, language);
+  const spokenService = formatCustomerService(service, language);
+  const spokenTime = formatCustomerTime(time, language);
+  return language === "es"
+    ? `La fecha exacta es ${spokenDate}. Tengo a ${name} para ${spokenService} el ${spokenDate} a las ${spokenTime}. ¿Quieres que confirme la cita?`
+    : `The exact date is ${spokenDate}. I have ${name} scheduled for ${spokenService} on ${spokenDate} at ${spokenTime}. Would you like me to confirm the appointment?`;
 };
 
 const stripAmPmForGroupedTime = (time) =>
@@ -1195,6 +1295,10 @@ const formatTimeForBooking = (value) => {
 
 const extractSpokenTimeForBooking = (text) => {
   const normalized = normalizeSpanishDateTimeText(text);
+  if (/\b(?:noon|mediodia)\b/i.test(normalized)) return "12:00 PM";
+  if (/\b(?:midnight|medianoche)\b/i.test(normalized)) return "12:00 AM";
+  if (/\ba las doce\b/i.test(normalized)) return "12:00 PM";
+
   const explicit = normalized.match(/\b(\d{1,2})(?::(\d{2}))?\s*(AM|PM)\b/i);
   if (explicit) {
     const hour = Number(explicit[1]);
@@ -1656,6 +1760,7 @@ export const attachMediaWebSocketServer = (server, dependencies = {}) => {
         : DEFAULT_DETERMINISTIC_COMPLETION_TIMEOUT_MS;
     const playbackMarkToResponseId = new Map();
     let confirmationDeliveryReady = false;
+    let pendingConfirmationSafetyReply = "";
     let activeConfirmationLifecycleId = "";
     let activeDeterministicLifecycleId = "";
     let lastSpeakExactStatus = null;
@@ -3295,6 +3400,12 @@ RULES:
       // Safety: barber is pre-assigned from routing — never ask which barber
       const isSpanish = currentLanguage === "es";
 
+      if (pendingConfirmationSafetyReply) {
+        const reply = pendingConfirmationSafetyReply;
+        pendingConfirmationSafetyReply = "";
+        return reply;
+      }
+
       if (bookingState.awaitingCorrection) {
         return isSpanish
           ? "Claro, ¿qué quieres cambiar, el servicio, el día o la hora?"
@@ -4359,12 +4470,23 @@ RULES:
       const confirmationPromptActiveAtTranscriptStart =
         bookingState.askedConfirm === true ||
         bookingState.confirmationPromptRequested === true;
+      const confirmationDecisionAtTranscriptStart = confirmationPromptActiveAtTranscriptStart
+        ? classifyConfirmationResponse(transcriptText, { language: currentLanguage })
+        : null;
       if (
         !isBuffered &&
         assistantPlaybackActive === true &&
-        confirmationPromptActiveAtTranscriptStart &&
-        (isContextualConfirmationYes(transcriptText) || isNo(transcriptText))
+        confirmationPromptActiveAtTranscriptStart
       ) {
+        if (confirmationDecisionAtTranscriptStart?.kind === "affirmative") {
+          console.log("[PRE_DELIVERY_CONFIRMATION_AUTHORIZATION_DISCARDED]", {
+            transcript: transcriptText,
+            reason: "assistant_playback_active",
+            decision: confirmationDecisionAtTranscriptStart.reason,
+          });
+          await finishCallerTranscriptHandling("pre_delivery_affirmative_discarded");
+          return;
+        }
         bufferCallerTranscript(
           transcriptText,
           "confirmation_response_during_assistant_playback",
@@ -4395,7 +4517,7 @@ RULES:
           bookingState.askedConfirm === true ||
           bookingState.confirmationPromptRequested === true;
         const isConfirmationResponse =
-          isInConfirmationContext && (isContextualConfirmationYes(transcriptText) || isNo(transcriptText));
+          isInConfirmationContext && Boolean(confirmationDecisionAtTranscriptStart);
         const isServiceResponse =
           bookingState.intent === "BOOK" &&
           !bookingState.service &&
@@ -4416,6 +4538,15 @@ RULES:
           isLikelyAlternativeSelectionResponse(transcriptText, alternativeOptions);
 
         if (isConfirmationResponse) {
+          if (confirmationDecisionAtTranscriptStart?.kind === "affirmative") {
+            console.log("[PRE_DELIVERY_CONFIRMATION_AUTHORIZATION_DISCARDED]", {
+              transcript: transcriptText,
+              reason: "caller_input_not_ready",
+              decision: confirmationDecisionAtTranscriptStart.reason,
+            });
+            await finishCallerTranscriptHandling("pre_delivery_affirmative_discarded");
+            return;
+          }
           bufferCallerTranscript(
             transcriptText,
             "confirmation_response_not_ready",
@@ -4559,7 +4690,7 @@ RULES:
         isLikelyAlternativeSelectionResponse(transcriptText, alternativeOptions);
       const isConfirmationResponse =
         (bookingState.askedConfirm === true || bookingState.confirmationPromptRequested === true) &&
-        (isContextualConfirmationYes(transcriptText) || isNo(transcriptText));
+        Boolean(confirmationDecisionAtTranscriptStart);
 
       if (
         bookingState.awaitingAlternativeSelection === true &&
@@ -4619,7 +4750,7 @@ RULES:
         const hasService = ["haircut", "beard", "barba", "corte", "pelo", "cabello", "fade"].some(kw => t.includes(kw));
 
         const isConfirmationRelevant =
-          isContextualConfirmationYes(transcriptText) ||
+          Boolean(confirmationDecisionAtTranscriptStart) ||
           confirmationWords.some(w =>
             t.includes(
               w.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "")
@@ -4671,6 +4802,78 @@ RULES:
         confirmed: bookingState.confirmed,
       }));
       logBookingPhase("transcript_received");
+
+      const awaitingExplicitConfirmation =
+        bookingState.intent === "BOOK" &&
+        getBookingPhase() === "awaiting_confirmation" &&
+        confirmationDeliveryReady === true;
+      const confirmationDecision = awaitingExplicitConfirmation
+        ? confirmationDecisionAtTranscriptStart
+        : null;
+
+      if (
+        confirmationDecision?.kind === "clarification" ||
+        confirmationDecision?.kind === "unclear"
+      ) {
+        bookingState.confirmed = false;
+        bookingState.askedConfirm = true;
+        bookingState.confirmationPromptRequested = true;
+        confirmationDeliveryReady = false;
+        pendingConfirmationSafetyReply = confirmationClarificationReply({
+          name: bookingState.name,
+          service: bookingState.service,
+          date: bookingState.parsedDate,
+          time: bookingState.parsedTime,
+          language: currentLanguage,
+        });
+
+        console.log("[CONFIRMATION_AUTHORIZATION_WITHHELD]", {
+          transcript: transcriptText,
+          decision: confirmationDecision.kind,
+          reason: confirmationDecision.reason,
+          state: bookingDecisionState(),
+        });
+
+        await finishCallerTranscriptHandling("confirmation_requires_explicit_answer");
+        await requestAssistantResponse({
+          immediate: true,
+          reason: "confirmation_requires_explicit_answer",
+        });
+        return;
+      }
+
+      if (confirmationDecision?.kind === "rejection") {
+        bookingState.confirmed = false;
+        bookingState.askedConfirm = false;
+        bookingState.confirmationPromptRequested = false;
+        bookingState.bookingAttempted = false;
+        bookingState.awaitingCorrection = true;
+        confirmationDeliveryReady = false;
+
+        console.log("[CONFIRMATION_REJECTED]", {
+          transcript: transcriptText,
+          reason: confirmationDecision.reason,
+          state: bookingDecisionState(),
+        });
+
+        await finishCallerTranscriptHandling("confirmation_rejected");
+        await requestAssistantResponse({ immediate: true, reason: "confirmation_rejected" });
+        return;
+      }
+
+      if (confirmationDecision?.kind === "modification") {
+        bookingState.confirmed = false;
+        bookingState.askedConfirm = false;
+        bookingState.confirmationPromptRequested = false;
+        bookingState.bookingAttempted = false;
+        bookingState.awaitingCorrection = true;
+        confirmationDeliveryReady = false;
+        console.log("[CONFIRMATION_INVALIDATED_FOR_MODIFICATION]", {
+          transcript: transcriptText,
+          reason: confirmationDecision.reason,
+          state: bookingDecisionState(),
+        });
+      }
 
       const text = String(transcriptText || "").toLowerCase();
       const inferredServiceFromTranscript = normalizeServiceName(transcriptText);
@@ -4865,10 +5068,12 @@ RULES:
 
       // Global service extraction — check barber's configured services first, then aliases
       if (bookingState.intent === "BOOK" && (!bookingState.service || bookingState.awaitingCorrection)) {
-        let extractedService = null;
+        const normalizedService = normalizeServiceName(transcriptText);
+        let extractedService =
+          normalizedService === "Haircut + Beard" ? normalizedService : null;
 
         // Step 1: Check against barber's actual configured services
-        if (barberDoc?.services?.length) {
+        if (!extractedService && barberDoc?.services?.length) {
           for (const svc of barberDoc.services) {
             const svcName = String(svc.name || "").toLowerCase();
             if (lower.includes(svcName)) {
@@ -4879,9 +5084,7 @@ RULES:
         }
 
         // Step 2: Fall back to aliases if no direct match
-        if (!extractedService) {
-          extractedService = normalizeServiceName(transcriptText);
-        }
+        if (!extractedService) extractedService = normalizedService;
 
         // Step 3: Fall back to keyword aliases if normalization finds no match
         if (!extractedService) {
@@ -5036,7 +5239,7 @@ RULES:
             const newTime = parsedBookingTime.time;
 
             if (newDate && !newTime) {
-              shouldCheckAvailabilityAfterParse = false;
+              shouldCheckAvailabilityAfterParse = Boolean(bookingState.parsedTime);
               console.log("[BOOKING_PARSE_DATE_ONLY_NO_TIME_DEFAULT]", {
                 transcript: transcriptText,
                 parsedDate: parsedBookingTime.date,
@@ -5127,31 +5330,14 @@ RULES:
         (bookingState.askedConfirm === true || bookingState.confirmationPromptRequested === true) &&
         confirmationDeliveryReady === true;
 
-      if (awaitingConfirmationResponse && isNo(transcriptText)) {
-        bookingState.confirmed = false;
-        bookingState.askedConfirm = false;
-        bookingState.confirmationPromptRequested = false;
-        bookingState.bookingAttempted = false;
-        bookingState.awaitingCorrection = true;
-
-        console.log("[CONFIRMATION_REJECTED]", {
-          transcript: transcriptText,
-          state: {
-            service: bookingState.service,
-            name: bookingState.name,
-            parsedDate: bookingState.parsedDate,
-            parsedTime: bookingState.parsedTime,
-          },
-        });
-
-        // If the caller gives a new date/time in the same correction, existing date/time parser can update it.
-        // If not, deterministic reply will ask what they want to change.
-      }
-
-      if (awaitingConfirmationResponse && isContextualConfirmationYes(transcriptText)) {
+      if (
+        awaitingConfirmationResponse &&
+        confirmationDecision?.kind === "affirmative"
+      ) {
         bookingState.confirmed = true;
         console.log("[CONFIRMATION_ACCEPTED]", {
           transcript: transcriptText,
+          reason: confirmationDecision.reason,
           state: {
             service: bookingState.service,
             name: bookingState.name,
@@ -6710,6 +6896,7 @@ RULES:
         },
         getState: () => ({
           bookingState: structuredClone(bookingState),
+          bookingPhase: getBookingPhase(),
           responseInFlightId,
           responseActive,
           aiResponseInProgress,
@@ -6721,6 +6908,7 @@ RULES:
           readyForCallerInput,
           currentLanguage,
           barberPreferredLang,
+          barberId,
           pendingLanguageUpdate: pendingLanguageUpdate
             ? {
                 targetLanguage: pendingLanguageUpdate.targetLanguage,

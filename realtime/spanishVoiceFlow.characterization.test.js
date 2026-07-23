@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import {
   attachMediaWebSocketServer,
+  classifyConfirmationResponse,
   extractIntendedSpeech,
   normalizeDeterministicSpeech,
 } from "./mediaStreamServer.js";
@@ -174,6 +175,25 @@ const deliverLatestExactResponse = async ({ ai, twilio, controls }, responseId) 
   return intended;
 };
 
+const completeLatestExactResponseBeforeMark = async ({ ai, controls }, responseId) => {
+  const intended = latestSpeech(ai);
+  await emitOpenAi(ai, { type: "response.created", response: { id: responseId } });
+  await emitOpenAi(ai, { type: "response.output_audio.delta", response_id: responseId, delta: "AA==" });
+  await emitOpenAi(ai, {
+    type: "response.output_audio_transcript.done",
+    response_id: responseId,
+    transcript: intended,
+  });
+  await emitOpenAi(ai, { type: "response.output_audio.done", response_id: responseId });
+  await emitOpenAi(ai, { type: "response.done", response: { id: responseId, status: "completed" } });
+  return { intended, mark: controls.getState().pendingAssistantMarkName };
+};
+
+const deliverPlaybackMark = async ({ twilio }, mark) => {
+  await emitTwilio(twilio, { event: "mark", mark: { name: mark } });
+  await settle();
+};
+
 const deliverSpanishConfirmation = async ({ ai, twilio, controls }, responseId) => {
   await controls.requestAssistantResponse({ immediate: true, reason: "spanish_confirmation_delivery" });
   const intended = latestSpeech(ai);
@@ -189,6 +209,63 @@ const deliverSpanishConfirmation = async ({ ai, twilio, controls }, responseId) 
   const mark = controls.getState().pendingAssistantMarkName;
   twilio.emit("message", Buffer.from(JSON.stringify({ event: "mark", mark: { name: mark } })));
   await settle();
+};
+
+const createConfirmationSafetySession = async ({
+  language = "es",
+  deliverPrompt = true,
+  isSlotAvailableResult = true,
+} = {}) => {
+  let bookings = 0;
+  let availabilityChecks = 0;
+  const session = createSession({
+    language,
+    isSlotAvailable: async () => {
+      availabilityChecks += 1;
+      return isSlotAvailableResult;
+    },
+    bookAppointment: async () => {
+      bookings += 1;
+      return { success: true, appointment: { _id: `appt-confirmation-safety-${language}` } };
+    },
+  });
+  session.controls.seedBookingState({
+    state: baseState({
+      name: "Abraham",
+      service: "Haircut",
+      parsedDate: "2026-08-01",
+      parsedTime: "11:00 AM",
+      askedConfirm: false,
+      confirmationPromptRequested: false,
+      confirmed: false,
+    }),
+    availability: { slotChecked: true, slotAvailable: true, slotAlternatives: [] },
+    context: {
+      currentLanguage: language,
+      barberId: "507f1f77bcf86cd799439011",
+      barberDoc: {
+        _id: "507f1f77bcf86cd799439011",
+        services: [
+          { name: "Haircut", durationMinutes: 30 },
+          { name: "Haircut + Beard", durationMinutes: 45 },
+        ],
+        availability: { timezone: "America/New_York", defaultServiceDurationMinutes: 30 },
+      },
+    },
+  });
+  if (deliverPrompt) {
+    await deliverSpanishConfirmation(session, `resp-safety-prompt-${language}-${Date.now()}`);
+  } else {
+    await session.controls.requestAssistantResponse({
+      immediate: true,
+      reason: `confirmation_safety_pending_${language}`,
+    });
+  }
+  return {
+    ...session,
+    get bookings() { return bookings; },
+    get availabilityChecks() { return availabilityChecks; },
+  };
 };
 
 const beginEnglishToSpanishSwitch = async (session) => {
@@ -792,6 +869,348 @@ test("Spanish confirmation aliases normalize as affirmative while bare See does 
   assert.notEqual(normalizeDeterministicSpeech("See"), normalizeDeterministicSpeech("si"));
 });
 
+test("shared bilingual confirmation classifier gives safety outcomes precedence over affirmative words", () => {
+  for (const [text, kind] of [
+    ["Yes", "affirmative"],
+    ["Yes!", "affirmative"],
+    ["Yes?", "clarification"],
+    ["Yes, confirm it", "affirmative"],
+    ["Correct", "affirmative"],
+    ["Confirm the appointment", "affirmative"],
+    ["Sí", "affirmative"],
+    ["Sí, confírmala", "affirmative"],
+    ["Correcto", "affirmative"],
+    ["¡Sí!", "affirmative"],
+    ["¿Sí?", "clarification"],
+    ["Confirma la cita", "affirmative"],
+    ["Don't confirm it", "rejection"],
+    ["No la confirmes", "rejection"],
+    ["Yes, but is that August first?", "clarification"],
+    ["Yes! But is that August first?", "clarification"],
+    ["¡Sí! Pero ¿es el primero?", "clarification"],
+    ["Sí, pero ¿es el primero?", "clarification"],
+    ["I think so", "unclear"],
+    ["Creo que sí", "unclear"],
+    ["Make it noon instead", "modification"],
+    ["Make it midnight instead", "modification"],
+    ["Mejor a las doce", "modification"],
+    ["Mejor a medianoche", "modification"],
+  ]) {
+    assert.equal(classifyConfirmationResponse(text).kind, kind, text);
+  }
+});
+
+test("Spanish and English date clarifications preserve canonical state and require a later explicit confirmation", async () => {
+  for (const scenario of [
+    {
+      language: "es",
+      question: "¿Es el veinticinco o el primero?",
+      yes: "Sí",
+      datePattern: /1 de agosto de 2026/i,
+      weekdayPattern: /sábado/i,
+      confirmPattern: /¿Quieres que confirme la cita\?/i,
+    },
+    {
+      language: "en",
+      question: "Is that July twenty-fifth or August first?",
+      yes: "Yes",
+      datePattern: /August 1, 2026/i,
+      weekdayPattern: /Saturday/i,
+      confirmPattern: /Would you like me to confirm the appointment\?/i,
+    },
+  ]) {
+    const session = await createConfirmationSafetySession({ language: scenario.language });
+    const beforeState = session.controls.getState();
+    const before = beforeState.bookingState;
+
+    await session.controls.handleCallerTranscript(scenario.question);
+
+    const afterQuestion = session.controls.getState();
+    assert.equal(session.bookings, 0);
+    assert.equal(session.availabilityChecks, 0);
+    assert.equal(afterQuestion.bookingPhase, "awaiting_confirmation");
+    assert.equal(afterQuestion.bookingState.service, before.service);
+    assert.equal(afterQuestion.bookingState.name, before.name);
+    assert.equal(afterQuestion.bookingState.parsedDate, before.parsedDate);
+    assert.equal(afterQuestion.bookingState.parsedTime, before.parsedTime);
+    assert.equal(afterQuestion.barberId, beforeState.barberId);
+    assert.equal(afterQuestion.bookingState.confirmed, false);
+    assert.match(latestSpeech(session.ai), scenario.datePattern);
+    assert.match(latestSpeech(session.ai), scenario.weekdayPattern);
+    assert.match(latestSpeech(session.ai), scenario.confirmPattern);
+
+    await deliverLatestExactResponse(
+      session,
+      `resp-safety-clarification-${scenario.language}`
+    );
+    await session.controls.handleCallerTranscript(scenario.yes);
+    await session.controls.handleCallerTranscript(scenario.yes);
+    assert.equal(session.bookings, 1);
+  }
+});
+
+test("questions, uncertainty, mixed answers, and rejection create zero appointments in both languages", async () => {
+  for (const [language, transcript, expectedKind] of [
+    ["es", "Necesito saber la fecha correcta antes de confirmar", "clarification"],
+    ["en", "I need the exact date before confirming", "clarification"],
+    ["es", "Creo que sí", "unclear"],
+    ["en", "I think so", "unclear"],
+    ["es", "Sí, pero ¿es el primero?", "clarification"],
+    ["en", "Yes, but is that August first?", "clarification"],
+    ["es", "No la confirmes", "rejection"],
+    ["en", "Don't confirm it", "rejection"],
+  ]) {
+    const session = await createConfirmationSafetySession({ language });
+    await session.controls.handleCallerTranscript(transcript);
+    assert.equal(classifyConfirmationResponse(transcript).kind, expectedKind);
+    assert.equal(session.bookings, 0, transcript);
+    assert.equal(session.availabilityChecks, 0, transcript);
+    assert.equal(session.controls.getState().bookingState.confirmed, false, transcript);
+  }
+});
+
+test("modification requests revoke confirmation and recheck the changed canonical slot", async () => {
+  for (const [language, transcript, expectedTime] of [
+    ["en", "Make it noon instead", "12:00 PM"],
+    ["es", "Mejor a las doce", "12:00 PM"],
+  ]) {
+    const session = await createConfirmationSafetySession({ language });
+    await session.controls.handleCallerTranscript(transcript);
+
+    const state = session.controls.getState().bookingState;
+    assert.equal(session.bookings, 0, transcript);
+    assert.equal(session.availabilityChecks, 1, `${transcript}: ${JSON.stringify(state)}`);
+    assert.equal(state.parsedTime, expectedTime, transcript);
+    assert.equal(state.confirmed, false, transcript);
+  }
+});
+
+test("English and Spanish midnight modifications recheck once and require fresh confirmation", async () => {
+  for (const scenario of [
+    {
+      language: "en",
+      transcript: "Make it midnight instead",
+      affirmative: "Yes",
+      timePattern: /12:00 AM/i,
+      confirmPattern: /confirm/i,
+    },
+    {
+      language: "es",
+      transcript: "Mejor a medianoche",
+      affirmative: "Sí",
+      timePattern: /12:00 de la medianoche/i,
+      confirmPattern: /confirm/i,
+    },
+  ]) {
+    const session = await createConfirmationSafetySession({ language: scenario.language });
+    await session.controls.handleCallerTranscript(scenario.transcript);
+
+    const afterModification = session.controls.getState();
+    assert.equal(session.bookings, 0);
+    assert.equal(session.availabilityChecks, 1);
+    assert.equal(afterModification.bookingState.parsedTime, "12:00 AM");
+    assert.equal(afterModification.bookingState.confirmed, false);
+    assert.equal(afterModification.bookingPhase, "awaiting_confirmation");
+    assert.match(latestSpeech(session.ai), scenario.timePattern);
+    assert.match(latestSpeech(session.ai), scenario.confirmPattern);
+
+    await deliverLatestExactResponse(
+      session,
+      `resp-midnight-modification-${scenario.language}`
+    );
+    await session.controls.handleCallerTranscript(scenario.affirmative);
+    assert.equal(session.bookings, 1);
+  }
+});
+
+test("English and Spanish date and service modifications recheck exactly once without booking", async () => {
+  for (const scenario of [
+    {
+      language: "en",
+      transcript: "Change it to Sunday",
+      assertChange: (state) => assert.notEqual(state.parsedDate, "2026-08-01"),
+      speechPattern: /Sunday/i,
+    },
+    {
+      language: "es",
+      transcript: "Cámbiala para el domingo",
+      assertChange: (state) => assert.notEqual(state.parsedDate, "2026-08-01"),
+      speechPattern: /domingo/i,
+    },
+    {
+      language: "en",
+      transcript: "I want a haircut and beard instead",
+      assertChange: (state) => assert.equal(state.service, "Haircut + Beard"),
+      speechPattern: /Haircut \+ Beard/i,
+    },
+    {
+      language: "es",
+      transcript: "Quiero corte y barba",
+      assertChange: (state) => assert.equal(state.service, "Haircut + Beard"),
+      speechPattern: /corte de pelo y barba/i,
+    },
+  ]) {
+    const session = await createConfirmationSafetySession({ language: scenario.language });
+    await session.controls.handleCallerTranscript(scenario.transcript);
+
+    const afterModification = session.controls.getState();
+    scenario.assertChange(afterModification.bookingState);
+    assert.equal(session.bookings, 0, scenario.transcript);
+    assert.equal(session.availabilityChecks, 1, scenario.transcript);
+    assert.equal(afterModification.bookingState.confirmed, false, scenario.transcript);
+    assert.equal(afterModification.bookingPhase, "awaiting_confirmation", scenario.transcript);
+    assert.match(latestSpeech(session.ai), scenario.speechPattern, scenario.transcript);
+  }
+});
+
+test("an unavailable modified slot is checked once and cannot use prior authorization", async () => {
+  const session = await createConfirmationSafetySession({
+    language: "en",
+    isSlotAvailableResult: false,
+  });
+  await session.controls.handleCallerTranscript("Make it midnight instead");
+
+  const state = session.controls.getState();
+  assert.equal(session.availabilityChecks, 1);
+  assert.equal(session.bookings, 0);
+  assert.equal(state.bookingState.parsedTime, "12:00 AM");
+  assert.equal(state.bookingState.confirmed, false);
+  assert.notEqual(state.bookingPhase, "awaiting_confirmation");
+
+  await session.controls.handleCallerTranscript("Yes");
+  assert.equal(session.availabilityChecks, 1);
+  assert.equal(session.bookings, 0);
+});
+
+test("pre-delivery affirmatives never become authorization after the playback mark", async () => {
+  for (const [language, premature, postMark] of [
+    ["en", "Yes", "Yes"],
+    ["es", "Sí", "Sí"],
+    ["es", "See", "Sí"],
+  ]) {
+    const session = await createConfirmationSafetySession({
+      language,
+      deliverPrompt: false,
+    });
+    const responseId = `resp-premark-${language}-${premature}`;
+    const { mark } = await completeLatestExactResponseBeforeMark(session, responseId);
+
+    await session.controls.handleCallerTranscript(premature, {
+      transcriptId: `premark-${language}-${premature}`,
+    });
+    assert.equal(session.bookings, 0, `${premature} before mark`);
+
+    await deliverPlaybackMark(session, mark);
+    await settle();
+    await settle();
+    assert.equal(session.bookings, 0, `${premature} after mark and buffered processing`);
+
+    await session.controls.handleCallerTranscript(postMark, {
+      transcriptId: `postmark-${language}-${premature}`,
+    });
+    assert.equal(session.bookings, 1, `${postMark} after mark`);
+    await session.controls.handleCallerTranscript(postMark, {
+      transcriptId: `postmark-${language}-${premature}`,
+    });
+    await session.controls.handleCallerTranscript(postMark, {
+      transcriptId: `postmark-repeat-${language}-${premature}`,
+    });
+    assert.equal(session.bookings, 1, `${postMark} duplicates`);
+  }
+});
+
+test("pre-delivery clarification and modification stay non-authorizing across playback generations", async () => {
+  const clarification = await createConfirmationSafetySession({
+    language: "en",
+    deliverPrompt: false,
+  });
+  const clarificationPlayback = await completeLatestExactResponseBeforeMark(
+    clarification,
+    "resp-premark-clarification"
+  );
+  await clarification.controls.handleCallerTranscript("Yes, but is that August first?");
+  assert.equal(clarification.bookings, 0);
+  await deliverPlaybackMark(clarification, clarificationPlayback.mark);
+  await settle();
+  assert.equal(clarification.bookings, 0);
+  assert.equal(clarification.controls.getState().bookingPhase, "awaiting_confirmation");
+
+  const modification = await createConfirmationSafetySession({
+    language: "en",
+    deliverPrompt: false,
+  });
+  const oldPlayback = await completeLatestExactResponseBeforeMark(
+    modification,
+    "resp-premark-old-details"
+  );
+  await modification.controls.handleCallerTranscript("Yes");
+  await modification.controls.handleCallerTranscript("Make it noon instead");
+  assert.equal(modification.bookings, 0);
+  await deliverPlaybackMark(modification, oldPlayback.mark);
+  await settle();
+  await settle();
+  assert.equal(modification.bookings, 0);
+  assert.equal(modification.controls.getState().bookingState.parsedTime, "12:00 PM");
+  assert.equal(modification.availabilityChecks, 1);
+
+  await deliverLatestExactResponse(modification, "resp-post-modification-details");
+  await modification.controls.handleCallerTranscript("Yes");
+  assert.equal(modification.bookings, 1);
+});
+
+test("affirmatives authorize exactly once only in the delivered confirmation phase", async () => {
+  for (const [language, affirmative] of [["es", "Sí"], ["en", "Yes"]]) {
+    const confirmed = await createConfirmationSafetySession({ language });
+    await confirmed.controls.handleCallerTranscript(affirmative, {
+      transcriptId: `explicit-${language}`,
+    });
+    await confirmed.controls.handleCallerTranscript(affirmative, {
+      transcriptId: `explicit-${language}`,
+    });
+    await confirmed.controls.handleCallerTranscript(affirmative, {
+      transcriptId: `duplicate-${language}`,
+    });
+    assert.equal(confirmed.bookings, 1);
+
+    let outsideBookings = 0;
+    const outside = createSession({
+      language,
+      bookAppointment: async () => { outsideBookings += 1; return { success: true }; },
+    });
+    outside.controls.seedBookingState({
+      state: baseState({
+        askedConfirm: false,
+        confirmationPromptRequested: false,
+        confirmed: false,
+      }),
+      availability: { slotChecked: true, slotAvailable: true },
+      context: { currentLanguage: language },
+    });
+    await outside.controls.handleCallerTranscript(affirmative);
+    assert.equal(outsideBookings, 0);
+  }
+});
+
+test("terminal exclamations authorize explicitly while question punctuation remains non-authorizing", async () => {
+  for (const [language, affirmative] of [["en", "Yes!"], ["es", "¡Sí!"]]) {
+    const session = await createConfirmationSafetySession({ language });
+    await session.controls.handleCallerTranscript(affirmative);
+    assert.equal(session.bookings, 1, affirmative);
+  }
+
+  for (const [language, transcript] of [
+    ["en", "Yes?"],
+    ["es", "¿Sí?"],
+    ["en", "Yes! But is that August first?"],
+    ["es", "¡Sí! Pero ¿es el primero?"],
+  ]) {
+    const session = await createConfirmationSafetySession({ language });
+    await session.controls.handleCallerTranscript(transcript);
+    assert.equal(session.bookings, 0, transcript);
+    assert.equal(session.controls.getState().bookingPhase, "awaiting_confirmation", transcript);
+  }
+});
+
 test("real confirmation handler accepts all required Spanish aliases and delivered-confirmation bare See", async () => {
   const aliases = new Map([
     ["sí", 1], ["si", 1], ["claro", 1], ["correcto", 1],
@@ -870,6 +1289,7 @@ test("See is rejected before playback acknowledgment, when embedded in a sentenc
   await deliverSpanishConfirmation(delivered, "resp-see-longer");
   await delivered.controls.handleCallerTranscript("I see what you mean");
   assert.equal(bookings, 0);
+  await deliverLatestExactResponse(delivered, "resp-see-longer-reprompt");
   await delivered.controls.handleCallerTranscript("no");
   assert.equal(delivered.controls.getState().bookingState.awaitingCorrection, true);
   await delivered.controls.handleCallerTranscript("See");
