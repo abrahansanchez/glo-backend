@@ -926,6 +926,7 @@ const normalizeSpokenAlternativeTimeText = (text) =>
     .replace(/\bo(?:'|\u2019|\s+)?clock\b/g, "")
     .replace(/\b(\d{1,2})\s+thirty\b/g, "$1:30")
     .replace(/\b(\d{1,2})\s+treinta\b/g, "$1:30")
+    .replace(/\b(\d{1,2})\s+y\s+treinta\b/g, "$1:30")
     .replace(/\b(\d{1,2})\s+y\s+media\b/g, "$1:30")
     .replace(/\bin the morning\b/g, "am")
     .replace(/\bin morning\b/g, "am")
@@ -937,6 +938,7 @@ const normalizeSpokenAlternativeTimeText = (text) =>
     .replace(/\bde la mañana\b/g, "am")
     .replace(/\bde la tarde\b/g, "pm")
     .replace(/\bde la noche\b/g, "pm")
+    .replace(/\bdel mediodia\b/g, "pm")
     .replace(/\s+/g, " ")
     .trim();
 
@@ -1072,10 +1074,7 @@ const selectAlternativeFromTranscript = (transcript, alternatives = [], language
 
   for (let index = 0; index < alternatives.length; index += 1) {
     const alternative = alternatives[index];
-    const aliases = new Set([
-      ...alternativeTimeAliasesFor(alternative?.time),
-      ...ordinalAliasesForAlternative(index, alternatives.length),
-    ]);
+    const aliases = ordinalAliasesForAlternative(index, alternatives.length);
 
     if (aliases.has(normalized)) {
       return {
@@ -1087,6 +1086,57 @@ const selectAlternativeFromTranscript = (transcript, alternatives = [], language
         language,
       };
     }
+  }
+
+  const explicitSuffix = normalized.match(/\b(am|pm)\b/)?.[1] || "";
+  const spokenWeekday =
+    normalized.match(/\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/)?.[1] || "";
+  const contextualMatches = [];
+  const containsAlias = (alias) =>
+    normalized === alias ||
+    normalized.startsWith(`${alias} `) ||
+    normalized.endsWith(` ${alias}`) ||
+    normalized.includes(` ${alias} `);
+
+  for (const alternative of alternatives) {
+    const slot = parseSlotTimeParts(alternative?.time);
+    if (!slot || (explicitSuffix && slot.suffix !== explicitSuffix)) continue;
+
+    if (spokenWeekday) {
+      const alternativeDate = new Date(`${alternative?.date || ""}T12:00:00.000Z`);
+      const alternativeWeekday = Number.isNaN(alternativeDate.getTime())
+        ? ""
+        : alternativeDate
+            .toLocaleDateString("en-US", { weekday: "long", timeZone: "UTC" })
+            .toLowerCase();
+      if (alternativeWeekday !== spokenWeekday) continue;
+    }
+
+    const timeAliases = alternativeTimeAliasesFor(alternative.time);
+    if ([...timeAliases].some(containsAlias)) contextualMatches.push(alternative);
+  }
+
+  const uniqueMatches = [
+    ...new Map(
+      contextualMatches.map((alternative) => [
+        `${alternative?.date || ""}|${alternative?.time || ""}`,
+        alternative,
+      ])
+    ).values(),
+  ];
+  if (uniqueMatches.length === 1) {
+    const alternative = uniqueMatches[0];
+    return {
+      matched: true,
+      alternative,
+      selectedTime: alternative?.time || "",
+      selectedDate: alternative?.date || "",
+      reason: "contextual_alias_match",
+      language,
+    };
+  }
+  if (uniqueMatches.length > 1) {
+    return { matched: false, reason: "ambiguous_alias_match" };
   }
 
   return { matched: false, reason: "no_alias_match" };
@@ -1257,6 +1307,9 @@ const detectCallerLanguagePreference = (text, currentLanguage) => {
 
 export const attachMediaWebSocketServer = (server, dependencies = {}) => {
   console.log("🔰 attachMediaWebSocketServer() called");
+  const isSlotAvailableForCall = dependencies.isSlotAvailable || isSlotAvailable;
+  const getAvailableSlotsForCall = dependencies.getAvailableSlots || getAvailableSlots;
+  const suggestClosestSlotsForCall = dependencies.suggestClosestSlots || suggestClosestSlots;
 
   const wss = new WebSocketServer({ noServer: true });
 
@@ -2435,7 +2488,7 @@ export const attachMediaWebSocketServer = (server, dependencies = {}) => {
     async function generateAlternativesForUnavailableSlot({ barber, date, time, durationMinutes }) {
       const dayKey = dayKeyForDate(date);
       const dayHours = dayKey ? barber?.availability?.businessHours?.[dayKey] : null;
-      const sameDaySlots = await getAvailableSlots({
+      const sameDaySlots = await getAvailableSlotsForCall({
         barber,
         date,
         durationMinutes,
@@ -2449,7 +2502,7 @@ export const attachMediaWebSocketServer = (server, dependencies = {}) => {
       if (alternatives.length < 3) {
         const futureStartDate = addCalendarDays(date, 1);
         const futureSlots = futureStartDate
-          ? await suggestClosestSlots({
+          ? await suggestClosestSlotsForCall({
               barber,
               date: futureStartDate,
               durationMinutes,
@@ -2559,7 +2612,7 @@ export const attachMediaWebSocketServer = (server, dependencies = {}) => {
         }
 
         const durationMinutes = getServiceDurationMinutes(barberDoc, service);
-        const available = await isSlotAvailable({
+        const available = await isSlotAvailableForCall({
           barber: barberDoc,
           date: parsedDate,
           time: parsedTime,
@@ -6625,6 +6678,7 @@ RULES:
         clearTwilioPlaybackForBargeIn,
         handleAssistantPlaybackWatchdogExpiry,
         handleCallerTranscript,
+        checkSlotAvailability,
         executeBookingIfReady,
         requestCallEnd,
         restoreBookingSnapshot,
