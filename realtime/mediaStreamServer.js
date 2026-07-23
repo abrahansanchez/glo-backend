@@ -3158,7 +3158,8 @@ RULES:
       if (!canSendAI()) return;
       if (aiResponseInProgress) return;
 
-      const exactGreeting = extractGreetingPhrase(initialPrompt);
+      const exactGreeting =
+        currentLanguage === "es" ? null : extractGreetingPhrase(initialPrompt);
       
       let greetingInstruction;
       if (exactGreeting) {
