@@ -24,6 +24,8 @@ const MIN_BARGE_IN_CLEAR_MS = 900;
 // Silence injection constants
 const SILENCE_FRAME_SIZE = 160; // 20ms of μ-law audio at 8kHz
 const PCMU_BYTES_PER_SECOND = 8000;
+const DEFAULT_PLAYBACK_WATCHDOG_MINIMUM_MS = 12000;
+const DEFAULT_PLAYBACK_MARK_ACK_MARGIN_MS = 4000;
 const CONTROLLED_AUDIO_TRACE_ENABLED =
   String(process.env.CONTROLLED_AUDIO_TRACE || "").toLowerCase() === "true";
 const MAX_TRACE_RESPONSES_PER_CALL = 32;
@@ -1851,6 +1853,12 @@ export const attachMediaWebSocketServer = (server, dependencies = {}) => {
       Number(dependencies.deterministicCompletionTimeoutMs) > 0
         ? Number(dependencies.deterministicCompletionTimeoutMs)
         : DEFAULT_DETERMINISTIC_COMPLETION_TIMEOUT_MS;
+    const schedulePlaybackWatchdog =
+      dependencies.schedulePlaybackWatchdog ||
+      ((callback, timeoutMs) => setTimeout(callback, timeoutMs));
+    const cancelPlaybackWatchdog =
+      dependencies.cancelPlaybackWatchdog ||
+      ((timer) => clearTimeout(timer));
     const playbackMarkToResponseId = new Map();
     let confirmationDeliveryReady = false;
     let pendingConfirmationSafetyReply = "";
@@ -1902,6 +1910,7 @@ export const attachMediaWebSocketServer = (server, dependencies = {}) => {
     let finalConfirmationResponseId = "";
     let finalConfirmationPlaybackMarkName = "";
     let endingCall = false;
+    let lastCallEndReason = "";
 
     const captureBookingSnapshot = () => cloneBookingDomainSnapshot({
       bookingState,
@@ -2161,6 +2170,7 @@ export const attachMediaWebSocketServer = (server, dependencies = {}) => {
     };
 
     const startOutboundKeepalive = (reason = "unknown") => {
+      if (endingCall) return false;
       if (sendingSilence || silenceInterval) {
         console.log("[OUTBOUND_KEEPALIVE_SKIPPED]", {
           reason,
@@ -2189,6 +2199,10 @@ export const attachMediaWebSocketServer = (server, dependencies = {}) => {
 
       sendingSilence = true;
       silenceInterval = setInterval(() => {
+        if (endingCall) {
+          stopOutboundKeepalive("call_ending");
+          return;
+        }
         if (twilioWs.readyState !== twilioWs.OPEN || !streamSid) {
           stopOutboundKeepalive("twilio_unavailable");
           return;
@@ -2926,14 +2940,52 @@ export const attachMediaWebSocketServer = (server, dependencies = {}) => {
       }
     }
 
+    const applySynchronousShutdownState = (reason = "call_ending") => {
+      clearAssistantPlaybackWatchdog();
+      stopOutboundKeepalive(reason);
+      readyForCallerInput = false;
+      confirmationDeliveryReady = false;
+
+      if (pendingAssistantMarkName) {
+        playbackMarkToResponseId.delete(pendingAssistantMarkName);
+        diagnosticAttempt(() => markCorrelations?.delete(pendingAssistantMarkName));
+      }
+      pendingAssistantMarkName = null;
+      assistantPlaybackActive = false;
+      assistantSpeaking = false;
+      assistantAudioSentThisResponse = false;
+      responseActive = false;
+      aiResponseInProgress = false;
+      responseInFlightId = "";
+      pendingAssistantResponse = null;
+      pendingResponsePurposeMetadata = null;
+      pendingExpectedResponseMetadata = null;
+      activeConfirmationLifecycleId = "";
+      activeDeterministicLifecycleId = "";
+
+      for (const record of responseLifecycleById.values()) {
+        if (record.lifecycleActionHandled === true) continue;
+        record.audioInvalidated = true;
+        record.transportAvailable = false;
+        record.transportFailureReason ||= reason;
+        record.lifecycleActionHandled = true;
+        record.bufferedAudioDeltas = [];
+      }
+    };
+
     const requestCallEnd = async (reason) => {
-      if (endingCall) return;
+      applySynchronousShutdownState(reason);
+      if (endingCall) {
+        lastCallEndReason ||= reason;
+        return;
+      }
       endingCall = true;
+      lastCallEndReason ||= reason;
       cancelPendingLanguageUpdate(`call_end:${reason}`);
       console.log(`[CALL_END_REQUESTED] callSid=${callSid || ""} barberId=${barberId || ""} reason=${reason}`);
 
       try {
-        const client = buildTwilioClient();
+        const client = (dependencies.buildTwilioClient || buildTwilioClient)();
         if (client && callSid) {
           await client.calls(callSid).update({ status: "completed" });
           return;
@@ -4169,7 +4221,7 @@ RULES:
 
     const clearAssistantPlaybackWatchdog = () => {
       if (assistantPlaybackWatchdogTimer) {
-        clearTimeout(assistantPlaybackWatchdogTimer);
+        cancelPlaybackWatchdog(assistantPlaybackWatchdogTimer);
         assistantPlaybackWatchdogTimer = null;
       }
     };
@@ -4334,15 +4386,36 @@ RULES:
         });
     };
 
-    const startAssistantPlaybackWatchdog = () => {
+    const startAssistantPlaybackWatchdog = (lifecycleRecord) => {
+      if (endingCall) {
+        clearAssistantPlaybackWatchdog();
+        return false;
+      }
       clearAssistantPlaybackWatchdog();
-      assistantPlaybackWatchdogTimer = setTimeout(() => {
+      const submittedAudioBytes = Math.max(0, Number(lifecycleRecord?.submittedAudioBytes) || 0);
+      const estimatedPlaybackDurationMs = Math.ceil(
+        (submittedAudioBytes / PCMU_BYTES_PER_SECOND) * 1000
+      );
+      const timeoutMs = Math.max(
+        DEFAULT_PLAYBACK_WATCHDOG_MINIMUM_MS,
+        estimatedPlaybackDurationMs + DEFAULT_PLAYBACK_MARK_ACK_MARGIN_MS
+      );
+      if (lifecycleRecord) {
+        lifecycleRecord.playbackWatchdogTimeoutMs = timeoutMs;
+        lifecycleRecord.estimatedPlaybackDurationMs = estimatedPlaybackDurationMs;
+      }
+      assistantPlaybackWatchdogTimer = schedulePlaybackWatchdog(() => {
         void handleAssistantPlaybackWatchdogExpiry();
-      }, 12000);
+      }, timeoutMs);
       assistantPlaybackWatchdogTimer.unref?.();
+      return true;
     };
 
     const sendAssistantPlaybackMark = (reason = "unknown") => {
+      if (endingCall) {
+        applySynchronousShutdownState(reason);
+        return false;
+      }
       if (!assistantAudioSentThisResponse || pendingAssistantMarkName) return false;
       if (twilioWs.readyState !== twilioWs.OPEN || !streamSid) {
         const lifecycleRecord = responseLifecycleById.get(responseInFlightId);
@@ -4453,7 +4526,7 @@ RULES:
         markName,
         responseInFlightId,
       });
-      startAssistantPlaybackWatchdog();
+      startAssistantPlaybackWatchdog(lifecycleRecord);
       return true;
     };
 
@@ -4539,6 +4612,14 @@ RULES:
     async function handleCallerTranscript(transcriptText, options = {}) {
       const isBuffered = options.buffered === true;
       transcriptText = String(transcriptText || "").trim();
+
+      if (endingCall) {
+        console.log("[TRANSCRIPT_IGNORED_CALL_ENDING]", {
+          transcript: transcriptText,
+          terminalReason: lastCallEndReason,
+        });
+        return;
+      }
 
       if (!transcriptText) {
         await finishCallerTranscriptHandling("empty_transcript");
@@ -5709,6 +5790,21 @@ RULES:
         return "recover";
       }
 
+      if (endingCall) {
+        record.audioInvalidated = true;
+        record.transportAvailable = false;
+        record.transportFailureReason ||= "call_ending";
+        record.lifecycleActionHandled = true;
+        record.bufferedAudioDeltas = [];
+        if (activeDeterministicLifecycleId === record.responseId) {
+          activeDeterministicLifecycleId = "";
+        }
+        if (activeConfirmationLifecycleId === record.responseId) {
+          activeConfirmationLifecycleId = "";
+        }
+        return "terminate";
+      }
+
       if (twilioWs.readyState !== twilioWs.OPEN || !streamSid) {
         record.transportAvailable = false;
         record.audioInvalidated = true;
@@ -5717,6 +5813,10 @@ RULES:
       }
 
       try {
+        const submittedBytes = record.bufferedAudioDeltas.reduce(
+          (sum, delta) => sum + decodedBase64Length(delta),
+          0
+        );
         for (const delta of record.bufferedAudioDeltas) {
           twilioWs.send(JSON.stringify({
             event: "media",
@@ -5727,15 +5827,12 @@ RULES:
         if (CONTROLLED_AUDIO_TRACE_ENABLED) diagnosticAttempt(() => {
           const responseTrace = responseTraceFor(record.responseId);
           if (!responseTrace) return;
-          const submittedBytes = record.bufferedAudioDeltas.reduce(
-            (sum, delta) => sum + decodedBase64Length(delta),
-            0
-          );
           responseTrace.submittedDeltaCount += record.bufferedAudioDeltas.length;
           responseTrace.submittedBytes += submittedBytes;
           responseTrace.firstMediaAt ||= Date.now();
           twilioBytesSubmittedTotal += submittedBytes;
         });
+        record.submittedAudioBytes += submittedBytes;
       } catch {
         record.transportAvailable = false;
         record.audioInvalidated = true;
@@ -5940,6 +6037,13 @@ RULES:
           trySendGreeting();
         }
 
+        const isResponseAudioDelta =
+          evt.type === "response.audio.delta" ||
+          evt.type === "response.output_audio.delta";
+        if (endingCall && String(evt.type || "").startsWith("response.")) {
+          return;
+        }
+
         const isTerminalResponseEvent = terminalResponseEvents.has(evt.type);
         const eventResponseId = evt.response?.id || evt.response_id || "";
 
@@ -5957,6 +6061,7 @@ RULES:
               statusReason: null,
               outputAudioEnded: false,
               audioSubmitted: false,
+              submittedAudioBytes: 0,
               playbackMark: null,
               markSent: false,
               playbackMarkAcknowledged: false,
@@ -6019,10 +6124,7 @@ RULES:
           if (CONTROLLED_AUDIO_TRACE_ENABLED) lastOpenAiResponseId = responseInFlightId;
         }
 
-        if (
-          evt.type === "response.audio.delta" ||
-          evt.type === "response.output_audio.delta"
-        ) {
+        if (isResponseAudioDelta) {
           const deltaLifecycle = responseLifecycleById.get(evt.response_id || responseInFlightId);
           if (deltaLifecycle?.deterministic !== true) assistantSpeaking = true;
           responseActive = true;
@@ -6514,7 +6616,11 @@ RULES:
               );
               submissionReturned = true;
               const lifecycleRecord = responseLifecycleById.get(evt.response_id || responseInFlightId);
-              if (lifecycleRecord) lifecycleRecord.audioSubmitted = true;
+              if (lifecycleRecord) {
+                lifecycleRecord.audioSubmitted = true;
+                lifecycleRecord.submittedAudioBytes =
+                  (Number(lifecycleRecord.submittedAudioBytes) || 0) + decodedBase64Length(evt.delta);
+              }
             } catch (sendError) {
               const lifecycleRecord = responseLifecycleById.get(evt.response_id || responseInFlightId);
               if (lifecycleRecord?.purpose === RESPONSE_PURPOSE.PRE_BOOKING_CONFIRMATION) {
@@ -6681,6 +6787,18 @@ RULES:
           markAcknowledgementProvesCallerHeardAudio: false,
         });
         diagnosticAttempt(() => markCorrelations?.delete(markName));
+      }
+
+      if (msg.event === "mark" && msg.mark?.name === pendingAssistantMarkName && endingCall) {
+        const markName = msg.mark?.name;
+        playbackMarkToResponseId.delete(markName);
+        diagnosticAttempt(() => markCorrelations?.delete(markName));
+        pendingAssistantMarkName = null;
+        assistantPlaybackActive = false;
+        assistantSpeaking = false;
+        assistantAudioSentThisResponse = false;
+        readyForCallerInput = false;
+        return;
       }
 
       if (msg.event === "mark" && msg.mark?.name === pendingAssistantMarkName) {
@@ -6863,10 +6981,10 @@ RULES:
     twilioWs.on("close", (code, reasonBuffer) => {
       console.log("📴 Twilio WebSocket closed");
       endingCall = true;
+      applySynchronousShutdownState("twilio_websocket_closed");
       cancelPendingLanguageUpdate("twilio_websocket_closed");
       void invalidateActiveDeterministicTransport("twilio_websocket_closed");
       void invalidateActiveConfirmationTransport("twilio_websocket_closed");
-      clearAssistantPlaybackWatchdog();
       for (const timer of deterministicCompletionTimers.values()) clearTimeout(timer);
       deterministicCompletionTimers.clear();
       stopSilence("twilio_ws_closed");
@@ -7057,6 +7175,8 @@ RULES:
               }
             : null,
           endingCall,
+          lastCallEndReason,
+          businessTimezone: barberDoc?.availability?.timezone || null,
           confirmationDeliveryReady,
           activeConfirmationLifecycleId,
           activeDeterministicLifecycleId,

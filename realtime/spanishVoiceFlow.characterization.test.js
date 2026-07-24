@@ -50,6 +50,50 @@ class FakeSocket extends EventEmitter {
 
 const settle = () => new Promise((resolve) => setImmediate(resolve));
 
+const createDeferred = () => {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+};
+
+class ManualTimerScheduler {
+  constructor() {
+    this.now = 0;
+    this.nextId = 1;
+    this.tasks = new Map();
+  }
+
+  schedule = (callback, timeoutMs) => {
+    const id = this.nextId++;
+    this.tasks.set(id, { callback, dueAt: this.now + timeoutMs });
+    return id;
+  };
+
+  cancel = (id) => {
+    this.tasks.delete(id);
+  };
+
+  advanceBy = async (milliseconds) => {
+    this.now += milliseconds;
+    const due = [...this.tasks.entries()]
+      .filter(([, task]) => task.dueAt <= this.now)
+      .sort((left, right) => left[1].dueAt - right[1].dueAt);
+    for (const [id, task] of due) {
+      if (!this.tasks.delete(id)) continue;
+      task.callback();
+      await settle();
+    }
+  };
+
+  get pendingCount() {
+    return this.tasks.size;
+  }
+}
+
 const baseState = (overrides = {}) => ({
   intent: "BOOK",
   name: "Cliente",
@@ -78,6 +122,8 @@ const createSession = ({
   language = "es",
   bookAppointment,
   languageUpdateTimeoutMs,
+  playbackScheduler,
+  buildTwilioClient,
   CallTranscriptModel = NoopCallTranscript,
   isSlotAvailable,
   getAvailableSlots,
@@ -91,6 +137,9 @@ const createSession = ({
     createOpenAISession: () => ai,
     bookAppointment,
     languageUpdateTimeoutMs,
+    schedulePlaybackWatchdog: playbackScheduler?.schedule,
+    cancelPlaybackWatchdog: playbackScheduler?.cancel,
+    buildTwilioClient,
     CallTranscriptModel,
     isSlotAvailable,
     getAvailableSlots,
@@ -175,10 +224,18 @@ const deliverLatestExactResponse = async ({ ai, twilio, controls }, responseId) 
   return intended;
 };
 
-const completeLatestExactResponseBeforeMark = async ({ ai, controls }, responseId) => {
+const completeLatestExactResponseBeforeMark = async (
+  { ai, controls },
+  responseId,
+  { audioDelta = "AA==" } = {}
+) => {
   const intended = latestSpeech(ai);
   await emitOpenAi(ai, { type: "response.created", response: { id: responseId } });
-  await emitOpenAi(ai, { type: "response.output_audio.delta", response_id: responseId, delta: "AA==" });
+  await emitOpenAi(ai, {
+    type: "response.output_audio.delta",
+    response_id: responseId,
+    delta: audioDelta,
+  });
   await emitOpenAi(ai, {
     type: "response.output_audio_transcript.done",
     response_id: responseId,
@@ -218,6 +275,9 @@ const createConfirmationSafetySession = async ({
   service = "Haircut",
   parsedDate = "2026-08-01",
   parsedTime = "11:00 AM",
+  playbackScheduler,
+  buildTwilioClient,
+  callSid,
 } = {}) => {
   let bookings = 0;
   let availabilityChecks = 0;
@@ -225,6 +285,8 @@ const createConfirmationSafetySession = async ({
   const bookingPayloads = [];
   const session = createSession({
     language,
+    playbackScheduler,
+    buildTwilioClient,
     isSlotAvailable: async (payload) => {
       availabilityChecks += 1;
       availabilityPayloads.push(structuredClone(payload));
@@ -249,6 +311,7 @@ const createConfirmationSafetySession = async ({
     availability: { slotChecked: true, slotAvailable: true, slotAlternatives: [] },
     context: {
       currentLanguage: language,
+      callSid,
       barberId: "507f1f77bcf86cd799439011",
       barberDoc: {
         _id: "507f1f77bcf86cd799439011",
@@ -1496,6 +1559,497 @@ test("pre-delivery clarification and modification stay non-authorizing across pl
   await deliverLatestExactResponse(modification, "resp-post-modification-details");
   await modification.controls.handleCallerTranscript("Yes");
   assert.equal(modification.bookings, 1);
+});
+
+test("duration-aware playback watchdog permits a late valid mark before a Spanish date modification", async () => {
+  const playbackScheduler = new ManualTimerScheduler();
+  const session = await createConfirmationSafetySession({
+    language: "es",
+    playbackScheduler,
+  });
+  const preserved = session.controls.getState();
+
+  await session.controls.handleCallerTranscript("\u00bfEs el primero de agosto?");
+  const longAudio = Buffer.alloc(110000).toString("base64");
+  const clarification = await completeLatestExactResponseBeforeMark(
+    session,
+    "resp-long-date-clarification",
+    { audioDelta: longAudio }
+  );
+  const lifecycleBeforeAck = session.controls.getState().lifecycleRecords
+    .find(([responseId]) => responseId === "resp-long-date-clarification")?.[1];
+  assert.equal(lifecycleBeforeAck.submittedAudioBytes, 110000);
+  assert.equal(lifecycleBeforeAck.estimatedPlaybackDurationMs, 13750);
+  assert.equal(lifecycleBeforeAck.playbackWatchdogTimeoutMs, 17750);
+
+  await playbackScheduler.advanceBy(12001);
+  assert.equal(session.controls.getState().endingCall, false);
+  assert.equal(session.controls.getState().readyForCallerInput, false);
+  assert.equal(session.controls.getState().confirmationDeliveryReady, false);
+
+  await deliverPlaybackMark(session, clarification.mark);
+  assert.equal(session.controls.getState().endingCall, false);
+  assert.equal(session.controls.getState().readyForCallerInput, true);
+
+  await session.controls.handleCallerTranscript("C\u00e1mbiala para el 29 de julio");
+  const modified = session.controls.getState();
+  assert.equal(modified.bookingState.parsedDate, "2026-07-29");
+  assert.equal(modified.bookingState.name, preserved.bookingState.name);
+  assert.equal(modified.bookingState.service, preserved.bookingState.service);
+  assert.equal(modified.bookingState.parsedTime, preserved.bookingState.parsedTime);
+  assert.equal(modified.barberId, preserved.barberId);
+  assert.equal(modified.currentLanguage, preserved.currentLanguage);
+  assert.equal(modified.businessTimezone, preserved.businessTimezone);
+  assert.equal(modified.confirmationDeliveryReady, false);
+  assert.equal(session.availabilityChecks, 1);
+  assert.equal(session.availabilityPayloads[0].date, "2026-07-29");
+  assert.equal(session.bookings, 0);
+
+  const renewed = await completeLatestExactResponseBeforeMark(
+    session,
+    "resp-renewed-july-29-confirmation"
+  );
+  await session.controls.handleCallerTranscript("S\u00ed", {
+    transcriptId: "premature-renewed-july-29-affirmative",
+  });
+  assert.equal(session.controls.getState().confirmationDeliveryReady, false);
+  assert.equal(session.bookings, 0);
+  assert.equal(session.availabilityChecks, 1);
+
+  await deliverPlaybackMark(session, renewed.mark);
+  assert.equal(session.controls.getState().confirmationDeliveryReady, true);
+  assert.equal(session.bookings, 0);
+
+  await session.controls.handleCallerTranscript("S\u00ed.", {
+    transcriptId: "post-playback-renewed-july-29-affirmative",
+  });
+  assert.equal(session.bookings, 1);
+  assert.equal(session.availabilityChecks, 1);
+  assert.deepEqual(session.bookingPayloads[0], {
+    barberId: preserved.barberId,
+    phone: "+15555550100",
+    name: preserved.bookingState.name,
+    date: "2026-07-29",
+    time: preserved.bookingState.parsedTime,
+    service: preserved.bookingState.service,
+  });
+  assert.equal(session.controls.getState().currentLanguage, preserved.currentLanguage);
+  assert.equal(session.controls.getState().businessTimezone, preserved.businessTimezone);
+});
+
+test("duration-aware playback watchdog ends safely when the mark acknowledgment is genuinely missing", async () => {
+  const playbackScheduler = new ManualTimerScheduler();
+  const session = await createConfirmationSafetySession({
+    language: "es",
+    deliverPrompt: false,
+    playbackScheduler,
+  });
+  const longAudio = Buffer.alloc(110000).toString("base64");
+  const playback = await completeLatestExactResponseBeforeMark(
+    session,
+    "resp-missing-duration-aware-mark",
+    { audioDelta: longAudio }
+  );
+
+  await playbackScheduler.advanceBy(12001);
+  assert.equal(session.controls.getState().endingCall, false);
+  assert.equal(session.controls.getState().readyForCallerInput, false);
+  assert.equal(session.controls.getState().confirmationDeliveryReady, false);
+  assert.equal(playbackScheduler.pendingCount, 1);
+
+  await playbackScheduler.advanceBy(5748);
+  assert.equal(session.controls.getState().endingCall, false);
+  assert.equal(session.bookings, 0);
+
+  await playbackScheduler.advanceBy(1);
+  await settle();
+  assert.equal(session.controls.getState().endingCall, true);
+  assert.equal(
+    session.controls.getState().lastCallEndReason,
+    "deterministic_playback_transport_unavailable"
+  );
+  assert.equal(session.controls.getState().readyForCallerInput, false);
+  assert.equal(session.controls.getState().confirmationDeliveryReady, false);
+  assert.equal(session.bookings, 0);
+  assert.equal(playbackScheduler.pendingCount, 0);
+
+  await deliverPlaybackMark(session, playback.mark);
+  assert.equal(session.controls.getState().endingCall, true);
+  assert.equal(session.controls.getState().readyForCallerInput, false);
+  assert.equal(session.controls.getState().confirmationDeliveryReady, false);
+  assert.equal(session.bookings, 0);
+  assert.equal(playbackScheduler.pendingCount, 0);
+
+  const callEndScheduler = new ManualTimerScheduler();
+  const endingSession = await createConfirmationSafetySession({
+    language: "es",
+    deliverPrompt: false,
+    playbackScheduler: callEndScheduler,
+  });
+  const endingPlayback = await completeLatestExactResponseBeforeMark(
+    endingSession,
+    "resp-general-call-end-clears-watchdog",
+    { audioDelta: longAudio }
+  );
+  assert.equal(callEndScheduler.pendingCount, 1);
+  const ending = endingSession.controls.requestCallEnd("explicit_test_call_end");
+  assert.equal(callEndScheduler.pendingCount, 0);
+  await callEndScheduler.advanceBy(17750);
+  await ending;
+  assert.equal(endingSession.controls.getState().lastCallEndReason, "explicit_test_call_end");
+  await deliverPlaybackMark(endingSession, endingPlayback.mark);
+  assert.equal(endingSession.controls.getState().readyForCallerInput, false);
+  assert.equal(endingSession.controls.getState().confirmationDeliveryReady, false);
+  assert.equal(callEndScheduler.pendingCount, 0);
+});
+
+test("call termination synchronously revokes delivered confirmation authorization", async () => {
+  for (const outcome of ["success", "failure"]) {
+    const playbackScheduler = new ManualTimerScheduler();
+    const twilioUpdate = createDeferred();
+    const session = await createConfirmationSafetySession({
+      language: "es",
+      playbackScheduler,
+      callSid: `CA-termination-${outcome}`,
+      buildTwilioClient: () => ({
+        calls: () => ({
+          update: () => twilioUpdate.promise,
+        }),
+      }),
+    });
+
+    const authorized = session.controls.getState();
+    assert.equal(authorized.readyForCallerInput, true);
+    assert.equal(authorized.confirmationDeliveryReady, true);
+    assert.equal(session.bookings, 0);
+    assert.equal(session.availabilityChecks, 0);
+    assert.equal(playbackScheduler.pendingCount, 0);
+
+    const termination = session.controls.requestCallEnd(`authoritative_${outcome}_reason`);
+    const revoked = session.controls.getState();
+    assert.equal(revoked.readyForCallerInput, false);
+    assert.equal(revoked.confirmationDeliveryReady, false);
+    assert.equal(revoked.lastCallEndReason, `authoritative_${outcome}_reason`);
+    assert.equal(playbackScheduler.pendingCount, 0);
+
+    await session.controls.handleCallerTranscript("S\u00ed.", {
+      transcriptId: `late-affirmative-${outcome}`,
+    });
+    assert.equal(session.bookings, 0);
+    assert.equal(session.availabilityChecks, 0);
+    assert.equal(
+      session.controls.getState().lastCallEndReason,
+      `authoritative_${outcome}_reason`
+    );
+
+    await session.controls.requestCallEnd(`replacement_${outcome}_reason`);
+    assert.equal(session.controls.getState().readyForCallerInput, false);
+    assert.equal(session.controls.getState().confirmationDeliveryReady, false);
+    assert.equal(
+      session.controls.getState().lastCallEndReason,
+      `authoritative_${outcome}_reason`
+    );
+    assert.equal(playbackScheduler.pendingCount, 0);
+
+    if (outcome === "success") {
+      twilioUpdate.resolve({ status: "completed" });
+    } else {
+      twilioUpdate.reject(new Error("delayed Twilio termination failure"));
+    }
+    await termination;
+    await session.controls.handleCallerTranscript("S\u00ed.", {
+      transcriptId: `late-affirmative-after-settlement-${outcome}`,
+    });
+    assert.equal(session.bookings, 0);
+    assert.equal(session.availabilityChecks, 0);
+    assert.equal(session.controls.getState().readyForCallerInput, false);
+    assert.equal(session.controls.getState().confirmationDeliveryReady, false);
+    assert.equal(
+      session.controls.getState().lastCallEndReason,
+      `authoritative_${outcome}_reason`
+    );
+  }
+});
+
+test("an in-flight deterministic response cannot submit playback after termination begins", async () => {
+  const playbackScheduler = new ManualTimerScheduler();
+  const twilioUpdate = createDeferred();
+  const session = await createConfirmationSafetySession({
+    language: "es",
+    deliverPrompt: false,
+    playbackScheduler,
+    callSid: "CA-in-flight-termination",
+    buildTwilioClient: () => ({
+      calls: () => ({ update: () => twilioUpdate.promise }),
+    }),
+  });
+  const intended = latestSpeech(session.ai);
+  await emitOpenAi(session.ai, {
+    type: "response.created",
+    response: { id: "resp-in-flight-at-termination" },
+  });
+  await emitOpenAi(session.ai, {
+    type: "response.output_audio.delta",
+    response_id: "resp-in-flight-at-termination",
+    delta: Buffer.alloc(110000).toString("base64"),
+  });
+  const marksBeforeTermination = session.twilio.sent.filter(
+    (message) => message.event === "mark"
+  ).length;
+
+  const termination = session.controls.requestCallEnd("in_flight_termination");
+  assert.equal(session.controls.getState().endingCall, true);
+  assert.equal(session.controls.getState().readyForCallerInput, false);
+  assert.equal(session.controls.getState().confirmationDeliveryReady, false);
+  assert.equal(playbackScheduler.pendingCount, 0);
+
+  await emitOpenAi(session.ai, {
+    type: "response.output_audio_transcript.done",
+    response_id: "resp-in-flight-at-termination",
+    transcript: intended,
+  });
+  await emitOpenAi(session.ai, {
+    type: "response.output_audio.done",
+    response_id: "resp-in-flight-at-termination",
+  });
+  await emitOpenAi(session.ai, {
+    type: "response.done",
+    response: { id: "resp-in-flight-at-termination", status: "completed" },
+  });
+
+  assert.equal(
+    session.twilio.sent.filter((message) => message.event === "mark").length,
+    marksBeforeTermination
+  );
+  assert.equal(playbackScheduler.pendingCount, 0);
+  assert.equal(session.controls.getState().readyForCallerInput, false);
+  assert.equal(session.controls.getState().confirmationDeliveryReady, false);
+  assert.equal(session.controls.getState().lastCallEndReason, "in_flight_termination");
+  assert.equal(session.bookings, 0);
+  assert.equal(session.availabilityChecks, 0);
+
+  twilioUpdate.resolve({ status: "completed" });
+  await termination;
+  await emitTwilio(session.twilio, {
+    event: "mark",
+    mark: { name: "assistant-playback-in-flight-late" },
+  });
+  await session.controls.handleCallerTranscript("S\u00ed.");
+  const lifecycle = session.controls.getState().lifecycleRecords
+    .find(([responseId]) => responseId === "resp-in-flight-at-termination")?.[1];
+  assert.equal(lifecycle.lifecycleActionHandled, true);
+  assert.equal(lifecycle.audioInvalidated, true);
+  assert.equal(session.bookings, 0);
+  assert.equal(session.availabilityChecks, 0);
+  assert.equal(playbackScheduler.pendingCount, 0);
+  assert.equal(session.controls.getState().lastCallEndReason, "in_flight_termination");
+});
+
+test("a deterministic response created after termination cannot recreate lifecycle or media", async () => {
+  const playbackScheduler = new ManualTimerScheduler();
+  const twilioUpdate = createDeferred();
+  const session = await createConfirmationSafetySession({
+    language: "es",
+    deliverPrompt: false,
+    playbackScheduler,
+    callSid: "CA-late-deterministic-created",
+    buildTwilioClient: () => ({
+      calls: () => ({ update: () => twilioUpdate.promise }),
+    }),
+  });
+  const intended = latestSpeech(session.ai);
+  const termination = session.controls.requestCallEnd("late_deterministic_shutdown");
+  const mediaBefore = session.twilio.sent.filter((message) => message.event === "media").length;
+  const marksBefore = session.twilio.sent.filter((message) => message.event === "mark").length;
+
+  assert.equal(session.controls.getState().endingCall, true);
+  assert.equal(session.controls.getState().responseActive, false);
+  assert.equal(session.controls.getState().responseInFlightId, "");
+  assert.equal(session.controls.getState().readyForCallerInput, false);
+  assert.equal(session.controls.getState().confirmationDeliveryReady, false);
+  assert.equal(playbackScheduler.pendingCount, 0);
+
+  await emitOpenAi(session.ai, {
+    type: "response.created",
+    response: { id: "resp-created-after-deterministic-shutdown" },
+  });
+  await emitOpenAi(session.ai, {
+    type: "response.output_audio.delta",
+    response_id: "resp-created-after-deterministic-shutdown",
+    delta: Buffer.alloc(110000).toString("base64"),
+  });
+  await emitOpenAi(session.ai, {
+    type: "response.output_audio_transcript.done",
+    response_id: "resp-created-after-deterministic-shutdown",
+    transcript: intended,
+  });
+  await emitOpenAi(session.ai, {
+    type: "response.output_audio.done",
+    response_id: "resp-created-after-deterministic-shutdown",
+  });
+  await emitOpenAi(session.ai, {
+    type: "response.done",
+    response: { id: "resp-created-after-deterministic-shutdown", status: "completed" },
+  });
+
+  const state = session.controls.getState();
+  assert.equal(session.twilio.sent.filter((message) => message.event === "media").length, mediaBefore);
+  assert.equal(session.twilio.sent.filter((message) => message.event === "mark").length, marksBefore);
+  assert.equal(playbackScheduler.pendingCount, 0);
+  assert.equal(state.responseActive, false);
+  assert.equal(state.responseInFlightId, "");
+  assert.equal(state.activeDeterministicLifecycleId, "");
+  assert.equal(state.activeConfirmationLifecycleId, "");
+  assert.equal(
+    state.lifecycleRecords.some(([id]) => id === "resp-created-after-deterministic-shutdown"),
+    false
+  );
+  assert.equal(state.readyForCallerInput, false);
+  assert.equal(state.confirmationDeliveryReady, false);
+  assert.equal(state.lastCallEndReason, "late_deterministic_shutdown");
+  assert.equal(session.bookings, 0);
+  assert.equal(session.availabilityChecks, 0);
+
+  twilioUpdate.resolve({ status: "completed" });
+  await termination;
+  await emitTwilio(session.twilio, {
+    event: "mark",
+    mark: { name: "assistant-playback-late-deterministic" },
+  });
+  await session.controls.handleCallerTranscript("S\u00ed.");
+  assert.equal(session.bookings, 0);
+  assert.equal(session.availabilityChecks, 0);
+  assert.equal(session.controls.getState().lastCallEndReason, "late_deterministic_shutdown");
+});
+
+test("a non-deterministic response created after termination cannot stream media", async () => {
+  const playbackScheduler = new ManualTimerScheduler();
+  const twilioUpdate = createDeferred();
+  let bookings = 0;
+  let availabilityChecks = 0;
+  const session = createSession({
+    language: "es",
+    playbackScheduler,
+    buildTwilioClient: () => ({
+      calls: () => ({ update: () => twilioUpdate.promise }),
+    }),
+    bookAppointment: async () => {
+      bookings += 1;
+      return { success: true };
+    },
+    isSlotAvailable: async () => {
+      availabilityChecks += 1;
+      return true;
+    },
+  });
+  session.controls.seedBookingState({
+    state: baseState(),
+    availability: { slotChecked: true, slotAvailable: true },
+    context: { callSid: "CA-late-generative-created", currentLanguage: "es" },
+  });
+
+  const termination = session.controls.requestCallEnd("late_generative_shutdown");
+  const mediaBefore = session.twilio.sent.filter((message) => message.event === "media").length;
+  const marksBefore = session.twilio.sent.filter((message) => message.event === "mark").length;
+  await emitOpenAi(session.ai, {
+    type: "response.created",
+    response: { id: "resp-created-after-generative-shutdown" },
+  });
+  await emitOpenAi(session.ai, {
+    type: "response.output_audio.delta",
+    response_id: "resp-created-after-generative-shutdown",
+    delta: Buffer.alloc(1600).toString("base64"),
+  });
+  await emitOpenAi(session.ai, {
+    type: "response.audio.delta",
+    response_id: "resp-created-after-generative-shutdown",
+    delta: Buffer.alloc(1600).toString("base64"),
+  });
+  await emitOpenAi(session.ai, {
+    type: "response.done",
+    response: { id: "resp-created-after-generative-shutdown", status: "completed" },
+  });
+
+  const state = session.controls.getState();
+  assert.equal(session.twilio.sent.filter((message) => message.event === "media").length, mediaBefore);
+  assert.equal(session.twilio.sent.filter((message) => message.event === "mark").length, marksBefore);
+  assert.equal(playbackScheduler.pendingCount, 0);
+  assert.equal(state.responseActive, false);
+  assert.equal(state.responseInFlightId, "");
+  assert.equal(state.activeDeterministicLifecycleId, "");
+  assert.equal(state.activeConfirmationLifecycleId, "");
+  assert.equal(state.readyForCallerInput, false);
+  assert.equal(state.confirmationDeliveryReady, false);
+  assert.equal(state.lastCallEndReason, "late_generative_shutdown");
+  assert.equal(bookings, 0);
+  assert.equal(availabilityChecks, 0);
+
+  twilioUpdate.reject(new Error("late generative delayed termination failure"));
+  await termination;
+  await emitTwilio(session.twilio, {
+    event: "mark",
+    mark: { name: "assistant-playback-late-generative" },
+  });
+  await session.controls.handleCallerTranscript("S\u00ed.");
+  assert.equal(bookings, 0);
+  assert.equal(availabilityChecks, 0);
+  assert.equal(session.controls.getState().lastCallEndReason, "late_generative_shutdown");
+});
+
+test("WebSocket-first closure revokes authorization and remains idempotently terminal", async () => {
+  const playbackScheduler = new ManualTimerScheduler();
+  const session = await createConfirmationSafetySession({
+    language: "es",
+    playbackScheduler,
+  });
+  const authorized = session.controls.getState();
+  assert.equal(authorized.readyForCallerInput, true);
+  assert.equal(authorized.confirmationDeliveryReady, true);
+  assert.equal(session.bookings, 0);
+  assert.equal(session.availabilityChecks, 0);
+  const responseCreatesBeforeClose = session.ai.sent.filter(
+    (message) => message.type === "response.create"
+  ).length;
+  const marksBeforeClose = session.twilio.sent.filter(
+    (message) => message.event === "mark"
+  );
+  const acknowledgedMark = marksBeforeClose.at(-1)?.mark?.name;
+
+  session.twilio.readyState = 3;
+  session.twilio.emit("close", 1000, Buffer.alloc(0));
+  await settle();
+  const closed = session.controls.getState();
+  assert.equal(closed.endingCall, true);
+  assert.equal(closed.readyForCallerInput, false);
+  assert.equal(closed.confirmationDeliveryReady, false);
+  assert.equal(closed.lastCallEndReason, "");
+  assert.equal(playbackScheduler.pendingCount, 0);
+
+  await session.controls.handleCallerTranscript("S\u00ed.");
+  await emitTwilio(session.twilio, {
+    event: "mark",
+    mark: { name: acknowledgedMark },
+  });
+  assert.equal(session.bookings, 0);
+  assert.equal(session.availabilityChecks, 0);
+  assert.equal(
+    session.ai.sent.filter((message) => message.type === "response.create").length,
+    responseCreatesBeforeClose
+  );
+  assert.equal(
+    session.twilio.sent.filter((message) => message.event === "mark").length,
+    marksBeforeClose.length
+  );
+  assert.equal(playbackScheduler.pendingCount, 0);
+
+  await session.controls.requestCallEnd("websocket_first_cleanup");
+  await session.controls.requestCallEnd("replacement_cleanup_reason");
+  assert.equal(session.controls.getState().lastCallEndReason, "websocket_first_cleanup");
+  assert.equal(session.controls.getState().readyForCallerInput, false);
+  assert.equal(session.controls.getState().confirmationDeliveryReady, false);
+  assert.equal(session.bookings, 0);
+  assert.equal(session.availabilityChecks, 0);
+  assert.equal(playbackScheduler.pendingCount, 0);
 });
 
 test("affirmatives authorize exactly once only in the delivered confirmation phase", async () => {
