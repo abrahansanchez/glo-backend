@@ -675,7 +675,7 @@ export const classifyConfirmationResponse = (text, { language = "auto" } = {}) =
 
   const affirmativePatterns = [
     /^(?:yes|yep|yup)$/,
-    /^yes(?: please)?[, ]+(?:confirm(?: it| the appointment)?|book it)$/,
+    /^yes(?: please)?[, ]+(?:i )?confirm(?: it| the appointment)?$|^yes(?: please)?[, ]+book it$/,
     /^(?:correct|that's right|thats right|sure|go ahead)$/,
     /^(?:confirm|confirm it|confirm the appointment|please confirm(?: it| the appointment)?)$/,
     /^(?:si|sí)$/,
@@ -5043,6 +5043,28 @@ RULES:
           { reason: "alternative_selection_clarification", purpose: RESPONSE_PURPOSE.CLARIFICATION }
         );
         await finishCallerTranscriptHandling("alternative_selection_clarification");
+        return;
+      }
+
+      if (
+        ["UNKNOWN", "OTHER"].includes(bookingState.intent) &&
+        !bookingState.awaitingName &&
+        currentLanguage === "en" &&
+        getBookingPhase() === "idle" &&
+        !hasBookingSignal
+      ) {
+        console.log("[ENGLISH_PRE_INTENT_CLARIFICATION]", {
+          transcript: transcriptText,
+          wordCount,
+        });
+        speakExact(
+          "Sorry, I didn't catch that. Would you like to book an appointment?",
+          {
+            reason: "english_pre_intent_clarification",
+            purpose: RESPONSE_PURPOSE.CLARIFICATION,
+          }
+        );
+        await finishCallerTranscriptHandling("english_pre_intent_clarification");
         return;
       }
 

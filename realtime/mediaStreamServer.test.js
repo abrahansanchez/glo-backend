@@ -71,7 +71,13 @@ class FakeSocket extends EventEmitter {
 
 const settle = () => new Promise((resolve) => setImmediate(resolve));
 
-const createProductionSession = ({ bookAppointment, deterministicCompletionTimeoutMs } = {}) => {
+const createProductionSession = ({
+  bookAppointment,
+  deterministicCompletionTimeoutMs,
+  isSlotAvailable,
+  CallTranscriptModel,
+  barberDoc,
+} = {}) => {
   const server = new EventEmitter();
   const ai = new FakeSocket();
   const twilio = new FakeSocket();
@@ -80,6 +86,8 @@ const createProductionSession = ({ bookAppointment, deterministicCompletionTimeo
     createOpenAISession: () => ai,
     bookAppointment,
     deterministicCompletionTimeoutMs,
+    isSlotAvailable,
+    CallTranscriptModel,
     onSessionReady: (value) => { controls = value; },
   });
   wss.emit("connection", twilio, { url: "/ws/media", headers: {} });
@@ -88,7 +96,7 @@ const createProductionSession = ({ bookAppointment, deterministicCompletionTimeo
   controls.seedBookingState({
     state: baseBookingState(),
     availability: { slotChecked: true, slotAvailable: true, slotAlternatives: [] },
-    context: { barberId: "barber-1", callerNumber: "+15555550100", streamSid: "stream-1" },
+    context: { barberId: "barber-1", callSid: "CA-test", callerNumber: "+15555550100", streamSid: "stream-1", barberDoc },
   });
   controls.setResponseState({ greetingComplete: true, readyForCallerInput: true });
   return { ai, twilio, controls };
@@ -478,6 +486,142 @@ test("every response purpose has centralized audio-safe token headroom", () => {
 
 test("Spanish fallback recognizes the actual confirmation wording", () => {
   assert.equal(isConfirmationPromptText("¿Confirmo esa cita?"), true);
+});
+
+const idleUnknownIntentState = () => ({
+  ...baseBookingState(),
+  intent: "OTHER",
+  name: "",
+  service: "",
+  dateTimeText: "",
+  requestedDateText: "",
+  requestedTimeText: "",
+  parsedDate: "",
+  parsedTime: "",
+  askedConfirm: false,
+  confirmationPromptRequested: false,
+  awaitingCorrection: false,
+  awaitingName: false,
+  awaitingAlternativeSelection: false,
+  alternatives: [],
+});
+
+test("unknown English turns use one lifecycle-gated deterministic clarification without inventing booking state", async () => {
+  let appointments = 0;
+  let sms = 0;
+  const transcriptUpdates = [];
+  class RecoveryTranscript {
+    static async findOneAndUpdate(_query, update) {
+      transcriptUpdates.push(structuredClone(update));
+      return null;
+    }
+  }
+  const { ai, twilio, controls } = createProductionSession({
+    isSlotAvailable: async () => true,
+    CallTranscriptModel: RecoveryTranscript,
+    barberDoc: {
+      _id: "barber-1",
+      services: [{ name: "Haircut", durationMinutes: 30 }],
+      availability: { timezone: "America/New_York", defaultServiceDurationMinutes: 30 },
+    },
+    bookAppointment: async () => {
+      appointments += 1;
+      sms += 1;
+      return { success: true, appointment: { _id: "appt-english-recovery" } };
+    },
+  });
+  controls.seedBookingState({
+    state: idleUnknownIntentState(),
+    availability: { slotChecked: false, slotAvailable: false, slotAlternatives: [] },
+    context: { currentLanguage: "en" },
+  });
+
+  await controls.handleCallerTranscript("I'd like to look at her");
+  const firstClarification = ai.sent.filter((message) => message.type === "response.create");
+  assert.equal(firstClarification.length, 1);
+  assert.equal(
+    extractIntendedSpeech(firstClarification[0].response.instructions),
+    "Sorry, I didn't catch that. Would you like to book an appointment?"
+  );
+  assert.deepEqual(controls.getState().bookingState, idleUnknownIntentState());
+
+  await controls.handleCallerTranscript("Abraham");
+  assert.equal(ai.sent.filter((message) => message.type === "response.create").length, 1);
+
+  await emitOpenAi(ai, { type: "response.created", response: { id: "resp-english-clarification" } });
+  await emitOpenAi(ai, { type: "response.output_audio.delta", response_id: "resp-english-clarification", delta: "AA==" });
+  await completeDeterministicResponse(ai, "resp-english-clarification");
+  const mark = controls.getState().pendingAssistantMarkName;
+  assert.ok(mark);
+  await emitTwilio(twilio, { event: "mark", mark: { name: mark } });
+
+  await controls.handleCallerTranscript("Abraham");
+  assert.equal(ai.sent.filter((message) => message.type === "response.create").length, 2);
+  assert.deepEqual(controls.getState().bookingState, idleUnknownIntentState());
+
+  await emitOpenAi(ai, { type: "response.created", response: { id: "resp-english-clarification-2" } });
+  await emitOpenAi(ai, { type: "response.output_audio.delta", response_id: "resp-english-clarification-2", delta: "AA==" });
+  await completeDeterministicResponse(ai, "resp-english-clarification-2");
+  await emitTwilio(twilio, { event: "mark", mark: { name: controls.getState().pendingAssistantMarkName } });
+
+  await controls.handleCallerTranscript("I want to book a haircut");
+  assert.equal(controls.getState().bookingState.service, "Haircut");
+  await emitOpenAi(ai, { type: "response.created", response: { id: "resp-date" } });
+  await emitOpenAi(ai, { type: "response.output_audio.delta", response_id: "resp-date", delta: "AA==" });
+  await completeDeterministicResponse(ai, "resp-date");
+  await emitTwilio(twilio, { event: "mark", mark: { name: controls.getState().pendingAssistantMarkName } });
+
+  await controls.handleCallerTranscript("Saturday August 1st 2026");
+  assert.equal(controls.getState().bookingState.parsedDate, "2026-08-01");
+  await emitOpenAi(ai, { type: "response.created", response: { id: "resp-time" } });
+  await emitOpenAi(ai, { type: "response.output_audio.delta", response_id: "resp-time", delta: "AA==" });
+  await completeDeterministicResponse(ai, "resp-time");
+  await emitTwilio(twilio, { event: "mark", mark: { name: controls.getState().pendingAssistantMarkName } });
+
+  await controls.handleCallerTranscript("11 AM");
+  assert.equal(controls.getState().bookingState.parsedTime, "11:00 AM");
+  assert.equal(controls.getState().bookingState.awaitingName, true);
+  await emitOpenAi(ai, { type: "response.created", response: { id: "resp-name" } });
+  await emitOpenAi(ai, { type: "response.output_audio.delta", response_id: "resp-name", delta: "AA==" });
+  await completeDeterministicResponse(ai, "resp-name");
+  await emitTwilio(twilio, { event: "mark", mark: { name: controls.getState().pendingAssistantMarkName } });
+
+  await controls.handleCallerTranscript("Abrahan English Test");
+  assert.equal(controls.getState().bookingState.name, "Abrahan English Test");
+  await emitOpenAi(ai, { type: "response.created", response: { id: "resp-confirm" } });
+  await emitOpenAi(ai, { type: "response.output_audio.delta", response_id: "resp-confirm", delta: "AA==" });
+  await completeDeterministicResponse(ai, "resp-confirm");
+  await emitTwilio(twilio, { event: "mark", mark: { name: controls.getState().pendingAssistantMarkName } });
+
+  assert.equal(appointments, 0);
+  await controls.handleCallerTranscript("Yes, I confirm.");
+  assert.equal(appointments, 1);
+  assert.equal(sms, 1);
+  assert.equal(controls.getState().bookingState.bookingFinalized, true);
+  assert.ok(transcriptUpdates.some((update) => update.$set?.outcome === "BOOKED"));
+  assert.equal(ai.sent.filter((message) => message.type === "response.create").length, 7);
+
+  await emitOpenAi(ai, { type: "response.created", response: { id: "resp-final" } });
+  await emitOpenAi(ai, { type: "response.output_audio.delta", response_id: "resp-final", delta: "AA==" });
+  await completeDeterministicResponse(ai, "resp-final");
+  await emitTwilio(twilio, { event: "mark", mark: { name: controls.getState().pendingAssistantMarkName } });
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  assert.equal(twilio.closeCount, 1);
+  assert.equal(appointments, 1);
+  assert.equal(sms, 1);
+});
+
+test("Spanish idle turns cannot enter the English pre-intent clarification branch", async () => {
+  const { ai, controls } = createProductionSession();
+  controls.seedBookingState({
+    state: idleUnknownIntentState(),
+    availability: { slotChecked: false, slotAvailable: false, slotAlternatives: [] },
+    context: { currentLanguage: "es" },
+  });
+
+  await controls.handleCallerTranscript("Abraham");
+  assert.equal(ai.sent.filter((message) => message.type === "response.create").length, 0);
+  assert.deepEqual(controls.getState().bookingState, idleUnknownIntentState());
 });
 
 test("routine deterministic audio streams in order before response.done and marks after completion", async () => {
