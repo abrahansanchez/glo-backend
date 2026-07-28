@@ -16,6 +16,7 @@ import {
   normalizeDeterministicSpeech,
   restoreBookingDomainSnapshot,
   attachMediaWebSocketServer,
+  validAudioDeltaByteLength,
 } from "./mediaStreamServer.js";
 import { bookAppointment as productionBookAppointment } from "../controllers/aiBookingEngine.js";
 
@@ -479,28 +480,53 @@ test("Spanish fallback recognizes the actual confirmation wording", () => {
   assert.equal(isConfirmationPromptText("¿Confirmo esa cita?"), true);
 });
 
-test("production completed exact name prompt buffers then sends once", async () => {
+test("routine deterministic audio streams in order before response.done and marks after completion", async () => {
   const { ai, twilio, controls } = createProductionSession();
+  await emitOpenAi(ai, { type: "input_audio_buffer.speech_stopped", audio_end_ms: 1000 });
+  await emitOpenAi(ai, { type: "input_audio_transcription.completed", item_id: "timing-empty", transcript: "" });
   await requestProductionNamePrompt(controls);
   const create = ai.sent.filter((message) => message.type === "response.create").at(-1);
   assert.equal(create.response.max_output_tokens, DETERMINISTIC_RESPONSE_POLICY[RESPONSE_PURPOSE.NAME_COLLECTION]);
   await emitOpenAi(ai, { type: "response.created", response: { id: "resp-name-complete" } });
-  await emitOpenAi(ai, {
-    type: "response.output_audio.delta",
-    response_id: "resp-name-complete",
-    delta: "AA==",
-  });
-  assert.equal(twilio.sent.filter((message) => message.event === "media").length, 0);
+  await emitOpenAi(ai, { type: "response.output_audio.delta", response_id: "resp-name-complete", delta: "AA==" });
+  await emitOpenAi(ai, { type: "response.output_audio.delta", response_id: "resp-name-complete", delta: "AQ==" });
+  assert.deepEqual(
+    twilio.sent.filter((message) => message.event === "media").map((message) => message.media.payload),
+    ["AA==", "AQ=="]
+  );
+  assert.equal(twilio.sent.filter((message) => message.event === "mark").length, 0);
+  assert.equal(ai.sent.filter((message) => message.type === "response.create").length, 1);
   await completeDeterministicResponse(ai, "resp-name-complete");
-  assert.equal(twilio.sent.filter((message) => message.event === "media").length, 1);
+  assert.equal(twilio.sent.filter((message) => message.event === "media").length, 2);
+  assert.equal(twilio.sent.filter((message) => message.event === "mark").length, 1);
   const mark = controls.getState().pendingAssistantMarkName;
   assert.ok(mark);
   await emitTwilio(twilio, { event: "mark", mark: { name: mark } });
   await completeDeterministicResponse(ai, "resp-name-complete");
-  assert.equal(twilio.sent.filter((message) => message.event === "media").length, 1);
+  assert.equal(twilio.sent.filter((message) => message.event === "media").length, 2);
+  assert.equal(ai.sent.filter((message) => message.type === "response.create").length, 1);
+  const state = controls.getState();
+  const record = state.lifecycleRecords.find(([id]) => id === "resp-name-complete")[1];
+  assert.ok(state.timing.callerSpeechEndedAtMs <= state.timing.completedTranscriptAtMs);
+  assert.ok(state.timing.completedTranscriptAtMs <= record.responseCreatedAtMs);
+  assert.ok(record.responseCreatedAtMs <= record.firstMediaAtMs);
+  assert.ok(record.firstMediaAtMs <= record.responseDoneAtMs);
+  assert.equal(record.deliveryMode, "streaming");
+  assert.equal(record.retryCount, 0);
+  console.log("[ROUTINE_STREAM_TIMING_TEST]", JSON.stringify({
+    callerSpeechEndedAtMs: state.timing.callerSpeechEndedAtMs,
+    completedTranscriptAtMs: state.timing.completedTranscriptAtMs,
+    responseCreatedAtMs: record.responseCreatedAtMs,
+    firstOutboundTwilioMediaAtMs: record.firstMediaAtMs,
+    responseDoneAtMs: record.responseDoneAtMs,
+    transcriptCompleteToFirstMediaMs: record.firstMediaAtMs - state.timing.completedTranscriptAtMs,
+    firstMediaBeforeResponseDone: record.firstMediaAtMs <= record.responseDoneAtMs,
+    generations: 1,
+    retries: record.retryCount,
+  }));
 });
 
-test("production incomplete name prompt sends no partial audio and completed retry sends once", async () => {
+test("incomplete streamed routine response uses one audible recovery without silent regeneration", async () => {
   const { ai, twilio, controls } = createProductionSession();
   await requestProductionNamePrompt(controls);
   await emitOpenAi(ai, { type: "response.created", response: { id: "resp-name-incomplete" } });
@@ -513,76 +539,396 @@ test("production incomplete name prompt sends no partial audio and completed ret
     transcript: "Perfect. May I have your",
     status: "incomplete",
   });
-  assert.equal(twilio.sent.filter((message) => message.event === "media").length, 0);
-  assert.equal(controls.getState().pendingAssistantMarkName, null);
-  assert.equal(controls.getState().readyForCallerInput, false);
-  const retry = controls.getState().pendingAssistantResponse;
-  assert.equal(retry.reason, "deterministic_retry");
-  assert.equal(retry.retryCount, 1);
-  await emitTwilio(twilio, { event: "mark", mark: { name: "fake-incomplete-mark" } });
-  assert.equal(controls.getState().readyForCallerInput, false);
-  assert.equal(await controls.flushQueuedAssistantResponse("name_retry"), true);
-  await emitOpenAi(ai, { type: "response.created", response: { id: "resp-name-retry" } });
-  await emitOpenAi(ai, {
-    type: "response.output_audio.delta",
-    response_id: "resp-name-retry",
-    delta: "AQ==",
-  });
-  await completeDeterministicResponse(ai, "resp-name-retry");
   assert.equal(twilio.sent.filter((message) => message.event === "media").length, 1);
+  const partialMark = controls.getState().pendingAssistantMarkName;
+  assert.ok(partialMark);
+  assert.equal(controls.getState().readyForCallerInput, false);
+  assert.equal(controls.getState().pendingAssistantResponse, null);
+  await emitTwilio(twilio, { event: "mark", mark: { name: partialMark } });
   assert.equal(ai.sent.filter((message) => message.type === "response.create").length, 2);
+  const recovery = ai.sent.filter((message) => message.type === "response.create").at(-1);
+  assert.match(extractIntendedSpeech(recovery.response.instructions), /repeat/i);
 });
 
-test("production mismatched deterministic transcript retries once then bounded recovery terminates once", async () => {
+test("barge-in cancels streamed routine ownership and blocks remaining deltas", async () => {
   const { ai, twilio, controls } = createProductionSession();
   await requestProductionNamePrompt(controls);
-  await emitOpenAi(ai, { type: "response.created", response: { id: "resp-mismatch-1" } });
-  await emitOpenAi(ai, { type: "response.output_audio.delta", response_id: "resp-mismatch-1", delta: "AA==" });
-  await completeDeterministicResponse(ai, "resp-mismatch-1", { transcript: "This is not the requested sentence." });
-  assert.equal(twilio.sent.filter((message) => message.event === "media").length, 0);
-  assert.equal(controls.getState().pendingAssistantResponse?.reason, "deterministic_retry");
-
-  assert.equal(await controls.flushQueuedAssistantResponse("mismatch_retry"), true);
-  await emitOpenAi(ai, { type: "response.created", response: { id: "resp-mismatch-2" } });
-  await emitOpenAi(ai, { type: "response.output_audio.delta", response_id: "resp-mismatch-2", delta: "AQ==" });
-  await completeDeterministicResponse(ai, "resp-mismatch-2", { transcript: "Still not the requested sentence." });
-  assert.equal(twilio.sent.filter((message) => message.event === "media").length, 0);
-  assert.equal(controls.getState().pendingAssistantResponse?.reason, "deterministic_recovery");
-  assert.equal(ai.sent.filter((message) => message.type === "response.create").length, 2);
-
-  assert.equal(await controls.flushQueuedAssistantResponse("bounded_recovery"), true);
-  await emitOpenAi(ai, { type: "response.created", response: { id: "resp-recovery" } });
-  await emitOpenAi(ai, { type: "response.output_audio.delta", response_id: "resp-recovery", delta: "Ag==" });
-  await completeDeterministicResponse(ai, "resp-recovery");
+  await emitOpenAi(ai, { type: "response.created", response: { id: "resp-barge-stream" } });
+  await emitOpenAi(ai, { type: "response.output_audio.delta", response_id: "resp-barge-stream", delta: "AA==" });
   assert.equal(twilio.sent.filter((message) => message.event === "media").length, 1);
-  const recoveryMark = controls.getState().pendingAssistantMarkName;
-  await emitTwilio(twilio, { event: "mark", mark: { name: recoveryMark } });
-  await new Promise((resolve) => setTimeout(resolve, 250));
-  assert.equal(twilio.closeCount, 1);
-  await emitTwilio(twilio, { event: "mark", mark: { name: recoveryMark } });
-  await emitOpenAi(ai, { type: "response.cancelled", response_id: "resp-recovery" });
-  assert.equal(twilio.closeCount, 1);
-  assert.equal(ai.sent.filter((message) => message.type === "response.create").length, 3);
+  assert.equal(await controls.clearTwilioPlaybackForBargeIn("streaming_barge_in"), true);
+  assert.equal(ai.sent.filter((message) => message.type === "response.cancel").length, 1);
+  assert.equal(twilio.sent.filter((message) => message.event === "clear").length, 1);
+  await emitOpenAi(ai, { type: "response.output_audio.delta", response_id: "resp-barge-stream", delta: "AQ==" });
+  await emitOpenAi(ai, { type: "response.output_audio.done", response_id: "resp-barge-stream" });
+  await emitOpenAi(ai, { type: "response.done", response: { id: "resp-barge-stream", status: "cancelled" } });
+  assert.equal(twilio.sent.filter((message) => message.event === "media").length, 1);
+  assert.equal(twilio.sent.filter((message) => message.event === "mark").length, 0);
 });
 
-test("production deterministic completion timeout retries, recovers, and terminates without silence", async () => {
+test("pre-booking confirmation remains buffered and unauthorized until its matching playback mark", async () => {
+  const { ai, twilio, controls } = createProductionSession();
+  await controls.requestAssistantResponse({ immediate: true, reason: "protected_confirmation" });
+  await emitOpenAi(ai, { type: "response.created", response: { id: "resp-protected-confirmation" } });
+  await emitOpenAi(ai, {
+    type: "response.output_audio.delta",
+    response_id: "resp-protected-confirmation",
+    delta: "AA==",
+  });
+  assert.equal(twilio.sent.filter((message) => message.event === "media").length, 0);
+  await emitExpectedOutputTranscript(ai, "resp-protected-confirmation");
+  await emitOpenAi(ai, { type: "response.output_audio.done", response_id: "resp-protected-confirmation" });
+  assert.equal(twilio.sent.filter((message) => message.event === "media").length, 0);
+  assert.equal(controls.getState().confirmationDeliveryReady, false);
+  await emitOpenAi(ai, {
+    type: "response.done",
+    response: { id: "resp-protected-confirmation", status: "completed" },
+  });
+  assert.equal(twilio.sent.filter((message) => message.event === "media").length, 1);
+  const mark = controls.getState().pendingAssistantMarkName;
+  assert.ok(mark);
+  assert.equal(controls.getState().confirmationDeliveryReady, false);
+  await emitTwilio(twilio, { event: "mark", mark: { name: mark } });
+  assert.equal(controls.getState().confirmationDeliveryReady, true);
+  assert.equal(controls.getState().bookingState.confirmed, false);
+});
+
+test("routine completion timeout creates one explicit recovery prompt without retrying the original", async () => {
   const { ai, twilio, controls } = createProductionSession({ deterministicCompletionTimeoutMs: 10 });
   await requestProductionNamePrompt(controls);
   await emitOpenAi(ai, { type: "response.created", response: { id: "resp-timeout-1" } });
   await new Promise((resolve) => setTimeout(resolve, 20));
-  assert.equal(controls.getState().pendingAssistantResponse?.reason, "deterministic_retry");
-  assert.equal(await controls.flushQueuedAssistantResponse("timeout_retry"), true);
-
-  await emitOpenAi(ai, { type: "response.created", response: { id: "resp-timeout-2" } });
-  await new Promise((resolve) => setTimeout(resolve, 20));
-  assert.equal(controls.getState().pendingAssistantResponse?.reason, "deterministic_recovery");
-  assert.equal(await controls.flushQueuedAssistantResponse("timeout_recovery"), true);
-
-  await emitOpenAi(ai, { type: "response.created", response: { id: "resp-timeout-recovery" } });
-  await new Promise((resolve) => setTimeout(resolve, 20));
+  const creates = ai.sent.filter((message) => message.type === "response.create");
+  assert.equal(creates.length, 2);
+  assert.match(extractIntendedSpeech(creates.at(-1).response.instructions), /repeat/i);
   assert.equal(twilio.sent.filter((message) => message.event === "media").length, 0);
-  assert.equal(ai.sent.filter((message) => message.type === "response.create").length, 3);
-  assert.equal(twilio.closeCount, 1);
+  assert.equal(controls.getState().pendingAssistantResponse, null);
+  assert.equal(twilio.closeCount, 0);
+});
+
+test("unknown deterministic purposes fail closed while factual purposes validate before playback", async () => {
+  for (const purpose of [undefined, null, "misspelled_transaction", RESPONSE_PURPOSE.UNAVAILABLE, RESPONSE_PURPOSE.ALTERNATIVE_SELECTION]) {
+    const { ai, twilio, controls } = createProductionSession();
+    controls.speakExact("The requested business statement.", { reason: "policy_test", purpose });
+    const responseId = `policy-${String(purpose)}`;
+    await emitOpenAi(ai, { type: "response.created", response: { id: responseId } });
+    await emitOpenAi(ai, { type: "response.output_audio.delta", response_id: responseId, delta: "AA==" });
+    assert.equal(twilio.sent.filter((message) => message.event === "media").length, 0, String(purpose));
+    await completeDeterministicResponse(ai, responseId);
+    assert.equal(twilio.sent.filter((message) => message.event === "media").length, 1, String(purpose));
+    assert.equal(controls.getState().lifecycleRecords.find(([id]) => id === responseId)[1].deliveryMode, "buffered");
+  }
+});
+
+test("false unavailable and wrong alternative statements never reach Twilio", async () => {
+  for (const [purpose, transcript] of [
+    [RESPONSE_PURPOSE.UNAVAILABLE, "That time is available."],
+    [RESPONSE_PURPOSE.ALTERNATIVE_SELECTION, "I can offer nine o'clock instead."],
+  ]) {
+    const { ai, twilio, controls } = createProductionSession();
+    controls.speakExact("That time is unavailable; I can offer 1:00 PM.", { reason: "factual_validation", purpose });
+    const responseId = `false-factual-${purpose}`;
+    await emitOpenAi(ai, { type: "response.created", response: { id: responseId } });
+    await emitOpenAi(ai, { type: "response.output_audio.delta", response_id: responseId, delta: "AA==" });
+    await completeDeterministicResponse(ai, responseId, { transcript });
+    assert.equal(twilio.sent.filter((message) => message.event === "media").length, 0);
+  }
+});
+
+test("stale response A events cannot displace or mutate active response B", async () => {
+  const { ai, twilio, controls } = createProductionSession();
+  await requestProductionNamePrompt(controls);
+  await emitOpenAi(ai, { type: "response.created", response: { id: "owner-a" } });
+  await emitOpenAi(ai, { type: "response.output_audio.delta", response_id: "owner-a", delta: "AA==" });
+  await completeDeterministicResponse(ai, "owner-a");
+  const markA = controls.getState().pendingAssistantMarkName;
+  await emitTwilio(twilio, { event: "mark", mark: { name: markA } });
+
+  await controls.requestAssistantResponse({ immediate: true, reason: "owner_b" });
+  await emitOpenAi(ai, { type: "response.created", response: { id: "owner-b" } });
+  const before = controls.getState();
+  await emitOpenAi(ai, { type: "response.output_audio.delta", response_id: "owner-a", delta: "AQ==" });
+  await emitOpenAi(ai, { type: "response.output_audio_transcript.done", response_id: "owner-a", transcript: "stale" });
+  await emitOpenAi(ai, { type: "response.output_audio.done", response_id: "owner-a" });
+  await emitOpenAi(ai, { type: "response.done", response: { id: "owner-a", status: "completed" } });
+  const after = controls.getState();
+  assert.equal(after.responseInFlightId, "owner-b");
+  assert.equal(after.responseActive, before.responseActive);
+  assert.equal(after.assistantSpeaking, before.assistantSpeaking);
+  assert.equal(after.readyForCallerInput, before.readyForCallerInput);
+  assert.equal(after.assistantAudioDeltaCount, before.assistantAudioDeltaCount);
+  assert.equal(after.pendingAssistantMarkName, before.pendingAssistantMarkName);
+  assert.deepEqual(after.lifecycleRecords, before.lifecycleRecords);
+});
+
+test("duplicate response.created cannot consume the serialized pending attempt for B", async () => {
+  const { ai, twilio, controls } = createProductionSession();
+  controls.speakExact("First response.", { purpose: RESPONSE_PURPOSE.SERVICE_COLLECTION });
+  await emitOpenAi(ai, { type: "response.created", response: { id: "created-owner-a" } });
+  await emitOpenAi(ai, { type: "response.output_audio.delta", response_id: "created-owner-a", delta: "AA==" });
+  await completeDeterministicResponse(ai, "created-owner-a", { transcript: "First response." });
+  await emitTwilio(twilio, { event: "mark", mark: { name: controls.getState().pendingAssistantMarkName } });
+
+  await requestProductionNamePrompt(controls);
+  const pendingB = controls.getState().pendingResponseCreationAttempt;
+  assert.equal(pendingB.deliveryMode, "streaming");
+  const beforeDuplicate = controls.getState();
+  await emitOpenAi(ai, { type: "response.created", response: { id: "created-owner-a" } });
+  const afterDuplicate = controls.getState();
+  assert.deepEqual(afterDuplicate.pendingResponseCreationAttempt, pendingB);
+  assert.equal(afterDuplicate.responseInFlightId, beforeDuplicate.responseInFlightId);
+  assert.equal(afterDuplicate.responseActive, beforeDuplicate.responseActive);
+  assert.equal(afterDuplicate.assistantSpeaking, beforeDuplicate.assistantSpeaking);
+  assert.deepEqual(afterDuplicate.lifecycleRecords, beforeDuplicate.lifecycleRecords);
+  assert.equal(twilio.sent.filter((message) => ["media", "mark"].includes(message.event)).length, 2);
+
+  await emitOpenAi(ai, { type: "response.created", response: { id: "created-owner-b" } });
+  const stateB = controls.getState();
+  const recordB = stateB.lifecycleRecords.find(([id]) => id === "created-owner-b")[1];
+  assert.equal(recordB.purpose, RESPONSE_PURPOSE.NAME_COLLECTION);
+  assert.equal(recordB.deliveryMode, "streaming");
+  assert.equal(recordB.deliveryMode, pendingB.deliveryMode);
+  assert.deepEqual(recordB.bookingSnapshot, pendingB.bookingSnapshot);
+  assert.equal(recordB.creationAttemptSequence, pendingB.sequence);
+  assert.equal(stateB.pendingResponseCreationAttempt, null);
+});
+
+test("cancel error correlation cannot let delayed A mutate active B", async () => {
+  const { ai, twilio, controls } = createProductionSession();
+  controls.speakExact("Response A.", { purpose: RESPONSE_PURPOSE.SERVICE_COLLECTION });
+  await emitOpenAi(ai, { type: "response.created", response: { id: "cancel-owner-a" } });
+  await emitOpenAi(ai, { type: "response.output_audio.delta", response_id: "cancel-owner-a", delta: "AA==" });
+  assert.equal(await controls.clearTwilioPlaybackForBargeIn("test_cancel_a"), true);
+  assert.equal(await controls.clearTwilioPlaybackForBargeIn("test_cancel_a_duplicate"), false);
+  const cancel = ai.sent.find((message) => message.type === "response.cancel");
+  assert.ok(cancel?.event_id);
+
+  controls.setResponseState({ responseActive: false, aiResponseInProgress: false, responseInFlightId: "", assistantSpeaking: false, readyForCallerInput: true });
+  controls.speakExact("Response B.", { purpose: RESPONSE_PURPOSE.DATE_COLLECTION });
+  await emitOpenAi(ai, { type: "response.created", response: { id: "cancel-owner-b" } });
+  await emitOpenAi(ai, { type: "response.output_audio.delta", response_id: "cancel-owner-b", delta: "AQ==" });
+  const before = controls.getState();
+  await emitOpenAi(ai, { type: "error", error: { code: "response_cancel_not_active", event_id: cancel.event_id } });
+  const after = controls.getState();
+  assert.equal(after.responseInFlightId, "cancel-owner-b");
+  assert.equal(after.responseActive, true);
+  assert.equal(after.assistantSpeaking, before.assistantSpeaking);
+  assert.equal(after.readyForCallerInput, false);
+  assert.deepEqual(
+    after.lifecycleRecords.find(([id]) => id === "cancel-owner-b"),
+    before.lifecycleRecords.find(([id]) => id === "cancel-owner-b")
+  );
+  await emitOpenAi(ai, { type: "error", error: { code: "response_cancel_not_active", event_id: cancel.event_id } });
+  assert.equal(controls.getState().responseInFlightId, "cancel-owner-b");
+  assert.equal(ai.sent.filter((message) => message.type === "response.cancel").length, 1);
+});
+
+test("owned direct terminal forms reconcile immediately and stale terminals cannot touch B", async () => {
+  for (const [eventType, expectedStatus] of [
+    ["response.completed", "completed"],
+    ["response.failed", "failed"],
+    ["response.incomplete", "incomplete"],
+    ["response.cancelled", "cancelled"],
+  ]) {
+    const { ai, controls } = createProductionSession({ deterministicCompletionTimeoutMs: 25 });
+    controls.speakExact("Terminal test.", { purpose: RESPONSE_PURPOSE.NAME_COLLECTION });
+    const responseId = `direct-${expectedStatus}`;
+    await emitOpenAi(ai, { type: "response.created", response: { id: responseId } });
+    await emitOpenAi(ai, { type: eventType, response: { id: responseId }, response_id: responseId });
+    const record = controls.getState().lifecycleRecords.find(([id]) => id === responseId)[1];
+    assert.equal(record.openAiStatus, expectedStatus);
+    assert.equal(record.terminalEventReceived, true);
+    const createsAfterTerminal = ai.sent.filter((message) => message.type === "response.create").length;
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    assert.equal(ai.sent.filter((message) => message.type === "response.create").length, createsAfterTerminal);
+  }
+});
+
+test("response-creation timeout quarantines the call and a fresh independent call still works", async () => {
+  let appointments = 0;
+  const { ai, twilio, controls } = createProductionSession({
+    deterministicCompletionTimeoutMs: 25,
+    bookAppointment: async () => { appointments += 1; return { success: true }; },
+  });
+  controls.speakExact("Your appointment is confirmed. Goodbye.", {
+    reason: "final_confirmation",
+    finalConfirmation: true,
+  });
+  const finalAttempt = controls.getState().pendingResponseCreationAttempt;
+  assert.equal(finalAttempt.finalConfirmation, true);
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  const timedOut = controls.getState();
+  assert.equal(timedOut.openAiConnectionQuarantined, true);
+  assert.equal(timedOut.endingCall, true);
+  assert.equal(timedOut.pendingResponseCreationAttempt, null);
+  assert.equal(timedOut.finalConfirmationAwaitingResponseCreated, false);
+  assert.equal(timedOut.finalConfirmationCallEndArmed, false);
+
+  assert.equal(
+    controls.speakExact("What day would you like?", { purpose: RESPONSE_PURPOSE.DATE_COLLECTION }),
+    false
+  );
+  assert.equal(ai.sent.filter((message) => message.type === "response.create").length, 1);
+  const beforeLateEvents = controls.getState();
+  const twilioActionsBefore = twilio.sent.filter((message) => ["media", "mark"].includes(message.event)).length;
+  await emitOpenAi(ai, { type: "response.created", response: { id: "fresh-late-a" } });
+  await emitOpenAi(ai, {
+    type: "response.output_audio.delta",
+    response_id: "fresh-late-a",
+    delta: "AA==",
+  });
+  await emitOpenAi(ai, { type: "response.output_audio_transcript.done", response_id: "fresh-late-a", transcript: "late" });
+  await emitOpenAi(ai, { type: "response.output_audio.done", response_id: "fresh-late-a" });
+  await emitOpenAi(ai, { type: "response.done", response: { id: "fresh-late-a", status: "completed" } });
+  await emitOpenAi(ai, { type: "error", error: { code: "response_cancel_not_active", event_id: "late-cancel" } });
+  await emitTwilio(twilio, { event: "mark", mark: { name: "late-mark-a" } });
+  const afterLateEvents = controls.getState();
+  assert.deepEqual(afterLateEvents.lifecycleRecords, beforeLateEvents.lifecycleRecords);
+  assert.equal(afterLateEvents.responseInFlightId, "");
+  assert.equal(afterLateEvents.readyForCallerInput, false);
+  assert.equal(afterLateEvents.confirmationDeliveryReady, false);
+  assert.equal(afterLateEvents.endingCall, true);
+  assert.equal(twilio.sent.filter((message) => ["media", "mark"].includes(message.event)).length, twilioActionsBefore);
+  assert.equal(appointments, 0);
+
+  const fresh = createProductionSession();
+  assert.notEqual(fresh.ai, ai);
+  assert.equal(fresh.controls.getState().openAiConnectionQuarantined, false);
+  fresh.controls.speakExact("Fresh call response.", { purpose: RESPONSE_PURPOSE.SERVICE_COLLECTION });
+  await emitOpenAi(fresh.ai, { type: "response.created", response: { id: "fresh-call-response" } });
+  await emitOpenAi(fresh.ai, { type: "response.output_audio.delta", response_id: "fresh-call-response", delta: "AA==" });
+  await completeDeterministicResponse(fresh.ai, "fresh-call-response", { transcript: "Fresh call response." });
+  assert.equal(fresh.twilio.sent.filter((message) => message.event === "media").length, 1);
+  assert.equal(fresh.controls.getState().openAiConnectionQuarantined, false);
+});
+
+test("authoritative shutdown cancels the creation-timeout callback idempotently", async () => {
+  const { ai, twilio, controls } = createProductionSession({ deterministicCompletionTimeoutMs: 20 });
+  controls.speakExact("Pending response.", { purpose: RESPONSE_PURPOSE.SERVICE_COLLECTION });
+  assert.equal(ai.sent.filter((message) => message.type === "response.create").length, 1);
+  await controls.requestCallEnd("shutdown_before_creation_timeout");
+  await controls.requestCallEnd("shutdown_before_creation_timeout_duplicate");
+  await new Promise((resolve) => setTimeout(resolve, 35));
+  const state = controls.getState();
+  assert.equal(state.endingCall, true);
+  assert.equal(state.openAiConnectionQuarantined, false);
+  assert.equal(state.pendingResponseCreationAttempt, null);
+  assert.equal(state.readyForCallerInput, false);
+  await emitOpenAi(ai, { type: "response.created", response: { id: "late-after-shutdown" } });
+  await emitTwilio(twilio, { event: "mark", mark: { name: "late-after-shutdown" } });
+  assert.equal(controls.getState().lifecycleRecords.some(([id]) => id === "late-after-shutdown"), false);
+  assert.equal(twilio.sent.filter((message) => ["media", "mark"].includes(message.event)).length, 0);
+});
+
+test("explicit failed and incomplete terminal types override contradictory completed status", async () => {
+  for (const [eventType, expectedStatus] of [
+    ["response.failed", "failed"],
+    ["response.incomplete", "incomplete"],
+  ]) {
+    const { ai, twilio, controls } = createProductionSession();
+    controls.speakExact("Please confirm the protected appointment.", {
+      purpose: RESPONSE_PURPOSE.PRE_BOOKING_CONFIRMATION,
+    });
+    const responseId = `contradictory-${expectedStatus}`;
+    await emitOpenAi(ai, { type: "response.created", response: { id: responseId } });
+    await emitOpenAi(ai, { type: "response.output_audio.delta", response_id: responseId, delta: "AA==" });
+    await emitOpenAi(ai, {
+      type: "response.output_audio_transcript.done",
+      response_id: responseId,
+      transcript: "Please confirm the protected appointment.",
+    });
+    await emitOpenAi(ai, {
+      type: eventType,
+      response: { id: responseId, status: "completed" },
+    });
+    const state = controls.getState();
+    const record = state.lifecycleRecords.find(([id]) => id === responseId)[1];
+    assert.equal(record.openAiStatus, expectedStatus);
+    assert.equal(record.audioSubmitted, false);
+    assert.equal(state.confirmationDeliveryReady, false);
+    assert.equal(twilio.sent.filter((message) => ["media", "mark"].includes(message.event)).length, 0);
+  }
+});
+
+test("a partially audible failed recovery cannot create a second recovery", async () => {
+  for (const status of ["incomplete", "completed"]) {
+    const { ai, twilio, controls } = createProductionSession();
+    await requestProductionNamePrompt(controls);
+    await emitOpenAi(ai, { type: "response.created", response: { id: `origin-${status}` } });
+    await emitOpenAi(ai, { type: "response.output_audio.delta", response_id: `origin-${status}`, delta: "AA==" });
+    await completeDeterministicResponse(ai, `origin-${status}`, { transcript: "incomplete original", status: "incomplete" });
+    await emitTwilio(twilio, { event: "mark", mark: { name: controls.getState().pendingAssistantMarkName } });
+    assert.equal(ai.sent.filter((message) => message.type === "response.create").length, 2);
+
+    const recoveryId = `recovery-${status}`;
+    await emitOpenAi(ai, { type: "response.created", response: { id: recoveryId } });
+    await emitOpenAi(ai, { type: "response.output_audio.delta", response_id: recoveryId, delta: "AQ==" });
+    await completeDeterministicResponse(ai, recoveryId, {
+      transcript: status === "completed" ? "semantically wrong recovery" : "partial recovery",
+      status,
+    });
+    const recoveryMark = controls.getState().pendingAssistantMarkName;
+    assert.ok(recoveryMark);
+    await emitTwilio(twilio, { event: "mark", mark: { name: recoveryMark } });
+    assert.equal(ai.sent.filter((message) => message.type === "response.create").length, 2);
+    assert.equal(controls.getState().readyForCallerInput, true);
+    assert.equal(twilio.sent.filter((message) => message.event === "mark").length, 2);
+  }
+});
+
+test("barge-in and endingCall prevent recovery playback or regeneration", async () => {
+  const barged = createProductionSession();
+  await requestProductionNamePrompt(barged.controls);
+  await emitOpenAi(barged.ai, { type: "response.created", response: { id: "barge-origin" } });
+  await emitOpenAi(barged.ai, { type: "response.output_audio.delta", response_id: "barge-origin", delta: "AA==" });
+  await completeDeterministicResponse(barged.ai, "barge-origin", { transcript: "bad", status: "incomplete" });
+  await emitTwilio(barged.twilio, { event: "mark", mark: { name: barged.controls.getState().pendingAssistantMarkName } });
+  await emitOpenAi(barged.ai, { type: "response.created", response: { id: "barge-recovery" } });
+  await emitOpenAi(barged.ai, { type: "response.output_audio.delta", response_id: "barge-recovery", delta: "AQ==" });
+  assert.equal(await barged.controls.clearTwilioPlaybackForBargeIn("recovery_barge_in"), true);
+  await emitOpenAi(barged.ai, { type: "response.output_audio.delta", response_id: "barge-recovery", delta: "Ag==" });
+  assert.equal(barged.twilio.sent.filter((message) => message.event === "media").length, 2);
+  assert.equal(barged.ai.sent.filter((message) => message.type === "response.cancel").length, 1);
+
+  const ending = createProductionSession();
+  await requestProductionNamePrompt(ending.controls);
+  await emitOpenAi(ending.ai, { type: "response.created", response: { id: "ending-origin" } });
+  await emitOpenAi(ending.ai, { type: "response.output_audio.delta", response_id: "ending-origin", delta: "AA==" });
+  await completeDeterministicResponse(ending.ai, "ending-origin", { transcript: "bad", status: "incomplete" });
+  const endingMark = ending.controls.getState().pendingAssistantMarkName;
+  await ending.controls.requestCallEnd("recovery_shutdown_test");
+  await emitTwilio(ending.twilio, { event: "mark", mark: { name: endingMark } });
+  assert.equal(ending.ai.sent.filter((message) => message.type === "response.create").length, 1);
+  assert.equal(ending.controls.getState().endingCall, true);
+  assert.equal(ending.controls.getState().readyForCallerInput, false);
+});
+
+test("strict audio validation rejects malformed deltas before media, accounting, or marks", async () => {
+  for (const invalid of ["", "   ", "%%==", "AAA", "A===", "AA=A"]) {
+    assert.equal(validAudioDeltaByteLength(invalid), 0, JSON.stringify(invalid));
+  }
+  assert.equal(validAudioDeltaByteLength("AA=="), 1);
+
+  const { ai, twilio, controls } = createProductionSession();
+  await requestProductionNamePrompt(controls);
+  await emitOpenAi(ai, { type: "response.created", response: { id: "invalid-then-valid" } });
+  for (const delta of ["", "   ", "%%==", "AAA"]) {
+    await emitOpenAi(ai, { type: "response.output_audio.delta", response_id: "invalid-then-valid", delta });
+  }
+  assert.equal(controls.getState().assistantAudioDeltaCount, 0);
+  assert.equal(twilio.sent.filter((message) => message.event === "media").length, 0);
+  await emitOpenAi(ai, { type: "response.output_audio.delta", response_id: "invalid-then-valid", delta: "AA==" });
+  assert.equal(controls.getState().assistantAudioDeltaCount, 1);
+  assert.equal(twilio.sent.filter((message) => message.event === "media").length, 1);
+
+  const empty = createProductionSession();
+  await requestProductionNamePrompt(empty.controls);
+  await emitOpenAi(empty.ai, { type: "response.created", response: { id: "invalid-only" } });
+  await emitOpenAi(empty.ai, { type: "response.output_audio.delta", response_id: "invalid-only", delta: "%%==" });
+  await completeDeterministicResponse(empty.ai, "invalid-only");
+  assert.equal(empty.twilio.sent.filter((message) => message.event === "media").length, 0);
+  assert.equal(empty.twilio.sent.filter((message) => message.event === "mark").length, 0);
+  assert.equal(empty.ai.sent.filter((message) => message.type === "response.create").length, 2);
 });
 
 test("production yes phrase cannot become a name or reach booking and SMS", async () => {
