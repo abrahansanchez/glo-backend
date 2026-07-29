@@ -88,13 +88,343 @@ const normalizeRoutineDeterministicMeaning = (value) => normalizeDeterministicSp
   .replace(/\s+/g, " ")
   .trim();
 
+const ROUTINE_REQUEST_WORDS =
+  /\b(?:what|which|when|where|who|how|may i|can i|could i|would you|do you|tell me|say|repeat|choose|pick|select|que|cual|cuando|donde|quien|como|puedo|podrias|dime|repita|repite|elige|escoge)\b/;
+const ROUTINE_TRUNCATED_ENDING =
+  /\b(?:a|an|and|at|de|del|el|for|in|la|las|los|of|on|or|para|por|the|to|tu|un|una|with|y|your)\s*$/;
+
+const routineTranscriptLooksComplete = (value) => {
+  const normalized = normalizeDeterministicSpeech(value);
+  if (!normalized || normalized.split(/\s+/).length < 3) return false;
+  return !ROUTINE_TRUNCATED_ENDING.test(normalized);
+};
+
+const routineTranscriptRequestsInput = (rawValue, normalizedValue) =>
+  /[?¿]/.test(String(rawValue || "")) ||
+  ROUTINE_REQUEST_WORDS.test(normalizedValue);
+
+const containsAnyRoutinePhrase = (value, phrases) =>
+  phrases.some((phrase) => value.includes(phrase));
+
+const CONFIRMATION_WEEKDAYS = Object.freeze([
+  ["sunday", "domingo"],
+  ["monday", "lunes"],
+  ["tuesday", "martes"],
+  ["wednesday", "miercoles"],
+  ["thursday", "jueves"],
+  ["friday", "viernes"],
+  ["saturday", "sabado"],
+]);
+
+const CONFIRMATION_MONTHS = Object.freeze([
+  ["january", "enero"],
+  ["february", "febrero"],
+  ["march", "marzo"],
+  ["april", "abril"],
+  ["may", "mayo"],
+  ["june", "junio"],
+  ["july", "julio"],
+  ["august", "agosto"],
+  ["september", "septiembre"],
+  ["october", "octubre"],
+  ["november", "noviembre"],
+  ["december", "diciembre"],
+]);
+
+const CONFIRMATION_HOUR_WORDS = Object.freeze({
+  one: "1",
+  two: "2",
+  three: "3",
+  four: "4",
+  five: "5",
+  six: "6",
+  seven: "7",
+  eight: "8",
+  nine: "9",
+  ten: "10",
+  eleven: "11",
+  twelve: "12",
+  una: "1",
+  uno: "1",
+  dos: "2",
+  tres: "3",
+  cuatro: "4",
+  cinco: "5",
+  seis: "6",
+  siete: "7",
+  ocho: "8",
+  nueve: "9",
+  diez: "10",
+  once: "11",
+  doce: "12",
+});
+
+const normalizeConfirmationFactText = (value) => {
+  let normalized = normalizeDeterministicSpeech(value)
+    .replace(/\bin the morning\b|\bde la manana\b/g, " am ")
+    .replace(/\bin the afternoon\b|\bin the evening\b|\bde la tarde\b|\bde la noche\b/g, " pm ")
+    .replace(/\bnoon\b|\bmediodia\b/g, " 12 pm ")
+    .replace(/\bmidnight\b|\bmedianoche\b/g, " 12 am ");
+  for (const [word, digit] of Object.entries(CONFIRMATION_HOUR_WORDS)) {
+    normalized = normalized.replace(new RegExp(`\\b${word}\\b`, "g"), digit);
+  }
+  return normalized
+    .replace(/\b(1[0-2]|0?[1-9])\s+([0-5]\d)\s+(am|pm)\b/g, "$1:$2 $3")
+    .replace(/\s+/g, " ")
+    .trim();
+};
+
+const extractConfirmationTimeKeys = (value) => {
+  const normalized = normalizeConfirmationFactText(value);
+  const keys = new Set();
+  for (const match of normalized.matchAll(/\b(1[0-2]|0?[1-9])(?::([0-5]\d))?\s*(am|pm)\b/g)) {
+    keys.add(`${Number(match[1])}:${match[2] || "00"} ${match[3]}`);
+  }
+  return keys;
+};
+
+const expectedConfirmationTimeKey = (value) => {
+  const match = normalizeConfirmationFactText(value).match(
+    /\b(1[0-2]|0?[1-9])(?::([0-5]\d))?\s*(am|pm)\b/
+  );
+  return match ? `${Number(match[1])}:${match[2] || "00"} ${match[3]}` : "";
+};
+
+const transcriptContainsNormalizedPhrase = (completed, expected) => {
+  const phrase = normalizeConfirmationFactText(expected);
+  if (!phrase) return false;
+  const escaped = phrase.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\s+/g, "\\s+");
+  return new RegExp(`(?:^|\\s)${escaped}(?:$|\\s)`).test(completed);
+};
+
+const transcriptContainsExpectedService = (completed, expectedService) => {
+  const service = normalizeDeterministicSpeech(expectedService);
+  if (!service) return false;
+
+  const hasHaircut = /\b(?:haircut|hair cut|cut|fade|lineup|corte|pelo|cabello)\b/.test(completed);
+  const hasBeard = /\b(?:beard|shave|barba)\b/.test(completed);
+  const expectsHaircut = /\b(?:haircut|hair cut|cut|fade|lineup|corte|pelo|cabello)\b/.test(service);
+  const expectsBeard = /\b(?:beard|shave|barba)\b/.test(service);
+
+  if (expectsHaircut && expectsBeard) return hasHaircut && hasBeard;
+  if (expectsHaircut) return hasHaircut && !hasBeard;
+  if (expectsBeard) return hasBeard && !hasHaircut;
+  return completed.includes(service);
+};
+
+const transcriptContainsExpectedDate = (completed, expectedDate) => {
+  const parsed = new Date(`${String(expectedDate || "").slice(0, 10)}T12:00:00.000Z`);
+  if (Number.isNaN(parsed.getTime())) return false;
+
+  const expectedWeekdayIndex = parsed.getUTCDay();
+  const expectedMonthIndex = parsed.getUTCMonth();
+  const expectedDay = parsed.getUTCDate();
+  const mentionedWeekdays = CONFIRMATION_WEEKDAYS
+    .map((aliases, index) => aliases.some((alias) => new RegExp(`\\b${alias}\\b`).test(completed)) ? index : -1)
+    .filter((index) => index >= 0);
+  const mentionedMonths = CONFIRMATION_MONTHS
+    .map((aliases, index) => aliases.some((alias) => new RegExp(`\\b${alias}\\b`).test(completed)) ? index : -1)
+    .filter((index) => index >= 0);
+  const explicitlyMentionedDays = [
+    /\b(?:sunday|monday|tuesday|wednesday|thursday|friday|saturday|domingo|lunes|martes|miercoles|jueves|viernes|sabado)\s*,?\s+(?:the\s+)?(\d{1,2})(?:st|nd|rd|th)?(?!\s*(?::\s*\d{2})?\s*(?:am|pm)\b)\b/g,
+    /\b(?:january|february|march|april|may|june|july|august|september|october|november|december)\s+(?:the\s+)?(\d{1,2})(?:st|nd|rd|th)?\b/g,
+    /\b(\d{1,2})(?:st|nd|rd|th)?\s+(?:of\s+)?(?:january|february|march|april|may|june|july|august|september|october|november|december)\b/g,
+    /\b(\d{1,2})\s+de\s+(?:enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre)\b/g,
+  ].flatMap((pattern) => [...completed.matchAll(pattern)].map((match) => Number(match[1])));
+
+  if (mentionedWeekdays.some((index) => index !== expectedWeekdayIndex)) return false;
+  if (mentionedMonths.some((index) => index !== expectedMonthIndex)) return false;
+  if (explicitlyMentionedDays.some((day) => day !== expectedDay)) return false;
+  if (mentionedWeekdays.includes(expectedWeekdayIndex)) return true;
+  if (!mentionedMonths.includes(expectedMonthIndex)) return false;
+
+  return new RegExp(`\\b${expectedDay}(?:st|nd|rd|th)?\\b`).test(completed);
+};
+
+export const validatePreBookingConfirmationTranscript = (record) => {
+  const rawCompleted = String(record?.completedOutputTranscript || "");
+  const completed = normalizeConfirmationFactText(rawCompleted);
+  const intended = normalizeConfirmationFactText(record?.intendedSpeech);
+  const bookingState = record?.bookingSnapshot?.bookingState;
+  if (!completed || !bookingState) return false;
+
+  const prematureSuccess =
+    /\b(?:appointment|booking|cita)\s+(?:is|has been|esta|ha sido)\s+(?:confirmed|booked|scheduled|finalized|all set|confirmada|reservada|programada|finalizada)\b/.test(completed) ||
+    /\b(?:you are|you're|estas)\s+(?:confirmed|booked|scheduled|all set|confirmado|confirmada|programado|programada)\b/.test(completed) ||
+    /\b(?:locked in|successfully (?:booked|scheduled)|ya (?:esta|quedo) confirmad[oa])\b/.test(completed);
+  if (prematureSuccess) return false;
+
+  if (/\bnext\b/.test(completed) && !/\bnext\b/.test(intended)) return false;
+
+  const confirmationQuestion =
+    /\b(?:should|shall|can|may) i (?:go ahead and )?confirm\b/.test(completed) ||
+    /\b(?:would|do) you (?:like|want) me to confirm\b/.test(completed) ||
+    /\b(?:do i have your permission|may i have your permission) to confirm\b/.test(completed) ||
+    /\b(?:please )?say yes to confirm\b/.test(completed) ||
+    /\b(?:puedo confirmar|quieres que confirme|deseas que confirme)\b/.test(completed) ||
+    (
+      /[?¿]/.test(rawCompleted) &&
+      /\bconfirmo (?:esa|esta|la) cita\b/.test(completed)
+    );
+  if (!confirmationQuestion) return false;
+
+  if (!transcriptContainsNormalizedPhrase(completed, bookingState.name)) return false;
+  if (!transcriptContainsExpectedService(completed, bookingState.service)) return false;
+  if (!transcriptContainsExpectedDate(completed, bookingState.parsedDate)) return false;
+
+  const expectedTime = expectedConfirmationTimeKey(bookingState.parsedTime);
+  const mentionedTimes = extractConfirmationTimeKeys(completed);
+  if (!expectedTime || !mentionedTimes.has(expectedTime)) return false;
+  if ([...mentionedTimes].some((time) => time !== expectedTime)) return false;
+
+  return true;
+};
+
+const mentionedRoutineCalendarTerms = (value) => {
+  const normalized = normalizeConfirmationFactText(value);
+  const terms = new Set();
+  for (const aliases of [...CONFIRMATION_WEEKDAYS, ...CONFIRMATION_MONTHS]) {
+    for (const alias of aliases) {
+      if (new RegExp(`\\b${alias}\\b`).test(normalized)) terms.add(alias);
+    }
+  }
+  return terms;
+};
+
+const routineFactsMatch = (intendedValue, completedValue) => {
+  const intendedTimes = extractConfirmationTimeKeys(intendedValue);
+  const completedTimes = extractConfirmationTimeKeys(completedValue);
+  if ([...intendedTimes].some((time) => !completedTimes.has(time))) return false;
+  if ([...completedTimes].some((time) => !intendedTimes.has(time))) return false;
+
+  const intendedCalendarTerms = mentionedRoutineCalendarTerms(intendedValue);
+  const completedCalendarTerms = mentionedRoutineCalendarTerms(completedValue);
+  if ([...intendedCalendarTerms].some((term) => !completedCalendarTerms.has(term))) return false;
+  if ([...completedCalendarTerms].some((term) => !intendedCalendarTerms.has(term))) return false;
+  return true;
+};
+
+const validateRoutineClarificationTranscript = ({ intended, completed, rawCompleted }) => {
+  if (!routineTranscriptRequestsInput(rawCompleted, completed)) return false;
+
+  const preIntentClarification =
+    containsAnyRoutinePhrase(intended, ["didn't catch", "did not catch", "no entendi"]) &&
+    /\b(?:appointment|book|booking|cita|agendar|reservar)\b/.test(intended);
+  if (preIntentClarification) {
+    return (
+      /\b(?:sorry|didn't catch|did not catch|didn't understand|did not understand|perdon|lo siento|no entendi)\b/.test(completed) &&
+      /\b(?:appointment|book|booking|cita|agendar|reservar)\b/.test(completed)
+    );
+  }
+
+  const asksForTime =
+    /\b(?:what time|which time|hora|horario)\b/.test(intended);
+  if (asksForTime) {
+    return /\b(?:time|hour|hora|horario|am|pm|morning|afternoon|evening|manana|tarde|noche)\b/.test(completed);
+  }
+
+  const asksForChange =
+    /\b(?:change|cambiar|cambies)\b/.test(intended);
+  if (asksForChange) {
+    return (
+      /\b(?:change|different|another|cambiar|cambio|otro|otra)\b/.test(completed) &&
+      /\b(?:service|day|date|time|servicio|dia|fecha|hora)\b/.test(completed)
+    );
+  }
+
+  const asksForDateClarification =
+    /\b(?:day|date|dia|fecha)\b/.test(intended);
+  if (asksForDateClarification) {
+    return /\b(?:day|date|when|dia|fecha|cuando)\b/.test(completed);
+  }
+
+  return false;
+};
+
+const validateAvailabilityFollowUpTranscript = ({ intended, completed, rawCompleted }) => {
+  if (!routineFactsMatch(intended, completed)) return false;
+
+  const intendedUnavailable =
+    /\b(?:isn't|is not|not available|unavailable|taken|closed|no esta disponible|ocupad[oa]|cerrad[oa])\b/.test(intended);
+  const completedUnavailable =
+    /\b(?:isn't|is not|not available|unavailable|taken|closed|no esta disponible|ocupad[oa]|cerrad[oa])\b/.test(completed);
+  if (intendedUnavailable !== completedUnavailable) return false;
+
+  const asksForChoice =
+    /\b(?:which|what other|work|works|would you like|choose|pick|cual|que otro|te funciona|prefieres|elige|escoge)\b/.test(completed);
+  const offersAlternative =
+    /\b(?:i have|i can offer|available instead|another|other day|other time|tengo|puedo ofrecer|otra hora|otro dia)\b/.test(completed);
+  return (
+    routineTranscriptRequestsInput(rawCompleted, completed) &&
+    (asksForChoice || offersAlternative)
+  );
+};
+
+export const validateOrdinaryDeterministicTranscript = (record) => {
+  const rawIntended = String(record?.intendedSpeech || "");
+  const rawCompleted = String(record?.completedOutputTranscript || "");
+  const intended = normalizeConfirmationFactText(rawIntended);
+  const completed = normalizeConfirmationFactText(rawCompleted);
+  if (!intended || !completed || !routineTranscriptLooksComplete(rawCompleted)) return false;
+
+  switch (record?.purpose) {
+    case RESPONSE_PURPOSE.NAME_COLLECTION:
+      return (
+        routineTranscriptRequestsInput(rawCompleted, completed) &&
+        /\b(?:name|nombre)\b/.test(completed) &&
+        !/\b(?:i have|we have|already have|tengo|tenemos)\s+(?:your|tu|su)?\s*(?:name|nombre)\b/.test(completed)
+      );
+    case RESPONSE_PURPOSE.SERVICE_COLLECTION:
+      return (
+        routineTranscriptRequestsInput(rawCompleted, completed) &&
+        /\b(?:service|services|haircut|hair cut|cut|beard|shave|servicio|servicios|corte|barba)\b/.test(completed)
+      );
+    case RESPONSE_PURPOSE.DATE_COLLECTION:
+      return (
+        routineTranscriptRequestsInput(rawCompleted, completed) &&
+        /\b(?:day|date|when|dia|fecha|cuando)\b/.test(completed)
+      );
+    case RESPONSE_PURPOSE.TIME_COLLECTION:
+      return (
+        routineTranscriptRequestsInput(rawCompleted, completed) &&
+        /\b(?:time|hour|when|am|pm|morning|afternoon|evening|hora|cuando|manana|tarde|noche)\b/.test(completed)
+      );
+    case RESPONSE_PURPOSE.CLARIFICATION:
+      return validateRoutineClarificationTranscript({ intended, completed, rawCompleted });
+    case RESPONSE_PURPOSE.UNAVAILABLE:
+    case RESPONSE_PURPOSE.ALTERNATIVE_SELECTION:
+      return validateAvailabilityFollowUpTranscript({ intended, completed, rawCompleted });
+    case RESPONSE_PURPOSE.ORDINARY_DETERMINISTIC: {
+      const intendedAvailabilityCheck =
+        /\b(?:check|verify|checking|verificar|revisar)\b/.test(intended) &&
+        /\b(?:time|slot|schedule|availability|hora|horario|disponibilidad)\b/.test(intended);
+      if (intendedAvailabilityCheck) {
+        return (
+          /\b(?:check|verify|checking|look at|verificar|revisar)\b/.test(completed) &&
+          /\b(?:time|slot|schedule|availability|hora|horario|disponibilidad)\b/.test(completed)
+        );
+      }
+      return false;
+    }
+    default:
+      return false;
+  }
+};
+
 const deterministicTranscriptMatches = (record) => {
   const intended = normalizeDeterministicSpeech(record?.intendedSpeech);
   const completed = normalizeDeterministicSpeech(record?.completedOutputTranscript);
   if (intended === completed) return true;
-  if (record?.purpose === RESPONSE_PURPOSE.PRE_BOOKING_CONFIRMATION) return false;
-  return normalizeRoutineDeterministicMeaning(record?.intendedSpeech) ===
-    normalizeRoutineDeterministicMeaning(record?.completedOutputTranscript);
+  if (record?.purpose === RESPONSE_PURPOSE.PRE_BOOKING_CONFIRMATION) {
+    return validatePreBookingConfirmationTranscript(record);
+  }
+  if (
+    normalizeRoutineDeterministicMeaning(record?.intendedSpeech) ===
+    normalizeRoutineDeterministicMeaning(record?.completedOutputTranscript)
+  ) {
+    return true;
+  }
+  return validateOrdinaryDeterministicTranscript(record);
 };
 
 const STREAMING_DETERMINISTIC_PURPOSES = new Set([
@@ -665,6 +995,19 @@ export const classifyConfirmationResponse = (text, { language = "auto" } = {}) =
     return { kind: "clarification", reason: "question_or_detail_request" };
   }
 
+  const replacementTargetPatterns = [
+    /\b(?:today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/,
+    /\b(?:hoy|manana|lunes|martes|miercoles|jueves|viernes|sabado|domingo)\b/,
+    /\b(?:january|february|march|april|may|june|july|august|september|october|november|december)\b/,
+    /\b(?:enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre)\b/,
+    /\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b/,
+    /\b(?:noon|midnight|mediodia|medianoche)\b/,
+    /\b(?:haircut|hair cut|cut|fade|lineup|line up|beard|shave|corte|pelo|cabello|barba)\b/,
+  ];
+  if (replacementTargetPatterns.some((pattern) => pattern.test(normalized))) {
+    return { kind: "modification", reason: "replacement_target" };
+  }
+
   const uncertaintyPatterns = [
     /\b(?:maybe|perhaps|possibly|probably|i think so|i guess|not sure|unsure)\b/,
     /\b(?:creo que si|quizas|tal vez|supongo|no estoy segur[oa])\b/,
@@ -811,7 +1154,9 @@ const containsDateSignal = (text) => {
   return (
     /\b(today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/.test(t) ||
     /\b(hoy|maã±ana|mañana|lunes|martes|miercoles|miércoles|jueves|viernes|sabado|sábado|domingo)\b/.test(t) ||
-    /\b\d{1,2}[/-]\d{1,2}\b/.test(t)
+    /\b(january|february|march|april|may|june|july|august|september|october|november|december)\b/.test(t) ||
+    /\b(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre)\b/.test(t) ||
+    /\b\d{1,4}[/-]\d{1,2}(?:[/-]\d{1,4})?\b/.test(t)
   );
 };
 
@@ -1935,6 +2280,14 @@ export const attachMediaWebSocketServer = (server, dependencies = {}) => {
     let lastAvailabilityCheckKey = "";
     let lastUnavailableInjectionKey = "";
     let barberDoc = null;
+    const parseNaturalDateTimeInBusinessTimezone = async (text) => {
+      if (!barberDoc && barberId && !dependencies.parseNaturalDateTime) {
+        barberDoc = await Barber.findById(barberId).lean();
+      }
+      return parseNaturalDateTimeForCall(text, {
+        timeZone: barberDoc?.availability?.timezone || "America/New_York",
+      });
+    };
     const bookingState = {
       intent: "OTHER",
       name: "",
@@ -2438,6 +2791,7 @@ export const attachMediaWebSocketServer = (server, dependencies = {}) => {
       const creationAttempt = {
         sequence,
         eventId,
+        reason,
         state: "awaiting_response_created",
         createdAtMs: Date.now(),
         purpose: metadata.purpose || null,
@@ -2595,7 +2949,7 @@ export const attachMediaWebSocketServer = (server, dependencies = {}) => {
       const combined = [requestedDateText, requestedTimeText, dateTimeText]
         .filter(Boolean)
         .join(" ");
-      const parsed = await parseNaturalDateTimeForCall(combined);
+      const parsed = await parseNaturalDateTimeInBusinessTimezone(combined);
       if (parsed?.conflict === true) {
         return { conflict: true, date: "", time: "" };
       }
@@ -2674,13 +3028,19 @@ export const attachMediaWebSocketServer = (server, dependencies = {}) => {
       bookingState.awaitingAlternativeSelection === true ||
       (slotChecked && slotAvailable === false);
 
-    const buildReplacementParseSources = ({ transcriptText, hasDate, hasTime, contextualTimeOnly }) => {
+    const buildReplacementParseSources = ({
+      transcriptText,
+      hasDate,
+      hasTime,
+      contextualTimeOnly,
+      preserveUnchangedFields = false,
+    }) => {
       const dateText = hasDate
         ? transcriptText
         : bookingState.parsedDate || bookingState.requestedDateText || "";
       const timeText = hasTime || contextualTimeOnly
         ? transcriptText
-        : shouldPreserveExistingTimeForDateOnlyReplacement(transcriptText)
+        : preserveUnchangedFields || shouldPreserveExistingTimeForDateOnlyReplacement(transcriptText)
           ? bookingState.parsedTime || bookingState.requestedTimeText || ""
           : "";
 
@@ -2697,6 +3057,7 @@ export const attachMediaWebSocketServer = (server, dependencies = {}) => {
       hasTime,
       contextualTimeOnly,
       phaseBeforeDateTimeParse,
+      preserveUnchangedFields = false,
     }) {
       const previous = {
         requestedDateText: bookingState.requestedDateText,
@@ -2715,7 +3076,10 @@ export const attachMediaWebSocketServer = (server, dependencies = {}) => {
         !hasTime &&
         !contextualTimeOnly &&
         Boolean(bookingState.parsedTime) &&
-        shouldPreserveExistingTimeForDateOnlyReplacement(transcriptText);
+        (
+          preserveUnchangedFields ||
+          shouldPreserveExistingTimeForDateOnlyReplacement(transcriptText)
+        );
 
       console.log("[SLOT_REPLACEMENT_STARTED]", {
         transcript: transcriptText,
@@ -2727,17 +3091,24 @@ export const attachMediaWebSocketServer = (server, dependencies = {}) => {
         previous,
       });
 
+      const parseTranscriptText =
+        preserveUnchangedFields && hasDate
+          ? normalizeModificationDateTargetText(transcriptText)
+          : transcriptText;
       const parseSources = buildReplacementParseSources({
-        transcriptText,
+        transcriptText: parseTranscriptText,
         hasDate,
         hasTime,
         contextualTimeOnly,
+        preserveUnchangedFields,
       });
       const parsedBookingTime = contextualTimeOnly
         ? {
             date: bookingState.parsedDate || "",
             time: contextualTimeOnly.time,
           }
+        : preserveUnchangedFields && hasDate && !hasTime
+          ? await parseNaturalDateTimeInBusinessTimezone(parseTranscriptText)
         : await parseBookingDateTime(parseSources);
 
       if (parsedBookingTime?.conflict === true) {
@@ -2780,6 +3151,10 @@ export const attachMediaWebSocketServer = (server, dependencies = {}) => {
       bookingState.dateTimeText = [bookingState.requestedDateText, bookingState.requestedTimeText]
         .filter(Boolean)
         .join(" ");
+
+      if (preserveUnchangedFields && (hasDate || hasTime || contextualTimeOnly)) {
+        bookingState.awaitingCorrection = false;
+      }
 
       resetAvailabilityCache("slot_replacement", {
         transcript: transcriptText,
@@ -3175,19 +3550,30 @@ export const attachMediaWebSocketServer = (server, dependencies = {}) => {
     const speakExact = (text, options = {}) => {
       const reason = options.reason || "speak_exact";
       const isFinalConfirmation = options.finalConfirmation === true;
+      const requestedPromptType = isFinalConfirmation
+        ? "final_confirmation"
+        : options.promptType || null;
       const purpose = options.purpose || (
         isFinalConfirmation
           ? RESPONSE_PURPOSE.FINAL_SUCCESS
-          : reason.includes("unavailable")
-            ? RESPONSE_PURPOSE.UNAVAILABLE
-            : reason.includes("alternative")
-              ? RESPONSE_PURPOSE.ALTERNATIVE_SELECTION
-              : reason.includes("recovery")
-                ? RESPONSE_PURPOSE.RECOVERY
-                : RESPONSE_PURPOSE.ORDINARY_DETERMINISTIC
+          : requestedPromptType === "name"
+            ? RESPONSE_PURPOSE.NAME_COLLECTION
+            : requestedPromptType === "service"
+              ? RESPONSE_PURPOSE.SERVICE_COLLECTION
+              : requestedPromptType === "date"
+                ? RESPONSE_PURPOSE.DATE_COLLECTION
+                : requestedPromptType === "time"
+                  ? RESPONSE_PURPOSE.TIME_COLLECTION
+                  : reason.includes("unavailable")
+                    ? RESPONSE_PURPOSE.UNAVAILABLE
+                    : reason.includes("alternative")
+                      ? RESPONSE_PURPOSE.ALTERNATIVE_SELECTION
+                      : reason.includes("recovery")
+                        ? RESPONSE_PURPOSE.RECOVERY
+                        : RESPONSE_PURPOSE.ORDINARY_DETERMINISTIC
       );
       const maxOutputTokens = deterministicPurposeBudget(purpose);
-      const promptType = isFinalConfirmation ? "final_confirmation" : options.promptType || null;
+      const promptType = requestedPromptType;
       const status = {
         reason,
         sent: false,
@@ -4474,6 +4860,74 @@ RULES:
       return true;
     };
 
+    const isEnglishPreIntentClarificationOwner = (value) =>
+      value?.reason === "english_pre_intent_clarification" &&
+      value?.purpose === RESPONSE_PURPOSE.CLARIFICATION;
+
+    const supersedeEnglishPreIntentClarification = async (transcriptText) => {
+      let supersededQueuedClarification = false;
+      if (isEnglishPreIntentClarificationOwner(pendingAssistantResponse)) {
+        pendingAssistantResponse = null;
+        deferFlushUntilCallerStops = false;
+        supersededQueuedClarification = true;
+      }
+
+      if (isEnglishPreIntentClarificationOwner(pendingResponseCreationAttempt)) {
+        pendingResponseCreationAttempt.supersededByBookingTurn = true;
+        console.log("[ENGLISH_PRE_INTENT_CLARIFICATION_SUPERSEDED]", {
+          stage: "awaiting_response_created",
+          transcript: transcriptText,
+          creationSequence: pendingResponseCreationAttempt.sequence,
+        });
+        return true;
+      }
+
+      const activeRecord = responseLifecycleById.get(
+        activeDeterministicLifecycleId || responseInFlightId
+      );
+      if (!isEnglishPreIntentClarificationOwner(activeRecord)) {
+        return supersededQueuedClarification;
+      }
+
+      activeRecord.supersededByBookingTurn = true;
+      activeRecord.audioInvalidated = true;
+      activeRecord.statusReason = "superseded_by_booking_turn";
+      activeRecord.lifecycleActionHandled = true;
+      activeRecord.bufferedAudioDeltas = [];
+
+      safeCancelResponse("english_pre_intent_clarification_superseded");
+      if (
+        (assistantPlaybackActive || pendingAssistantMarkName || activeRecord.audioSubmitted) &&
+        twilioWs.readyState === twilioWs.OPEN &&
+        streamSid
+      ) {
+        try {
+          twilioWs.send(JSON.stringify({ event: "clear", streamSid }));
+        } catch {
+          // Lifecycle invalidation below still prevents any further stale audio delivery.
+        }
+      }
+
+      if (pendingAssistantMarkName) {
+        playbackMarkToResponseId.delete(pendingAssistantMarkName);
+        diagnosticAttempt(() => markCorrelations?.delete(pendingAssistantMarkName));
+      }
+      pendingAssistantMarkName = null;
+      assistantPlaybackActive = false;
+      assistantAudioSentThisResponse = false;
+      clearAssistantPlaybackWatchdog();
+      resetDeterministicGenerationState(activeRecord);
+      readyForCallerInput = true;
+      retireResponseId(activeRecord.responseId);
+
+      console.log("[ENGLISH_PRE_INTENT_CLARIFICATION_SUPERSEDED]", {
+        stage: "active_response",
+        transcript: transcriptText,
+        responseId: activeRecord.responseId,
+      });
+      return true;
+    };
+
     const handleAssistantPlaybackWatchdogExpiry = async () => {
         console.log("[TWILIO_PLAYBACK_WATCHDOG_RESET_CALLER_INPUT_READY]", {
           assistantPlaybackActive,
@@ -4748,6 +5202,17 @@ RULES:
         isBareSeeAsrArtifact(text)
       );
 
+    const callerTurnHasBookingSignal = (value) => {
+      const normalized = normalizeDeterministicSpeech(value);
+      return (
+        /\b(?:appointment|book|booking|schedule|cita|agendar|reservar|quiero|necesito)\b/.test(normalized) ||
+        containsDateSignal(value) ||
+        containsTimeSignal(value) ||
+        containsLooseTimeSignal(value) ||
+        /\b(?:haircut|hair cut|beard|barba|corte|pelo|cabello|fade|lineup|line up|shave)\b/.test(normalized)
+      );
+    };
+
     async function handleCallerTranscript(transcriptText, options = {}) {
       const isBuffered = options.buffered === true;
       transcriptText = String(transcriptText || "").trim();
@@ -4777,6 +5242,19 @@ RULES:
       if (bookingState.bookingFinalized) {
         console.log("[TRANSCRIPT_IGNORED_BOOKING_FINALIZED]", { transcript: transcriptText });
         await finishCallerTranscriptHandling("booking_finalized");
+        return;
+      }
+
+      if (
+        !isBuffered &&
+        callerTurnHasBookingSignal(transcriptText) &&
+        await supersedeEnglishPreIntentClarification(transcriptText)
+      ) {
+        await handleCallerTranscript(transcriptText, {
+          ...options,
+          buffered: true,
+          reason: "english_pre_intent_clarification_superseded",
+        });
         return;
       }
 
@@ -5221,7 +5699,8 @@ RULES:
         return;
       }
 
-      let explicitModificationTargetDate = "";
+      const confirmationModificationRequested =
+        confirmationDecision?.kind === "modification";
       if (confirmationDecision?.kind === "modification") {
         bookingState.confirmed = false;
         bookingState.askedConfirm = false;
@@ -5229,36 +5708,9 @@ RULES:
         bookingState.bookingAttempted = false;
         bookingState.awaitingCorrection = true;
         confirmationDeliveryReady = false;
-        const normalizedTarget = normalizeModificationDateTargetText(transcriptText);
-        const hasExplicitDateTarget =
-          /\b(?:january|february|march|april|may|june|july|august|september|october|november|december|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/i.test(normalizedTarget) ||
-          /\b\d{1,2}[/-]\d{1,2}\b/.test(normalizedTarget);
-        if (hasExplicitDateTarget) {
-          const parsedTarget = await parseNaturalDateTime(normalizedTarget);
-          explicitModificationTargetDate = parsedTarget?.date || "";
-        }
-        if (explicitModificationTargetDate) {
-          const previousDate = bookingState.parsedDate;
-          bookingState.requestedDateText = transcriptText;
-          bookingState.dateTimeText = [
-            bookingState.requestedDateText,
-            bookingState.requestedTimeText || bookingState.parsedTime,
-          ].filter(Boolean).join(" ");
-          bookingState.parsedDate = explicitModificationTargetDate;
-          resetAvailabilityCache("explicit_modification_date_target", {
-            transcript: transcriptText,
-            previousDate,
-            newDate: explicitModificationTargetDate,
-          });
-          bookingState.awaitingCorrection = false;
-          await updateTranscriptFields({
-            requestedDateTimeText: bookingState.dateTimeText,
-          });
-        }
         console.log("[CONFIRMATION_INVALIDATED_FOR_MODIFICATION]", {
           transcript: transcriptText,
           reason: confirmationDecision.reason,
-          explicitModificationTargetDate,
           state: bookingDecisionState(),
         });
       }
@@ -5381,7 +5833,10 @@ RULES:
               ? "Claro. ¿A qué nombre pongo la cita?"
               : "Of course. May I have your name for the appointment?";
 
-            speakExact(reprompt, { reason: "name_reprompt_after_confusion" });
+            speakExact(reprompt, {
+              reason: "name_reprompt_after_confusion",
+              promptType: "name",
+            });
 
             console.log("[NAME_REPROMPT_AFTER_CONFUSION]", { transcript: transcriptText });
 
@@ -5556,13 +6011,17 @@ RULES:
           alternativesCount: bookingState.alternatives?.length || 0,
         });
 
-        if (unavailableOrAlternativeAtParse && hasSlotReplacementSignal) {
+        if (
+          hasSlotReplacementSignal &&
+          (unavailableOrAlternativeAtParse || confirmationModificationRequested)
+        ) {
           const readyForFreshAvailability = await applySlotReplacementFromTranscript({
             transcriptText,
             hasDate,
             hasTime,
             contextualTimeOnly,
             phaseBeforeDateTimeParse,
+            preserveUnchangedFields: confirmationModificationRequested,
           });
           if (readyForFreshAvailability === "date_conflict") {
             speakExact(
@@ -5694,7 +6153,7 @@ RULES:
         ) {
           await injectUnavailableSlotContextIfNeeded();
           if (
-            explicitModificationTargetDate &&
+            confirmationModificationRequested &&
             slotChecked === true &&
             slotAvailable === true &&
             bookingState.name
@@ -5744,7 +6203,10 @@ RULES:
           ? "Estoy teniendo problema verificando ese horario ahora mismo. ¿A qué nombre pongo esta solicitud para que el barbero pueda darle seguimiento?"
           : "I'm having trouble checking that time right now. What name should I put this request under so the barber can follow up?";
         await finishCallerTranscriptHandling("availability_check_error");
-        speakExact(fallbackReply, { reason: "availability_check_error_request_follow_up" });
+        speakExact(fallbackReply, {
+          reason: "availability_check_error_request_follow_up",
+          promptType: "name",
+        });
         return;
       }
 
@@ -6325,6 +6787,7 @@ RULES:
               responseCreatedAtMs: Date.now(),
               firstMediaAtMs: null,
               responseDoneAtMs: null,
+              reason: metadata.reason || "",
               purpose: metadata.purpose || null,
               maxOutputTokens: metadata.maxOutputTokens ?? null,
               openAiStatus: null,
@@ -6353,6 +6816,7 @@ RULES:
               reopenAfterPlayback: false,
               finalConfirmation: metadata.finalConfirmation === true,
               terminateAfterPlayback: metadata.terminateAfterPlayback === true,
+              supersededByBookingTurn: metadata.supersededByBookingTurn === true,
             });
             if (metadata.purpose === RESPONSE_PURPOSE.PRE_BOOKING_CONFIRMATION) {
               activeConfirmationLifecycleId = responseInFlightId;
@@ -6361,6 +6825,23 @@ RULES:
               activeDeterministicLifecycleId = responseInFlightId;
               armDeterministicCompletionTimeout(responseLifecycleById.get(responseInFlightId));
             }
+          }
+          if (metadata.supersededByBookingTurn === true) {
+            const supersededRecord = responseLifecycleById.get(responseInFlightId);
+            if (supersededRecord) {
+              supersededRecord.audioInvalidated = true;
+              supersededRecord.statusReason = "superseded_by_booking_turn";
+              supersededRecord.lifecycleActionHandled = true;
+              supersededRecord.bufferedAudioDeltas = [];
+              safeCancelResponse("english_pre_intent_clarification_superseded_before_created");
+              resetDeterministicGenerationState(supersededRecord);
+              readyForCallerInput = true;
+              retireResponseId(supersededRecord.responseId);
+              await flushQueuedAssistantResponse(
+                "english_pre_intent_clarification_superseded"
+              );
+            }
+            return;
           }
           if (CONTROLLED_AUDIO_TRACE_ENABLED) diagnosticAttempt(() => {
             lastOpenAiResponseId = responseInFlightId || lastOpenAiResponseId;
@@ -7569,15 +8050,3 @@ RULES:
   console.log(`🎧 Media WebSocket Ready → ${WS_PATH}`);
   return wss;
 };
-
-
-
-
-
-
-
-
-
-
-
-
