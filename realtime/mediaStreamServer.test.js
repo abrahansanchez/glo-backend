@@ -510,6 +510,22 @@ test("purpose-aware confirmation validation accepts safe rewording and rejects c
     },
   };
   assert.equal(validatePreBookingConfirmationTranscript(record), true);
+  assert.equal(
+    validatePreBookingConfirmationTranscript({
+      ...record,
+      completedOutputTranscript:
+        "I have Customer down for a haircut on Wednesday, July 22 at 10 AM. Should I confirm it?",
+    }),
+    true
+  );
+  assert.equal(
+    validatePreBookingConfirmationTranscript({
+      ...record,
+      completedOutputTranscript:
+        "Tengo a Customer para un corte el miercoles 22 de julio a las 10 AM. Quieres que confirme?",
+    }),
+    true
+  );
 
   for (const transcript of [
     "",
@@ -519,6 +535,8 @@ test("purpose-aware confirmation validation accepts safe rewording and rejects c
     "I have Joanne down for a haircut on Wednesday at 10 AM. Should I confirm it?",
     "I have Customer down for a beard trim on Wednesday at 10 AM. Should I confirm it?",
     "I have Customer down for a haircut on Thursday at 10 AM. Should I confirm it?",
+    "I have Customer down for a haircut on Wednesday, July 23 at 10 AM. Should I confirm it?",
+    "Tengo a Customer para un corte el miercoles 23 de julio a las 10 AM. Quieres que confirme?",
     "I have Customer down for a haircut next Wednesday at 10 AM. Should I confirm it?",
     "I have Customer down for a haircut on Wednesday at 11 AM. Should I confirm it?",
     "I have Customer down for a haircut on Wednesday at 10 AM. I will confirm that appointment now.",
@@ -645,7 +663,13 @@ test("harmlessly reworded completed confirmation audio is delivered once without
 });
 
 test("unsafe confirmation rewording remains buffered and enters bounded retry", async () => {
-  const { ai, twilio, controls } = createProductionSession();
+  let appointments = 0;
+  const { ai, twilio, controls } = createProductionSession({
+    bookAppointment: async () => {
+      appointments += 1;
+      return { success: true };
+    },
+  });
   controls.seedBookingState({
     state: {
       ...baseBookingState(),
@@ -663,14 +687,16 @@ test("unsafe confirmation rewording remains buffered and enters bounded retry", 
     delta: "AA==",
   });
   await completeDeterministicResponse(ai, "resp-unsafe-confirmation", {
-    transcript: "Your haircut appointment on Thursday at 11 AM is confirmed.",
+    transcript: "I have Customer down for a haircut on Wednesday, July 23 at 10 AM. Should I confirm it?",
   });
+  await controls.handleCallerTranscript("Yes, I confirm.");
   assert.ok(controls.getState().pendingAssistantResponse);
   assert.equal(await controls.flushQueuedAssistantResponse("unsafe_confirmation_retry"), true);
 
   assert.equal(twilio.sent.filter((message) => message.event === "media").length, 0);
   assert.equal(controls.getState().confirmationDeliveryReady, false);
   assert.equal(ai.sent.filter((message) => message.type === "response.create").length, 2);
+  assert.equal(appointments, 0);
 });
 
 const idleUnknownIntentState = () => ({
