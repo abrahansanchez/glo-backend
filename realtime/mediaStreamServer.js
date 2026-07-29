@@ -226,7 +226,7 @@ const transcriptContainsExpectedDate = (completed, expectedDate) => {
     .map((aliases, index) => aliases.some((alias) => new RegExp(`\\b${alias}\\b`).test(completed)) ? index : -1)
     .filter((index) => index >= 0);
   const explicitlyMentionedDays = [
-    /\b(?:sunday|monday|tuesday|wednesday|thursday|friday|saturday|domingo|lunes|martes|miercoles|jueves|viernes|sabado)\s*,?\s+(?:the\s+)?(\d{1,2})(?:st|nd|rd|th)?\b/g,
+    /\b(?:sunday|monday|tuesday|wednesday|thursday|friday|saturday|domingo|lunes|martes|miercoles|jueves|viernes|sabado)\s*,?\s+(?:the\s+)?(\d{1,2})(?:st|nd|rd|th)?(?!\s*(?::\s*\d{2})?\s*(?:am|pm)\b)\b/g,
     /\b(?:january|february|march|april|may|june|july|august|september|october|november|december)\s+(?:the\s+)?(\d{1,2})(?:st|nd|rd|th)?\b/g,
     /\b(\d{1,2})(?:st|nd|rd|th)?\s+(?:of\s+)?(?:january|february|march|april|may|june|july|august|september|october|november|december)\b/g,
     /\b(\d{1,2})\s+de\s+(?:enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre)\b/g,

@@ -526,6 +526,21 @@ test("purpose-aware confirmation validation accepts safe rewording and rejects c
     }),
     true
   );
+  for (const transcript of [
+    "I have Customer down for a haircut on Wednesday 10 AM. Should I confirm it?",
+    "I have Customer down for a haircut on Wednesday 10:00 AM. Should I confirm it?",
+    "Tengo a Customer para un corte el miercoles 10 AM. Quieres que confirme?",
+    "Tengo a Customer para un corte el miercoles 10:00 AM. Quieres que confirme?",
+  ]) {
+    assert.equal(
+      validatePreBookingConfirmationTranscript({
+        ...record,
+        completedOutputTranscript: transcript,
+      }),
+      true,
+      transcript
+    );
+  }
 
   for (const transcript of [
     "",
@@ -651,7 +666,7 @@ test("harmlessly reworded completed confirmation audio is delivered once without
   });
   await completeDeterministicResponse(ai, "resp-semantic-confirmation", {
     transcript:
-      "I have Customer down for a haircut on Wednesday at ten in the morning. Would you like me to confirm the appointment?",
+      "I have Customer down for a haircut on Wednesday 10:00 AM. Would you like me to confirm the appointment?",
   });
 
   assert.equal(ai.sent.filter((message) => message.type === "response.create").length, 1);
