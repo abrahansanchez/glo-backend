@@ -16,6 +16,8 @@ import {
   normalizeDeterministicSpeech,
   restoreBookingDomainSnapshot,
   attachMediaWebSocketServer,
+  validateOrdinaryDeterministicTranscript,
+  validatePreBookingConfirmationTranscript,
   validAudioDeltaByteLength,
 } from "./mediaStreamServer.js";
 import { bookAppointment as productionBookAppointment } from "../controllers/aiBookingEngine.js";
@@ -96,7 +98,13 @@ const createProductionSession = ({
   controls.seedBookingState({
     state: baseBookingState(),
     availability: { slotChecked: true, slotAvailable: true, slotAlternatives: [] },
-    context: { barberId: "barber-1", callSid: "CA-test", callerNumber: "+15555550100", streamSid: "stream-1", barberDoc },
+    context: {
+      barberId: "barber-1",
+      callSid: "CA-test",
+      callerNumber: "+15555550100",
+      streamSid: "stream-1",
+      barberDoc,
+    },
   });
   controls.setResponseState({ greetingComplete: true, readyForCallerInput: true });
   return { ai, twilio, controls };
@@ -488,6 +496,183 @@ test("Spanish fallback recognizes the actual confirmation wording", () => {
   assert.equal(isConfirmationPromptText("¿Confirmo esa cita?"), true);
 });
 
+test("purpose-aware confirmation validation accepts safe rewording and rejects changed or premature facts", () => {
+  const record = {
+    completedOutputTranscript:
+      "I have Customer down for a haircut on Wednesday at ten in the morning. Would you like me to confirm the appointment?",
+    bookingSnapshot: {
+      bookingState: {
+        name: "Customer",
+        service: "haircut",
+        parsedDate: "2026-07-22",
+        parsedTime: "10:00 AM",
+      },
+    },
+  };
+  assert.equal(validatePreBookingConfirmationTranscript(record), true);
+
+  for (const transcript of [
+    "",
+    "I have Customer down for a haircut on Wednesday at ten in the morning.",
+    "Customer, your haircut appointment on Wednesday at 10 AM is confirmed.",
+    "I have Jordan down for a haircut on Wednesday at 10 AM. Should I confirm it?",
+    "I have Joanne down for a haircut on Wednesday at 10 AM. Should I confirm it?",
+    "I have Customer down for a beard trim on Wednesday at 10 AM. Should I confirm it?",
+    "I have Customer down for a haircut on Thursday at 10 AM. Should I confirm it?",
+    "I have Customer down for a haircut next Wednesday at 10 AM. Should I confirm it?",
+    "I have Customer down for a haircut on Wednesday at 11 AM. Should I confirm it?",
+    "I have Customer down for a haircut on Wednesday at 10 AM. I will confirm that appointment now.",
+  ]) {
+    assert.equal(
+      validatePreBookingConfirmationTranscript({
+        ...record,
+        completedOutputTranscript: transcript,
+      }),
+      false,
+      transcript
+    );
+  }
+});
+
+test("purpose-aware ordinary deterministic validation accepts safe collection and availability rewording", () => {
+  for (const scenario of [
+    {
+      purpose: RESPONSE_PURPOSE.NAME_COLLECTION,
+      intendedSpeech: "Perfect. May I have your name for the appointment?",
+      completedOutputTranscript: "Could I get your name for the appointment?",
+    },
+    {
+      purpose: RESPONSE_PURPOSE.SERVICE_COLLECTION,
+      intendedSpeech: "Perfect, what service are you looking for? We offer haircut, beard, or haircut and beard.",
+      completedOutputTranscript: "Which service would you like: a haircut, a beard trim, or both?",
+    },
+    {
+      purpose: RESPONSE_PURPOSE.DATE_COLLECTION,
+      intendedSpeech: "What day would you like to come in?",
+      completedOutputTranscript: "Which date works best for you?",
+    },
+    {
+      purpose: RESPONSE_PURPOSE.TIME_COLLECTION,
+      intendedSpeech: "What time would you like to come in?",
+      completedOutputTranscript: "What hour would work for you?",
+    },
+    {
+      purpose: RESPONSE_PURPOSE.UNAVAILABLE,
+      intendedSpeech: "That time isn't available. I have 1:00 PM or 2:00 PM. Which works?",
+      completedOutputTranscript: "That slot is unavailable. Would you like 1 PM or 2 PM instead?",
+    },
+    {
+      purpose: RESPONSE_PURPOSE.ALTERNATIVE_SELECTION,
+      intendedSpeech: "I have Friday at 1:00 PM. Which works?",
+      completedOutputTranscript: "Would Friday at 1 PM work for you?",
+    },
+    {
+      purpose: RESPONSE_PURPOSE.CLARIFICATION,
+      intendedSpeech: "Sorry, I didn't catch that. Would you like to book an appointment?",
+      completedOutputTranscript: "Sorry, I didn't understand. Are you trying to book an appointment?",
+    },
+  ]) {
+    assert.equal(validateOrdinaryDeterministicTranscript(scenario), true, scenario.purpose);
+  }
+});
+
+test("purpose-aware ordinary deterministic validation rejects unrelated, truncated, and changed factual output", () => {
+  for (const scenario of [
+    {
+      purpose: RESPONSE_PURPOSE.NAME_COLLECTION,
+      intendedSpeech: "Perfect. May I have your name for the appointment?",
+      completedOutputTranscript: "Could I get your",
+    },
+    {
+      purpose: RESPONSE_PURPOSE.NAME_COLLECTION,
+      intendedSpeech: "Perfect. May I have your name for the appointment?",
+      completedOutputTranscript: "Your appointment is tomorrow.",
+    },
+    {
+      purpose: RESPONSE_PURPOSE.DATE_COLLECTION,
+      intendedSpeech: "What day would you like to come in?",
+      completedOutputTranscript: "What service would you like?",
+    },
+    {
+      purpose: RESPONSE_PURPOSE.UNAVAILABLE,
+      intendedSpeech: "That time isn't available. I have 1:00 PM or 2:00 PM. Which works?",
+      completedOutputTranscript: "That time is available. Would you like 1 PM or 2 PM?",
+    },
+    {
+      purpose: RESPONSE_PURPOSE.ALTERNATIVE_SELECTION,
+      intendedSpeech: "I have Friday at 1:00 PM. Which works?",
+      completedOutputTranscript: "Would Friday at 3 PM work for you?",
+    },
+    {
+      purpose: RESPONSE_PURPOSE.CLARIFICATION,
+      intendedSpeech: "Sorry, I didn't catch that. Would you like to book an appointment?",
+      completedOutputTranscript: "The weather looks nice today.",
+    },
+  ]) {
+    assert.equal(validateOrdinaryDeterministicTranscript(scenario), false, scenario.purpose);
+  }
+});
+
+test("harmlessly reworded completed confirmation audio is delivered once without regeneration", async () => {
+  const { ai, twilio, controls } = createProductionSession();
+  controls.seedBookingState({
+    state: {
+      ...baseBookingState(),
+      askedConfirm: false,
+      confirmationPromptRequested: false,
+    },
+    availability: { slotChecked: true, slotAvailable: true, slotAlternatives: [] },
+  });
+
+  await controls.requestAssistantResponse({ immediate: true, reason: "semantic_confirmation" });
+  await emitOpenAi(ai, { type: "response.created", response: { id: "resp-semantic-confirmation" } });
+  await emitOpenAi(ai, {
+    type: "response.output_audio.delta",
+    response_id: "resp-semantic-confirmation",
+    delta: "AA==",
+  });
+  await completeDeterministicResponse(ai, "resp-semantic-confirmation", {
+    transcript:
+      "I have Customer down for a haircut on Wednesday at ten in the morning. Would you like me to confirm the appointment?",
+  });
+
+  assert.equal(ai.sent.filter((message) => message.type === "response.create").length, 1);
+  assert.equal(twilio.sent.filter((message) => message.event === "media").length, 1);
+  const lifecycle = controls.getState().lifecycleRecords
+    .find(([responseId]) => responseId === "resp-semantic-confirmation")[1];
+  assert.equal(lifecycle.transcriptMatches, true);
+  assert.equal(lifecycle.retryCount, 0);
+});
+
+test("unsafe confirmation rewording remains buffered and enters bounded retry", async () => {
+  const { ai, twilio, controls } = createProductionSession();
+  controls.seedBookingState({
+    state: {
+      ...baseBookingState(),
+      askedConfirm: false,
+      confirmationPromptRequested: false,
+    },
+    availability: { slotChecked: true, slotAvailable: true, slotAlternatives: [] },
+  });
+
+  await controls.requestAssistantResponse({ immediate: true, reason: "unsafe_semantic_confirmation" });
+  await emitOpenAi(ai, { type: "response.created", response: { id: "resp-unsafe-confirmation" } });
+  await emitOpenAi(ai, {
+    type: "response.output_audio.delta",
+    response_id: "resp-unsafe-confirmation",
+    delta: "AA==",
+  });
+  await completeDeterministicResponse(ai, "resp-unsafe-confirmation", {
+    transcript: "Your haircut appointment on Thursday at 11 AM is confirmed.",
+  });
+  assert.ok(controls.getState().pendingAssistantResponse);
+  assert.equal(await controls.flushQueuedAssistantResponse("unsafe_confirmation_retry"), true);
+
+  assert.equal(twilio.sent.filter((message) => message.event === "media").length, 0);
+  assert.equal(controls.getState().confirmationDeliveryReady, false);
+  assert.equal(ai.sent.filter((message) => message.type === "response.create").length, 2);
+});
+
 const idleUnknownIntentState = () => ({
   ...baseBookingState(),
   intent: "OTHER",
@@ -504,6 +689,39 @@ const idleUnknownIntentState = () => ({
   awaitingName: false,
   awaitingAlternativeSelection: false,
   alternatives: [],
+});
+
+test("unknown English idle turns receive one lifecycle-gated clarification without state mutation", async () => {
+  const { ai, twilio, controls } = createProductionSession();
+  controls.seedBookingState({
+    state: idleUnknownIntentState(),
+    availability: { slotChecked: false, slotAvailable: false, slotAlternatives: [] },
+    context: { currentLanguage: "en" },
+  });
+
+  await controls.handleCallerTranscript("I'd like to look at her");
+  assert.equal(ai.sent.filter((message) => message.type === "response.create").length, 1);
+  assert.equal(
+    extractIntendedSpeech(ai.sent.at(-1).response.instructions),
+    "Sorry, I didn't catch that. Would you like to book an appointment?"
+  );
+  assert.deepEqual(controls.getState().bookingState, idleUnknownIntentState());
+
+  await controls.handleCallerTranscript("Abraham");
+  assert.equal(ai.sent.filter((message) => message.type === "response.create").length, 1);
+
+  await emitOpenAi(ai, { type: "response.created", response: { id: "resp-english-idle" } });
+  await emitOpenAi(ai, {
+    type: "response.output_audio.delta",
+    response_id: "resp-english-idle",
+    delta: "AA==",
+  });
+  await completeDeterministicResponse(ai, "resp-english-idle");
+  await emitTwilio(twilio, {
+    event: "mark",
+    mark: { name: controls.getState().pendingAssistantMarkName },
+  });
+  assert.deepEqual(controls.getState().bookingState, idleUnknownIntentState());
 });
 
 test("unknown English turns use one lifecycle-gated deterministic clarification without inventing booking state", async () => {
@@ -611,7 +829,99 @@ test("unknown English turns use one lifecycle-gated deterministic clarification 
   assert.equal(sms, 1);
 });
 
-test("Spanish idle turns cannot enter the English pre-intent clarification branch", async () => {
+test("immediate valid booking turn supersedes English pre-intent clarification before any stale playback", async () => {
+  let availabilityChecks = 0;
+  const { ai, twilio, controls } = createProductionSession({
+    isSlotAvailable: async () => {
+      availabilityChecks += 1;
+      return true;
+    },
+    barberDoc: {
+      _id: "barber-1",
+      services: [
+        { name: "Haircut", durationMinutes: 30 },
+        { name: "Haircut + Beard", durationMinutes: 45 },
+      ],
+      availability: {
+        timezone: "America/New_York",
+        defaultServiceDurationMinutes: 30,
+      },
+    },
+  });
+  controls.seedBookingState({
+    state: idleUnknownIntentState(),
+    availability: { slotChecked: false, slotAvailable: false, slotAlternatives: [] },
+    context: { currentLanguage: "en" },
+  });
+
+  await controls.handleCallerTranscript("I'd like to look at her", {
+    transcriptId: "unclear-before-booking",
+  });
+  assert.equal(ai.sent.filter((message) => message.type === "response.create").length, 1);
+  assert.equal(
+    controls.getState().pendingResponseCreationAttempt?.reason,
+    "english_pre_intent_clarification"
+  );
+
+  await controls.handleCallerTranscript("I'd like to book a haircut Friday at 2 PM", {
+    transcriptId: "immediate-valid-booking",
+  });
+  const bookingState = controls.getState();
+  assert.equal(bookingState.bookingState.intent, "BOOK");
+  assert.equal(bookingState.bookingState.service, "Haircut");
+  assert.equal(bookingState.bookingState.parsedTime, "2:00 PM");
+  assert.equal(bookingState.bookingState.awaitingName, true);
+  assert.equal(availabilityChecks, 1);
+  assert.equal(twilio.sent.filter((message) => message.event === "media").length, 0);
+  assert.equal(bookingState.pendingResponseCreationAttempt?.supersededByBookingTurn, true);
+
+  await emitOpenAi(ai, {
+    type: "response.created",
+    response: { id: "resp-stale-english-clarification" },
+  });
+  assert.equal(ai.sent.filter((message) => message.type === "response.cancel").length, 1);
+  assert.equal(ai.sent.filter((message) => message.type === "response.create").length, 2);
+  assert.equal(twilio.sent.filter((message) => message.event === "media").length, 0);
+
+  await emitOpenAi(ai, {
+    type: "response.output_audio.delta",
+    response_id: "resp-stale-english-clarification",
+    delta: "AA==",
+  });
+  await emitOpenAi(ai, {
+    type: "response.done",
+    response: { id: "resp-stale-english-clarification", status: "cancelled" },
+  });
+  assert.equal(twilio.sent.filter((message) => message.event === "media").length, 0);
+
+  await emitOpenAi(ai, {
+    type: "response.created",
+    response: { id: "resp-fresh-name-prompt" },
+  });
+  await emitOpenAi(ai, {
+    type: "response.output_audio.delta",
+    response_id: "resp-fresh-name-prompt",
+    delta: "AQ==",
+  });
+  await completeDeterministicResponse(ai, "resp-fresh-name-prompt", {
+    transcript: "Could I get your name for the appointment?",
+  });
+
+  assert.equal(twilio.sent.filter((message) => message.event === "media").length, 1);
+  const freshMark = controls.getState().pendingAssistantMarkName;
+  assert.ok(freshMark);
+  await emitTwilio(twilio, { event: "mark", mark: { name: freshMark } });
+  const finalState = controls.getState();
+  assert.equal(finalState.readyForCallerInput, true);
+  assert.equal(finalState.bookingState.awaitingName, true);
+  assert.equal(
+    finalState.lifecycleRecords.find(([id]) => id === "resp-stale-english-clarification")[1]
+      .audioInvalidated,
+    true
+  );
+});
+
+test("Spanish idle turns do not enter the English clarification branch", async () => {
   const { ai, controls } = createProductionSession();
   controls.seedBookingState({
     state: idleUnknownIntentState(),
@@ -622,6 +932,130 @@ test("Spanish idle turns cannot enter the English pre-intent clarification branc
   await controls.handleCallerTranscript("Abraham");
   assert.equal(ai.sent.filter((message) => message.type === "response.create").length, 0);
   assert.deepEqual(controls.getState().bookingState, idleUnknownIntentState());
+});
+
+test("natural correction forms continuously require a fresh marked confirmation before exactly one appointment and SMS", async () => {
+  for (const [index, correction] of [
+    "Friday",
+    "2 PM",
+    "Friday at 2 PM",
+    "Haircut and beard",
+  ].entries()) {
+    let availabilityChecks = 0;
+    let appointments = 0;
+    let sms = 0;
+    const bookingBoundary = (request) => productionBookAppointment(request, {
+      BarberModel: {
+        findById: async () => ({
+          availability: { timezone: "America/New_York" },
+          services: [
+            { name: "Haircut", durationMinutes: 30 },
+            { name: "Haircut + Beard", durationMinutes: 45 },
+          ],
+        }),
+      },
+      AppointmentModel: {
+        create: async (appointment) => {
+          appointments += 1;
+          return { ...appointment, _id: `appt-natural-correction-${index}` };
+        },
+      },
+      isSlotAvailable: async () => true,
+      sendAppointmentConfirmationSms: async () => { sms += 1; },
+    });
+    const { ai, twilio, controls } = createProductionSession({
+      bookAppointment: bookingBoundary,
+      isSlotAvailable: async () => {
+        availabilityChecks += 1;
+        return true;
+      },
+      barberDoc: {
+        _id: "barber-1",
+        services: [
+          { name: "Haircut", durationMinutes: 30 },
+          { name: "Haircut + Beard", durationMinutes: 45 },
+        ],
+        availability: {
+          timezone: "America/New_York",
+          defaultServiceDurationMinutes: 30,
+        },
+      },
+    });
+    controls.seedBookingState({
+      state: {
+        ...baseBookingState(),
+        service: "Haircut",
+        requestedDateText: "August 5",
+        requestedTimeText: "11 AM",
+        parsedDate: "2026-08-05",
+        parsedTime: "11:00 AM",
+        askedConfirm: false,
+        confirmationPromptRequested: false,
+        alternatives: [],
+        selectedAlternative: null,
+      },
+      availability: { slotChecked: true, slotAvailable: true, slotAlternatives: [] },
+      context: {
+        barberId: "barber-1",
+        callerNumber: "+15555550100",
+        streamSid: "stream-1",
+        currentLanguage: "en",
+      },
+    });
+
+    const deliverCurrentResponse = async (responseId) => {
+      await emitOpenAi(ai, { type: "response.created", response: { id: responseId } });
+      await emitOpenAi(ai, {
+        type: "response.output_audio.delta",
+        response_id: responseId,
+        delta: "AA==",
+      });
+      await completeDeterministicResponse(ai, responseId);
+      const mark = controls.getState().pendingAssistantMarkName;
+      assert.ok(mark, `${correction}: playback mark`);
+      await emitTwilio(twilio, { event: "mark", mark: { name: mark } });
+      return mark;
+    };
+
+    await controls.requestAssistantResponse({
+      immediate: true,
+      reason: `old-natural-correction-confirmation-${index}`,
+    });
+    const oldMark = await deliverCurrentResponse(`resp-old-natural-correction-${index}`);
+    assert.equal(controls.getState().confirmationDeliveryReady, true, correction);
+
+    await controls.handleCallerTranscript(correction, {
+      transcriptId: `natural-correction-${index}`,
+    });
+    const corrected = controls.getState();
+    assert.equal(corrected.bookingState.confirmed, false, correction);
+    assert.equal(corrected.confirmationDeliveryReady, false, correction);
+    assert.equal(availabilityChecks, 1, correction);
+    assert.equal(appointments, 0, correction);
+    assert.equal(sms, 0, correction);
+
+    await emitTwilio(twilio, { event: "mark", mark: { name: oldMark } });
+    assert.equal(controls.getState().confirmationDeliveryReady, false, correction);
+    assert.equal(appointments, 0, correction);
+
+    await deliverCurrentResponse(`resp-fresh-natural-correction-${index}`);
+    const delivered = controls.getState();
+    const freshLifecycle = delivered.lifecycleRecords
+      .find(([id]) => id === `resp-fresh-natural-correction-${index}`)[1];
+    assert.equal(freshLifecycle.purpose, RESPONSE_PURPOSE.PRE_BOOKING_CONFIRMATION, correction);
+    assert.equal(freshLifecycle.playbackMarkAcknowledged, true, correction);
+    assert.equal(delivered.confirmationDeliveryReady, true, correction);
+
+    await controls.handleCallerTranscript("Yes", {
+      transcriptId: `fresh-natural-correction-yes-${index}`,
+    });
+    await controls.handleCallerTranscript("Yes", {
+      transcriptId: `duplicate-natural-correction-yes-${index}`,
+    });
+    assert.equal(availabilityChecks, 1, correction);
+    assert.equal(appointments, 1, correction);
+    assert.equal(sms, 1, correction);
+  }
 });
 
 test("routine deterministic audio streams in order before response.done and marks after completion", async () => {
@@ -741,7 +1175,7 @@ test("routine completion timeout creates one explicit recovery prompt without re
   const { ai, twilio, controls } = createProductionSession({ deterministicCompletionTimeoutMs: 10 });
   await requestProductionNamePrompt(controls);
   await emitOpenAi(ai, { type: "response.created", response: { id: "resp-timeout-1" } });
-  await new Promise((resolve) => setTimeout(resolve, 20));
+  await new Promise((resolve) => setTimeout(resolve, 12));
   const creates = ai.sent.filter((message) => message.type === "response.create");
   assert.equal(creates.length, 2);
   assert.match(extractIntendedSpeech(creates.at(-1).response.instructions), /repeat/i);
