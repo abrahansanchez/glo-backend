@@ -1825,6 +1825,7 @@ const parseContextualTimeOnly = (transcript, { parsedDate, language = "en" } = {
     .replace(/\bfor\b/g, "")
     .replace(/\bplease\b/g, "")
     .replace(/\bpor\s+favor\b/g, "")
+    .replace(/\b(?:change it to|make it|move it to|instead|cambialo a|cambiala a|cambia a|mejor a)\b/g, "")
     .replace(/\s+/g, " ")
     .trim();
 
@@ -2216,6 +2217,12 @@ export const attachMediaWebSocketServer = (server, dependencies = {}) => {
     let responseActive = false;
     let assistantSpeaking = false;
     let callerSpeaking = false;
+    let callerTurnSequence = 0;
+    let activeCallerTurnId = 0;
+    let activeCallerSpeechEpisode = null;
+    let hasAcceptedPriorEpisode = false;
+    let lastAcceptedCallerSpeechEndMs = null;
+    let lastCallerSpeechStopRejectionReason = "";
     let deferFlushUntilCallerStops = false;
     let flushDelayTimer = null;
     let readyForCallerInput = false;
@@ -2744,6 +2751,40 @@ export const attachMediaWebSocketServer = (server, dependencies = {}) => {
     };
 
     const queueAssistantResponse = (queued, reason) => {
+      const currentStateKey = buildBookingStateKey();
+      const existingDeferredOwner = pendingAssistantResponse?.deferredByCallerSpeech === true;
+      const existingOwnerStillValid =
+        existingDeferredOwner &&
+        callerSpeaking === true &&
+        pendingAssistantResponse.deferredCallerTurnId === activeCallerTurnId &&
+        pendingAssistantResponse.stateKey === currentStateKey;
+      const requiredExactResponse =
+        Boolean(queued?.exactInstructions) &&
+        (queued?.finalConfirmation === true ||
+          queued?.terminateAfterPlayback === true ||
+          queued?.purpose === RESPONSE_PURPOSE.FINAL_SUCCESS);
+
+      if (existingOwnerStillValid && !requiredExactResponse) {
+        console.log("[QUEUE_RESPONSE_RETAINED_PENDING_DRAIN]", {
+          reason,
+          retainedReason: pendingAssistantResponse.reason || "",
+          queuedInstructionPreview: queuedInstructionPreviewFor(pendingAssistantResponse),
+        });
+        return { accepted: false, disposition: "retained_existing_owner" };
+      }
+
+      if (pendingAssistantResponse) {
+        console.log("[QUEUE_RESPONSE_SUPERSEDED]", {
+          reason,
+          supersededReason: pendingAssistantResponse.reason || "",
+          terminalReason: existingDeferredOwner
+            ? (existingOwnerStillValid
+              ? "required_exact_response"
+              : "stale_caller_turn_or_booking_state")
+            : "newer_response_owner",
+          queuedInstructionPreview: queuedInstructionPreviewFor(pendingAssistantResponse),
+        });
+      }
       const shouldStampDeterministicBooking =
         queued?.deterministicBooking === true ||
         (
@@ -2751,14 +2792,19 @@ export const attachMediaWebSocketServer = (server, dependencies = {}) => {
           queued?.finalConfirmation !== true &&
           Boolean(queued?.promptType)
         );
-      const queuedWithPhase = shouldStampDeterministicBooking
+      const queuedWithPhase = {
+        ...(shouldStampDeterministicBooking
         ? {
             ...queued,
             deterministicBooking: true,
             bookingPhase: queued.bookingPhase || getBookingPhase(),
             stateKey: queued.stateKey || buildBookingStateKey(),
           }
-        : queued;
+        : queued),
+        stateKey: queued.stateKey || currentStateKey,
+        deferredByCallerSpeech: callerSpeaking === true,
+        deferredCallerTurnId: callerSpeaking === true ? activeCallerTurnId : null,
+      };
 
       pendingAssistantResponse = queuedWithPhase;
       console.log("[QUEUE_RESPONSE_OWNER]", {
@@ -2769,6 +2815,7 @@ export const attachMediaWebSocketServer = (server, dependencies = {}) => {
         stateKey: queuedWithPhase?.stateKey || null,
         ...responseIdleState(),
       });
+      return { accepted: true, disposition: "owned" };
     };
 
     const sendResponseCreate = (payload, reason = "unknown", metadata = {}) => {
@@ -3444,6 +3491,14 @@ export const attachMediaWebSocketServer = (server, dependencies = {}) => {
       aiResponseInProgress = false;
       responseInFlightId = "";
       pendingAssistantResponse = null;
+      callerSpeaking = false;
+      callerTurnSequence = 0;
+      activeCallerTurnId = 0;
+      activeCallerSpeechEpisode = null;
+      hasAcceptedPriorEpisode = false;
+      lastAcceptedCallerSpeechEndMs = null;
+      lastCallerSpeechStopRejectionReason = "";
+      lastCallerSpeechEndedAtMs = null;
       pendingResponseCreationAttempt = null;
       if (pendingResponseCreationTimer) clearTimeout(pendingResponseCreationTimer);
       pendingResponseCreationTimer = null;
@@ -3605,7 +3660,7 @@ export const attachMediaWebSocketServer = (server, dependencies = {}) => {
 
       const exactInstructions = `Say this exactly, with no extra words: "${text}"`;
       const queueExactForPlayback = (queueReason) => {
-        queueAssistantResponse({
+        const queueResult = queueAssistantResponse({
           exactInstructions,
           reason: isFinalConfirmation ? "final_confirmation" : reason,
           lang: currentLanguage,
@@ -3619,7 +3674,15 @@ export const attachMediaWebSocketServer = (server, dependencies = {}) => {
           retryCount: Number(options.retryCount || 0),
           terminateAfterPlayback: options.terminateAfterPlayback === true,
         }, queueReason);
+        if (!queueResult.accepted) {
+          console.log("[SPEAK_EXACT_QUEUE_NOT_ACCEPTED]", { reason, disposition: queueResult.disposition });
+          return false;
+        }
         status.queued = true;
+        if (callerSpeaking) {
+          deferFlushUntilCallerStops = true;
+          console.log("[SPEAK_EXACT_DEFERRED_UNTIL_CALLER_STOPS]", { reason });
+        }
         if (isFinalConfirmation) finalConfirmationQueuedForPlayback = true;
         if (isFinalConfirmation) {
           console.log("[FINAL_CONFIRMATION_QUEUED_FOR_PLAYBACK]", {
@@ -4287,7 +4350,7 @@ RULES:
             });
           }
 
-          queueAssistantResponse({
+          const queueResult = queueAssistantResponse({
             exactInstructions,
             reason,
             lang: currentLanguage,
@@ -4306,6 +4369,7 @@ RULES:
 
           console.log("[QUEUE_DETERMINISTIC_BOOKING_REPLY]", {
             reason,
+            disposition: queueResult.disposition,
             responseActive,
             assistantSpeaking,
             responseInFlightId,
@@ -4361,7 +4425,7 @@ RULES:
         : `${baseInstructions}\n\n${languageInstructionFor()}${bookingOverlay}`;
 
       if (responseActive === true || assistantSpeaking === true || responseInFlightId) {
-        queueAssistantResponse({
+        const queueResult = queueAssistantResponse({
           instructions,
           reason,
           lang: currentLanguage,
@@ -4370,6 +4434,7 @@ RULES:
 
         console.log("[QUEUE_RESPONSE_CREATE_ACTIVE_RESPONSE]", {
           reason,
+          disposition: queueResult.disposition,
           responseActive,
           assistantSpeaking,
           responseInFlightId,
@@ -5150,6 +5215,97 @@ RULES:
         deferFlushUntilCallerStops = false;
       }
       return scheduledDeferredResponse;
+    };
+
+    const validAudioOffset = (value) =>
+      typeof value === "number" && Number.isFinite(value) && value >= 0;
+    const suppliedMalformedOffset = (event, field) =>
+      Object.hasOwn(event, field) && !validAudioOffset(event[field]);
+    const usableItemId = (value) => typeof value === "string" && value.trim() ? value : null;
+
+    const beginCallerSpeechTurn = (event = {}, reason = "vad_speech_started") => {
+      if (suppliedMalformedOffset(event, "audio_start_ms")) {
+        console.log("[CALLER_TURN_START_IGNORED_MALFORMED_OFFSET]", { reason });
+        return activeCallerTurnId;
+      }
+      if (!activeCallerSpeechEpisode) {
+        callerTurnSequence += 1;
+        activeCallerTurnId = callerTurnSequence;
+        activeCallerSpeechEpisode = {
+          itemId: usableItemId(event.item_id),
+          audioStartMs: validAudioOffset(event.audio_start_ms) ? event.audio_start_ms : null,
+          callerTurnId: activeCallerTurnId,
+        };
+        lastCallerSpeechEndedAtMs = null;
+        console.log("[CALLER_TURN_STARTED]", { reason, callerTurnId: activeCallerTurnId });
+      } else {
+        console.log("[CALLER_TURN_START_IGNORED_ACTIVE_EPISODE]", {
+          reason,
+          callerTurnId: activeCallerTurnId,
+        });
+      }
+      callerSpeaking = true;
+      return activeCallerTurnId;
+    };
+
+    const finishCallerSpeechEpisode = (event = {}) => {
+      if (!activeCallerSpeechEpisode) {
+        lastCallerSpeechStopRejectionReason = "no_active_speech_episode";
+        console.log("[CALLER_TURN_STOP_IGNORED_NO_ACTIVE_EPISODE]");
+        return false;
+      }
+      if (suppliedMalformedOffset(event, "audio_end_ms")) {
+        lastCallerSpeechStopRejectionReason = "malformed_speech_stop_offset";
+        return false;
+      }
+      const audioEndMs = validAudioOffset(event.audio_end_ms) ? event.audio_end_ms : null;
+      const stopItemId = usableItemId(event.item_id);
+      const active = activeCallerSpeechEpisode;
+      if (active.itemId && stopItemId && active.itemId !== stopItemId) {
+        lastCallerSpeechStopRejectionReason = "speech_stop_item_id_mismatch";
+        return false;
+      }
+      const matchedItemId = Boolean(active.itemId && stopItemId && active.itemId === stopItemId);
+      if (!matchedItemId && audioEndMs === null && hasAcceptedPriorEpisode) {
+        lastCallerSpeechStopRejectionReason = "uncorrelated_speech_stop_missing_offset";
+        console.log("[CALLER_TURN_STOP_IGNORED_UNCORRELATED_MISSING_OFFSET]", {
+          callerTurnId: activeCallerTurnId,
+        });
+        return false;
+      }
+      if (
+        active.audioStartMs !== null &&
+        audioEndMs !== null &&
+        audioEndMs < active.audioStartMs
+      ) {
+        lastCallerSpeechStopRejectionReason = "stale_speech_stop_before_active_start";
+        console.log("[CALLER_TURN_STOP_IGNORED_STALE_EPISODE]", {
+          callerTurnId: activeCallerTurnId,
+          audioEndMs,
+          activeCallerSpeechStartMs: active.audioStartMs,
+        });
+        return false;
+      }
+      if (
+        !matchedItemId && active.audioStartMs === null &&
+        (lastAcceptedCallerSpeechEndMs === null || audioEndMs === null || audioEndMs <= lastAcceptedCallerSpeechEndMs)
+      ) {
+        lastCallerSpeechStopRejectionReason = lastAcceptedCallerSpeechEndMs === null
+          ? "uncorrelated_speech_stop_unknown_prior_end"
+          : "stale_speech_stop_offset";
+        console.log("[CALLER_TURN_STOP_IGNORED_STALE_EPISODE]", {
+          callerTurnId: activeCallerTurnId,
+          audioEndMs,
+          lastAcceptedCallerSpeechEndMs,
+        });
+        return false;
+      }
+      activeCallerSpeechEpisode = null;
+      hasAcceptedPriorEpisode = true;
+      if (audioEndMs !== null) lastAcceptedCallerSpeechEndMs = audioEndMs;
+      lastCallerSpeechStopRejectionReason = "";
+      lastCallerSpeechEndedAtMs = Date.now();
+      return true;
     };
 
     async function processBufferedCallerTranscript(reason) {
@@ -5985,7 +6141,8 @@ RULES:
           !hasTime &&
           (
             phaseBeforeDateTimeParse === "collecting_time" ||
-            (unavailableOrAlternativeAtParse && Boolean(bookingState.parsedDate))
+            (unavailableOrAlternativeAtParse && Boolean(bookingState.parsedDate)) ||
+            confirmationModificationRequested
           )
             ? parseContextualTimeOnly(transcriptText, {
                 parsedDate: bookingState.parsedDate,
@@ -6300,7 +6457,7 @@ RULES:
           bookingSnapshot: retrySnapshot,
         });
 
-        queueAssistantResponse({
+        const queueResult = queueAssistantResponse({
           ...retryRequest.queued,
           reason: "confirmation_max_output_tokens_retry",
           lang: currentLanguage,
@@ -6310,6 +6467,11 @@ RULES:
           bookingPhase: getBookingPhase(),
           stateKey: buildBookingStateKey(),
         }, "confirmation_max_output_tokens_retry");
+        if (!queueResult.accepted) {
+          console.log("[CONFIRMATION_RETRY_QUEUE_RETAINED]", {
+            disposition: queueResult.disposition,
+          });
+        }
         scheduleQueuedAssistantFlush("confirmation_max_output_tokens_retry");
         return "retry";
       }
@@ -6383,7 +6545,7 @@ RULES:
         finalConfirmationPlaybackMarkName = "";
       }
 
-      queueAssistantResponse({
+      const queueResult = queueAssistantResponse({
         exactInstructions,
         reason: recovery ? "deterministic_recovery" : "deterministic_retry",
         lang: currentLanguage,
@@ -6400,6 +6562,11 @@ RULES:
         finalConfirmation: finalConfirmationRetry,
         terminateAfterPlayback: recovery || record.terminateAfterPlayback === true,
       }, recovery ? "deterministic_recovery" : "deterministic_retry");
+      if (!queueResult.accepted) {
+        console.log("[DETERMINISTIC_RETRY_QUEUE_RETAINED]", {
+          disposition: queueResult.disposition,
+        });
+      }
       scheduleQueuedAssistantFlush(recovery ? "deterministic_recovery" : "deterministic_retry");
     };
 
@@ -6701,7 +6868,7 @@ RULES:
           return;
         }
 
-        if (openAiConnectionQuarantined) return;
+        if (endingCall || openAiConnectionQuarantined) return;
 
         if (CONTROLLED_AUDIO_TRACE_ENABLED) {
           if (evt.session?.id) openAiSessionId = evt.session.id;
@@ -7027,7 +7194,7 @@ RULES:
         }
         if (evt.type === "input_audio_buffer.speech_started") {
           console.log("[SERVER_VAD_SPEECH_STARTED]", evt);
-          callerSpeaking = true;
+          beginCallerSpeechTurn(evt);
           console.log("[CALLER_SPEAKING_STARTED]");
           if (assistantPlaybackActive || pendingAssistantMarkName) {
             pendingBargeInStartedAt = Date.now();
@@ -7058,8 +7225,9 @@ RULES:
         }
 
         if (evt.type === "input_audio_buffer.speech_stopped") {
-          lastCallerSpeechEndedAtMs = Date.now();
           console.log("[SERVER_VAD_SPEECH_STOPPED]", evt);
+          const acceptedSpeechStop = finishCallerSpeechEpisode(evt);
+          if (!acceptedSpeechStop) return;
           if (pendingBargeInWhilePlayback) {
             const audioEndMs = Number.isFinite(Number(evt.audio_end_ms))
               ? Number(evt.audio_end_ms)
@@ -7987,7 +8155,10 @@ RULES:
           if (Object.hasOwn(state, "aiResponseInProgress")) aiResponseInProgress = state.aiResponseInProgress;
           if (Object.hasOwn(state, "assistantSpeaking")) assistantSpeaking = state.assistantSpeaking;
           if (Object.hasOwn(state, "assistantPlaybackActive")) assistantPlaybackActive = state.assistantPlaybackActive;
-          if (Object.hasOwn(state, "callerSpeaking")) callerSpeaking = state.callerSpeaking;
+          if (Object.hasOwn(state, "callerSpeaking")) {
+            if (state.callerSpeaking) beginCallerSpeechTurn({}, "test_control");
+            else callerSpeaking = false;
+          }
           if (Object.hasOwn(state, "greetingComplete")) greetingComplete = state.greetingComplete;
           if (Object.hasOwn(state, "readyForCallerInput")) readyForCallerInput = state.readyForCallerInput;
           if (Object.hasOwn(state, "pendingAssistantMarkName")) pendingAssistantMarkName = state.pendingAssistantMarkName;
@@ -8005,6 +8176,10 @@ RULES:
           assistantPlaybackActive,
           assistantAudioDeltaCount,
           callerSpeaking,
+          activeCallerTurnId,
+          activeCallerSpeechEpisodeOpen: Boolean(activeCallerSpeechEpisode),
+          activeCallerSpeechStartMs: activeCallerSpeechEpisode?.audioStartMs ?? null,
+          lastCallerSpeechStopRejectionReason,
           pendingAssistantMarkName,
           pendingAssistantResponse: structuredClone(pendingAssistantResponse),
           readyForCallerInput,
@@ -8027,6 +8202,7 @@ RULES:
           activeConfirmationLifecycleId,
           activeDeterministicLifecycleId,
           finalConfirmationCallEndArmed,
+          finalConfirmationQueuedForPlayback,
           finalConfirmationSentOnce,
           finalConfirmationAwaitingResponseCreated,
           finalConfirmationResponseId,

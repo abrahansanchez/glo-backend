@@ -765,6 +765,243 @@ test("unknown English idle turns receive one lifecycle-gated clarification witho
   assert.deepEqual(controls.getState().bookingState, idleUnknownIntentState());
 });
 
+test("exact response queued during caller speech drains once and reports retained ownership", async () => {
+  const { ai, controls } = createProductionSession();
+  controls.setResponseState({ callerSpeaking: true, greetingComplete: true, readyForCallerInput: true });
+  assert.equal(controls.speakExact("The weekday and date do not match. What date would you like?", {
+    reason: "date_conflict_clarification",
+    purpose: RESPONSE_PURPOSE.CLARIFICATION,
+  }), true);
+  assert.equal(controls.speakExact("Sorry, I didn't catch that. Would you like to book an appointment?", {
+    reason: "english_pre_intent_clarification",
+    purpose: RESPONSE_PURPOSE.CLARIFICATION,
+  }), false);
+  assert.equal(controls.getState().lastSpeakExactStatus?.queued, false);
+  assert.match(controls.getState().pendingAssistantResponse.exactInstructions, /weekday and date do not match/i);
+  await controls.handleCallerTranscript("");
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.equal(ai.sent.filter((message) => message.type === "response.create").length, 1);
+  assert.match(extractIntendedSpeech(ai.sent.at(-1).response.instructions), /weekday and date do not match/i);
+  assert.equal(await controls.flushQueuedAssistantResponse("repeated_drain"), false);
+});
+
+test("a deferred owner from a prior caller turn is superseded even when booking state is unchanged", async () => {
+  const { ai, controls } = createProductionSession();
+  controls.setResponseState({ greetingComplete: true, readyForCallerInput: true });
+  await emitOpenAi(ai, { type: "input_audio_buffer.speech_started", audio_start_ms: 0 });
+  assert.equal(controls.speakExact("Response A", { reason: "turn_one_response" }), true);
+  const firstTurn = controls.getState().activeCallerTurnId;
+
+  controls.setResponseState({ responseActive: true, aiResponseInProgress: true, responseInFlightId: "busy" });
+  await emitOpenAi(ai, { type: "input_audio_buffer.speech_stopped", audio_end_ms: 100 });
+  await controls.handleCallerTranscript("");
+  await emitOpenAi(ai, { type: "input_audio_buffer.speech_started", audio_start_ms: 200 });
+  assert.ok(controls.getState().activeCallerTurnId > firstTurn);
+  assert.equal(controls.speakExact("Response B", { reason: "turn_two_response" }), true);
+  assert.match(controls.getState().pendingAssistantResponse.exactInstructions, /Response B/);
+
+  controls.setResponseState({ responseActive: false, aiResponseInProgress: false, responseInFlightId: "" });
+  await controls.handleCallerTranscript("");
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  const creates = ai.sent.filter((message) => message.type === "response.create");
+  assert.equal(creates.length, 1);
+  assert.equal(extractIntendedSpeech(creates[0].response.instructions), "Response B");
+  assert.equal(await controls.flushQueuedAssistantResponse("repeated_cross_turn_drain"), false);
+});
+
+test("VAD speech boundaries reject delayed, duplicate, and unexpected stops without changing caller-turn ownership", async () => {
+  const { ai, controls } = createProductionSession();
+  await emitOpenAi(ai, { type: "input_audio_buffer.speech_started", audio_start_ms: 0 });
+  const firstTurn = controls.getState().activeCallerTurnId;
+  await emitOpenAi(ai, { type: "input_audio_buffer.speech_started", audio_start_ms: 0 });
+  assert.equal(controls.getState().activeCallerTurnId, firstTurn);
+  await emitOpenAi(ai, { type: "input_audio_buffer.speech_stopped", audio_end_ms: 100 });
+  await emitOpenAi(ai, { type: "input_audio_buffer.speech_stopped", audio_end_ms: 100 });
+  await emitOpenAi(ai, { type: "input_audio_buffer.speech_started", audio_start_ms: 200 });
+  const secondTurn = controls.getState().activeCallerTurnId;
+  assert.equal(secondTurn, firstTurn + 1);
+
+  controls.setResponseState({ responseActive: true, aiResponseInProgress: true, responseInFlightId: "busy" });
+  assert.equal(controls.speakExact("Turn two response", { reason: "turn_two_vad_owner" }), true);
+  assert.equal(controls.getState().pendingAssistantResponse?.deferredCallerTurnId, secondTurn);
+  await emitOpenAi(ai, { type: "input_audio_buffer.speech_stopped", audio_end_ms: 100 });
+  await emitOpenAi(ai, { type: "input_audio_buffer.speech_started", audio_start_ms: 200 });
+  const afterDelayedEvents = controls.getState();
+  assert.equal(afterDelayedEvents.activeCallerTurnId, secondTurn);
+  assert.equal(afterDelayedEvents.activeCallerSpeechEpisodeOpen, true);
+  assert.equal(afterDelayedEvents.pendingAssistantResponse?.deferredCallerTurnId, secondTurn);
+
+  await emitOpenAi(ai, { type: "input_audio_buffer.speech_stopped", audio_end_ms: 300 });
+  controls.setResponseState({ responseActive: false, aiResponseInProgress: false, responseInFlightId: "" });
+  await controls.handleCallerTranscript("");
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  const creates = ai.sent.filter((message) => message.type === "response.create");
+  assert.equal(creates.length, 1);
+  assert.equal(extractIntendedSpeech(creates[0].response.instructions), "Turn two response");
+  await emitOpenAi(ai, { type: "input_audio_buffer.speech_stopped", audio_end_ms: 300 });
+  assert.equal(controls.getState().activeCallerTurnId, secondTurn);
+});
+
+test("offset-less delayed stops cannot close a protected second caller turn", async () => {
+  for (const [label, secondStartEvent] of [
+    ["present-start", { type: "input_audio_buffer.speech_started", audio_start_ms: 200 }],
+    ["missing-start", { type: "input_audio_buffer.speech_started" }],
+  ]) {
+    const { ai, controls } = createProductionSession();
+    await emitOpenAi(ai, { type: "input_audio_buffer.speech_started", audio_start_ms: 0 });
+    await emitOpenAi(ai, { type: "input_audio_buffer.speech_stopped", audio_end_ms: 100 });
+    await emitOpenAi(ai, secondStartEvent);
+    const secondTurn = controls.getState().activeCallerTurnId;
+    const priorStopAt = controls.getState().timing.callerSpeechEndedAtMs;
+
+    controls.setResponseState({ responseActive: true, aiResponseInProgress: true, responseInFlightId: "busy" });
+    assert.equal(controls.speakExact(`Protected ${label} response`, { reason: `protected_${label}` }), true);
+    await emitOpenAi(ai, { type: "input_audio_buffer.speech_stopped" });
+    await emitOpenAi(ai, secondStartEvent);
+    const protectedState = controls.getState();
+    assert.equal(protectedState.activeCallerTurnId, secondTurn, label);
+    assert.equal(protectedState.activeCallerSpeechEpisodeOpen, true, label);
+    assert.equal(protectedState.callerSpeaking, true, label);
+    assert.equal(protectedState.timing.callerSpeechEndedAtMs, priorStopAt, label);
+    assert.equal(
+      protectedState.lastCallerSpeechStopRejectionReason,
+      "uncorrelated_speech_stop_missing_offset",
+      label
+    );
+    assert.equal(protectedState.pendingAssistantResponse?.deferredCallerTurnId, secondTurn, label);
+
+    await emitOpenAi(ai, { type: "input_audio_buffer.speech_stopped", audio_end_ms: 300 });
+    controls.setResponseState({ responseActive: false, aiResponseInProgress: false, responseInFlightId: "" });
+    await controls.handleCallerTranscript("");
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const creates = ai.sent.filter((message) => message.type === "response.create");
+    assert.equal(creates.length, 1, label);
+    assert.equal(extractIntendedSpeech(creates[0].response.instructions), `Protected ${label} response`);
+    assert.equal(await controls.flushQueuedAssistantResponse(`repeated_${label}_drain`), false);
+    await emitOpenAi(ai, { type: "input_audio_buffer.speech_stopped" });
+    assert.equal(controls.getState().activeCallerTurnId, secondTurn, label);
+    assert.equal(controls.getState().lastCallerSpeechStopRejectionReason, "no_active_speech_episode", label);
+  }
+});
+
+test("opaque prior ends and malformed stop offsets fail closed", async () => {
+  const { ai, controls } = createProductionSession();
+  await emitOpenAi(ai, { type: "input_audio_buffer.speech_started" });
+  await emitOpenAi(ai, { type: "input_audio_buffer.speech_stopped" });
+  await emitOpenAi(ai, { type: "input_audio_buffer.speech_started" });
+  const secondTurn = controls.getState().activeCallerTurnId;
+  await emitOpenAi(ai, { type: "input_audio_buffer.speech_stopped", audio_end_ms: 300 });
+  assert.equal(controls.getState().activeCallerTurnId, secondTurn);
+  assert.equal(controls.getState().activeCallerSpeechEpisodeOpen, true);
+  assert.equal(controls.getState().lastCallerSpeechStopRejectionReason, "uncorrelated_speech_stop_unknown_prior_end");
+
+  for (const audio_end_ms of [null, "", false, NaN, Infinity, "300", {}, -1]) {
+    await emitOpenAi(ai, { type: "input_audio_buffer.speech_stopped", audio_end_ms });
+    assert.equal(controls.getState().activeCallerSpeechEpisodeOpen, true);
+    assert.equal(controls.getState().lastCallerSpeechStopRejectionReason, "malformed_speech_stop_offset");
+  }
+});
+
+test("item_id pairs govern VAD stop ownership and terminal shutdown ignores late VAD events", async () => {
+  const { ai, controls } = createProductionSession();
+  await emitOpenAi(ai, { type: "input_audio_buffer.speech_started", item_id: "item-1", audio_start_ms: 0 });
+  await emitOpenAi(ai, { type: "input_audio_buffer.speech_stopped", item_id: "item-1", audio_end_ms: 100 });
+  await emitOpenAi(ai, { type: "input_audio_buffer.speech_started", item_id: "item-2" });
+  const secondTurn = controls.getState().activeCallerTurnId;
+  await emitOpenAi(ai, { type: "input_audio_buffer.speech_stopped", item_id: "item-2" });
+  assert.equal(controls.getState().activeCallerSpeechEpisodeOpen, false);
+
+  await emitOpenAi(ai, { type: "input_audio_buffer.speech_started", item_id: "item-3", audio_start_ms: 200 });
+  controls.setResponseState({ responseActive: true, aiResponseInProgress: true, responseInFlightId: "busy" });
+  assert.equal(controls.speakExact("Item three response", { reason: "item_three" }), true);
+  await emitOpenAi(ai, { type: "input_audio_buffer.speech_stopped", item_id: "item-1", audio_end_ms: 300 });
+  assert.equal(controls.getState().activeCallerTurnId, secondTurn + 1);
+  assert.equal(controls.getState().activeCallerSpeechEpisodeOpen, true);
+  assert.equal(controls.getState().lastCallerSpeechStopRejectionReason, "speech_stop_item_id_mismatch");
+  assert.equal(controls.getState().pendingAssistantResponse?.deferredCallerTurnId, secondTurn + 1);
+  await emitOpenAi(ai, { type: "input_audio_buffer.speech_stopped", item_id: "item-3", audio_end_ms: 300 });
+  controls.setResponseState({ responseActive: false, aiResponseInProgress: false, responseInFlightId: "" });
+  await controls.handleCallerTranscript("");
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.equal(ai.sent.filter((message) => message.type === "response.create").length, 1);
+
+  await controls.requestCallEnd("test_terminal_vad_cleanup");
+  await emitOpenAi(ai, { type: "input_audio_buffer.speech_started", item_id: "late", audio_start_ms: 400 });
+  await emitOpenAi(ai, { type: "input_audio_buffer.speech_stopped", item_id: "late", audio_end_ms: 500 });
+  const terminal = controls.getState();
+  assert.equal(terminal.activeCallerTurnId, 0);
+  assert.equal(terminal.activeCallerSpeechEpisodeOpen, false);
+  assert.equal(terminal.callerSpeaking, false);
+  assert.equal(terminal.pendingAssistantResponse, null);
+});
+
+test("a required final confirmation supersedes a stale caller-turn owner", async () => {
+  const { ai, controls } = createProductionSession();
+  controls.setResponseState({ greetingComplete: true, readyForCallerInput: true });
+  await emitOpenAi(ai, { type: "input_audio_buffer.speech_started", audio_start_ms: 0 });
+  assert.equal(controls.speakExact("Older clarification", { reason: "older_clarification" }), true);
+  controls.setResponseState({ responseActive: true, aiResponseInProgress: true, responseInFlightId: "busy" });
+  await emitOpenAi(ai, { type: "input_audio_buffer.speech_stopped", audio_end_ms: 100 });
+  await controls.handleCallerTranscript("");
+  await emitOpenAi(ai, { type: "input_audio_buffer.speech_started", audio_start_ms: 200 });
+
+  assert.equal(controls.speakExact("Your appointment is confirmed.", {
+    reason: "final_confirmation",
+    finalConfirmation: true,
+    terminateAfterPlayback: true,
+  }), true);
+  const queued = controls.getState();
+  assert.equal(queued.lastSpeakExactStatus?.queued, true);
+  assert.equal(queued.finalConfirmationQueuedForPlayback, true);
+  assert.match(queued.pendingAssistantResponse.exactInstructions, /Your appointment is confirmed/);
+
+  controls.setResponseState({ responseActive: false, aiResponseInProgress: false, responseInFlightId: "" });
+  await controls.handleCallerTranscript("");
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  const creates = ai.sent.filter((message) => message.type === "response.create");
+  assert.equal(creates.length, 1);
+  assert.equal(extractIntendedSpeech(creates[0].response.instructions), "Your appointment is confirmed.");
+  assert.equal(controls.getState().pendingAssistantResponse, null);
+  assert.equal(controls.getState().finalConfirmationQueuedForPlayback, false);
+  assert.equal(await controls.flushQueuedAssistantResponse("repeated_final_confirmation_drain"), false);
+  assert.equal(ai.sent.filter((message) => message.type === "response.create").length, 1);
+});
+
+test("a rejected final confirmation does not claim queued ownership", () => {
+  const { ai, controls } = createProductionSession();
+  ai.readyState = 3;
+  assert.equal(controls.speakExact("Your appointment is confirmed.", {
+    reason: "final_confirmation",
+    finalConfirmation: true,
+    terminateAfterPlayback: true,
+  }), false);
+  const state = controls.getState();
+  assert.equal(state.lastSpeakExactStatus?.queued, false);
+  assert.equal(state.finalConfirmationQueuedForPlayback, false);
+});
+
+test("English pre-intent clarification follows caller-speech queue ownership through one drain", async () => {
+  const { ai, controls } = createProductionSession();
+  controls.seedBookingState({
+    state: idleUnknownIntentState(),
+    availability: { slotChecked: false, slotAvailable: false, slotAlternatives: [] },
+    context: { currentLanguage: "en" },
+  });
+  controls.setResponseState({ callerSpeaking: true, greetingComplete: true, readyForCallerInput: true });
+
+  await controls.handleCallerTranscript("I'd like to look at her");
+  await new Promise((resolve) => setTimeout(resolve, 300));
+
+  const creates = ai.sent.filter((message) => message.type === "response.create");
+  assert.equal(creates.length, 1);
+  assert.equal(
+    extractIntendedSpeech(creates[0].response.instructions),
+    "Sorry, I didn't catch that. Would you like to book an appointment?"
+  );
+  assert.equal(controls.getState().pendingAssistantResponse, null);
+  assert.equal(await controls.flushQueuedAssistantResponse("repeated_pre_intent_drain"), false);
+});
+
 test("unknown English turns use one lifecycle-gated deterministic clarification without inventing booking state", async () => {
   let appointments = 0;
   let sms = 0;

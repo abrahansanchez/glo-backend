@@ -1718,6 +1718,10 @@ test("modification requests revoke confirmation and recheck the changed canonica
   for (const [language, transcript, expectedTime] of [
     ["en", "Make it noon instead", "12:00 PM"],
     ["es", "Mejor a las doce", "12:00 PM"],
+    ["en", "Change it to three PM instead", "3:00 PM"],
+    ["en", "Change it to 3 PM", "3:00 PM"],
+    ["en", "Change it to 3:00 PM", "3:00 PM"],
+    ["es", "Cámbialo a tres PM", "3:00 PM"],
   ]) {
     const session = await createConfirmationSafetySession({ language });
     await session.controls.handleCallerTranscript(transcript);
@@ -1728,6 +1732,80 @@ test("modification requests revoke confirmation and recheck the changed canonica
     assert.equal(state.parsedTime, expectedTime, transcript);
     assert.equal(state.confirmed, false, transcript);
   }
+});
+
+test("spelled English confirmation time modification rechecks and books only the revised slot", async () => {
+  let availabilityChecks = 0;
+  const appointments = [];
+  const smsMessages = [];
+  const bookingBoundary = (request) => productionBookAppointment(request, {
+    BarberModel: {
+      findById: async () => ({
+        availability: { timezone: "America/New_York" },
+        services: [{ name: "Haircut", duration: 30 }],
+      }),
+    },
+    AppointmentModel: {
+      create: async (appointment) => {
+        appointments.push(structuredClone(appointment));
+        return { ...appointment, _id: "appt-spelled-time" };
+      },
+    },
+    isSlotAvailable: async () => {
+      availabilityChecks += 1;
+      return true;
+    },
+    sendAppointmentConfirmationSms: async (...args) => { smsMessages.push(args); },
+  });
+  const session = createSession({
+    language: "en",
+    bookAppointment: bookingBoundary,
+    isSlotAvailable: async () => {
+      availabilityChecks += 1;
+      return true;
+    },
+  });
+  session.controls.seedBookingState({
+    state: baseState({
+      name: "Abraham",
+      service: "Haircut",
+      parsedDate: "2026-08-01",
+      parsedTime: "2:00 PM",
+    }),
+    availability: { slotChecked: true, slotAvailable: true, slotAlternatives: [] },
+    context: {
+      currentLanguage: "en",
+      barberId: "507f1f77bcf86cd799439011",
+      callerNumber: "+15555550100",
+      callSid: "CA-spelled-time-modification",
+      barberDoc: {
+        _id: "507f1f77bcf86cd799439011",
+        services: [{ name: "Haircut", durationMinutes: 30 }],
+        availability: { timezone: "America/New_York", defaultServiceDurationMinutes: 30 },
+      },
+    },
+  });
+
+  await deliverSpanishConfirmation(session, "resp-original-two-pm-confirmation");
+  await session.controls.handleCallerTranscript("Change it to three PM instead.");
+  const revised = session.controls.getState();
+  assert.equal(revised.bookingState.parsedTime, "3:00 PM");
+  assert.equal(revised.bookingState.confirmed, false);
+  assert.equal(availabilityChecks, 1);
+  assert.equal(appointments.length, 0);
+  assert.equal(smsMessages.length, 0);
+
+  await deliverLatestExactResponse(session, "resp-revised-three-pm-confirmation");
+  assert.equal(appointments.length, 0);
+  assert.equal(smsMessages.length, 0);
+  await session.controls.handleCallerTranscript("Yes, I confirm.");
+  await session.controls.handleCallerTranscript("Yes, I confirm.");
+
+  assert.equal(appointments.length, 1);
+  assert.equal(smsMessages.length, 1);
+  assert.equal(appointments[0].time, "3:00 PM");
+  assert.equal(appointments.some((appointment) => appointment.time === "2:00 PM"), false);
+  assert.match(JSON.stringify(smsMessages), /3:00 PM/);
 });
 
 test("English and Spanish midnight modifications recheck once and require fresh confirmation", async () => {
