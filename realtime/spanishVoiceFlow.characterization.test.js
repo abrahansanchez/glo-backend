@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { spawnSync } from "node:child_process";
 import {
   attachMediaWebSocketServer,
   classifyConfirmationResponse,
@@ -705,9 +706,16 @@ test("Spanish weekday plus day-of-month preserves July 30 through the availabili
 
 test("production July 23 context honors Spanish day thirty instead of the current Thursday", async () => {
   const checks = [];
+  const parserTimeZones = [];
   const productionReference = new Date("2026-07-23T12:00:00-04:00");
   const session = createSession({
-    parseNaturalDateTime: (text) => parseNaturalDateTime(text, { referenceDate: productionReference }),
+    parseNaturalDateTime: (text, options = {}) => {
+      parserTimeZones.push(options.timeZone);
+      return parseNaturalDateTime(text, {
+        referenceDate: productionReference,
+        timeZone: options.timeZone,
+      });
+    },
     isSlotAvailable: async (args) => { checks.push(args); return true; },
   });
   session.controls.seedBookingState({
@@ -742,6 +750,7 @@ test("production July 23 context honors Spanish day thirty instead of the curren
   assert.deepEqual(checks.map(({ date, time }) => ({ date, time })), [
     { date: "2026-07-30", time: "11:30 AM" },
   ]);
+  assert.deepEqual(parserTimeZones, ["America/New_York"]);
   assert.equal(checks.some((check) => check.date === "2026-07-23"), false);
 });
 
@@ -793,16 +802,74 @@ test("conflicting Spanish and English weekday-day inputs clarify once without av
 
 test("English weekday ordinals preserve valid dates and representative suffixes safely", async () => {
   const referenceDate = new Date("2026-07-23T12:00:00-04:00");
-  const valid = await parseNaturalDateTime("Thursday the 30th at 11 AM", { referenceDate, bookingHorizonDays: 62 });
+  const parserOptions = {
+    referenceDate,
+    bookingHorizonDays: 62,
+    timeZone: "America/New_York",
+  };
+  const valid = await parseNaturalDateTime("Thursday the 30th at 11 AM", parserOptions);
   assert.equal(valid.date, "2026-07-30");
-  assert.equal(valid.time, "16:00");
+  assert.equal(valid.time, "11:00");
+
+  const conflict = await parseNaturalDateTime("Thursday the 31st at 11 AM", parserOptions);
+  assert.equal(conflict.conflict, true);
+
+  const spanish = await parseNaturalDateTime("jueves treinta a las once y media", parserOptions);
+  assert.equal(spanish.date, "2026-07-30");
+  assert.equal(spanish.time, "11:30");
+
+  const dateOnly = await parseNaturalDateTime("Thursday the 30th", parserOptions);
+  assert.equal(dateOnly.date, "2026-07-30");
+  assert.equal(dateOnly.time, "");
+
   for (const ordinal of ["1st", "2nd", "3rd", "11th", "12th", "13th", "21st", "22nd", "23rd", "31st"]) {
     const parsed = await parseNaturalDateTime(`Thursday the ${ordinal} at 11 AM`, {
-      referenceDate,
-      bookingHorizonDays: 62,
+      ...parserOptions,
     });
     assert.ok(parsed, ordinal);
     assert.ok(parsed.conflict || parsed.date, ordinal);
+  }
+
+  const parserModuleUrl = new URL("../utils/ai/dateParser.js", import.meta.url).href;
+  const timezoneProbe = `
+    const { parseNaturalDateTime } = await import(process.env.GLO_DATE_PARSER_URL);
+    const options = {
+      referenceDate: new Date("2026-07-23T12:00:00-04:00"),
+      bookingHorizonDays: 62,
+      timeZone: "America/New_York",
+    };
+    const valid = await parseNaturalDateTime("Thursday the 30th at 11 AM", options);
+    const conflict = await parseNaturalDateTime("Thursday the 31st at 11 AM", options);
+    const spanish = await parseNaturalDateTime("jueves treinta a las once y media", options);
+    const dateOnly = await parseNaturalDateTime("Thursday the 30th", options);
+    process.stdout.write(JSON.stringify({ valid, conflict, spanish, dateOnly }));
+  `;
+  for (const systemTimezone of ["America/New_York", "UTC", "Asia/Seoul"]) {
+    const probe = spawnSync(process.execPath, ["--input-type=module", "-e", timezoneProbe], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        TZ: systemTimezone,
+        GLO_DATE_PARSER_URL: parserModuleUrl,
+      },
+    });
+    assert.equal(probe.status, 0, `${systemTimezone}: ${probe.stderr}`);
+    const result = JSON.parse(probe.stdout);
+    assert.deepEqual(
+      {
+        valid: { date: result.valid.date, time: result.valid.time },
+        conflict: result.conflict.conflict,
+        spanish: { date: result.spanish.date, time: result.spanish.time },
+        dateOnly: { date: result.dateOnly.date, time: result.dateOnly.time },
+      },
+      {
+        valid: { date: "2026-07-30", time: "11:00" },
+        conflict: true,
+        spanish: { date: "2026-07-30", time: "11:30" },
+        dateOnly: { date: "2026-07-30", time: "" },
+      },
+      systemTimezone
+    );
   }
 });
 
@@ -1169,6 +1236,7 @@ test("shared bilingual confirmation classifier gives safety outcomes precedence 
     ["Yes!", "affirmative"],
     ["Yes?", "clarification"],
     ["Yes, confirm it", "affirmative"],
+    ["Yes, I confirm.", "affirmative"],
     ["Correct", "affirmative"],
     ["Confirm the appointment", "affirmative"],
     ["Sí", "affirmative"],
@@ -1571,6 +1639,58 @@ test("explicit date modifications remain distinct from punctuationless clarifica
       time: before.bookingState.parsedTime,
       service: before.bookingState.service,
     }], scenario.transcript);
+  }
+});
+
+test("natural final-confirmation replacements update only stated fields and recheck once", async () => {
+  for (const scenario of [
+    {
+      transcript: "Friday",
+      assertChange: (after, before) => {
+        assert.notEqual(after.parsedDate, before.parsedDate);
+        assert.equal(after.parsedTime, before.parsedTime);
+        assert.equal(after.service, before.service);
+      },
+    },
+    {
+      transcript: "2 PM",
+      assertChange: (after, before) => {
+        assert.equal(after.parsedDate, before.parsedDate);
+        assert.equal(after.parsedTime, "2:00 PM");
+        assert.equal(after.service, before.service);
+      },
+    },
+    {
+      transcript: "Friday at 2 PM",
+      assertChange: (after, before) => {
+        assert.notEqual(after.parsedDate, before.parsedDate);
+        assert.equal(after.parsedTime, "2:00 PM");
+        assert.equal(after.service, before.service);
+      },
+    },
+    {
+      transcript: "Haircut and beard",
+      assertChange: (after, before) => {
+        assert.equal(after.parsedDate, before.parsedDate);
+        assert.equal(after.parsedTime, before.parsedTime);
+        assert.equal(after.service, "Haircut + Beard");
+      },
+    },
+  ]) {
+    assert.equal(classifyConfirmationResponse(scenario.transcript).kind, "modification");
+    const session = await createConfirmationSafetySession({ language: "en" });
+    const before = structuredClone(session.controls.getState().bookingState);
+
+    await session.controls.handleCallerTranscript(scenario.transcript);
+
+    const after = session.controls.getState();
+    scenario.assertChange(after.bookingState, before);
+    assert.equal(session.availabilityChecks, 1, scenario.transcript);
+    assert.equal(session.bookings, 0, scenario.transcript);
+    assert.equal(after.bookingState.name, before.name, scenario.transcript);
+    assert.equal(after.bookingState.confirmed, false, scenario.transcript);
+    assert.equal(after.confirmationDeliveryReady, false, scenario.transcript);
+    assert.equal(after.bookingPhase, "awaiting_confirmation", scenario.transcript);
   }
 });
 
@@ -2275,7 +2395,7 @@ test("WebSocket-first closure revokes authorization and remains idempotently ter
 });
 
 test("affirmatives authorize exactly once only in the delivered confirmation phase", async () => {
-  for (const [language, affirmative] of [["es", "Sí"], ["en", "Yes"]]) {
+  for (const [language, affirmative] of [["es", "Sí"], ["en", "Yes"], ["en", "Yes, I confirm."]]) {
     const confirmed = await createConfirmationSafetySession({ language });
     await confirmed.controls.handleCallerTranscript(affirmative, {
       transcriptId: `explicit-${language}`,
