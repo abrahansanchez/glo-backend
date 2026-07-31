@@ -1,5 +1,6 @@
 import { WebSocketServer } from "ws";
 import { createHmac, randomUUID } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import twilio from "twilio";
 import { createOpenAISession } from "../utils/ai/openaiSession.js";
 import CallTranscript from "../models/CallTranscript.js";
@@ -1150,9 +1151,14 @@ const isNoisyTranscript = (text, bookingState) => {
 };
 
 const containsDateSignal = (text) => {
-  const t = String(text || "").toLowerCase();
+  let t = String(text || "").toLowerCase();
+  t = t.replace(/\b(de|por|en)\s+la\s+mañana\b/g, "$1 la __glo_daypart_morning__");
+  const hasSpanishTomorrow = Array.from(
+    t.matchAll(/\b(?:maÃ£Â±ana|maÃ±ana|mañana)\b/g)
+  ).some((match) => !/(?:de|por|en)\s+la\s*$/i.test(t.slice(0, match.index)));
   return (
     /\b(today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/.test(t) ||
+    hasSpanishTomorrow ||
     /\b(hoy|maã±ana|mañana|lunes|martes|miercoles|miércoles|jueves|viernes|sabado|sábado|domingo)\b/.test(t) ||
     /\b(january|february|march|april|may|june|july|august|september|october|november|december)\b/.test(t) ||
     /\b(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre)\b/.test(t) ||
@@ -1162,6 +1168,8 @@ const containsDateSignal = (text) => {
 
 const containsTimeSignal = (text) => {
   const t = String(text || "").toLowerCase();
+  // Bare "mañana" is a date (tomorrow), never an exact appointment time.
+  if (/^\s*ma.{0,2}ana\s*$/.test(t)) return false;
   return (
     /\b\d{1,2}\s*(:\d{2})?\s*(am|pm)\b/.test(t) ||
     /\b\d{1,2}\s*(de la ma[ñn]ana|de la tarde|de la noche)\b/.test(t) ||
@@ -1627,10 +1635,10 @@ const ordinalAliasesForAlternative = (index, total) => {
   const isLast = index === total - 1;
 
   if (isFirst) {
-    ["first", "first one", "first option", "the first", "the first one", "the first option", "earliest", "next", "next one", "la primera", "primera", "primera opcion"].forEach((alias) => addNormalizedAlias(aliases, alias));
+    ["first", "first one", "first option", "the first", "the first one", "the first option", "earliest", "next", "next one", "la primera", "primera", "la primera opcion", "primera opcion"].forEach((alias) => addNormalizedAlias(aliases, alias));
   }
   if (isSecond) {
-    ["second", "second one", "second option", "the second", "the second one", "the second option", "la segunda", "segunda", "segunda opcion"].forEach((alias) => addNormalizedAlias(aliases, alias));
+    ["second", "second one", "second option", "the second", "the second one", "the second option", "la segunda", "segunda", "la segunda opcion", "segunda opcion"].forEach((alias) => addNormalizedAlias(aliases, alias));
     if (total === 3) {
       ["middle", "middle one", "middle option", "the middle", "the middle one", "the middle option"].forEach((alias) => addNormalizedAlias(aliases, alias));
     }
@@ -1651,6 +1659,7 @@ const selectAlternativeFromTranscript = (transcript, alternatives = [], language
   }
 
   const normalized = normalizeSpokenAlternativeTimeText(transcript);
+  const normalizedOrdinalSelection = normalized.replace(/\s+de la tomorrow$/, "");
   if (!normalized) return { matched: false, reason: "empty_transcript" };
   if (ALT_SELECTION_FILLERS.has(normalized)) {
     return { matched: false, reason: "filler_word" };
@@ -1660,7 +1669,7 @@ const selectAlternativeFromTranscript = (transcript, alternatives = [], language
     const alternative = alternatives[index];
     const aliases = ordinalAliasesForAlternative(index, alternatives.length);
 
-    if (aliases.has(normalized)) {
+    if (aliases.has(normalized) || aliases.has(normalizedOrdinalSelection)) {
       return {
         matched: true,
         alternative,
@@ -1670,6 +1679,25 @@ const selectAlternativeFromTranscript = (transcript, alternatives = [], language
         language,
       };
     }
+  }
+
+  const ordinalMatches = alternatives
+    .map((alternative, index) => ({ alternative, aliases: ordinalAliasesForAlternative(index, alternatives.length) }))
+    .filter(({ aliases }) => [...aliases].some((alias) =>
+      new RegExp(`(?:^|\\s)${alias.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&")}(?:$|\\s)`).test(normalized)
+    ));
+  const hasOrdinalNegation = /\b(?:not|don't|dont|no|except|anything but|other than|ningun|ninguna|no quiero|no la)\b/.test(normalized);
+  const hasOrdinalChoice = /\b(?:works?|work for me|i'll take|ill take|take|choose|pick|me quedo|esta bien|me funciona)\b/.test(normalized);
+  if (ordinalMatches.length === 1 && hasOrdinalChoice && !hasOrdinalNegation) {
+    const alternative = ordinalMatches[0].alternative;
+    return {
+      matched: true,
+      alternative,
+      selectedTime: alternative?.time || "",
+      selectedDate: alternative?.date || "",
+      reason: "natural_ordinal_match",
+      language,
+    };
   }
 
   const explicitSuffix = normalized.match(/\b(am|pm)\b/)?.[1] || "";
@@ -1789,6 +1817,24 @@ const extractSpokenTimeForBooking = (text) => {
     const minute = explicit[2] || "00";
     const suffix = explicit[3].toUpperCase();
     if (hour >= 1 && hour <= 12) return `${hour}:${minute} ${suffix}`;
+  }
+
+  const normalizedMorningDaypart = normalized.match(
+    /\bat\s+(\d{1,2})(?::(\d{2}))?\s+de\s+la\s+tomorrow\b/i
+  );
+  if (normalizedMorningDaypart) {
+    const hour = Number(normalizedMorningDaypart[1]);
+    const minute = normalizedMorningDaypart[2] || "00";
+    if (hour >= 1 && hour <= 12) return `${hour}:${minute} AM`;
+  }
+
+  const spanishHalfHour = normalized.match(/\b(\d{1,2}):30\s+de la\s+(maÃ±ana|tarde|noche)\b/i);
+  if (spanishHalfHour) {
+    const hour = Number(spanishHalfHour[1]);
+    if (hour >= 1 && hour <= 12) {
+      if (/maÃ±ana/i.test(spanishHalfHour[2])) return `${hour}:30 AM`;
+      return `${hour}:30 PM`;
+    }
   }
 
   const hourOnly = normalized.match(/\b(\d{1,2})\b/);
@@ -2231,6 +2277,7 @@ export const attachMediaWebSocketServer = (server, dependencies = {}) => {
     let bufferedCallerTranscript = null;
     let bufferedCallerTranscriptAt = null;
     let bufferedCallerTranscriptPriority = "";
+    let bufferedCallerTurnId = null;
     let isProcessingBufferedTranscript = false;
     let assistantTurnSeq = 0;
     let assistantAudioSentThisResponse = false;
@@ -2241,12 +2288,14 @@ export const attachMediaWebSocketServer = (server, dependencies = {}) => {
     let assistantPlaybackWatchdogTimer = null;
     let responseCreateSendReason = null;
     let approvedResponseCreateSendInProgress = false;
+    const callerTurnOwnershipContext = new AsyncLocalStorage();
     let pendingAssistantResponse = null;
     let pendingResponseCreationAttempt = null;
     let pendingResponseCreationTimer = null;
     let responseCreationAttemptSequence = 0;
     let openAiConnectionQuarantined = false;
     const responseLifecycleById = new Map();
+    const callerTurnIdByInputItemId = new Map();
     const retiredResponseIds = new Map();
     const outstandingCancellationByEventId = new Map();
     let lastCallerSpeechEndedAtMs = null;
@@ -2724,6 +2773,18 @@ export const attachMediaWebSocketServer = (server, dependencies = {}) => {
       });
     };
 
+    const markOlderCreationSupersededByCallerTurn = (callerTurnId) => {
+      if (
+        callerTurnId !== null &&
+        pendingResponseCreationAttempt?.callerTurnId !== null &&
+        pendingResponseCreationAttempt?.callerTurnId !== undefined &&
+        pendingResponseCreationAttempt.callerTurnId !== callerTurnId &&
+        pendingResponseCreationAttempt.finalConfirmation !== true
+      ) {
+        pendingResponseCreationAttempt.supersededByNewerCallerTurn = true;
+      }
+    };
+
     const bufferCallerTranscript = (transcriptText, reason, priority = "normal") => {
       if (bufferedCallerTranscriptPriority === "confirmation_response" && priority !== "confirmation_response") {
         console.log("[CONFIRMATION_RESPONSE_BUFFER_PRIORITY]", {
@@ -2738,6 +2799,8 @@ export const attachMediaWebSocketServer = (server, dependencies = {}) => {
       bufferedCallerTranscript = transcriptText;
       bufferedCallerTranscriptAt = Date.now();
       bufferedCallerTranscriptPriority = priority;
+      bufferedCallerTurnId = callerTurnOwnershipContext.getStore() ?? null;
+      markOlderCreationSupersededByCallerTurn(bufferedCallerTurnId);
 
       if (priority === "confirmation_response") {
         console.log("[CONFIRMATION_RESPONSE_BUFFER_PRIORITY]", {
@@ -2792,6 +2855,14 @@ export const attachMediaWebSocketServer = (server, dependencies = {}) => {
           queued?.finalConfirmation !== true &&
           Boolean(queued?.promptType)
         );
+      const queuedCallerTurnId =
+        queued.callerTurnId ??
+        callerTurnOwnershipContext.getStore() ??
+        (callerSpeaking === true ? activeCallerTurnId || null : null);
+      const deferredByOwningCallerSpeech =
+        callerSpeaking === true &&
+        queuedCallerTurnId !== null &&
+        queuedCallerTurnId === activeCallerTurnId;
       const queuedWithPhase = {
         ...(shouldStampDeterministicBooking
         ? {
@@ -2802,8 +2873,9 @@ export const attachMediaWebSocketServer = (server, dependencies = {}) => {
           }
         : queued),
         stateKey: queued.stateKey || currentStateKey,
-        deferredByCallerSpeech: callerSpeaking === true,
-        deferredCallerTurnId: callerSpeaking === true ? activeCallerTurnId : null,
+        callerTurnId: queuedCallerTurnId,
+        deferredByCallerSpeech: deferredByOwningCallerSpeech,
+        deferredCallerTurnId: deferredByOwningCallerSpeech ? activeCallerTurnId : null,
       };
 
       pendingAssistantResponse = queuedWithPhase;
@@ -2841,6 +2913,8 @@ export const attachMediaWebSocketServer = (server, dependencies = {}) => {
         reason,
         state: "awaiting_response_created",
         createdAtMs: Date.now(),
+        callerTurnId:
+          metadata.callerTurnId ?? callerTurnOwnershipContext.getStore() ?? null,
         purpose: metadata.purpose || null,
         maxOutputTokens: payload?.response?.max_output_tokens ?? null,
         retryCount: Number(metadata.retryCount || 0),
@@ -3491,10 +3565,15 @@ export const attachMediaWebSocketServer = (server, dependencies = {}) => {
       aiResponseInProgress = false;
       responseInFlightId = "";
       pendingAssistantResponse = null;
+      bufferedCallerTranscript = null;
+      bufferedCallerTranscriptAt = null;
+      bufferedCallerTranscriptPriority = "";
+      bufferedCallerTurnId = null;
       callerSpeaking = false;
       callerTurnSequence = 0;
       activeCallerTurnId = 0;
       activeCallerSpeechEpisode = null;
+      callerTurnIdByInputItemId.clear();
       hasAcceptedPriorEpisode = false;
       lastAcceptedCallerSpeechEndMs = null;
       lastCallerSpeechStopRejectionReason = "";
@@ -3662,6 +3741,7 @@ export const attachMediaWebSocketServer = (server, dependencies = {}) => {
       const queueExactForPlayback = (queueReason) => {
         const queueResult = queueAssistantResponse({
           exactInstructions,
+          callerTurnId: options.callerTurnId ?? callerTurnOwnershipContext.getStore() ?? null,
           reason: isFinalConfirmation ? "final_confirmation" : reason,
           lang: currentLanguage,
           immediate: true,
@@ -3700,6 +3780,7 @@ export const attachMediaWebSocketServer = (server, dependencies = {}) => {
 
       const responseCreatePayload = buildExactResponseRequest(exactInstructions, maxOutputTokens);
       const sent = sendResponseCreate(responseCreatePayload, reason, {
+        callerTurnId: options.callerTurnId ?? callerTurnOwnershipContext.getStore() ?? null,
         purpose,
         retryCount: Number(options.retryCount || 0),
         exactInstructions,
@@ -4241,13 +4322,13 @@ RULES:
         : "Say yes to confirm, or tell me what you want to change.";
     };
 
-    const requestAssistantResponse = async ({ immediate = false, reason = "unknown" } = {}) => {
+    const requestAssistantResponse = async ({ immediate = false, reason = "unknown", forceOrdinary = false } = {}) => {
       if (!greetingComplete) return;
       if (!canSendAI()) return;
 
       logBookingPhase(`request_assistant_response:${reason}`);
 
-      if (bookingState.intent === "BOOK") {
+      if (bookingState.intent === "BOOK" && forceOrdinary !== true) {
         console.log("[DETERMINISTIC_REPLY_DECISION]", {
           reason,
           phase: "before",
@@ -4416,7 +4497,7 @@ RULES:
 
       const forcedNext = nextBookingQuestion();
       const bookingOverlay =
-        bookingState.intent === "BOOK"
+        bookingState.intent === "BOOK" && forceOrdinary !== true
           ? `\n\nBOOKING STATE:\n- name: ${bookingState.name || "(missing)"}\n- service: ${bookingState.service || "(missing)"}\n- date: ${bookingState.parsedDate || bookingState.requestedDateText || "(missing)"}\n- time: ${bookingState.parsedTime || bookingState.requestedTimeText || "(missing)"}\n- askedConfirm: ${bookingState.askedConfirm}\n- backendBookingFinalized: ${bookingState.bookingFinalized}\n\nNEXT ACTION (MANDATORY): ${forcedNext}\nAsk ONLY one question. Never claim booking confirmation unless backendBookingFinalized is true.`
           : "";
 
@@ -4619,6 +4700,19 @@ RULES:
 
     const flushQueuedAssistantResponse = async (reason = "unknown") => {
       const queuedAssistantResponse = pendingAssistantResponse;
+      if (
+        queuedAssistantResponse?.deferredByCallerSpeech === true &&
+        queuedAssistantResponse.deferredCallerTurnId !== activeCallerTurnId
+      ) {
+        console.log("[STALE_QUEUED_RESPONSE_DROPPED_BEFORE_FLUSH_CALLER_TURN_MISMATCH]", {
+          reason,
+          queuedCallerTurnId: queuedAssistantResponse.deferredCallerTurnId ?? null,
+          activeCallerTurnId,
+        });
+        pendingAssistantResponse = null;
+        deferFlushUntilCallerStops = false;
+        return false;
+      }
       const idleReason = [
         "confirmation_max_output_tokens_retry",
         "deterministic_retry",
@@ -4759,7 +4853,10 @@ RULES:
         const queuedResponse = materializeQueuedExactResponse(queued);
         const payload = queuedResponse.payload;
         console.log("[FLUSH_QUEUED_SPEAK_EXACT]", { reason: queued.reason });
-        const sent = sendResponseCreate(payload, queued.reason || reason, queuedResponse.metadata);
+        const sent = sendResponseCreate(payload, queued.reason || reason, {
+          ...queuedResponse.metadata,
+          callerTurnId: queued.callerTurnId ?? null,
+        });
         if (!sent) {
           pendingAssistantResponse = queued;
           if (queued.finalConfirmation === true) finalConfirmationQueuedForPlayback = true;
@@ -4788,6 +4885,7 @@ RULES:
       };
       const sent = sendResponseCreate(payload, queued.reason || reason, {
         purpose: isSetupCall ? RESPONSE_PURPOSE.SETUP : RESPONSE_PURPOSE.GENERATIVE,
+        callerTurnId: queued.callerTurnId ?? null,
       });
       if (!sent) {
         pendingAssistantResponse = queued;
@@ -5190,12 +5288,30 @@ RULES:
 
     const finishCallerTranscriptHandling = async (reason = "transcript_completed") => {
       let scheduledDeferredResponse = false;
-      if (callerSpeaking) {
+      const handlingCallerTurnId = callerTurnOwnershipContext.getStore() ?? null;
+      const handlerOwnsActiveCallerTurn =
+        handlingCallerTurnId === activeCallerTurnId && handlingCallerTurnId !== null;
+      if (callerSpeaking && handlerOwnsActiveCallerTurn) {
         callerSpeaking = false;
         console.log("[CALLER_SPEAKING_STOPPED_AFTER_TRANSCRIPT]", { reason });
+      } else if (callerSpeaking) {
+        console.log("[STALE_CALLER_TRANSCRIPT_CANNOT_STOP_NEWER_CALLER_TURN]", {
+          reason,
+          handlingCallerTurnId,
+          activeCallerTurnId,
+        });
       }
 
-      if (pendingAssistantResponse?.finalConfirmation === true) {
+      const pendingResponseOwnedByCurrentCallerTurn =
+        pendingAssistantResponse?.deferredByCallerSpeech === true &&
+        pendingAssistantResponse.deferredCallerTurnId === activeCallerTurnId;
+      if (
+        pendingAssistantResponse?.finalConfirmation === true &&
+        (
+          pendingAssistantResponse.deferredByCallerSpeech !== true ||
+          (reason === "booking_executed" && pendingResponseOwnedByCurrentCallerTurn)
+        )
+      ) {
         const finalConfirmationDispatched = await flushQueuedAssistantResponse(
           "final_confirmation_after_caller_stopped"
         );
@@ -5207,10 +5323,18 @@ RULES:
         }
       }
 
-      if (deferFlushUntilCallerStops && pendingAssistantResponse) {
+      if (deferFlushUntilCallerStops && pendingAssistantResponse && pendingResponseOwnedByCurrentCallerTurn) {
         console.log("[FLUSH_RESCHEDULED_AFTER_CALLER_STOPPED]");
         scheduleQueuedAssistantFlush("caller_stopped_after_transcript_delayed");
         scheduledDeferredResponse = true;
+      } else if (deferFlushUntilCallerStops && pendingAssistantResponse) {
+        console.log("[STALE_QUEUED_RESPONSE_DROPPED_CALLER_TURN_MISMATCH]", {
+          reason,
+          queuedCallerTurnId: pendingAssistantResponse.deferredCallerTurnId ?? null,
+          activeCallerTurnId,
+        });
+        pendingAssistantResponse = null;
+        deferFlushUntilCallerStops = false;
       } else if (deferFlushUntilCallerStops) {
         deferFlushUntilCallerStops = false;
       }
@@ -5222,6 +5346,23 @@ RULES:
     const suppliedMalformedOffset = (event, field) =>
       Object.hasOwn(event, field) && !validAudioOffset(event[field]);
     const usableItemId = (value) => typeof value === "string" && value.trim() ? value : null;
+    const bindCallerTurnToInputItemId = (itemId, callerTurnId) => {
+      const usableId = usableItemId(itemId);
+      if (!usableId || callerTurnId === null || callerTurnId === undefined) return;
+      if (!callerTurnIdByInputItemId.has(usableId)) {
+        callerTurnIdByInputItemId.set(usableId, callerTurnId);
+      } else if (callerTurnIdByInputItemId.get(usableId) !== callerTurnId) {
+        callerTurnIdByInputItemId.set(usableId, null);
+      }
+      while (callerTurnIdByInputItemId.size > 64) {
+        callerTurnIdByInputItemId.delete(callerTurnIdByInputItemId.keys().next().value);
+      }
+    };
+    const resolveCallerTurnFromInputItemId = (itemId) => {
+      const usableId = usableItemId(itemId);
+      if (!usableId || !callerTurnIdByInputItemId.has(usableId)) return null;
+      return callerTurnIdByInputItemId.get(usableId);
+    };
 
     const beginCallerSpeechTurn = (event = {}, reason = "vad_speech_started") => {
       if (suppliedMalformedOffset(event, "audio_start_ms")) {
@@ -5236,6 +5377,9 @@ RULES:
           audioStartMs: validAudioOffset(event.audio_start_ms) ? event.audio_start_ms : null,
           callerTurnId: activeCallerTurnId,
         };
+        if (activeCallerSpeechEpisode.itemId) {
+          bindCallerTurnToInputItemId(activeCallerSpeechEpisode.itemId, activeCallerTurnId);
+        }
         lastCallerSpeechEndedAtMs = null;
         console.log("[CALLER_TURN_STARTED]", { reason, callerTurnId: activeCallerTurnId });
       } else {
@@ -5329,10 +5473,12 @@ RULES:
 
       const toProcess = bufferedCallerTranscript;
       const bufferedPriority = bufferedCallerTranscriptPriority;
+      const bufferedTurnId = bufferedCallerTurnId;
 
       bufferedCallerTranscript = null;
       bufferedCallerTranscriptAt = null;
       bufferedCallerTranscriptPriority = "";
+      bufferedCallerTurnId = null;
       isProcessingBufferedTranscript = true;
 
       console.log("[BUFFERED_TRANSCRIPT_PROCESSING]", {
@@ -5342,7 +5488,11 @@ RULES:
       });
 
       try {
-        await handleCallerTranscript(toProcess, { buffered: true, reason });
+        await handleCallerTranscript(toProcess, {
+          buffered: true,
+          reason,
+          callerTurnId: bufferedTurnId,
+        });
         return true;
       } finally {
         isProcessingBufferedTranscript = false;
@@ -5370,6 +5520,18 @@ RULES:
     };
 
     async function handleCallerTranscript(transcriptText, options = {}) {
+      if (options.callerTurnOwnershipEstablished !== true) {
+        const callerTurnId = Object.hasOwn(options, "callerTurnId")
+          ? options.callerTurnId
+          : activeCallerTurnId || null;
+        return callerTurnOwnershipContext.run(callerTurnId, () =>
+          handleCallerTranscript(transcriptText, {
+            ...options,
+            callerTurnOwnershipEstablished: true,
+          })
+        );
+      }
+      const handlingCallerTurnId = callerTurnOwnershipContext.getStore() ?? null;
       const isBuffered = options.buffered === true;
       transcriptText = String(transcriptText || "").trim();
 
@@ -5401,6 +5563,19 @@ RULES:
         return;
       }
 
+      const transcriptId = options.transcriptId || currentCallerTranscriptId || transcriptText;
+      if (processedTranscriptIds.has(transcriptId)) {
+        console.log("[TRANSCRIPT_DEDUPE] skipping duplicate transcript", transcriptId);
+        await finishCallerTranscriptHandling("duplicate_transcript");
+        return;
+      }
+      if (isNoisyTranscript(transcriptText, bookingState)) {
+        console.log("[TRANSCRIPT_IGNORED_NOISE]", { transcript: transcriptText, reason: "filler_or_noise" });
+        console.log("[NO_RESPONSE_LOW_SIGNAL_TRANSCRIPT]", { transcript: transcriptText });
+        await finishCallerTranscriptHandling("noisy_transcript");
+        return;
+      }
+
       if (
         !isBuffered &&
         callerTurnHasBookingSignal(transcriptText) &&
@@ -5424,6 +5599,12 @@ RULES:
       const confirmationDecisionAtTranscriptStart = confirmationPromptActiveAtTranscriptStart
         ? classifyConfirmationResponse(transcriptText, { language: currentLanguage })
         : null;
+      const confirmationDecisionIsActionable = [
+        "affirmative",
+        "rejection",
+        "modification",
+        "clarification",
+      ].includes(confirmationDecisionAtTranscriptStart?.kind);
       if (
         !isBuffered &&
         assistantPlaybackActive === true &&
@@ -5436,6 +5617,17 @@ RULES:
             decision: confirmationDecisionAtTranscriptStart.reason,
           });
           await finishCallerTranscriptHandling("pre_delivery_affirmative_discarded");
+          return;
+        }
+        if (
+          !confirmationDecisionIsActionable &&
+          !callerTurnHasBookingSignal(transcriptText)
+        ) {
+          console.log("[PRE_DELIVERY_CONFIRMATION_NOISE_IGNORED]", {
+            transcript: transcriptText,
+            decision: confirmationDecisionAtTranscriptStart?.reason,
+          });
+          await finishCallerTranscriptHandling("pre_delivery_confirmation_noise_ignored");
           return;
         }
         bufferCallerTranscript(
@@ -5468,7 +5660,7 @@ RULES:
           bookingState.askedConfirm === true ||
           bookingState.confirmationPromptRequested === true;
         const isConfirmationResponse =
-          isInConfirmationContext && Boolean(confirmationDecisionAtTranscriptStart);
+          isInConfirmationContext && confirmationDecisionIsActionable;
         const isServiceResponse =
           bookingState.intent === "BOOK" &&
           !bookingState.service &&
@@ -5591,12 +5783,6 @@ RULES:
         return;
       }
 
-      const transcriptId = options.transcriptId || currentCallerTranscriptId || transcriptText;
-      if (processedTranscriptIds.has(transcriptId)) {
-        console.log("[TRANSCRIPT_DEDUPE] skipping duplicate transcript", transcriptId);
-        await finishCallerTranscriptHandling("duplicate_transcript");
-        return;
-      }
       processedTranscriptIds.add(transcriptId);
 
       // Noise/filler gate — but never ignore if askedConfirm is true (yes/no matters)
@@ -5764,6 +5950,8 @@ RULES:
         }
       }
 
+      markOlderCreationSupersededByCallerTurn(handlingCallerTurnId);
+
       userTranscriptLines.push(transcriptText);
       await appendMessage({ role: "caller", text: transcriptText, lang: currentLanguage });
 
@@ -5929,6 +6117,8 @@ RULES:
         return;
       }
 
+      let currentTurnAvailabilityContinuation = false;
+      let currentTurnAcceptedBookingProgress = false;
       const lower = transcriptText.toLowerCase();
       const notNamePhrases = [
         "alucinando", "hallucinating", "no funciona", "esto no", "me esta cortando",
@@ -6020,6 +6210,7 @@ RULES:
             const extracted = cleanClientName(transcriptText);
             if (isClearNameResponse(extracted)) {
               bookingState.name = extracted;
+              currentTurnAcceptedBookingProgress = true;
               bookingState.awaitingName = false;
               bookingState.awaitingCorrection = false;
               await updateTranscriptFields({ clientName: bookingState.name });
@@ -6045,6 +6236,7 @@ RULES:
             });
           } else if (wordCount <= 3 && !hasBookingKeyword) {
             bookingState.name = cleanClientName(transcriptText);
+            currentTurnAcceptedBookingProgress = true;
             const acceptedName = bookingState.name;
             const wasAwaitingName = bookingState.awaitingName;
             bookingState.awaitingName = false;
@@ -6106,6 +6298,7 @@ RULES:
           const correctionMode = Boolean(bookingState.awaitingCorrection);
           bookingState.service = extractedService;
           if (previousService !== extractedService) {
+            currentTurnAvailabilityContinuation = true;
             slotChecked = false;
             slotAvailable = false;
             slotAlternatives = [];
@@ -6150,6 +6343,7 @@ RULES:
               })
             : null;
         let shouldCheckAvailabilityAfterParse = true;
+        let currentTurnAcceptedSlotUpdate = false;
         const hasSlotReplacementSignal = Boolean(hasDate || hasTime || contextualTimeOnly);
         let slotInputHandled = false;
 
@@ -6191,6 +6385,7 @@ RULES:
             return;
           }
           shouldCheckAvailabilityAfterParse = readyForFreshAvailability;
+          currentTurnAcceptedSlotUpdate = readyForFreshAvailability === true;
           slotInputHandled = true;
         }
 
@@ -6215,6 +6410,7 @@ RULES:
           }
 
           await updateTranscriptFields({ requestedDateTimeText: `${bookingState.parsedDate} ${bookingState.parsedTime}` });
+          currentTurnAcceptedSlotUpdate = true;
           console.log("[CONTEXTUAL_TIME_ONLY_PARSED]", {
             transcript: transcriptText,
             previousTime,
@@ -6234,6 +6430,13 @@ RULES:
         }
 
         if (!slotInputHandled && !contextualTimeOnly && (hasDate || hasTime)) {
+          const dateConflictCorrection = bookingState.awaitingDateConflictCorrection === true;
+          if (dateConflictCorrection && hasDate) {
+            bookingState.requestedDateText = transcriptText;
+            bookingState.requestedTimeText = hasTime
+              ? transcriptText
+              : (bookingState.dateConflictPreservedTime || "");
+          }
           if (hasDate && !bookingState.requestedDateText) bookingState.requestedDateText = transcriptText;
           if (hasTime && !bookingState.requestedTimeText) bookingState.requestedTimeText = transcriptText;
           bookingState.dateTimeText = [bookingState.requestedDateText, bookingState.requestedTimeText]
@@ -6247,6 +6450,10 @@ RULES:
           });
 
           if (parsedBookingTime?.conflict === true) {
+            bookingState.awaitingDateConflictCorrection = true;
+            bookingState.dateConflictPreservedTime = extractSpokenTimeForBooking(
+              [bookingState.requestedTimeText, bookingState.dateTimeText].filter(Boolean).join(" ")
+            );
             speakExact(
               currentLanguage === "es"
                 ? "El día y la fecha no coinciden. ¿Qué fecha deseas?"
@@ -6262,6 +6469,9 @@ RULES:
             // Always allow overwrite when slot was unavailable or when new value differs
             const newDate = parsedBookingTime.date;
             const newTime = parsedBookingTime.time;
+            currentTurnAcceptedSlotUpdate = Boolean(
+              (hasDate && newDate) || (hasTime && newTime)
+            );
 
             if (newDate && !newTime) {
               shouldCheckAvailabilityAfterParse = Boolean(bookingState.parsedTime);
@@ -6293,6 +6503,10 @@ RULES:
               });
               bookingState.awaitingCorrection = false;
             }
+            if (dateConflictCorrection && parsedBookingTime.date) {
+              bookingState.awaitingDateConflictCorrection = false;
+              bookingState.dateConflictPreservedTime = "";
+            }
           }
           await updateTranscriptFields({ requestedDateTimeText: bookingState.dateTimeText });
         }
@@ -6303,8 +6517,11 @@ RULES:
           state: bookingDecisionState(),
         });
 
+        const currentTurnAvailabilityAuthorized =
+          currentTurnAcceptedSlotUpdate || currentTurnAvailabilityContinuation;
         if (
           shouldCheckAvailabilityAfterParse &&
+          currentTurnAvailabilityAuthorized &&
           bookingState.parsedDate &&
           bookingState.parsedTime
         ) {
@@ -6327,6 +6544,29 @@ RULES:
             transcript: transcriptText,
             state: bookingDecisionState(),
           });
+        }
+
+        if (
+          !currentTurnAvailabilityAuthorized &&
+          bookingState.parsedDate &&
+          bookingState.parsedTime &&
+          bookingState.awaitingAlternativeSelection !== true &&
+          bookingState.askedConfirm !== true &&
+          bookingState.confirmationPromptRequested !== true &&
+          currentTurnAcceptedBookingProgress !== true &&
+          getBookingPhase() !== "awaiting_name"
+        ) {
+          const scheduledDeferredResponse = await finishCallerTranscriptHandling(
+            "stored_slot_without_current_turn_update"
+          );
+          if (!scheduledDeferredResponse) {
+            await requestAssistantResponse({
+              immediate: true,
+              reason: "stored_slot_without_current_turn_update",
+              forceOrdinary: true,
+            });
+          }
+          return;
         }
 
         if (shouldRequestNameAfterAvailableSlot()) {
@@ -6443,6 +6683,7 @@ RULES:
       bufferedCallerTranscript = null;
       bufferedCallerTranscriptAt = null;
       bufferedCallerTranscriptPriority = "";
+      bufferedCallerTurnId = null;
 
       if (action === "retry") {
         restoreBookingSnapshot(record.bookingSnapshot);
@@ -6459,6 +6700,7 @@ RULES:
 
         const queueResult = queueAssistantResponse({
           ...retryRequest.queued,
+          callerTurnId: record.callerTurnId ?? null,
           reason: "confirmation_max_output_tokens_retry",
           lang: currentLanguage,
           immediate: true,
@@ -6480,13 +6722,17 @@ RULES:
       bookingState.confirmationPromptRequested = false;
       if (record.transportAvailable === false) {
         bufferedCallerTranscript = null;
+        bufferedCallerTurnId = null;
         return "recover";
       }
       speakExact(
         currentLanguage === "es"
           ? "No pude completar la confirmación. Repasemos la cita otra vez."
           : "I couldn't complete the confirmation. Let's review the appointment again.",
-        { reason: "confirmation_retry_failed_recovery" }
+        {
+          reason: "confirmation_retry_failed_recovery",
+          callerTurnId: record.callerTurnId ?? null,
+        }
       );
       return "recover";
     };
@@ -6547,6 +6793,7 @@ RULES:
 
       const queueResult = queueAssistantResponse({
         exactInstructions,
+        callerTurnId: record.callerTurnId ?? null,
         reason: recovery ? "deterministic_recovery" : "deterministic_retry",
         lang: currentLanguage,
         immediate: true,
@@ -6587,12 +6834,14 @@ RULES:
 
       const ownsLifecycle = activeDeterministicLifecycleId === record.responseId;
       if (record.deliveryMode === "streaming") {
-        const completedAndMatched =
+        const normalizedRoutineTranscript = normalizeConfirmationFactText(record.completedOutputTranscript);
+        const unsafeRoutineBookingClaim = /\b(?:appointment|booking|cita)\s+(?:is|has been|esta|ha sido)\s+(?:confirmed|booked|scheduled|confirmada|reservada|programada)\b/.test(normalizedRoutineTranscript);
+        const transportComplete =
           record.openAiStatus === "completed" &&
-          record.transcriptMatches === true &&
           ownsLifecycle &&
           record.audioInvalidated !== true &&
-          record.transportAvailable !== false;
+          record.transportAvailable !== false &&
+          !unsafeRoutineBookingClaim;
 
         if (endingCall || record.audioInvalidated === true || !ownsLifecycle) {
           record.lifecycleActionHandled = true;
@@ -6615,18 +6864,28 @@ RULES:
             currentLanguage === "es"
               ? "No pude completar mi respuesta. ¿Podrías repetirlo?"
               : "I couldn't complete my response. Could you repeat that?",
-            { reason: "routine_stream_recovery", purpose: RESPONSE_PURPOSE.RECOVERY }
+            {
+              reason: "routine_stream_recovery",
+              purpose: RESPONSE_PURPOSE.RECOVERY,
+              callerTurnId: record.callerTurnId ?? null,
+            }
           );
           return "recover";
         }
 
-        record.deterministicDelivered = completedAndMatched;
-        record.recoveryAfterPlayback = !completedAndMatched && record.purpose !== RESPONSE_PURPOSE.RECOVERY;
-        record.reopenAfterPlayback = !completedAndMatched && record.purpose === RESPONSE_PURPOSE.RECOVERY;
+        if (transportComplete && record.transcriptMatches !== true) {
+          console.log("[ROUTINE_SEMANTIC_MISMATCH_DELIVERED]", {
+            responseId: record.responseId,
+            purpose: record.purpose,
+          });
+        }
+        record.deterministicDelivered = transportComplete;
+        record.recoveryAfterPlayback = !transportComplete && record.purpose !== RESPONSE_PURPOSE.RECOVERY;
+        record.reopenAfterPlayback = !transportComplete && record.purpose === RESPONSE_PURPOSE.RECOVERY;
         sendAssistantPlaybackMark(
-          completedAndMatched ? "routine_stream_complete" : "routine_stream_recovery_pending"
+          transportComplete ? "routine_stream_complete" : "routine_stream_recovery_pending"
         );
-        return completedAndMatched ? "delivered" : "recover_after_playback";
+        return transportComplete ? "delivered" : "recover_after_playback";
       }
 
       const completedAndMatched =
@@ -6645,6 +6904,7 @@ RULES:
           bufferedCallerTranscript = null;
           bufferedCallerTranscriptAt = null;
           bufferedCallerTranscriptPriority = "";
+          bufferedCallerTurnId = null;
         }
         if (record.transportAvailable === false) {
           await requestCallEnd("deterministic_transport_unavailable");
@@ -6774,6 +7034,7 @@ RULES:
       bufferedCallerTranscript = null;
       bufferedCallerTranscriptAt = null;
       bufferedCallerTranscriptPriority = "";
+      bufferedCallerTurnId = null;
       await applyConfirmationLifecycle(record);
       return true;
     };
@@ -6949,6 +7210,7 @@ RULES:
             pruneResponseLifecycleHistory();
             responseLifecycleById.set(responseInFlightId, {
               responseId: responseInFlightId,
+              callerTurnId: metadata.callerTurnId ?? null,
               creationAttemptSequence: metadata.sequence,
               creationEventId: metadata.eventId,
               responseCreatedAtMs: Date.now(),
@@ -6993,20 +7255,27 @@ RULES:
               armDeterministicCompletionTimeout(responseLifecycleById.get(responseInFlightId));
             }
           }
-          if (metadata.supersededByBookingTurn === true) {
+          if (
+            metadata.supersededByBookingTurn === true ||
+            metadata.supersededByNewerCallerTurn === true
+          ) {
             const supersededRecord = responseLifecycleById.get(responseInFlightId);
             if (supersededRecord) {
               supersededRecord.audioInvalidated = true;
-              supersededRecord.statusReason = "superseded_by_booking_turn";
+              supersededRecord.statusReason = metadata.supersededByNewerCallerTurn === true
+                ? "superseded_by_newer_caller_turn"
+                : "superseded_by_booking_turn";
               supersededRecord.lifecycleActionHandled = true;
               supersededRecord.bufferedAudioDeltas = [];
               safeCancelResponse("english_pre_intent_clarification_superseded_before_created");
               resetDeterministicGenerationState(supersededRecord);
               readyForCallerInput = true;
               retireResponseId(supersededRecord.responseId);
-              await flushQueuedAssistantResponse(
-                "english_pre_intent_clarification_superseded"
-              );
+              const supersedeReason = metadata.supersededByNewerCallerTurn === true
+                ? "older_caller_turn_response_superseded"
+                : "english_pre_intent_clarification_superseded";
+              const processedBuffered = await processBufferedCallerTranscript(supersedeReason);
+              if (!processedBuffered) await flushQueuedAssistantResponse(supersedeReason);
             }
             return;
           }
@@ -7167,14 +7436,21 @@ RULES:
             transcript: evt.transcript,
           });
           const transcriptText = (evt.transcript || "").trim();
+          const transcriptCallerTurnId = resolveCallerTurnFromInputItemId(evt.item_id);
+          if (transcriptCallerTurnId === null) {
+            console.log("[USER_TRANSCRIPT_IGNORED_UNCORRELATED_ITEM]", { item_id: evt.item_id ?? null });
+            return;
+          }
           if (pendingBargeInWhilePlayback && transcriptText) {
             await clearTwilioPlaybackForBargeIn("barge_in_transcript_confirmed", {
               transcriptPreview: transcriptText.slice(0, 80),
             });
           }
-          currentCallerTranscriptId = evt.item_id || evt.event_id || evt.id || transcriptText;
+          currentCallerTranscriptId = evt.event_id || evt.id || evt.item_id || transcriptText;
           try {
-            await handleCallerTranscript(transcriptText);
+            await handleCallerTranscript(transcriptText, {
+              callerTurnId: transcriptCallerTurnId,
+            });
           } finally {
             currentCallerTranscriptId = null;
           }
@@ -7184,7 +7460,16 @@ RULES:
           evt.type === "input_audio_transcription.failed"
         ) {
           console.log("[USER_TRANSCRIPT_FAILED]", evt);
-          await finishCallerTranscriptHandling("transcript_failed");
+          const failedCallerTurnId = resolveCallerTurnFromInputItemId(evt.item_id);
+          if (failedCallerTurnId === null) {
+            console.log("[USER_TRANSCRIPT_FAILURE_IGNORED_UNCORRELATED]", {
+              itemId: evt.item_id || null,
+            });
+            return;
+          }
+          await callerTurnOwnershipContext.run(failedCallerTurnId, () =>
+            finishCallerTranscriptHandling("transcript_failed")
+          );
         }
         if (evt.type === "conversation.item.created") {
           console.log("[CONVERSATION_ITEM_CREATED]", evt);
@@ -7858,7 +8143,11 @@ RULES:
             currentLanguage === "es"
               ? "No pude completar mi respuesta. ¿Podrías repetirlo?"
               : "I couldn't complete my response. Could you repeat that?",
-            { reason: "routine_stream_recovery", purpose: RESPONSE_PURPOSE.RECOVERY }
+            {
+              reason: "routine_stream_recovery",
+              purpose: RESPONSE_PURPOSE.RECOVERY,
+              callerTurnId: lifecycleRecord.callerTurnId ?? null,
+            }
           );
           return;
         }
@@ -8182,6 +8471,9 @@ RULES:
           lastCallerSpeechStopRejectionReason,
           pendingAssistantMarkName,
           pendingAssistantResponse: structuredClone(pendingAssistantResponse),
+          bufferedCallerTranscript,
+          bufferedCallerTurnId,
+          callerTurnIdByInputItemId: Array.from(callerTurnIdByInputItemId.entries()),
           readyForCallerInput,
           currentLanguage,
           barberPreferredLang,

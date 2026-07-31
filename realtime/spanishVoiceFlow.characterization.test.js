@@ -202,6 +202,63 @@ const latestSpeech = (ai) => {
   return extractIntendedSpeech(create?.response?.instructions);
 };
 
+const traceAlternativeFallbackTurn = async ({
+  transcript,
+  language = "es",
+  awaitingAlternativeSelection,
+  alternativesPresent,
+  parsedDate = "2026-07-30",
+  parsedTime = "12:00 PM",
+}) => {
+  const alternatives = [
+    { date: "2026-07-31", time: "9:00 AM" },
+    { date: "2026-07-31", time: "10:30 AM" },
+  ];
+  const availability = [];
+  let appointments = 0;
+  const session = createSession({
+    language,
+    isSlotAvailable: async (request) => { availability.push(request); return true; },
+    bookAppointment: async () => { appointments += 1; return { _id: "unexpected" }; },
+  });
+  session.controls.seedBookingState({
+    state: baseState({
+      name: "Cliente",
+      parsedDate,
+      parsedTime,
+      awaitingAlternativeSelection,
+      alternatives: alternativesPresent ? alternatives : [],
+    }),
+    availability: {
+      slotChecked: true,
+      slotAvailable: awaitingAlternativeSelection ? false : true,
+      slotAlternatives: alternativesPresent ? alternatives : [],
+    },
+    context: {
+      currentLanguage: language,
+      barberDoc: {
+        _id: "barber-1",
+        services: [{ name: "Haircut", durationMinutes: 30 }],
+        availability: { timezone: "America/New_York", defaultServiceDurationMinutes: 30 },
+      },
+    },
+  });
+  const before = structuredClone(session.controls.getState().bookingState);
+  await session.controls.handleCallerTranscript(transcript);
+  const after = structuredClone(session.controls.getState().bookingState);
+  const responses = session.ai.sent.filter((message) => message.type === "response.create");
+  return {
+    alternatives,
+    before,
+    after,
+    availability,
+    appointments,
+    responseCount: responses.length,
+    speech: latestSpeech(session.ai),
+    instructions: String(responses.at(-1)?.response?.instructions || ""),
+  };
+};
+
 const emitOpenAi = async (ai, event) => {
   ai.emit("message", Buffer.from(JSON.stringify(event)));
   await settle();
@@ -611,6 +668,11 @@ test("offered Spanish spoken times select canonical alternatives before general 
     { date: "2026-08-01", time: "10:30 AM" },
     { date: "2026-08-01", time: "11:00 AM" },
   ];
+  const afternoonAlternatives = [{ date: "2026-07-30", time: "2:30 PM" }];
+  const morningAlternatives = [
+    { date: "2026-07-31", time: "9:00 AM" },
+    { date: "2026-07-31", time: "10:30 AM" },
+  ];
   const cases = [
     { transcript: "uno y treinta", alternatives: thursdayAlternatives, date: "2026-07-30", time: "1:30 PM" },
     { transcript: "Una y treinta de la tarde", alternatives: thursdayAlternatives, date: "2026-07-30", time: "1:30 PM" },
@@ -619,12 +681,33 @@ test("offered Spanish spoken times select canonical alternatives before general 
     { transcript: "diez y treinta", alternatives: saturdayAlternatives, date: "2026-08-01", time: "10:30 AM" },
     { transcript: "diez y treinta de la mañana", alternatives: saturdayAlternatives, date: "2026-08-01", time: "10:30 AM" },
     { transcript: "diez y media de la mañana", alternatives: saturdayAlternatives, date: "2026-08-01", time: "10:30 AM" },
+    { transcript: "dos y media de la tarde", alternatives: afternoonAlternatives, date: "2026-07-30", time: "2:30 PM" },
+    { transcript: "a las nueve de la mañana", alternatives: morningAlternatives, date: "2026-07-31", time: "9:00 AM" },
+    { transcript: "nueve de la mañana", alternatives: morningAlternatives, date: "2026-07-31", time: "9:00 AM" },
+    { transcript: "a las diez y media de la mañana", alternatives: morningAlternatives, date: "2026-07-31", time: "10:30 AM" },
+    { transcript: "diez y media de la mañana", alternatives: morningAlternatives, date: "2026-07-31", time: "10:30 AM" },
+    { transcript: "la primera", alternatives: morningAlternatives, date: "2026-07-31", time: "9:00 AM" },
+    { transcript: "primera", alternatives: morningAlternatives, date: "2026-07-31", time: "9:00 AM" },
+    { transcript: "la segunda", alternatives: morningAlternatives, date: "2026-07-31", time: "10:30 AM" },
+    { transcript: "segunda", alternatives: morningAlternatives, date: "2026-07-31", time: "10:30 AM" },
+    { transcript: "la primera opción", alternatives: morningAlternatives, date: "2026-07-31", time: "9:00 AM" },
+    { transcript: "la primera opción", alternatives: morningAlternatives, date: "2026-07-31", time: "9:00 AM" },
+    { transcript: "primera opción", alternatives: morningAlternatives, date: "2026-07-31", time: "9:00 AM" },
+    { transcript: "la segunda opción", alternatives: morningAlternatives, date: "2026-07-31", time: "10:30 AM" },
+    { transcript: "segunda opción", alternatives: morningAlternatives, date: "2026-07-31", time: "10:30 AM" },
+    { transcript: "la primera de la mañana", alternatives: morningAlternatives, date: "2026-07-31", time: "9:00 AM" },
+    { transcript: "la segunda de la mañana", alternatives: morningAlternatives, date: "2026-07-31", time: "10:30 AM" },
+    { transcript: "a las nueve de la tarde", alternatives: [{ date: "2026-07-31", time: "9:00 PM" }], date: "2026-07-31", time: "9:00 PM" },
+    { transcript: "a las diez y media de la tarde", alternatives: [{ date: "2026-07-31", time: "10:30 PM" }], date: "2026-07-31", time: "10:30 PM" },
+    { transcript: "9:00 AM", alternatives: morningAlternatives, date: "2026-07-31", time: "9:00 AM" },
+    { transcript: "10:30 AM", alternatives: morningAlternatives, date: "2026-07-31", time: "10:30 AM" },
+    { transcript: "2:00 PM", alternatives: [{ date: "2026-07-31", time: "2:00 PM" }], date: "2026-07-31", time: "2:00 PM" },
   ];
 
   for (const [index, scenario] of cases.entries()) {
-    let availabilityChecks = 0;
+    const availabilityChecks = [];
     const session = createSession({
-      isSlotAvailable: async () => { availabilityChecks += 1; return true; },
+      isSlotAvailable: async (request) => { availabilityChecks.push(request); return true; },
     });
     session.controls.seedBookingState({
       state: baseState({
@@ -652,12 +735,180 @@ test("offered Spanish spoken times select canonical alternatives before general 
 
     await session.controls.handleCallerTranscript(scenario.transcript);
     const state = session.controls.getState().bookingState;
-    assert.equal(state.parsedDate, scenario.date);
-    assert.equal(state.parsedTime, scenario.time);
+    assert.equal(state.parsedDate, scenario.date, `${scenario.transcript}: ${JSON.stringify(state)}`);
+    assert.equal(state.parsedTime, scenario.time, scenario.transcript);
     assert.equal(state.awaitingAlternativeSelection, false);
     assert.equal(state.awaitingName, true);
-    assert.equal(availabilityChecks, 1);
+    assert.equal(availabilityChecks.length, 1);
+    assert.equal(availabilityChecks[0].date, scenario.date, scenario.transcript);
+    assert.equal(availabilityChecks[0].time, scenario.time, scenario.transcript);
     assert.match(latestSpeech(session.ai), /nombre/i, `case ${index + 1} should request the caller's name`);
+  }
+});
+
+test("Spanish ordinal alternative selection rejects unrelated phrases and remains scoped to pending alternatives", async () => {
+  const alternatives = [
+    { date: "2026-07-31", time: "9:00 AM" },
+    { date: "2026-07-31", time: "10:30 AM" },
+  ];
+  for (const transcript of ["es la primera vez", "primera cita", "la opción", "otra opción", "no quiero la primera", "ninguna opción"]) {
+    let availabilityChecks = 0;
+    let appointments = 0;
+    const session = createSession({
+      isSlotAvailable: async () => { availabilityChecks += 1; return true; },
+      bookAppointment: async () => { appointments += 1; return { _id: "unexpected" }; },
+    });
+    session.controls.seedBookingState({
+      state: baseState({ name: "Cliente", parsedDate: "2026-07-30", parsedTime: "12:00 PM", awaitingAlternativeSelection: true, alternatives }),
+      availability: { slotChecked: true, slotAvailable: false, slotAlternatives: alternatives },
+      context: { currentLanguage: "es", barberDoc: { _id: "barber-1", services: [{ name: "Haircut", durationMinutes: 30 }], availability: { timezone: "America/New_York" } } },
+    });
+    await session.controls.handleCallerTranscript(transcript);
+    const state = session.controls.getState().bookingState;
+    assert.equal(state.parsedDate, "2026-07-30", transcript);
+    assert.equal(state.parsedTime, "12:00 PM", transcript);
+    assert.notEqual(`${state.parsedDate}|${state.parsedTime}`, "2026-07-31|9:00 AM", transcript);
+    assert.notEqual(`${state.parsedDate}|${state.parsedTime}`, "2026-07-31|10:30 AM", transcript);
+    assert.equal(appointments, 0, transcript);
+  }
+
+  let availabilityChecks = 0;
+  const outsideState = createSession({ isSlotAvailable: async () => { availabilityChecks += 1; return true; } });
+  outsideState.controls.seedBookingState({
+    state: baseState({ name: "Cliente", parsedDate: "2026-07-30", parsedTime: "12:00 PM", awaitingAlternativeSelection: false, alternatives }),
+    availability: { slotChecked: true, slotAvailable: true, slotAlternatives: [] },
+    context: { currentLanguage: "es", barberDoc: { _id: "barber-1", services: [{ name: "Haircut", durationMinutes: 30 }], availability: { timezone: "America/New_York" } } },
+  });
+  await outsideState.controls.handleCallerTranscript("la primera opción");
+  const outside = outsideState.controls.getState().bookingState;
+  assert.equal(outside.parsedDate, "2026-07-30");
+  assert.equal(outside.parsedTime, "12:00 PM");
+});
+
+test("generic availability fallback isolation uses fresh handler turns for every ordinal-like control", async (t) => {
+  const pendingControls = [
+    "es la primera vez",
+    "primera cita",
+    "la opción",
+    "otra opción",
+    "no quiero la primera",
+    "ninguna opción",
+  ];
+  for (const transcript of pendingControls) {
+    await t.test(`pending alternative: ${transcript}`, async () => {
+      const trace = await traceAlternativeFallbackTurn({ transcript, awaitingAlternativeSelection: true, alternativesPresent: true });
+      assert.equal(trace.before.parsedDate, "2026-07-30");
+      assert.equal(trace.before.parsedTime, "12:00 PM");
+      assert.equal(trace.after.parsedDate, "2026-07-30", transcript);
+      assert.equal(trace.after.parsedTime, "12:00 PM", transcript);
+      assert.equal(trace.after.awaitingAlternativeSelection, true, transcript);
+      assert.deepEqual(trace.after.alternatives, trace.alternatives, transcript);
+      assert.equal(trace.availability.length, 0, transcript);
+      assert.equal(trace.after.askedConfirm, false, transcript);
+      assert.equal(trace.after.confirmationPromptRequested, false, transcript);
+      assert.equal(trace.responseCount, 1, transcript);
+      assert.ok(trace.speech || trace.instructions, transcript);
+      assert.equal(trace.appointments, 0, transcript);
+      assert.equal(trace.after.bookingFinalized, false, transcript);
+    });
+  }
+
+  for (const [transcript, alternativesPresent] of [
+    ["la primera opción", true],
+    ["la segunda opción", true],
+    ["primera cita", true],
+    ["la primera opción", false],
+    ["la segunda opción", false],
+    ["primera cita", false],
+  ]) {
+    await t.test(`outside alternative state (${alternativesPresent ? "stale alternatives" : "no alternatives"}): ${transcript}`, async () => {
+      const trace = await traceAlternativeFallbackTurn({ transcript, awaitingAlternativeSelection: false, alternativesPresent });
+      assert.equal(trace.after.parsedDate, "2026-07-30", transcript);
+      assert.equal(trace.after.parsedTime, "12:00 PM", transcript);
+      assert.equal(trace.appointments, 0, transcript);
+      assert.equal(trace.after.bookingFinalized, false, transcript);
+      assert.equal(trace.after.awaitingAlternativeSelection, false, transcript);
+      assert.equal(trace.availability.length, 0, transcript);
+      assert.equal(trace.after.askedConfirm, false, transcript);
+      assert.equal(trace.after.confirmationPromptRequested, false, transcript);
+      assert.equal(trace.responseCount, 1, transcript);
+      assert.ok(trace.speech || trace.instructions, transcript);
+    });
+  }
+});
+
+test("Spanish and English neutral controls cannot authorize stored-slot availability", async (t) => {
+  const controls = [
+    ["es", "hola"],
+    ["es", "tengo una pregunta"],
+    ["es", "puede repetir"],
+    ["en", "just a question"],
+    ["en", "not right now"],
+    ["en", "I don't want the first one"],
+  ];
+  for (const [language, transcript] of controls) {
+    for (const awaitingAlternativeSelection of [false, true]) {
+      await t.test(`${language} / ${awaitingAlternativeSelection ? "pending" : "outside"}: ${transcript}`, async () => {
+        const trace = await traceAlternativeFallbackTurn({
+          transcript,
+          language,
+          awaitingAlternativeSelection,
+          alternativesPresent: awaitingAlternativeSelection,
+        });
+        assert.equal(trace.availability.length, 0, transcript);
+        assert.equal(trace.after.parsedDate, "2026-07-30", transcript);
+        assert.equal(trace.after.parsedTime, "12:00 PM", transcript);
+        assert.equal(trace.after.askedConfirm, false, transcript);
+        assert.equal(trace.after.confirmationPromptRequested, false, transcript);
+        assert.equal(trace.responseCount, 1, transcript);
+        assert.ok(trace.speech || trace.instructions, transcript);
+        assert.equal(trace.after.bookingFinalized, false, transcript);
+        if (awaitingAlternativeSelection) {
+          assert.equal(trace.after.awaitingAlternativeSelection, true, transcript);
+          assert.deepEqual(trace.after.alternatives, trace.alternatives, transcript);
+        }
+      });
+    }
+  }
+});
+
+test("stored-slot variants cannot authorize availability or suppress caller-visible responses", async (t) => {
+  const storedSlots = [
+    ["both populated", "2026-07-30", "12:00 PM", 0],
+    ["date only", "2026-07-30", "", 0],
+    ["time only", "", "12:00 PM", 0],
+    ["both empty", "", "", 0],
+  ];
+  const cases = [
+    ["pending primera cita", "primera cita", true, true],
+    ["outside la primera opción", "la primera opción", false, true],
+    ["neutral hola", "hola", false, false],
+    ["neutral tengo una pregunta", "tengo una pregunta", false, false],
+    ["neutral puede repetir", "puede repetir", false, false],
+  ];
+  for (const [label, transcript, awaitingAlternativeSelection, alternativesPresent] of cases) {
+    for (const [slotLabel, parsedDate, parsedTime, expectedAvailabilityCalls] of storedSlots) {
+      await t.test(`${label} / ${slotLabel}`, async () => {
+        const trace = await traceAlternativeFallbackTurn({
+          transcript,
+          awaitingAlternativeSelection,
+          alternativesPresent,
+          parsedDate,
+          parsedTime,
+        });
+        assert.equal(trace.availability.length, expectedAvailabilityCalls, `${label} / ${slotLabel}`);
+        if (expectedAvailabilityCalls === 1) {
+          assert.equal(trace.availability[0].date, "2026-07-30");
+          assert.equal(trace.availability[0].time, "12:00 PM");
+        }
+        assert.equal(trace.after.parsedDate, parsedDate, `${label} / ${slotLabel}`);
+        assert.equal(trace.after.parsedTime, parsedTime, `${label} / ${slotLabel}`);
+        assert.equal(trace.appointments, 0, `${label} / ${slotLabel}`);
+        assert.equal(trace.after.bookingFinalized, false, `${label} / ${slotLabel}`);
+        assert.equal(trace.responseCount, 1, `${label} / ${slotLabel}`);
+        assert.ok(trace.speech || trace.instructions, `${label} / ${slotLabel}`);
+      });
+    }
   }
 });
 
@@ -1069,6 +1320,264 @@ test("English alternative selection remains unchanged", async () => {
   assert.equal(state.awaitingName, true);
   assert.equal(availabilityChecks, 1);
   assert.match(latestSpeech(session.ai), /name/i);
+});
+
+test("date-conflict correction replaces the stale conflicting source and retains the stated time", async () => {
+  let availabilityChecks = 0;
+  const session = createSession({
+    language: "en",
+    parseNaturalDateTime: (text) => parseNaturalDateTime(text, {
+      referenceDate: new Date("2026-07-23T12:00:00-04:00"),
+      bookingHorizonDays: 62,
+    }),
+    isSlotAvailable: async () => { availabilityChecks += 1; return true; },
+  });
+  session.controls.seedBookingState({
+    state: baseState({ name: "", requestedDateText: "", requestedTimeText: "", dateTimeText: "", parsedDate: "", parsedTime: "" }),
+    availability: { slotChecked: false, slotAvailable: false, slotAlternatives: [] },
+    context: {
+      currentLanguage: "en",
+      barberId: "barber-1",
+      barberDoc: {
+        _id: "barber-1",
+        services: [{ name: "Haircut", durationMinutes: 30 }],
+        availability: { timezone: "America/New_York", defaultServiceDurationMinutes: 30 },
+      },
+    },
+  });
+  await session.controls.handleCallerTranscript("Thursday 31 at 11 AM.");
+  assert.equal(availabilityChecks, 0);
+  await deliverLatestExactResponse(session, "resp-date-conflict-clarification");
+
+  await session.controls.handleCallerTranscript("July 30.");
+  const state = session.controls.getState().bookingState;
+  assert.notEqual(state.awaitingDateConflictCorrection, true, JSON.stringify(state));
+  assert.equal(state.parsedDate, "2026-07-30");
+  assert.equal(state.parsedTime, "11:00 AM");
+  assert.equal(state.name, "");
+  assert.equal(state.service, "Haircut");
+  assert.equal(availabilityChecks, 1);
+});
+
+test("bare mañana remains date-only until an explicit Spanish time completes the slot", async () => {
+  const availabilityChecks = [];
+  const referenceDate = new Date("2026-07-30T12:00:00-04:00");
+  const session = createSession({
+    language: "es",
+    isSlotAvailable: async (request) => { availabilityChecks.push(request); return true; },
+    parseNaturalDateTime: (text, options = {}) => parseNaturalDateTime(text, {
+      ...options,
+      referenceDate,
+      timeZone: "America/New_York",
+    }),
+  });
+  session.controls.seedBookingState({
+    state: baseState({ name: "", parsedDate: "", parsedTime: "", requestedDateText: "", requestedTimeText: "", dateTimeText: "" }),
+    availability: { slotChecked: false, slotAvailable: false, slotAlternatives: [] },
+    context: {
+      currentLanguage: "es",
+      barberId: "barber-1",
+      barberDoc: {
+        _id: "barber-1",
+        services: [{ name: "Haircut", durationMinutes: 30 }],
+        availability: { timezone: "America/New_York", defaultServiceDurationMinutes: 30 },
+      },
+    },
+  });
+  await session.controls.requestAssistantResponse({ immediate: true, reason: "spanish_date_collection" });
+  await deliverLatestExactResponse(session, "resp-spanish-date-collection");
+  await session.controls.handleCallerTranscript("mañana");
+  const afterDate = session.controls.getState().bookingState;
+  assert.equal(afterDate.requestedDateText, "mañana");
+  assert.equal(afterDate.requestedTimeText, "");
+  assert.equal(afterDate.parsedDate, "2026-07-31", JSON.stringify(afterDate));
+  assert.equal(afterDate.parsedTime, "");
+  assert.equal(availabilityChecks.length, 0);
+  assert.match(latestSpeech(session.ai), /a qu. hora/i);
+  await deliverLatestExactResponse(session, "resp-spanish-time-collection");
+
+  await session.controls.handleCallerTranscript("dos y media de la tarde");
+  const afterTime = session.controls.getState().bookingState;
+  assert.equal(afterTime.parsedDate, "2026-07-31");
+  assert.equal(afterTime.parsedTime, "2:30 PM");
+  assert.equal(afterTime.awaitingName, true);
+  assert.equal(availabilityChecks.length, 1);
+  assert.equal(availabilityChecks[0].date, "2026-07-31");
+  assert.equal(availabilityChecks[0].time, "2:30 PM");
+});
+
+test("Spanish half-hour time preserves a delivered date-only booking state", async () => {
+  const availabilityChecks = [];
+  const referenceDate = new Date("2026-07-30T12:00:00-04:00");
+  const session = createSession({
+    language: "es",
+    isSlotAvailable: async (request) => { availabilityChecks.push(request); return true; },
+    parseNaturalDateTime: (text, options = {}) => parseNaturalDateTime(text, {
+      ...options,
+      referenceDate,
+      timeZone: "America/New_York",
+    }),
+  });
+  session.controls.seedBookingState({
+    state: baseState({
+      name: "Cliente",
+      service: "Haircut",
+      requestedDateText: "mañana",
+      requestedTimeText: "",
+      dateTimeText: "mañana",
+      parsedDate: "2026-07-31",
+      parsedTime: "",
+    }),
+    availability: { slotChecked: false, slotAvailable: false, slotAlternatives: [] },
+    context: {
+      currentLanguage: "es",
+      barberId: "barber-1",
+      barberDoc: {
+        _id: "barber-1",
+        services: [{ name: "Haircut", durationMinutes: 30 }],
+        availability: { timezone: "America/New_York", defaultServiceDurationMinutes: 30 },
+      },
+    },
+  });
+  await session.controls.requestAssistantResponse({ immediate: true, reason: "spanish_missing_time" });
+  await deliverLatestExactResponse(session, "resp-spanish-half-hour-time-prompt");
+  await session.controls.handleCallerTranscript("dos y media de la tarde");
+
+  const state = session.controls.getState().bookingState;
+  assert.equal(state.parsedDate, "2026-07-31");
+  assert.equal(state.parsedTime, "2:30 PM");
+  assert.notEqual(state.parsedTime, "2:00 PM");
+  assert.equal(state.name, "Cliente");
+  assert.equal(state.service, "Haircut");
+  assert.equal(state.awaitingName, false);
+  assert.equal(availabilityChecks.length, 1);
+  assert.equal(availabilityChecks[0].date, "2026-07-31");
+  assert.equal(availabilityChecks[0].time, "2:30 PM");
+});
+
+test("Spanish morning dayparts retain AM before the date-preservation assertion", async () => {
+  for (const [transcript, expectedTime] of [
+    ["a las dos de la mañana", "2:00 AM"],
+  ]) {
+    const checks = [];
+    const session = createSession({
+      language: "es",
+      isSlotAvailable: async (request) => { checks.push(request); return true; },
+      parseNaturalDateTime: (text, options = {}) => parseNaturalDateTime(text, {
+        ...options,
+        referenceDate: new Date("2026-07-30T12:00:00-04:00"),
+        timeZone: "America/New_York",
+      }),
+    });
+    session.controls.seedBookingState({
+      state: baseState({ name: "Cliente", service: "Haircut", parsedDate: "2026-07-31", parsedTime: "" }),
+      availability: { slotChecked: false, slotAvailable: false, slotAlternatives: [] },
+      context: {
+        currentLanguage: "es",
+        barberId: "barber-1",
+        barberDoc: { _id: "barber-1", services: [{ name: "Haircut", durationMinutes: 30 }], availability: { timezone: "America/New_York" } },
+      },
+    });
+    await session.controls.requestAssistantResponse({ immediate: true, reason: "spanish_morning_time_control" });
+    await deliverLatestExactResponse(session, `resp-spanish-morning-${expectedTime.replace(/\W/g, "")}`);
+    await session.controls.handleCallerTranscript(transcript);
+    const state = session.controls.getState().bookingState;
+    assert.equal(state.parsedTime, expectedTime, transcript);
+    assert.equal(state.parsedDate, "2026-07-31", transcript);
+    assert.equal(checks.length, 1, transcript);
+    assert.equal(checks[0].time, expectedTime, transcript);
+  }
+});
+
+test("Spanish half-hour morning daypart retains AM independently", async () => {
+  const checks = [];
+  const session = createSession({
+    language: "es",
+    isSlotAvailable: async (request) => { checks.push(request); return true; },
+    parseNaturalDateTime: (text, options = {}) => parseNaturalDateTime(text, {
+      ...options,
+      referenceDate: new Date("2026-07-30T12:00:00-04:00"),
+      timeZone: "America/New_York",
+    }),
+  });
+  session.controls.seedBookingState({
+    state: baseState({ name: "Cliente", service: "Haircut", parsedDate: "2026-07-31", parsedTime: "" }),
+    availability: { slotChecked: false, slotAvailable: false, slotAlternatives: [] },
+    context: {
+      currentLanguage: "es",
+      barberId: "barber-1",
+      barberDoc: { _id: "barber-1", services: [{ name: "Haircut", durationMinutes: 30 }], availability: { timezone: "America/New_York" } },
+    },
+  });
+  await session.controls.requestAssistantResponse({ immediate: true, reason: "spanish_half_hour_morning_control" });
+  await deliverLatestExactResponse(session, "resp-spanish-half-hour-morning");
+  await session.controls.handleCallerTranscript("a las dos y media de la mañana");
+  const state = session.controls.getState().bookingState;
+  assert.equal(state.parsedTime, "2:30 AM");
+  assert.equal(state.parsedDate, "2026-07-31");
+  assert.equal(checks.length, 1);
+  assert.equal(checks[0].time, "2:30 AM");
+});
+
+test("Spanish explicit-time controls preserve minute and daypart values", async () => {
+  for (const [transcript, expectedTime] of [
+    ["dos de la tarde", "2:00 PM"],
+    ["dos y media de la tarde", "2:30 PM"],
+    ["a las dos y media de la tarde", "2:30 PM"],
+    ["2:30 PM", "2:30 PM"],
+    ["a las dos y media de la mañana", "2:30 AM"],
+  ]) {
+    const checks = [];
+    const session = createSession({
+      language: "es",
+      isSlotAvailable: async (request) => { checks.push(request); return true; },
+      parseNaturalDateTime: (text, options = {}) => parseNaturalDateTime(text, {
+        ...options,
+        referenceDate: new Date("2026-07-30T12:00:00-04:00"),
+        timeZone: "America/New_York",
+      }),
+    });
+    session.controls.seedBookingState({
+      state: baseState({ name: "Cliente", service: "Haircut", parsedDate: "2026-07-31", parsedTime: "" }),
+      availability: { slotChecked: false, slotAvailable: false, slotAlternatives: [] },
+      context: {
+        currentLanguage: "es",
+        barberId: "barber-1",
+        barberDoc: {
+          _id: "barber-1",
+          services: [{ name: "Haircut", durationMinutes: 30 }],
+          availability: { timezone: "America/New_York", defaultServiceDurationMinutes: 30 },
+        },
+      },
+    });
+    await session.controls.requestAssistantResponse({ immediate: true, reason: "spanish_time_control" });
+    await deliverLatestExactResponse(session, `resp-spanish-time-control-${expectedTime.replace(/\W/g, "")}`);
+    await session.controls.handleCallerTranscript(transcript);
+    const state = session.controls.getState().bookingState;
+    assert.equal(state.parsedDate, "2026-07-31", transcript);
+    assert.equal(state.parsedTime, expectedTime, transcript);
+    assert.equal(checks.length, 1, transcript);
+    assert.equal(checks[0].time, expectedTime, transcript);
+  }
+});
+
+test("natural English and Spanish ordinal choices select one offered alternative", async () => {
+  for (const [language, transcript] of [["en", "The first option works for me."], ["es", "Me quedo con la segunda."]]) {
+    const alternatives = [
+      { date: "2026-07-30", time: "1:00 PM" },
+      { date: "2026-07-30", time: "2:00 PM" },
+    ];
+    const session = createSession({ language, isSlotAvailable: async () => true });
+    session.controls.seedBookingState({
+      state: baseState({ name: "", parsedDate: "2026-07-30", parsedTime: "12:00 PM", awaitingAlternativeSelection: true, alternatives }),
+      availability: { slotChecked: true, slotAvailable: false, slotAlternatives: alternatives },
+      context: { currentLanguage: language, barberDoc: { _id: "barber-1", services: [{ name: "Haircut", durationMinutes: 30 }], availability: { timezone: "America/New_York" } } },
+    });
+    await session.controls.handleCallerTranscript(transcript);
+    const state = session.controls.getState().bookingState;
+    assert.equal(state.awaitingAlternativeSelection, false);
+    assert.equal(state.parsedTime, language === "en" ? "1:00 PM" : "2:00 PM");
+  }
 });
 
 test("Spanish-primary unavailable alternative sequence advances through booking and hangs up once", { timeout: 5000 }, async () => {
@@ -2709,7 +3218,7 @@ test("Spanish exact-output matching ignores accents and punctuation but rejects 
   );
 });
 
-test("Spanish routine semantic mismatch keeps streamed audio and uses one explicit recovery", async () => {
+test("Spanish routine semantic mismatch keeps delivered streamed audio without recovery", async () => {
   const { ai, twilio, controls } = createSession();
   controls.seedBookingState({
     state: baseState({ name: "" }),
@@ -2731,11 +3240,8 @@ test("Spanish routine semantic mismatch keeps streamed audio and uses one explic
   assert.ok(mark);
   assert.equal(ai.sent.filter((message) => message.type === "response.create").length, 1);
   await emitTwilio(twilio, { event: "mark", mark: { name: mark } });
-  assert.equal(ai.sent.filter((message) => message.type === "response.create").length, 2);
-  assert.match(
-    extractIntendedSpeech(ai.sent.filter((message) => message.type === "response.create").at(-1).response.instructions),
-    /repetirlo/i
-  );
+  assert.equal(ai.sent.filter((message) => message.type === "response.create").length, 1);
+  assert.equal(controls.getState().pendingAssistantResponse, null);
 });
 
 test("harmless polite wording difference keeps streamed routine audio without regeneration", async () => {

@@ -110,6 +110,36 @@ const createProductionSession = ({
   return { ai, twilio, controls };
 };
 
+const createOwnershipSideEffectProbe = () => {
+  let appointments = 0;
+  let smsSubmissions = 0;
+  let bookedOutcomeWrites = 0;
+  class OwnershipTranscript {
+    static async findOneAndUpdate(_query, update) {
+      if (update?.$set?.outcome === "BOOKED") bookedOutcomeWrites += 1;
+      return null;
+    }
+  }
+  const bookAppointment = (request) => productionBookAppointment(request, {
+    BarberModel: {
+      findById: async () => ({ availability: { timezone: "America/New_York" } }),
+    },
+    AppointmentModel: {
+      create: async (appointment) => {
+        appointments += 1;
+        return { ...appointment, _id: `ownership-appointment-${appointments}` };
+      },
+    },
+    isSlotAvailable: async () => true,
+    sendAppointmentConfirmationSms: async () => { smsSubmissions += 1; },
+  });
+  return {
+    bookAppointment,
+    CallTranscriptModel: OwnershipTranscript,
+    counts: () => ({ appointments, smsSubmissions, bookedOutcomeWrites }),
+  };
+};
+
 const emitOpenAi = async (ai, event) => {
   ai.emit("message", Buffer.from(JSON.stringify(event)));
   await settle();
@@ -118,6 +148,38 @@ const emitOpenAi = async (ai, event) => {
 const emitTwilio = async (twilio, event) => {
   twilio.emit("message", Buffer.from(JSON.stringify(event)));
   await settle();
+};
+
+// Advances ownership through the same OpenAI VAD events used in production.
+// Callers must first open the current episode with speech_started and may queue
+// work while that caller is speaking.  This deliberately never mutates test
+// state through setResponseState({ callerSpeaking }) or a turn-id shortcut.
+const advanceCallerTurnThroughVad = async ({
+  ai,
+  controls,
+  itemId,
+  stopAtMs,
+  nextItemId,
+  nextStartAtMs,
+  finishStoppedTranscript = true,
+  betweenTurns,
+}) => {
+  const priorTurnId = controls.getState().activeCallerTurnId;
+  await emitOpenAi(ai, {
+    type: "input_audio_buffer.speech_stopped",
+    item_id: itemId,
+    audio_end_ms: stopAtMs,
+  });
+  if (finishStoppedTranscript) await controls.handleCallerTranscript("");
+  if (betweenTurns) await betweenTurns({ priorTurnId });
+  await emitOpenAi(ai, {
+    type: "input_audio_buffer.speech_started",
+    item_id: nextItemId,
+    audio_start_ms: nextStartAtMs,
+  });
+  const nextTurnId = controls.getState().activeCallerTurnId;
+  assert.equal(nextTurnId, priorTurnId + 1, "real VAD events must create a distinct caller turn");
+  return { priorTurnId, nextTurnId };
 };
 
 const emitExpectedOutputTranscript = async (ai, responseId) => {
@@ -767,7 +829,13 @@ test("unknown English idle turns receive one lifecycle-gated clarification witho
 
 test("exact response queued during caller speech drains once and reports retained ownership", async () => {
   const { ai, controls } = createProductionSession();
-  controls.setResponseState({ callerSpeaking: true, greetingComplete: true, readyForCallerInput: true });
+  controls.setResponseState({ greetingComplete: true, readyForCallerInput: true });
+  await emitOpenAi(ai, {
+    type: "input_audio_buffer.speech_started",
+    item_id: "current-turn-exact",
+    audio_start_ms: 0,
+  });
+  const activeTurnId = controls.getState().activeCallerTurnId;
   assert.equal(controls.speakExact("The weekday and date do not match. What date would you like?", {
     reason: "date_conflict_clarification",
     purpose: RESPONSE_PURPOSE.CLARIFICATION,
@@ -778,6 +846,12 @@ test("exact response queued during caller speech drains once and reports retaine
   }), false);
   assert.equal(controls.getState().lastSpeakExactStatus?.queued, false);
   assert.match(controls.getState().pendingAssistantResponse.exactInstructions, /weekday and date do not match/i);
+  assert.equal(controls.getState().pendingAssistantResponse.deferredCallerTurnId, activeTurnId);
+  await emitOpenAi(ai, {
+    type: "input_audio_buffer.speech_stopped",
+    item_id: "current-turn-exact",
+    audio_end_ms: 100,
+  });
   await controls.handleCallerTranscript("");
   await new Promise((resolve) => setTimeout(resolve, 300));
   assert.equal(ai.sent.filter((message) => message.type === "response.create").length, 1);
@@ -807,6 +881,1024 @@ test("a deferred owner from a prior caller turn is superseded even when booking 
   assert.equal(creates.length, 1);
   assert.equal(extractIntendedSpeech(creates[0].response.instructions), "Response B");
   assert.equal(await controls.flushQueuedAssistantResponse("repeated_cross_turn_drain"), false);
+});
+
+test("a stale deferred ordinary response cannot satisfy a genuinely newer caller turn", async () => {
+  const { ai, controls } = createProductionSession();
+  controls.seedBookingState({
+    state: idleUnknownIntentState(),
+    availability: { slotChecked: false, slotAvailable: false, slotAlternatives: [] },
+    context: { currentLanguage: "en" },
+  });
+  await emitOpenAi(ai, {
+    type: "input_audio_buffer.speech_started",
+    item_id: "ordinary-turn-one",
+    audio_start_ms: 0,
+  });
+  const firstTurnId = controls.getState().activeCallerTurnId;
+  assert.equal(controls.speakExact("Older turn response", { reason: "older_turn_response" }), true);
+  assert.equal(controls.getState().pendingAssistantResponse?.deferredCallerTurnId, firstTurnId);
+
+  const { nextTurnId } = await advanceCallerTurnThroughVad({
+    ai,
+    controls,
+    itemId: "ordinary-turn-one",
+    stopAtMs: 100,
+    nextItemId: "ordinary-turn-two",
+    nextStartAtMs: 200,
+  });
+  assert.equal(controls.getState().pendingAssistantResponse?.deferredCallerTurnId, firstTurnId);
+  assert.equal(nextTurnId, firstTurnId + 1);
+
+  await controls.handleCallerTranscript("I'd like to look at her");
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  const creates = ai.sent.filter((message) => message.type === "response.create");
+  assert.equal(creates.length, 1);
+  assert.equal(
+    extractIntendedSpeech(creates[0].response.instructions),
+    "Sorry, I didn't catch that. Would you like to book an appointment?"
+  );
+  assert.equal(controls.getState().pendingAssistantResponse, null);
+  assert.equal(controls.getState().bookingState.intent, "OTHER");
+  assert.equal(controls.getState().bookingState.bookingFinalized, false);
+});
+
+for (const [label, transcript] of [["empty", ""], ["noise", "um"]]) {
+  test(`${label} turn N+1 does not supersede turn N's unresolved response without a replacement`, async () => {
+    let availabilityChecks = 0;
+    const sideEffects = createOwnershipSideEffectProbe();
+    const { ai, twilio, controls } = createProductionSession({
+      bookAppointment: sideEffects.bookAppointment,
+      CallTranscriptModel: sideEffects.CallTranscriptModel,
+      isSlotAvailable: async () => { availabilityChecks += 1; return true; },
+    });
+    controls.seedBookingState({
+      state: idleUnknownIntentState(),
+      availability: { slotChecked: false, slotAvailable: false, slotAlternatives: [] },
+      context: { currentLanguage: "en" },
+    });
+    await emitOpenAi(ai, {
+      type: "input_audio_buffer.speech_started",
+      item_id: `${label}-owner-one`,
+      audio_start_ms: 0,
+    });
+    const turnOne = controls.getState().activeCallerTurnId;
+    await controls.handleCallerTranscript("I'd like to look at her");
+    const { nextTurnId: turnTwo } = await advanceCallerTurnThroughVad({
+      ai,
+      controls,
+      itemId: `${label}-owner-one`,
+      stopAtMs: 100,
+      nextItemId: `${label}-owner-two`,
+      nextStartAtMs: 200,
+      finishStoppedTranscript: false,
+      betweenTurns: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        assert.equal(controls.getState().pendingResponseCreationAttempt?.callerTurnId, turnOne);
+      },
+    });
+    await emitOpenAi(ai, {
+      type: "input_audio_buffer.speech_stopped",
+      item_id: `${label}-owner-two`,
+      audio_end_ms: 300,
+    });
+    await emitOpenAi(ai, {
+      type: "conversation.item.input_audio_transcription.completed",
+      item_id: `${label}-owner-two`,
+      transcript,
+    });
+    assert.equal(turnTwo, turnOne + 1);
+    assert.equal(controls.getState().pendingResponseCreationAttempt?.callerTurnId, turnOne);
+    assert.notEqual(controls.getState().pendingResponseCreationAttempt?.supersededByNewerCallerTurn, true);
+    assert.equal(controls.getState().bufferedCallerTranscript, null);
+    assert.equal(controls.getState().bufferedCallerTurnId, null);
+
+    await emitOpenAi(ai, { type: "response.created", response: { id: `${label}-owner-response` } });
+    await emitOpenAi(ai, {
+      type: "response.output_audio.delta",
+      response_id: `${label}-owner-response`,
+      delta: "AA==",
+    });
+    await completeDeterministicResponse(ai, `${label}-owner-response`);
+    assert.equal(ai.sent.filter((message) => message.type === "response.cancel").length, 0);
+    assert.equal(ai.sent.filter((message) => message.type === "response.create").length, 1);
+    assert.equal(twilio.sent.filter((message) => message.event === "media").length, 1);
+    assert.equal(
+      controls.getState().lifecycleRecords.find(([id]) => id === `${label}-owner-response`)?.[1].callerTurnId,
+      turnOne
+    );
+    assert.equal(availabilityChecks, 0);
+    assert.deepEqual(sideEffects.counts(), { appointments: 0, smsSubmissions: 0, bookedOutcomeWrites: 0 });
+    assert.equal(controls.getState().endingCall, false);
+  });
+}
+
+test("a non-ready duplicate is rejected before buffering or superseding its unresolved response", async () => {
+  let availabilityChecks = 0;
+  const sideEffects = createOwnershipSideEffectProbe();
+  const { ai, twilio, controls } = createProductionSession({
+    bookAppointment: sideEffects.bookAppointment,
+    CallTranscriptModel: sideEffects.CallTranscriptModel,
+    isSlotAvailable: async () => { availabilityChecks += 1; return true; },
+    barberDoc: {
+      _id: "barber-1",
+      services: [{ name: "Haircut", durationMinutes: 30 }],
+      availability: { timezone: "America/New_York", defaultServiceDurationMinutes: 30 },
+    },
+  });
+  controls.seedBookingState({
+    state: idleUnknownIntentState(),
+    availability: { slotChecked: false, slotAvailable: false, slotAlternatives: [] },
+    context: { currentLanguage: "en" },
+  });
+  const transcript = "I'd like to book a haircut Friday at 2 PM";
+  await emitOpenAi(ai, { type: "input_audio_buffer.speech_started", item_id: "duplicate-owner-one", audio_start_ms: 0 });
+  const turnOne = controls.getState().activeCallerTurnId;
+  await emitOpenAi(ai, {
+    type: "conversation.item.input_audio_transcription.completed",
+    item_id: "duplicate-owner-one",
+    event_id: "duplicate-transcription-event",
+    transcript,
+  });
+  const afterOriginal = controls.getState();
+  assert.equal(afterOriginal.pendingResponseCreationAttempt?.callerTurnId, turnOne);
+  assert.equal(afterOriginal.pendingResponseCreationAttempt?.supersededByNewerCallerTurn === true, false);
+  assert.equal(availabilityChecks, 1);
+
+  await emitOpenAi(ai, { type: "input_audio_buffer.speech_stopped", item_id: "duplicate-owner-one", audio_end_ms: 100 });
+  await emitOpenAi(ai, { type: "input_audio_buffer.speech_started", item_id: "duplicate-owner-two", audio_start_ms: 200 });
+  const turnTwo = controls.getState().activeCallerTurnId;
+  assert.equal(turnTwo, turnOne + 1);
+  await emitOpenAi(ai, {
+    type: "conversation.item.input_audio_transcription.completed",
+    item_id: "duplicate-owner-two",
+    event_id: "duplicate-transcription-event",
+    transcript,
+  });
+
+  const afterDuplicate = controls.getState();
+  assert.equal(afterDuplicate.bufferedCallerTranscript, null);
+  assert.equal(afterDuplicate.bufferedCallerTurnId, null);
+  assert.equal(afterDuplicate.pendingResponseCreationAttempt?.callerTurnId, turnOne);
+  assert.equal(afterDuplicate.pendingResponseCreationAttempt?.supersededByNewerCallerTurn === true, false);
+  assert.equal(availabilityChecks, 1);
+  assert.deepEqual(sideEffects.counts(), { appointments: 0, smsSubmissions: 0, bookedOutcomeWrites: 0 });
+
+  await emitOpenAi(ai, { type: "response.created", response: { id: "duplicate-owner-response" } });
+  await emitOpenAi(ai, { type: "response.output_audio.delta", response_id: "duplicate-owner-response", delta: "AA==" });
+  await completeDeterministicResponse(ai, "duplicate-owner-response");
+  const markName = controls.getState().pendingAssistantMarkName;
+  await emitTwilio(twilio, { event: "mark", mark: { name: markName } });
+  const finalState = controls.getState();
+  const lifecycle = finalState.lifecycleRecords.find(([id]) => id === "duplicate-owner-response")?.[1];
+  assert.equal(lifecycle.callerTurnId, turnOne);
+  assert.equal(lifecycle.openAiStatus, "completed");
+  assert.equal(ai.sent.filter((message) => message.type === "response.create").length, 1);
+  assert.equal(
+    twilio.sent.filter((message) => message.event === "media" && message.media?.payload === "AA==").length,
+    1
+  );
+  assert.equal(finalState.bookingState.parsedTime, "2:00 PM");
+  assert.equal(finalState.bookingState.bookingFinalized, false);
+  assert.equal(finalState.endingCall, false);
+});
+
+test("unrelated unclear confirmation speech cannot buffer or supersede an unresolved confirmation", async () => {
+  let availabilityChecks = 0;
+  const sideEffects = createOwnershipSideEffectProbe();
+  const { ai, controls } = createProductionSession({
+    bookAppointment: sideEffects.bookAppointment,
+    CallTranscriptModel: sideEffects.CallTranscriptModel,
+    isSlotAvailable: async () => { availabilityChecks += 1; return true; },
+  });
+  controls.seedBookingState({
+    state: {
+      ...baseBookingState(),
+      name: "",
+      askedConfirm: false,
+      confirmationPromptRequested: false,
+      awaitingName: true,
+    },
+    availability: { slotChecked: true, slotAvailable: true, slotAlternatives: [] },
+    context: { currentLanguage: "en" },
+  });
+  await emitOpenAi(ai, { type: "input_audio_buffer.speech_started", item_id: "unclear-confirmation-owner", audio_start_ms: 0 });
+  const turnOne = controls.getState().activeCallerTurnId;
+  await emitOpenAi(ai, {
+    type: "conversation.item.input_audio_transcription.completed",
+    item_id: "unclear-confirmation-owner",
+    transcript: "Customer",
+  });
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  const unresolved = controls.getState();
+  assert.equal(unresolved.pendingResponseCreationAttempt?.callerTurnId, turnOne);
+  assert.equal(unresolved.bookingState.confirmationPromptRequested, true);
+
+  await emitOpenAi(ai, { type: "input_audio_buffer.speech_stopped", item_id: "unclear-confirmation-owner", audio_end_ms: 100 });
+  await emitOpenAi(ai, { type: "input_audio_buffer.speech_started", item_id: "unclear-confirmation-new-turn", audio_start_ms: 200 });
+  const turnTwo = controls.getState().activeCallerTurnId;
+  await emitOpenAi(ai, {
+    type: "conversation.item.input_audio_transcription.completed",
+    item_id: "unclear-confirmation-new-turn",
+    transcript: "I like blue skies.",
+  });
+  const state = controls.getState();
+  assert.equal(turnTwo, turnOne + 1);
+  assert.equal(state.bufferedCallerTranscript, null);
+  assert.equal(state.bufferedCallerTurnId, null);
+  assert.equal(state.pendingResponseCreationAttempt?.callerTurnId, turnOne);
+  assert.equal(state.pendingResponseCreationAttempt?.supersededByNewerCallerTurn === true, false);
+  assert.equal(ai.sent.filter((message) => message.type === "response.create").length, 1);
+  assert.equal(availabilityChecks, 0);
+  assert.deepEqual(sideEffects.counts(), { appointments: 0, smsSubmissions: 0, bookedOutcomeWrites: 0 });
+  assert.equal(state.bookingState.parsedDate, "2026-07-22");
+  assert.equal(state.bookingState.parsedTime, "10:00 AM");
+  assert.equal(state.endingCall, false);
+});
+
+test("an uncorrelated transcription failure cannot flush a non-deferred final confirmation", async () => {
+  const sideEffects = createOwnershipSideEffectProbe();
+  const { ai, controls } = createProductionSession({
+    bookAppointment: sideEffects.bookAppointment,
+    CallTranscriptModel: sideEffects.CallTranscriptModel,
+  });
+  controls.setResponseState({ responseActive: true, aiResponseInProgress: true, responseInFlightId: "prior-busy-response" });
+  assert.equal(controls.speakExact("Your appointment is confirmed.", {
+    reason: "uncorrelated_failure_final",
+    finalConfirmation: true,
+    terminateAfterPlayback: true,
+  }), true);
+  assert.equal(controls.getState().pendingAssistantResponse?.deferredByCallerSpeech, false);
+  controls.setResponseState({ responseActive: false, aiResponseInProgress: false, responseInFlightId: "" });
+  await emitOpenAi(ai, {
+    type: "conversation.item.input_audio_transcription.failed",
+    item_id: "unknown-failure-item",
+    error: { message: "uncorrelated failure" },
+  });
+  const state = controls.getState();
+  assert.equal(state.activeCallerTurnId, 0);
+  assert.equal(state.callerSpeaking, false);
+  assert.equal(state.pendingAssistantResponse?.finalConfirmation, true);
+  assert.equal(state.pendingAssistantResponse?.deferredByCallerSpeech, false);
+  assert.equal(ai.sent.filter((message) => message.type === "response.create").length, 0);
+  assert.deepEqual(sideEffects.counts(), { appointments: 0, smsSubmissions: 0, bookedOutcomeWrites: 0 });
+  assert.equal(state.endingCall, false);
+});
+
+test("a colliding cross-turn item_id makes a delayed failure fail closed", async () => {
+  const sideEffects = createOwnershipSideEffectProbe();
+  const { ai, controls } = createProductionSession({
+    bookAppointment: sideEffects.bookAppointment,
+    CallTranscriptModel: sideEffects.CallTranscriptModel,
+  });
+  await emitOpenAi(ai, { type: "input_audio_buffer.speech_started", item_id: "colliding-item", audio_start_ms: 0 });
+  const turnOne = controls.getState().activeCallerTurnId;
+  await emitOpenAi(ai, { type: "input_audio_buffer.speech_stopped", item_id: "colliding-item", audio_end_ms: 100 });
+  await emitOpenAi(ai, { type: "input_audio_buffer.speech_started", item_id: "colliding-item", audio_start_ms: 200 });
+  const turnTwo = controls.getState().activeCallerTurnId;
+  assert.equal(turnTwo, turnOne + 1);
+  assert.equal(controls.speakExact("Current caller-turn response", { reason: "collision_current_turn" }), true);
+  const beforeFailure = controls.getState();
+  assert.equal(beforeFailure.callerSpeaking, true);
+  assert.equal(beforeFailure.pendingAssistantResponse?.callerTurnId, turnTwo);
+  assert.deepEqual(
+    beforeFailure.callerTurnIdByInputItemId.find(([itemId]) => itemId === "colliding-item"),
+    ["colliding-item", null]
+  );
+
+  await emitOpenAi(ai, {
+    type: "conversation.item.input_audio_transcription.failed",
+    item_id: "colliding-item",
+    error: { message: "delayed turn-one failure" },
+  });
+  const afterFailure = controls.getState();
+  assert.equal(afterFailure.activeCallerTurnId, turnTwo);
+  assert.equal(afterFailure.callerSpeaking, true);
+  assert.equal(afterFailure.pendingAssistantResponse?.callerTurnId, turnTwo);
+  assert.equal(afterFailure.pendingAssistantResponse?.deferredCallerTurnId, turnTwo);
+  assert.equal(ai.sent.filter((message) => message.type === "response.create").length, 0);
+  assert.deepEqual(sideEffects.counts(), { appointments: 0, smsSubmissions: 0, bookedOutcomeWrites: 0 });
+  assert.equal(afterFailure.endingCall, false);
+});
+
+test("an ambiguous completion cannot confirm barge-in or invalidate active playback", async () => {
+  const sideEffects = createOwnershipSideEffectProbe();
+  const { ai, controls } = createProductionSession({
+    bookAppointment: sideEffects.bookAppointment,
+    CallTranscriptModel: sideEffects.CallTranscriptModel,
+  });
+  controls.seedBookingState({ state: idleUnknownIntentState(), availability: { slotChecked: false, slotAvailable: false, slotAlternatives: [] }, context: { currentLanguage: "en" } });
+  await emitOpenAi(ai, { type: "input_audio_buffer.speech_started", item_id: "barge-collision", audio_start_ms: 0 });
+  await emitOpenAi(ai, {
+    type: "conversation.item.input_audio_transcription.completed",
+    item_id: "barge-collision",
+    transcript: "I'd like to look at her",
+  });
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  await emitOpenAi(ai, { type: "response.created", response: { id: "barge-collision-response" } });
+  await emitOpenAi(ai, { type: "response.output_audio.delta", response_id: "barge-collision-response", delta: "AA==" });
+  await emitOpenAi(ai, { type: "input_audio_buffer.speech_stopped", item_id: "barge-collision", audio_end_ms: 100 });
+  await emitOpenAi(ai, { type: "input_audio_buffer.speech_started", item_id: "barge-collision", audio_start_ms: 200 });
+  const activeTurn = controls.getState().activeCallerTurnId;
+  await emitOpenAi(ai, {
+    type: "conversation.item.input_audio_transcription.completed",
+    item_id: "barge-collision",
+    transcript: "I'd like to book a haircut Friday at 2 PM",
+  });
+  const state = controls.getState();
+  const lifecycle = state.lifecycleRecords.find(([id]) => id === "barge-collision-response")?.[1];
+  assert.equal(state.activeCallerTurnId, activeTurn);
+  assert.equal(state.callerSpeaking, true);
+  assert.equal(lifecycle.audioInvalidated, false);
+  assert.equal(ai.sent.filter((message) => message.type === "response.cancel").length, 0);
+  assert.equal(state.bufferedCallerTranscript, null);
+  assert.deepEqual(sideEffects.counts(), { appointments: 0, smsSubmissions: 0, bookedOutcomeWrites: 0 });
+  assert.equal(state.endingCall, false);
+});
+
+for (const failureType of [
+  "conversation.item.input_audio_transcription.failed",
+  "input_audio_transcription.failed",
+]) {
+  test(`${failureType} keeps a colliding item_id ambiguous across repeated terminal events`, async () => {
+    const sideEffects = createOwnershipSideEffectProbe();
+    const { ai, controls } = createProductionSession({
+      bookAppointment: sideEffects.bookAppointment,
+      CallTranscriptModel: sideEffects.CallTranscriptModel,
+    });
+    await emitOpenAi(ai, { type: "input_audio_buffer.speech_started", item_id: "persistent-collision", audio_start_ms: 0 });
+    const turnOne = controls.getState().activeCallerTurnId;
+    await emitOpenAi(ai, { type: "input_audio_buffer.speech_stopped", item_id: "persistent-collision", audio_end_ms: 100 });
+    await emitOpenAi(ai, { type: "input_audio_buffer.speech_started", item_id: "persistent-collision", audio_start_ms: 200 });
+    const turnTwo = controls.getState().activeCallerTurnId;
+    assert.equal(turnTwo, turnOne + 1);
+    assert.equal(controls.speakExact("Protected current response", { reason: "persistent_collision" }), true);
+
+    await emitOpenAi(ai, { type: failureType, item_id: "persistent-collision", error: { message: "old failure" } });
+    await emitOpenAi(ai, {
+      type: "conversation.item.input_audio_transcription.completed",
+      item_id: "persistent-collision",
+      transcript: "I'd like to book a haircut Friday at 2 PM",
+    });
+    const state = controls.getState();
+    assert.deepEqual(
+      state.callerTurnIdByInputItemId.find(([itemId]) => itemId === "persistent-collision"),
+      ["persistent-collision", null]
+    );
+    assert.equal(state.activeCallerTurnId, turnTwo);
+    assert.equal(state.callerSpeaking, true);
+    assert.equal(state.pendingAssistantResponse?.callerTurnId, turnTwo);
+    assert.equal(state.bufferedCallerTranscript, null);
+    assert.equal(ai.sent.filter((message) => message.type === "response.create").length, 0);
+    assert.deepEqual(sideEffects.counts(), { appointments: 0, smsSubmissions: 0, bookedOutcomeWrites: 0 });
+    assert.equal(state.endingCall, false);
+  });
+}
+
+test("missing and unknown transcription item IDs fail closed against an active caller turn", async () => {
+  const sideEffects = createOwnershipSideEffectProbe();
+  const { ai, controls } = createProductionSession({
+    bookAppointment: sideEffects.bookAppointment,
+    CallTranscriptModel: sideEffects.CallTranscriptModel,
+  });
+  await emitOpenAi(ai, { type: "input_audio_buffer.speech_started", item_id: "known-active-item", audio_start_ms: 0 });
+  const activeTurn = controls.getState().activeCallerTurnId;
+  assert.equal(controls.speakExact("Known active response", { reason: "known_active" }), true);
+  for (const event of [
+    { type: "conversation.item.input_audio_transcription.failed", error: { message: "missing" } },
+    { type: "input_audio_transcription.failed", item_id: "unknown-item", error: { message: "unknown" } },
+    { type: "conversation.item.input_audio_transcription.completed", transcript: "book Friday at 2 PM" },
+    { type: "input_audio_transcription.completed", item_id: "unknown-item", transcript: "book Friday at 2 PM" },
+  ]) await emitOpenAi(ai, event);
+  const state = controls.getState();
+  assert.equal(state.activeCallerTurnId, activeTurn);
+  assert.equal(state.callerSpeaking, true);
+  assert.equal(state.pendingAssistantResponse?.callerTurnId, activeTurn);
+  assert.equal(state.bufferedCallerTranscript, null);
+  assert.equal(ai.sent.filter((message) => message.type === "response.create").length, 0);
+  assert.deepEqual(sideEffects.counts(), { appointments: 0, smsSubmissions: 0, bookedOutcomeWrites: 0 });
+  assert.equal(state.endingCall, false);
+});
+
+test("same-turn repeated item_id start remains authoritative and completes once", async () => {
+  const sideEffects = createOwnershipSideEffectProbe();
+  const { ai, controls } = createProductionSession({
+    bookAppointment: sideEffects.bookAppointment,
+    CallTranscriptModel: sideEffects.CallTranscriptModel,
+  });
+  await emitOpenAi(ai, { type: "input_audio_buffer.speech_started", item_id: "same-owner-item", audio_start_ms: 0 });
+  const owner = controls.getState().activeCallerTurnId;
+  await emitOpenAi(ai, { type: "input_audio_buffer.speech_started", item_id: "same-owner-item", audio_start_ms: 0 });
+  assert.deepEqual(
+    controls.getState().callerTurnIdByInputItemId.find(([itemId]) => itemId === "same-owner-item"),
+    ["same-owner-item", owner]
+  );
+  await emitOpenAi(ai, {
+    type: "conversation.item.input_audio_transcription.completed",
+    item_id: "same-owner-item",
+    transcript: "I'd like to look at her",
+  });
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  const state = controls.getState();
+  assert.equal(state.callerSpeaking, false);
+  assert.equal(state.pendingResponseCreationAttempt?.callerTurnId, owner);
+  assert.equal(ai.sent.filter((message) => message.type === "response.create").length, 1);
+  assert.deepEqual(sideEffects.counts(), { appointments: 0, smsSubmissions: 0, bookedOutcomeWrites: 0 });
+  assert.equal(state.endingCall, false);
+});
+
+test("evicted item_id terminal events fail closed against the newest active caller turn", async () => {
+  const sideEffects = createOwnershipSideEffectProbe();
+  const { ai, controls } = createProductionSession({
+    bookAppointment: sideEffects.bookAppointment,
+    CallTranscriptModel: sideEffects.CallTranscriptModel,
+  });
+  for (let index = 0; index < 65; index += 1) {
+    await emitOpenAi(ai, {
+      type: "input_audio_buffer.speech_started",
+      item_id: `bounded-item-${index}`,
+      audio_start_ms: index * 20,
+    });
+    if (index < 64) {
+      await emitOpenAi(ai, {
+        type: "input_audio_buffer.speech_stopped",
+        item_id: `bounded-item-${index}`,
+        audio_end_ms: index * 20 + 10,
+      });
+    }
+  }
+  const activeTurn = controls.getState().activeCallerTurnId;
+  assert.equal(controls.getState().callerTurnIdByInputItemId.length, 64);
+  assert.equal(controls.getState().callerTurnIdByInputItemId.some(([itemId]) => itemId === "bounded-item-0"), false);
+  assert.equal(controls.speakExact("Newest active response", { reason: "bounded_correlation" }), true);
+  await emitOpenAi(ai, {
+    type: "conversation.item.input_audio_transcription.failed",
+    item_id: "bounded-item-0",
+    error: { message: "evicted old failure" },
+  });
+  await emitOpenAi(ai, {
+    type: "conversation.item.input_audio_transcription.completed",
+    item_id: "bounded-item-0",
+    transcript: "I'd like to book a haircut Friday at 2 PM",
+  });
+  const state = controls.getState();
+  assert.equal(state.activeCallerTurnId, activeTurn);
+  assert.equal(state.callerSpeaking, true);
+  assert.equal(state.pendingAssistantResponse?.callerTurnId, activeTurn);
+  assert.equal(ai.sent.filter((message) => message.type === "response.create").length, 0);
+  assert.deepEqual(sideEffects.counts(), { appointments: 0, smsSubmissions: 0, bookedOutcomeWrites: 0 });
+  assert.equal(state.endingCall, false);
+});
+
+test("a buffered turn N+1 transcript retains N+1 ownership when turn N+2 begins before drain", async () => {
+  let availabilityChecks = 0;
+  const { ai, controls } = createProductionSession({
+    isSlotAvailable: async () => { availabilityChecks += 1; return true; },
+    barberDoc: {
+      _id: "barber-1",
+      services: [{ name: "Haircut", durationMinutes: 30 }],
+      availability: { timezone: "America/New_York", defaultServiceDurationMinutes: 30 },
+    },
+  });
+  controls.seedBookingState({
+    state: idleUnknownIntentState(),
+    availability: { slotChecked: false, slotAvailable: false, slotAlternatives: [] },
+    context: { currentLanguage: "en" },
+  });
+
+  await emitOpenAi(ai, {
+    type: "input_audio_buffer.speech_started",
+    item_id: "buffer-origin-response",
+    audio_start_ms: 0,
+  });
+  assert.equal(
+    controls.speakExact("Please tell me which service you would like.", { reason: "buffer_origin_prompt" }),
+    true
+  );
+  await emitOpenAi(ai, {
+    type: "input_audio_buffer.speech_stopped",
+    item_id: "buffer-origin-response",
+    audio_end_ms: 100,
+  });
+  await emitOpenAi(ai, {
+    type: "conversation.item.input_audio_transcription.completed",
+    item_id: "buffer-origin-response",
+    transcript: "",
+  });
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  const turnN = controls.getState().pendingResponseCreationAttempt?.callerTurnId;
+
+  await emitOpenAi(ai, {
+    type: "input_audio_buffer.speech_started",
+    item_id: "buffered-turn-n-plus-one",
+    audio_start_ms: 200,
+  });
+  const turnNPlusOne = controls.getState().activeCallerTurnId;
+  await emitOpenAi(ai, {
+    type: "conversation.item.input_audio_transcription.completed",
+    item_id: "buffered-turn-n-plus-one",
+    transcript: "I'd like to book a haircut Friday at 2 PM",
+  });
+  assert.equal(controls.getState().bufferedCallerTurnId, turnNPlusOne);
+  assert.equal(controls.getState().pendingResponseCreationAttempt?.supersededByNewerCallerTurn, true);
+
+  const { nextTurnId: turnNPlusTwo } = await advanceCallerTurnThroughVad({
+    ai,
+    controls,
+    itemId: "buffered-turn-n-plus-one",
+    stopAtMs: 300,
+    nextItemId: "buffered-turn-n-plus-two",
+    nextStartAtMs: 400,
+    finishStoppedTranscript: false,
+  });
+  assert.equal(turnNPlusOne, turnN + 1);
+  assert.equal(turnNPlusTwo, turnNPlusOne + 1);
+
+  await emitOpenAi(ai, { type: "response.created", response: { id: "buffer-origin-created" } });
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  const state = controls.getState();
+  assert.equal(state.activeCallerTurnId, turnNPlusTwo);
+  assert.equal(state.callerSpeaking, true);
+  assert.equal(state.bufferedCallerTranscript, null);
+  assert.equal(state.bufferedCallerTurnId, null);
+  assert.equal(state.pendingAssistantResponse?.callerTurnId, turnNPlusOne);
+  assert.notEqual(state.pendingAssistantResponse?.callerTurnId, turnNPlusTwo);
+  assert.equal(state.bookingState.parsedTime, "2:00 PM");
+  assert.equal(availabilityChecks, 1);
+  assert.equal(ai.sent.filter((message) => message.type === "response.create").length, 1);
+  assert.equal(ai.sent.filter((message) => message.type === "response.cancel").length, 1);
+});
+
+test("a late transcription failure for turn N cannot clear or mutate active turn N+1", async () => {
+  const { ai, controls } = createProductionSession();
+  await emitOpenAi(ai, {
+    type: "input_audio_buffer.speech_started",
+    item_id: "failed-transcription-turn-n",
+    audio_start_ms: 0,
+  });
+  const turnN = controls.getState().activeCallerTurnId;
+  const { nextTurnId: turnNPlusOne } = await advanceCallerTurnThroughVad({
+    ai,
+    controls,
+    itemId: "failed-transcription-turn-n",
+    stopAtMs: 100,
+    nextItemId: "active-transcription-turn-n-plus-one",
+    nextStartAtMs: 200,
+    finishStoppedTranscript: false,
+  });
+  assert.equal(turnNPlusOne, turnN + 1);
+  assert.equal(controls.speakExact("Current turn response", { reason: "current_turn_after_old_failure" }), true);
+  const beforeFailure = controls.getState();
+  assert.equal(beforeFailure.callerSpeaking, true);
+  assert.equal(beforeFailure.pendingAssistantResponse?.callerTurnId, turnNPlusOne);
+  assert.equal(beforeFailure.pendingAssistantResponse?.deferredCallerTurnId, turnNPlusOne);
+
+  await emitOpenAi(ai, {
+    type: "conversation.item.input_audio_transcription.failed",
+    item_id: "failed-transcription-turn-n",
+    error: { message: "late failure" },
+  });
+  const afterFailure = controls.getState();
+  assert.equal(afterFailure.activeCallerTurnId, turnNPlusOne);
+  assert.equal(afterFailure.callerSpeaking, true);
+  assert.equal(afterFailure.pendingAssistantResponse?.callerTurnId, turnNPlusOne);
+  assert.equal(afterFailure.pendingAssistantResponse?.deferredByCallerSpeech, true);
+  assert.equal(afterFailure.pendingAssistantResponse?.deferredCallerTurnId, turnNPlusOne);
+  assert.equal(ai.sent.filter((message) => message.type === "response.create").length, 0);
+});
+
+test("a stale deferred final confirmation cannot flush for a genuinely newer unrelated caller turn", async () => {
+  let appointments = 0;
+  const { ai, controls } = createProductionSession({
+    bookAppointment: async () => {
+      appointments += 1;
+      return { success: true };
+    },
+  });
+  controls.seedBookingState({
+    state: idleUnknownIntentState(),
+    availability: { slotChecked: false, slotAvailable: false, slotAlternatives: [] },
+    context: { currentLanguage: "en" },
+  });
+  await emitOpenAi(ai, {
+    type: "input_audio_buffer.speech_started",
+    item_id: "final-turn-one",
+    audio_start_ms: 0,
+  });
+  const firstTurnId = controls.getState().activeCallerTurnId;
+  assert.equal(controls.speakExact("Your appointment is confirmed.", {
+    reason: "stale_final_confirmation",
+    finalConfirmation: true,
+    terminateAfterPlayback: true,
+  }), true);
+  assert.equal(controls.getState().pendingAssistantResponse?.deferredCallerTurnId, firstTurnId);
+
+  await advanceCallerTurnThroughVad({
+    ai,
+    controls,
+    itemId: "final-turn-one",
+    stopAtMs: 100,
+    nextItemId: "final-turn-two",
+    nextStartAtMs: 200,
+  });
+  await controls.handleCallerTranscript("I'd like to look at her");
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  const creates = ai.sent.filter((message) => message.type === "response.create");
+  assert.equal(creates.length, 1);
+  assert.equal(
+    extractIntendedSpeech(creates[0].response.instructions),
+    "Sorry, I didn't catch that. Would you like to book an appointment?"
+  );
+  assert.equal(controls.getState().pendingAssistantResponse, null);
+  assert.equal(controls.getState().bookingState.bookingFinalized, false);
+  assert.equal(appointments, 0);
+});
+
+test("a non-deferred final confirmation retains its existing flush path across caller-turn identity", async () => {
+  const { ai, controls } = createProductionSession();
+  controls.setResponseState({ responseActive: true, aiResponseInProgress: true, responseInFlightId: "busy" });
+  assert.equal(controls.speakExact("Your appointment is confirmed.", {
+    reason: "non_deferred_final_confirmation",
+    finalConfirmation: true,
+    terminateAfterPlayback: true,
+  }), true);
+  assert.equal(controls.getState().pendingAssistantResponse?.deferredByCallerSpeech, false);
+  assert.equal(controls.getState().pendingAssistantResponse?.deferredCallerTurnId, null);
+
+  controls.setResponseState({ responseActive: false, aiResponseInProgress: false, responseInFlightId: "" });
+  await emitOpenAi(ai, {
+    type: "input_audio_buffer.speech_started",
+    item_id: "non-deferred-final-turn",
+    audio_start_ms: 0,
+  });
+  await controls.handleCallerTranscript("unrelated caller turn");
+  const creates = ai.sent.filter((message) => message.type === "response.create");
+  assert.equal(creates.length, 1);
+  assert.equal(extractIntendedSpeech(creates[0].response.instructions), "Your appointment is confirmed.");
+  assert.equal(controls.getState().pendingAssistantResponse, null);
+});
+
+test("a completed turn-N response remains N-owned and cannot suppress turn N+1", async () => {
+  const sideEffects = createOwnershipSideEffectProbe();
+  const { ai, twilio, controls } = createProductionSession({
+    bookAppointment: sideEffects.bookAppointment,
+    CallTranscriptModel: sideEffects.CallTranscriptModel,
+  });
+  controls.seedBookingState({
+    state: idleUnknownIntentState(),
+    availability: { slotChecked: false, slotAvailable: false, slotAlternatives: [] },
+    context: { currentLanguage: "en" },
+  });
+  const storedBefore = structuredClone(controls.getState().bookingState);
+  await emitOpenAi(ai, {
+    type: "input_audio_buffer.speech_started",
+    item_id: "completed-turn-one",
+    audio_start_ms: 0,
+  });
+  const turnOne = controls.getState().activeCallerTurnId;
+  await controls.handleCallerTranscript("I'd like to look at her");
+
+  const { nextTurnId: turnTwo } = await advanceCallerTurnThroughVad({
+    ai,
+    controls,
+    itemId: "completed-turn-one",
+    stopAtMs: 100,
+    nextItemId: "completed-turn-two",
+    nextStartAtMs: 200,
+    finishStoppedTranscript: false,
+    betweenTurns: async () => {
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      assert.equal(controls.getState().pendingResponseCreationAttempt?.callerTurnId, turnOne);
+      await emitOpenAi(ai, { type: "response.created", response: { id: "completed-owner-one" } });
+      assert.equal(
+        controls.getState().lifecycleRecords.find(([id]) => id === "completed-owner-one")?.[1].callerTurnId,
+        turnOne
+      );
+      await emitOpenAi(ai, {
+        type: "response.output_audio.delta",
+        response_id: "completed-owner-one",
+        delta: "AA==",
+      });
+      await completeDeterministicResponse(ai, "completed-owner-one");
+      await emitTwilio(twilio, {
+        event: "mark",
+        mark: { name: controls.getState().pendingAssistantMarkName },
+      });
+    },
+  });
+  assert.equal(turnTwo, turnOne + 1);
+  await controls.handleCallerTranscript("I'd like to look over there");
+  await new Promise((resolve) => setTimeout(resolve, 300));
+
+  const state = controls.getState();
+  const oldLifecycle = state.lifecycleRecords.find(([id]) => id === "completed-owner-one")?.[1];
+  assert.equal(oldLifecycle.callerTurnId, turnOne);
+  assert.equal(oldLifecycle.openAiStatus, "completed");
+  assert.equal(state.pendingResponseCreationAttempt?.callerTurnId, turnTwo);
+  const creates = ai.sent.filter((message) => message.type === "response.create");
+  assert.equal(creates.length, 2);
+  assert.ok(creates.every((message) => extractIntendedSpeech(message.response.instructions).trim().length > 0));
+  assert.deepEqual(state.bookingState, storedBefore);
+  assert.equal(state.bookingState.bookingFinalized, false);
+  assert.equal(state.bookingState.bookingAttempted, false);
+  assert.deepEqual(sideEffects.counts(), { appointments: 0, smsSubmissions: 0, bookedOutcomeWrites: 0 });
+  assert.equal(state.endingCall, false);
+});
+
+test("turn-N availability work resumed after await cannot acquire turn N+1 ownership", async () => {
+  let availabilityChecks = 0;
+  const sideEffects = createOwnershipSideEffectProbe();
+  let releaseAvailability;
+  let signalAvailabilityStarted;
+  const availabilityStarted = new Promise((resolve) => { signalAvailabilityStarted = resolve; });
+  const availabilityRelease = new Promise((resolve) => { releaseAvailability = resolve; });
+  const { ai, controls } = createProductionSession({
+    bookAppointment: sideEffects.bookAppointment,
+    CallTranscriptModel: sideEffects.CallTranscriptModel,
+    isSlotAvailable: async () => {
+      availabilityChecks += 1;
+      signalAvailabilityStarted();
+      return availabilityRelease;
+    },
+    barberDoc: {
+      _id: "barber-1",
+      services: [{ name: "Haircut", durationMinutes: 30 }],
+      availability: { timezone: "America/New_York", defaultServiceDurationMinutes: 30 },
+    },
+  });
+  controls.seedBookingState({
+    state: idleUnknownIntentState(),
+    availability: { slotChecked: false, slotAvailable: false, slotAlternatives: [] },
+    context: { currentLanguage: "en" },
+  });
+  await emitOpenAi(ai, {
+    type: "input_audio_buffer.speech_started",
+    item_id: "await-owner-one",
+    audio_start_ms: 0,
+  });
+  const turnOne = controls.getState().activeCallerTurnId;
+  const turnOneWork = controls.handleCallerTranscript("I'd like to book a haircut Friday at 2 PM");
+  await availabilityStarted;
+
+  const { nextTurnId: turnTwo } = await advanceCallerTurnThroughVad({
+    ai,
+    controls,
+    itemId: "await-owner-one",
+    stopAtMs: 100,
+    nextItemId: "await-owner-two",
+    nextStartAtMs: 200,
+    finishStoppedTranscript: false,
+  });
+  assert.equal(turnTwo, turnOne + 1);
+  assert.equal(controls.getState().callerSpeaking, true);
+  releaseAvailability(true);
+  await turnOneWork;
+
+  const resumed = controls.getState();
+  assert.equal(resumed.activeCallerTurnId, turnTwo);
+  assert.equal(resumed.callerSpeaking, true);
+  assert.equal(resumed.pendingAssistantResponse?.callerTurnId, turnOne);
+  assert.equal(resumed.pendingAssistantResponse?.deferredByCallerSpeech, false);
+  assert.notEqual(resumed.pendingAssistantResponse?.deferredCallerTurnId, turnTwo);
+  assert.equal(availabilityChecks, 1);
+  assert.equal(resumed.bookingState.parsedTime, "2:00 PM");
+  assert.equal(resumed.bookingState.bookingFinalized, false);
+
+  await controls.handleCallerTranscript("Abraham");
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  const finalState = controls.getState();
+  assert.equal(finalState.activeCallerTurnId, turnTwo);
+  assert.notEqual(finalState.pendingResponseCreationAttempt?.callerTurnId, turnOne);
+  assert.equal(finalState.bookingState.name, "Abraham");
+  assert.equal(finalState.bookingState.bookingFinalized, false);
+  assert.equal(finalState.bookingState.bookingAttempted, false);
+  assert.deepEqual(sideEffects.counts(), { appointments: 0, smsSubmissions: 0, bookedOutcomeWrites: 0 });
+  assert.equal(finalState.endingCall, false);
+});
+
+test("an invalidated active turn-N response remains N-owned and cannot suppress turn N+1", async () => {
+  let availabilityChecks = 0;
+  const sideEffects = createOwnershipSideEffectProbe();
+  const { ai, controls } = createProductionSession({
+    bookAppointment: sideEffects.bookAppointment,
+    CallTranscriptModel: sideEffects.CallTranscriptModel,
+    isSlotAvailable: async () => { availabilityChecks += 1; return true; },
+    barberDoc: {
+      _id: "barber-1",
+      services: [{ name: "Haircut", durationMinutes: 30 }],
+      availability: { timezone: "America/New_York", defaultServiceDurationMinutes: 30 },
+    },
+  });
+  controls.seedBookingState({
+    state: idleUnknownIntentState(),
+    availability: { slotChecked: false, slotAvailable: false, slotAlternatives: [] },
+    context: { currentLanguage: "en" },
+  });
+  await emitOpenAi(ai, {
+    type: "input_audio_buffer.speech_started",
+    item_id: "invalidated-owner-one",
+    audio_start_ms: 0,
+  });
+  const turnOne = controls.getState().activeCallerTurnId;
+  await controls.handleCallerTranscript("I'd like to look at her");
+  const { nextTurnId: turnTwo } = await advanceCallerTurnThroughVad({
+    ai,
+    controls,
+    itemId: "invalidated-owner-one",
+    stopAtMs: 100,
+    nextItemId: "invalidated-owner-two",
+    nextStartAtMs: 200,
+    finishStoppedTranscript: false,
+    betweenTurns: async () => {
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      assert.equal(controls.getState().pendingResponseCreationAttempt?.callerTurnId, turnOne);
+      await emitOpenAi(ai, { type: "response.created", response: { id: "invalidated-owner-response" } });
+      await emitOpenAi(ai, {
+        type: "response.output_audio.delta",
+        response_id: "invalidated-owner-response",
+        delta: "AA==",
+      });
+    },
+  });
+  await emitOpenAi(ai, {
+    type: "conversation.item.input_audio_transcription.completed",
+    item_id: "invalidated-owner-two",
+    transcript: "I'd like to book a haircut Friday at 2 PM",
+  });
+  await new Promise((resolve) => setTimeout(resolve, 300));
+
+  const state = controls.getState();
+  const invalidated = state.lifecycleRecords.find(([id]) => id === "invalidated-owner-response")?.[1];
+  assert.equal(turnTwo, turnOne + 1);
+  assert.equal(invalidated.callerTurnId, turnOne);
+  assert.equal(invalidated.audioInvalidated, true);
+  assert.equal(invalidated.transportFailureReason, "barge_in_transcript_confirmed");
+  assert.equal(ai.sent.filter((message) => message.type === "response.cancel").length, 1);
+  assert.equal(state.pendingResponseCreationAttempt?.callerTurnId, turnTwo);
+  assert.equal(ai.sent.filter((message) => message.type === "response.create").length, 2);
+  assert.equal(availabilityChecks, 1);
+  assert.equal(state.bookingState.parsedTime, "2:00 PM");
+  assert.equal(state.bookingState.bookingFinalized, false);
+  assert.equal(state.bookingState.bookingAttempted, false);
+  assert.deepEqual(sideEffects.counts(), { appointments: 0, smsSubmissions: 0, bookedOutcomeWrites: 0 });
+  assert.equal(state.endingCall, false);
+});
+
+test("an already-cancelled turn-N lifecycle remains N-owned and cannot suppress turn N+1", async () => {
+  let availabilityChecks = 0;
+  const sideEffects = createOwnershipSideEffectProbe();
+  const { ai, controls } = createProductionSession({
+    bookAppointment: sideEffects.bookAppointment,
+    CallTranscriptModel: sideEffects.CallTranscriptModel,
+    isSlotAvailable: async () => { availabilityChecks += 1; return true; },
+    barberDoc: {
+      _id: "barber-1",
+      services: [{ name: "Haircut", durationMinutes: 30 }],
+      availability: { timezone: "America/New_York", defaultServiceDurationMinutes: 30 },
+    },
+  });
+  controls.seedBookingState({ state: idleUnknownIntentState(), availability: { slotChecked: false, slotAvailable: false, slotAlternatives: [] }, context: { currentLanguage: "en" } });
+  await emitOpenAi(ai, { type: "input_audio_buffer.speech_started", item_id: "cancelled-owner-one", audio_start_ms: 0 });
+  const turnOne = controls.getState().activeCallerTurnId;
+  await controls.handleCallerTranscript("I'd like to look at her");
+  await emitOpenAi(ai, { type: "input_audio_buffer.speech_stopped", item_id: "cancelled-owner-one", audio_end_ms: 100 });
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  await emitOpenAi(ai, { type: "response.created", response: { id: "already-cancelled-owner" } });
+  await emitOpenAi(ai, { type: "response.output_audio.delta", response_id: "already-cancelled-owner", delta: "AA==" });
+  await emitOpenAi(ai, { type: "response.cancelled", response: { id: "already-cancelled-owner", status: "cancelled" } });
+  const beforeNextTurn = controls.getState();
+  const cancelledBefore = beforeNextTurn.lifecycleRecords.find(([id]) => id === "already-cancelled-owner")?.[1];
+  assert.equal(cancelledBefore.callerTurnId, turnOne);
+  assert.equal(cancelledBefore.openAiStatus, "cancelled");
+
+  await emitOpenAi(ai, { type: "input_audio_buffer.speech_started", item_id: "cancelled-owner-two", audio_start_ms: 200 });
+  const turnTwo = controls.getState().activeCallerTurnId;
+  await emitOpenAi(ai, {
+    type: "conversation.item.input_audio_transcription.completed",
+    item_id: "cancelled-owner-two",
+    transcript: "I'd like to book a haircut Friday at 2 PM",
+  });
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  const state = controls.getState();
+  const cancelledAfter = state.lifecycleRecords.find(([id]) => id === "already-cancelled-owner")?.[1];
+  assert.equal(turnTwo, turnOne + 1);
+  assert.equal(cancelledAfter.callerTurnId, turnOne);
+  assert.equal(cancelledAfter.openAiStatus, "cancelled");
+  assert.equal(state.pendingResponseCreationAttempt?.callerTurnId, turnTwo);
+  assert.equal(availabilityChecks, 1);
+  assert.equal(state.bookingState.parsedTime, "2:00 PM");
+  assert.equal(ai.sent.filter((message) => message.type === "response.create").length, 2);
+  assert.deepEqual(sideEffects.counts(), { appointments: 0, smsSubmissions: 0, bookedOutcomeWrites: 0 });
+  assert.equal(state.endingCall, false);
+});
+
+test("a current-turn active streaming lifecycle completes and acknowledges playback exactly once", async () => {
+  const sideEffects = createOwnershipSideEffectProbe();
+  const { ai, twilio, controls } = createProductionSession({
+    bookAppointment: sideEffects.bookAppointment,
+    CallTranscriptModel: sideEffects.CallTranscriptModel,
+  });
+  controls.seedBookingState({ state: idleUnknownIntentState(), availability: { slotChecked: false, slotAvailable: false, slotAlternatives: [] }, context: { currentLanguage: "en" } });
+  await emitOpenAi(ai, { type: "input_audio_buffer.speech_started", item_id: "current-stream-owner", audio_start_ms: 0 });
+  const owner = controls.getState().activeCallerTurnId;
+  await emitOpenAi(ai, {
+    type: "conversation.item.input_audio_transcription.completed",
+    item_id: "current-stream-owner",
+    transcript: "I'd like to look at her",
+  });
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  await emitOpenAi(ai, { type: "response.created", response: { id: "current-stream-response" } });
+  await emitOpenAi(ai, { type: "response.output_audio.delta", response_id: "current-stream-response", delta: "AA==" });
+  const streaming = controls.getState().lifecycleRecords.find(([id]) => id === "current-stream-response")?.[1];
+  assert.equal(streaming.callerTurnId, owner);
+  assert.equal(streaming.openAiStatus, null);
+  assert.equal(controls.getState().assistantPlaybackActive, true);
+  assert.equal(twilio.sent.filter((message) => message.event === "media" && message.media?.payload === "AA==").length, 1);
+  await completeDeterministicResponse(ai, "current-stream-response");
+  const markName = controls.getState().pendingAssistantMarkName;
+  await emitOpenAi(ai, { type: "response.done", response: { id: "current-stream-response", status: "completed" } });
+  await emitTwilio(twilio, { event: "mark", mark: { name: markName } });
+  await emitTwilio(twilio, { event: "mark", mark: { name: markName } });
+  const state = controls.getState();
+  const lifecycle = state.lifecycleRecords.find(([id]) => id === "current-stream-response")?.[1];
+  assert.equal(lifecycle.callerTurnId, owner);
+  assert.equal(lifecycle.openAiStatus, "completed");
+  assert.equal(ai.sent.filter((message) => message.type === "response.create").length, 1);
+  assert.equal(twilio.sent.filter((message) => message.event === "media" && message.media?.payload === "AA==").length, 1);
+  assert.equal(state.bookingState.bookingFinalized, false);
+  assert.deepEqual(sideEffects.counts(), { appointments: 0, smsSubmissions: 0, bookedOutcomeWrites: 0 });
+  assert.equal(state.endingCall, false);
+});
+
+test("a turn-N generation failure and retry remain N-owned and cannot suppress turn N+1", async () => {
+  let availabilityChecks = 0;
+  const sideEffects = createOwnershipSideEffectProbe();
+  const { ai, controls } = createProductionSession({
+    bookAppointment: sideEffects.bookAppointment,
+    CallTranscriptModel: sideEffects.CallTranscriptModel,
+    isSlotAvailable: async () => { availabilityChecks += 1; return true; },
+    barberDoc: {
+      _id: "barber-1",
+      services: [{ name: "Haircut", durationMinutes: 30 }],
+      availability: { timezone: "America/New_York", defaultServiceDurationMinutes: 30 },
+    },
+  });
+  controls.seedBookingState({
+    state: idleUnknownIntentState(),
+    availability: { slotChecked: false, slotAvailable: false, slotAlternatives: [] },
+    context: { currentLanguage: "en" },
+  });
+  await emitOpenAi(ai, {
+    type: "input_audio_buffer.speech_started",
+    item_id: "failed-owner-one",
+    audio_start_ms: 0,
+  });
+  const turnOne = controls.getState().activeCallerTurnId;
+  await controls.handleCallerTranscript("I'd like to look at her");
+  const { nextTurnId: turnTwo } = await advanceCallerTurnThroughVad({
+    ai,
+    controls,
+    itemId: "failed-owner-one",
+    stopAtMs: 100,
+    nextItemId: "failed-owner-two",
+    nextStartAtMs: 200,
+    finishStoppedTranscript: false,
+    betweenTurns: async () => {
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      assert.equal(controls.getState().pendingResponseCreationAttempt?.callerTurnId, turnOne);
+      await emitOpenAi(ai, { type: "response.created", response: { id: "failed-owner-response" } });
+      await emitOpenAi(ai, {
+        type: "response.failed",
+        response: { id: "failed-owner-response", status: "failed" },
+      });
+      const failedState = controls.getState();
+      assert.equal(
+        failedState.lifecycleRecords.find(([id]) => id === "failed-owner-response")?.[1].callerTurnId,
+        turnOne
+      );
+      assert.equal(failedState.pendingResponseCreationAttempt?.callerTurnId, turnOne);
+      assert.equal(failedState.pendingResponseCreationAttempt?.reason, "routine_stream_recovery");
+    },
+  });
+  await controls.handleCallerTranscript("I'd like to book a haircut Friday at 2 PM");
+  assert.equal(controls.getState().pendingResponseCreationAttempt?.supersededByNewerCallerTurn, true);
+  await emitOpenAi(ai, { type: "response.created", response: { id: "failed-owner-recovery" } });
+  await new Promise((resolve) => setTimeout(resolve, 300));
+
+  const state = controls.getState();
+  const failed = state.lifecycleRecords.find(([id]) => id === "failed-owner-response")?.[1];
+  assert.equal(turnTwo, turnOne + 1);
+  assert.equal(failed.callerTurnId, turnOne);
+  assert.equal(failed.openAiStatus, "failed");
+  assert.equal(state.pendingResponseCreationAttempt?.callerTurnId, turnTwo);
+  assert.equal(ai.sent.filter((message) => message.type === "response.create").length, 3);
+  assert.equal(ai.sent.filter((message) => message.type === "response.cancel").length, 1);
+  assert.equal(availabilityChecks, 1);
+  assert.equal(state.bookingState.parsedTime, "2:00 PM");
+  assert.equal(state.bookingState.bookingFinalized, false);
+  assert.equal(state.bookingState.bookingAttempted, false);
+  assert.deepEqual(sideEffects.counts(), { appointments: 0, smsSubmissions: 0, bookedOutcomeWrites: 0 });
+  assert.equal(state.endingCall, false);
 });
 
 test("VAD speech boundaries reject delayed, duplicate, and unexpected stops without changing caller-turn ownership", async () => {
@@ -1815,6 +2907,15 @@ test("production yes phrase cannot become a name or reach booking and SMS", asyn
 
 test("production explicit clear reconciles completed confirmation waiting for its mark", async () => {
   const { ai, controls } = createProductionSession();
+  controls.seedBookingState({
+    state: {
+      ...baseBookingState(),
+      askedConfirm: false,
+      confirmationPromptRequested: false,
+      confirmed: false,
+    },
+    availability: { slotChecked: true, slotAvailable: true, slotAlternatives: [] },
+  });
   await controls.requestAssistantResponse({ immediate: true, reason: "test_confirmation" });
   await emitOpenAi(ai, { type: "response.created", response: { id: "resp-clear-prod" } });
   await emitOpenAi(ai, { type: "response.output_audio.delta", response_id: "resp-clear-prod", delta: "AA==" });
@@ -1827,6 +2928,9 @@ test("production explicit clear reconciles completed confirmation waiting for it
   assert.equal(afterClear.confirmationDeliveryReady, false);
   assert.equal(afterClear.lifecycleRecords[0][1].lifecycleActionHandled, true);
   assert.equal(afterClear.pendingAssistantResponse.retryCount, 1);
+  assert.equal(afterClear.bookingState.askedConfirm, true);
+  assert.equal(afterClear.bookingState.confirmationPromptRequested, true);
+  assert.equal(afterClear.bookingState.confirmed, false);
   assert.equal(await controls.clearTwilioPlaybackForBargeIn("explicit_clear_test_repeat"), false);
   assert.equal(controls.getState().pendingAssistantResponse.retryCount, 1);
 });
