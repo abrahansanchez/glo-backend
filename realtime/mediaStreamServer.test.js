@@ -713,6 +713,10 @@ test("harmlessly reworded completed confirmation audio is delivered once without
   controls.seedBookingState({
     state: {
       ...baseBookingState(),
+      name: "Anthony Martinez",
+      service: "Haircut",
+      parsedDate: "2026-08-11",
+      parsedTime: "3:00 PM",
       askedConfirm: false,
       confirmationPromptRequested: false,
     },
@@ -728,7 +732,7 @@ test("harmlessly reworded completed confirmation audio is delivered once without
   });
   await completeDeterministicResponse(ai, "resp-semantic-confirmation", {
     transcript:
-      "I have Customer down for a haircut on Wednesday 10:00 AM. Would you like me to confirm the appointment?",
+      "I have Anthony Martinez down for a Haircut on Tuesday, August 11, 2026 at 3 PM. Would you like me to confirm the appointment?",
   });
 
   assert.equal(ai.sent.filter((message) => message.type === "response.create").length, 1);
@@ -2310,10 +2314,20 @@ test("natural correction forms continuously require a fresh marked confirmation 
     "2 PM",
     "Friday at 2 PM",
     "Haircut and beard",
+    "Actually, can you change the time to 3:00 p.m. instead?",
+    "Actually can you change it to 3 PM instead?",
   ].entries()) {
     let availabilityChecks = 0;
     let appointments = 0;
     let sms = 0;
+    const createdAppointmentTimes = [];
+    const transcriptUpdates = [];
+    class CorrectionTranscript {
+      static async findOneAndUpdate(_query, update) {
+        transcriptUpdates.push(structuredClone(update));
+        return null;
+      }
+    }
     const bookingBoundary = (request) => productionBookAppointment(request, {
       BarberModel: {
         findById: async () => ({
@@ -2327,6 +2341,7 @@ test("natural correction forms continuously require a fresh marked confirmation 
       AppointmentModel: {
         create: async (appointment) => {
           appointments += 1;
+          createdAppointmentTimes.push(appointment.time);
           return { ...appointment, _id: `appt-natural-correction-${index}` };
         },
       },
@@ -2335,6 +2350,7 @@ test("natural correction forms continuously require a fresh marked confirmation 
     });
     const { ai, twilio, controls } = createProductionSession({
       bookAppointment: bookingBoundary,
+      CallTranscriptModel: CorrectionTranscript,
       isSlotAvailable: async () => {
         availabilityChecks += 1;
         return true;
@@ -2354,11 +2370,12 @@ test("natural correction forms continuously require a fresh marked confirmation 
     controls.seedBookingState({
       state: {
         ...baseBookingState(),
+        name: "Anthony Martinez",
         service: "Haircut",
-        requestedDateText: "August 5",
-        requestedTimeText: "11 AM",
-        parsedDate: "2026-08-05",
-        parsedTime: "11:00 AM",
+        requestedDateText: "August 11, 2026",
+        requestedTimeText: "1 PM",
+        parsedDate: "2026-08-11",
+        parsedTime: "1:00 PM",
         askedConfirm: false,
         confirmationPromptRequested: false,
         alternatives: [],
@@ -2403,6 +2420,14 @@ test("natural correction forms continuously require a fresh marked confirmation 
     assert.equal(availabilityChecks, 1, correction);
     assert.equal(appointments, 0, correction);
     assert.equal(sms, 0, correction);
+    if (correction.includes("3")) {
+      assert.equal(corrected.bookingState.parsedTime, "3:00 PM", correction);
+      assert.equal(corrected.bookingState.service, "Haircut", correction);
+      assert.equal(corrected.bookingState.name, "Anthony Martinez", correction);
+      assert.equal(corrected.bookingState.parsedDate, "2026-08-11", correction);
+      assert.equal(corrected.currentLanguage, "en", correction);
+      assert.equal(corrected.bookingPhase, "awaiting_confirmation", correction);
+    }
 
     await emitTwilio(twilio, { event: "mark", mark: { name: oldMark } });
     assert.equal(controls.getState().confirmationDeliveryReady, false, correction);
@@ -2425,6 +2450,21 @@ test("natural correction forms continuously require a fresh marked confirmation 
     assert.equal(availabilityChecks, 1, correction);
     assert.equal(appointments, 1, correction);
     assert.equal(sms, 1, correction);
+    assert.equal(
+      ai.sent.filter((message) => message.type === "response.create").length,
+      3,
+      correction
+    );
+    assert.deepEqual(
+      createdAppointmentTimes,
+      [correction.includes("3") ? "3:00 PM" : delivered.bookingState.parsedTime],
+      correction
+    );
+    assert.equal(
+      transcriptUpdates.filter((update) => update.$set?.outcome === "BOOKED").length,
+      1,
+      correction
+    );
   }
 });
 

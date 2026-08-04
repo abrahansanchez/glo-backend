@@ -1878,7 +1878,9 @@ const parseContextualTimeOnly = (transcript, { parsedDate, language = "en" } = {
   if (!normalized) return null;
   if (ALT_SELECTION_FILLERS.has(normalized)) return null;
 
-  const timeOnlyMatch = normalized.match(/^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$/i);
+  const timeOnlyMatch =
+    normalized.match(/^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$/i) ||
+    normalized.match(/\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/i);
   if (!timeOnlyMatch) {
     return null;
   }
@@ -6728,7 +6730,7 @@ RULES:
       speakExact(
         currentLanguage === "es"
           ? "No pude completar la confirmación. Repasemos la cita otra vez."
-          : "I couldn't complete the confirmation. Let's review the appointment again.",
+          : "I couldn't deliver the confirmation, so the appointment has not been booked. Let's review the appointment again.",
         {
           reason: "confirmation_retry_failed_recovery",
           callerTurnId: record.callerTurnId ?? null,
