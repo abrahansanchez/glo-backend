@@ -2318,6 +2318,7 @@ test("natural correction forms continuously require a fresh marked confirmation 
     "Actually can you change it to 3 PM instead?",
     "Actually, can I change the time to 3pm?",
     "Actually, can I change the time to 3 p.m. instead?",
+    "Can I actually change the time to 3 PM?",
   ].entries()) {
     let availabilityChecks = 0;
     const availabilityTimes = [];
@@ -2631,6 +2632,243 @@ test("barge-in cancels streamed routine ownership and blocks remaining deltas", 
   await emitOpenAi(ai, { type: "response.done", response: { id: "resp-barge-stream", status: "cancelled" } });
   assert.equal(twilio.sent.filter((message) => message.event === "media").length, 1);
   assert.equal(twilio.sent.filter((message) => message.event === "mark").length, 0);
+});
+
+test("active routine barge-in cancels A before creating B and late A events cannot disturb B", async () => {
+  let bookings = 0;
+  let sms = 0;
+  let bookedWrites = 0;
+  class ActiveBargeTranscript {
+    static async findOneAndUpdate(_query, update) {
+      if (update?.$set?.outcome === "BOOKED") bookedWrites += 1;
+      return null;
+    }
+  }
+  const { ai, twilio, controls } = createProductionSession({
+    CallTranscriptModel: ActiveBargeTranscript,
+    bookAppointment: async () => {
+      bookings += 1;
+      sms += 1;
+      return { success: true, appointment: { _id: "unexpected-active-barge-booking" } };
+    },
+  });
+  controls.seedBookingState({
+    state: {
+      ...baseBookingState(), service: "", name: "", requestedDateText: "",
+      requestedTimeText: "", parsedDate: "", parsedTime: "", askedConfirm: false,
+      confirmationPromptRequested: false, alternatives: [],
+    },
+    availability: { slotChecked: false, slotAvailable: false, slotAlternatives: [] },
+    context: {
+      barberId: "507f1f77bcf86cd799439011",
+      callSid: "CA-active-generation-barge-in",
+      streamSid: "MZ-active-generation-barge-in",
+      currentLanguage: "en",
+    },
+  });
+
+  await controls.requestAssistantResponse({ immediate: true, reason: "active_barge_service_prompt" });
+  await emitOpenAi(ai, { type: "response.created", response: { id: "active-barge-a" } });
+  await emitOpenAi(ai, {
+    type: "response.output_audio.delta", response_id: "active-barge-a", delta: "AA==",
+  });
+  await emitOpenAi(ai, {
+    type: "input_audio_buffer.speech_started", item_id: "active-barge-caller", audio_start_ms: 1000,
+  });
+  await emitOpenAi(ai, {
+    type: "input_audio_buffer.speech_stopped", item_id: "active-barge-caller", audio_end_ms: 5100,
+  });
+  const cancelA = ai.sent.find((message) => message.type === "response.cancel");
+  assert.ok(cancelA?.event_id);
+  assert.equal(twilio.sent.filter((message) => message.event === "clear").length, 1);
+
+  await emitOpenAi(ai, {
+    type: "conversation.item.input_audio_transcription.completed",
+    item_id: "active-barge-caller",
+    transcript: "Twenty uh 2 p.m",
+  });
+  const outboundTypes = ai.sent
+    .filter((message) => ["response.cancel", "response.create"].includes(message.type))
+    .map((message) => message.type);
+  assert.deepEqual(outboundTypes, ["response.create", "response.cancel", "response.create"]);
+  assert.equal(ai.sent.filter((message) => message.type === "response.create").length, 2);
+
+  await emitOpenAi(ai, { type: "response.created", response: { id: "active-barge-b" } });
+  await emitOpenAi(ai, {
+    type: "response.output_audio.delta", response_id: "active-barge-b", delta: "AQ==",
+  });
+  const beforeLateA = controls.getState();
+  assert.equal(beforeLateA.responseInFlightId, "active-barge-b");
+  assert.equal(beforeLateA.responseActive, true);
+
+  await emitOpenAi(ai, {
+    type: "response.output_audio.delta", response_id: "active-barge-a", delta: "Ag==",
+  });
+  await emitOpenAi(ai, { type: "response.cancelled", response_id: "active-barge-a", reason: "cancelled" });
+  await emitOpenAi(ai, {
+    type: "response.done", response: { id: "active-barge-a", status: "cancelled" },
+  });
+  await emitOpenAi(ai, {
+    type: "error",
+    error: { code: "response_cancel_not_active", event_id: cancelA.event_id },
+  });
+  await emitTwilio(twilio, { event: "mark", mark: { name: "assistant-playback-1" } });
+
+  const afterLateA = controls.getState();
+  assert.equal(afterLateA.responseInFlightId, "active-barge-b");
+  assert.equal(afterLateA.responseActive, true);
+  assert.equal(afterLateA.aiResponseInProgress, true);
+  assert.equal(afterLateA.assistantPlaybackActive, true);
+  assert.equal(afterLateA.pendingAssistantMarkName, null);
+  assert.equal(ai.sent.filter((message) => message.type === "response.create").length, 2);
+  assert.notEqual(
+    afterLateA.responseActive === true && afterLateA.responseInFlightId === "",
+    true
+  );
+  assert.equal(bookings, 0);
+  assert.equal(sms, 0);
+  assert.equal(bookedWrites, 0);
+});
+
+test("completed OpenAI generation interrupted during Twilio playback retires cleanly and drains the caller turn once", async () => {
+  let bookings = 0;
+  let sms = 0;
+  let bookedWrites = 0;
+  class LiveOrderTranscript {
+    static async findOneAndUpdate(_query, update) {
+      if (update?.$set?.outcome === "BOOKED") bookedWrites += 1;
+      return null;
+    }
+  }
+  const { ai, twilio, controls } = createProductionSession({
+    CallTranscriptModel: LiveOrderTranscript,
+    bookAppointment: async () => {
+      bookings += 1;
+      sms += 1;
+      return { success: true, appointment: { _id: "unexpected-barge-booking" } };
+    },
+  });
+  controls.seedBookingState({
+    state: {
+      ...baseBookingState(),
+      service: "",
+      name: "",
+      requestedDateText: "",
+      requestedTimeText: "",
+      parsedDate: "",
+      parsedTime: "",
+      askedConfirm: false,
+      confirmationPromptRequested: false,
+      alternatives: [],
+    },
+    availability: { slotChecked: false, slotAvailable: false, slotAlternatives: [] },
+    context: {
+      barberId: "507f1f77bcf86cd799439011",
+      callSid: "CA2dd584409fe403c6878877429bc132eb",
+      streamSid: "MZ-live-order-barge-in",
+      currentLanguage: "en",
+    },
+  });
+
+  await controls.requestAssistantResponse({ immediate: true, reason: "live_order_service_prompt" });
+  assert.match(
+    extractIntendedSpeech(ai.sent.find((message) => message.type === "response.create").response.instructions),
+    /what service are you looking for/i
+  );
+  await emitOpenAi(ai, { type: "response.created", response: { id: "resp-live-order-service" } });
+  await emitOpenAi(ai, {
+    type: "response.output_audio.delta",
+    response_id: "resp-live-order-service",
+    delta: "AA==",
+  });
+  await emitOpenAi(ai, {
+    type: "input_audio_buffer.speech_started",
+    item_id: "item-live-order-caller",
+    audio_start_ms: 1000,
+  });
+  await emitExpectedOutputTranscript(ai, "resp-live-order-service");
+  await emitOpenAi(ai, { type: "response.output_audio.done", response_id: "resp-live-order-service" });
+  await emitOpenAi(ai, {
+    type: "response.done",
+    response: { id: "resp-live-order-service", status: "completed" },
+  });
+  const staleMark = controls.getState().pendingAssistantMarkName;
+  assert.ok(staleMark);
+
+  await emitOpenAi(ai, {
+    type: "input_audio_buffer.speech_stopped",
+    item_id: "item-live-order-caller",
+    audio_end_ms: 5100,
+  });
+  assert.equal(twilio.sent.filter((message) => message.event === "clear").length, 1);
+  assert.equal(ai.sent.filter((message) => message.type === "response.cancel").length, 0);
+  await emitTwilio(twilio, { event: "mark", mark: { name: staleMark } });
+  await emitOpenAi(ai, {
+    type: "conversation.item.input_audio_transcription.completed",
+    item_id: "item-live-order-caller",
+    transcript: "Twenty uh 2 p.m",
+  });
+
+  const creates = ai.sent.filter((message) => message.type === "response.create");
+  assert.equal(creates.length, 2);
+  assert.match(extractIntendedSpeech(creates.at(-1).response.instructions), /service/i);
+  const state = controls.getState();
+  assert.equal(state.responseActive, true);
+  assert.notEqual(state.responseInFlightId, "resp-live-order-service");
+  assert.equal(state.assistantPlaybackActive, false);
+  assert.equal(state.pendingAssistantMarkName, null);
+  assert.equal(bookings, 0);
+  assert.equal(sms, 0);
+  assert.equal(bookedWrites, 0);
+});
+
+test("correlated barge-in transcript may clear completed playback before speech_stopped and still drains once", async () => {
+  class TranscriptBeforeStopModel {
+    static async findOneAndUpdate() { return null; }
+  }
+  const { ai, twilio, controls } = createProductionSession({
+    CallTranscriptModel: TranscriptBeforeStopModel,
+  });
+  controls.seedBookingState({
+    state: {
+      ...baseBookingState(), service: "", name: "", requestedDateText: "",
+      requestedTimeText: "", parsedDate: "", parsedTime: "", askedConfirm: false,
+      confirmationPromptRequested: false, alternatives: [],
+    },
+    availability: { slotChecked: false, slotAvailable: false, slotAlternatives: [] },
+    context: {
+      barberId: "507f1f77bcf86cd799439011",
+      callSid: "CA2dd584409fe403c6878877429bc132eb",
+      streamSid: "MZ-transcript-before-stop",
+      currentLanguage: "en",
+    },
+  });
+  await controls.requestAssistantResponse({ immediate: true, reason: "transcript_before_stop_service_prompt" });
+  await emitOpenAi(ai, { type: "response.created", response: { id: "resp-transcript-before-stop" } });
+  await emitOpenAi(ai, {
+    type: "response.output_audio.delta", response_id: "resp-transcript-before-stop", delta: "AA==",
+  });
+  await emitOpenAi(ai, {
+    type: "input_audio_buffer.speech_started", item_id: "item-transcript-before-stop", audio_start_ms: 1000,
+  });
+  await completeDeterministicResponse(ai, "resp-transcript-before-stop");
+  const staleMark = controls.getState().pendingAssistantMarkName;
+  await emitOpenAi(ai, {
+    type: "conversation.item.input_audio_transcription.completed",
+    item_id: "item-transcript-before-stop",
+    transcript: "Twenty uh 2 p.m",
+  });
+  assert.equal(twilio.sent.filter((message) => message.event === "clear").length, 1);
+  assert.equal(ai.sent.filter((message) => message.type === "response.cancel").length, 0);
+  await emitTwilio(twilio, { event: "mark", mark: { name: staleMark } });
+  await emitOpenAi(ai, {
+    type: "input_audio_buffer.speech_stopped", item_id: "item-transcript-before-stop", audio_end_ms: 5100,
+  });
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.equal(ai.sent.filter((message) => message.type === "response.create").length, 2);
+  assert.equal(controls.getState().responseInFlightId, "");
+  assert.equal(controls.getState().assistantPlaybackActive, false);
+  assert.equal(controls.getState().pendingAssistantMarkName, null);
 });
 
 test("pre-booking confirmation remains buffered and unauthorized until its matching playback mark", async () => {

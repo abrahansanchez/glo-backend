@@ -2605,6 +2605,15 @@ export const attachMediaWebSocketServer = (server, dependencies = {}) => {
     function safeCancelResponse(reason = "unknown") {
       if (endingCall || !responseActive || !responseInFlightId || ai.readyState !== ai.OPEN) return false;
       const targetResponseId = responseInFlightId;
+      const lifecycle = responseLifecycleById.get(targetResponseId);
+      if (["completed", "failed", "incomplete", "cancelled"].includes(lifecycle?.openAiStatus)) {
+        console.log("[RESPONSE_CANCEL_SKIPPED_TERMINAL]", {
+          reason,
+          responseInFlightId: targetResponseId,
+          openAiStatus: lifecycle.openAiStatus,
+        });
+        return false;
+      }
       const cancellationExpiryCutoff = Date.now() - CANCELLATION_RECORD_TTL_MS;
       for (const [eventId, record] of outstandingCancellationByEventId) {
         if (record.createdAtMs < cancellationExpiryCutoff) outstandingCancellationByEventId.delete(eventId);
@@ -2613,7 +2622,6 @@ export const attachMediaWebSocketServer = (server, dependencies = {}) => {
         if (record.targetResponseId === targetResponseId && record.state === "pending") return false;
       }
       const eventId = `glo_cancel_${randomUUID()}`;
-      const lifecycle = responseLifecycleById.get(targetResponseId);
       try {
         ai.send(JSON.stringify({ type: "response.cancel", event_id: eventId }));
         outstandingCancellationByEventId.set(eventId, {
@@ -5002,10 +5010,20 @@ RULES:
         pendingBargeInStartedAt = null;
         pendingBargeInAudioStartMs = null;
         pendingBargeInWhilePlayback = false;
-        if (responseInFlightId === clearedResponseId) responseInFlightId = "";
+        const clearedOwnedResponse = responseInFlightId === clearedResponseId;
+        if (clearedOwnedResponse) responseInFlightId = "";
+        if (clearedOwnedResponse) {
+          responseActive = false;
+          aiResponseInProgress = false;
+          if (activeDeterministicLifecycleId === clearedResponseId) {
+            activeDeterministicLifecycleId = "";
+          }
+          if (lifecycleRecord?.purpose !== RESPONSE_PURPOSE.PRE_BOOKING_CONFIRMATION) {
+            lifecycleRecord.lifecycleActionHandled = true;
+          }
+        }
         readyForCallerInput =
-          lifecycleRecord?.purpose !== RESPONSE_PURPOSE.PRE_BOOKING_CONFIRMATION &&
-          lifecycleRecord?.openAiStatus === "completed";
+          lifecycleRecord?.purpose !== RESPONSE_PURPOSE.PRE_BOOKING_CONFIRMATION;
         console.log("[TWILIO_PLAYBACK_CLEARED_ON_BARGE_IN_CALLER_INPUT_READY]", {
           reason,
           responseActive,
