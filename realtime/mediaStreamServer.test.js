@@ -2316,8 +2316,11 @@ test("natural correction forms continuously require a fresh marked confirmation 
     "Haircut and beard",
     "Actually, can you change the time to 3:00 p.m. instead?",
     "Actually can you change it to 3 PM instead?",
+    "Actually, can I change the time to 3pm?",
+    "Actually, can I change the time to 3 p.m. instead?",
   ].entries()) {
     let availabilityChecks = 0;
+    const availabilityTimes = [];
     let appointments = 0;
     let sms = 0;
     const createdAppointmentTimes = [];
@@ -2351,8 +2354,9 @@ test("natural correction forms continuously require a fresh marked confirmation 
     const { ai, twilio, controls } = createProductionSession({
       bookAppointment: bookingBoundary,
       CallTranscriptModel: CorrectionTranscript,
-      isSlotAvailable: async () => {
+      isSlotAvailable: async ({ time }) => {
         availabilityChecks += 1;
+        availabilityTimes.push(time);
         return true;
       },
       barberDoc: {
@@ -2373,9 +2377,9 @@ test("natural correction forms continuously require a fresh marked confirmation 
         name: "Anthony Martinez",
         service: "Haircut",
         requestedDateText: "August 11, 2026",
-        requestedTimeText: "1 PM",
+        requestedTimeText: "12 PM",
         parsedDate: "2026-08-11",
-        parsedTime: "1:00 PM",
+        parsedTime: "12:00 PM",
         askedConfirm: false,
         confirmationPromptRequested: false,
         alternatives: [],
@@ -2418,6 +2422,7 @@ test("natural correction forms continuously require a fresh marked confirmation 
     assert.equal(corrected.bookingState.confirmed, false, correction);
     assert.equal(corrected.confirmationDeliveryReady, false, correction);
     assert.equal(availabilityChecks, 1, correction);
+    if (correction.includes("3")) assert.deepEqual(availabilityTimes, ["3:00 PM"], correction);
     assert.equal(appointments, 0, correction);
     assert.equal(sms, 0, correction);
     if (correction.includes("3")) {
@@ -2427,6 +2432,10 @@ test("natural correction forms continuously require a fresh marked confirmation 
       assert.equal(corrected.bookingState.parsedDate, "2026-08-11", correction);
       assert.equal(corrected.currentLanguage, "en", correction);
       assert.equal(corrected.bookingPhase, "awaiting_confirmation", correction);
+      const correctedCreate = ai.sent.filter((message) => message.type === "response.create").at(-1);
+      const correctedSpeech = extractIntendedSpeech(correctedCreate.response.instructions);
+      assert.match(correctedSpeech, /3:00 PM/, correction);
+      assert.doesNotMatch(correctedSpeech, /what time would you like/i, correction);
     }
 
     await emitTwilio(twilio, { event: "mark", mark: { name: oldMark } });
@@ -2438,6 +2447,9 @@ test("natural correction forms continuously require a fresh marked confirmation 
     const freshLifecycle = delivered.lifecycleRecords
       .find(([id]) => id === `resp-fresh-natural-correction-${index}`)[1];
     assert.equal(freshLifecycle.purpose, RESPONSE_PURPOSE.PRE_BOOKING_CONFIRMATION, correction);
+    if (correction.includes("3")) {
+      assert.match(freshLifecycle.completedOutputTranscript, /3:00 PM/, correction);
+    }
     assert.equal(freshLifecycle.playbackMarkAcknowledged, true, correction);
     assert.equal(delivered.confirmationDeliveryReady, true, correction);
 
@@ -2466,6 +2478,73 @@ test("natural correction forms continuously require a fresh marked confirmation 
       correction
     );
   }
+});
+
+test("no-value change-the-time request preserves clean-baseline clarification behavior", async () => {
+  let availabilityChecks = 0;
+  let appointments = 0;
+  let sms = 0;
+  const transcriptUpdates = [];
+  class AmbiguousChangeTranscript {
+    static async findOneAndUpdate(_query, update) {
+      transcriptUpdates.push(structuredClone(update));
+      return null;
+    }
+  }
+  const { ai, twilio, controls } = createProductionSession({
+    isSlotAvailable: async () => {
+      availabilityChecks += 1;
+      return true;
+    },
+    CallTranscriptModel: AmbiguousChangeTranscript,
+    bookAppointment: async () => {
+      appointments += 1;
+      sms += 1;
+      return { success: true, appointment: { _id: "ambiguous-change" } };
+    },
+  });
+  controls.seedBookingState({
+    state: {
+      ...baseBookingState(),
+      name: "Anthony Martinez",
+      service: "Haircut",
+      requestedDateText: "August 11, 2026",
+      requestedTimeText: "12 PM",
+      parsedDate: "2026-08-11",
+      parsedTime: "12:00 PM",
+      askedConfirm: false,
+      confirmationPromptRequested: false,
+      alternatives: [],
+    },
+    availability: { slotChecked: true, slotAvailable: true, slotAlternatives: [] },
+    context: { currentLanguage: "en" },
+  });
+
+  await controls.requestAssistantResponse({ immediate: true, reason: "ambiguous-change-original" });
+  await emitOpenAi(ai, { type: "response.created", response: { id: "resp-ambiguous-original" } });
+  await emitOpenAi(ai, {
+    type: "response.output_audio.delta",
+    response_id: "resp-ambiguous-original",
+    delta: "AA==",
+  });
+  await completeDeterministicResponse(ai, "resp-ambiguous-original");
+  const originalMark = controls.getState().pendingAssistantMarkName;
+  assert.ok(originalMark);
+  await emitTwilio(twilio, { event: "mark", mark: { name: originalMark } });
+
+  await controls.handleCallerTranscript("Actually, can I change the time?", {
+    transcriptId: "no-value-change-time-turn",
+  });
+  const state = controls.getState();
+  const clarification = ai.sent.filter((message) => message.type === "response.create").at(-1);
+  assert.equal(state.bookingState.parsedTime, "12:00 PM");
+  assert.equal(state.bookingState.awaitingCorrection, false);
+  assert.equal(state.bookingPhase, "awaiting_confirmation");
+  assert.equal(availabilityChecks, 0);
+  assert.equal(appointments, 0);
+  assert.equal(sms, 0);
+  assert.equal(transcriptUpdates.filter((update) => update.$set?.outcome === "BOOKED").length, 0);
+  assert.match(extractIntendedSpeech(clarification.response.instructions), /confirm the appointment/i);
 });
 
 test("routine deterministic audio streams in order before response.done and marks after completion", async () => {

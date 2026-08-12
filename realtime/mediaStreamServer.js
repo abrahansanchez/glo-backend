@@ -975,7 +975,9 @@ export const classifyConfirmationResponse = (text, { language = "auto" } = {}) =
     /\b(?:cambia|cambiala|cambialo|mueve|muevela|mejor)\b/,
     /\bquiero\s+(?:corte|barba|otro|otra).*\b(?:en vez|instead)?\b/,
   ];
-  if (modificationPatterns.some((pattern) => pattern.test(normalized))) {
+  const explicitTimeReplacement =
+    /\bchange\s+the\s+time\s+to\b/.test(normalized) && containsTimeSignal(raw);
+  if (explicitTimeReplacement || modificationPatterns.some((pattern) => pattern.test(normalized))) {
     return { kind: "modification", reason: "requested_change" };
   }
 
