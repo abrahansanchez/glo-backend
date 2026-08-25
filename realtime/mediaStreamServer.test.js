@@ -11,6 +11,7 @@ import {
   cloneBookingDomainSnapshot,
   confirmationLifecycleCanAdvance,
   createConfirmationLifecycleTestHarness,
+  diagnosePreBookingConfirmationTranscript,
   extractIntendedSpeech,
   isConfirmationPromptText,
   materializeQueuedExactResponse,
@@ -633,6 +634,109 @@ test("purpose-aware confirmation validation accepts safe rewording and rejects c
       transcript
     );
   }
+});
+
+test("pre-booking confirmation diagnostics preserve boolean decisions and classify failed invariants", () => {
+  const baseRecord = {
+    intendedSpeech:
+      "The exact date is Tuesday, August 25, 2026. I have Danielle Hernandez scheduled for Haircut on Tuesday, August 25, 2026 at 5:00 PM. Would you like me to confirm the appointment?",
+    bookingSnapshot: {
+      bookingState: {
+        name: "Danielle Hernandez",
+        service: "Haircut",
+        parsedDate: "2026-08-25",
+        parsedTime: "5:00 PM",
+      },
+    },
+  };
+  const cases = [
+    ["exact safe confirmation", baseRecord.intendedSpeech, true, null],
+    [
+      "harmless safe rewording",
+      "I have Danielle Hernandez down for a haircut on Tuesday, August 25 at 5 PM. Should I confirm it?",
+      true,
+      null,
+    ],
+    [
+      "stale 4 PM when 5 PM is expected",
+      "I have Danielle Hernandez down for a haircut on Tuesday, August 25 at 4 PM. Should I confirm it?",
+      false,
+      "missing_expected_time",
+    ],
+    [
+      "missing caller name",
+      "I have a haircut on Tuesday, August 25 at 5 PM. Should I confirm it?",
+      false,
+      "missing_name",
+    ],
+    [
+      "wrong service",
+      "I have Danielle Hernandez down for a beard trim on Tuesday, August 25 at 5 PM. Should I confirm it?",
+      false,
+      "conflicting_service",
+    ],
+    [
+      "wrong date",
+      "I have Danielle Hernandez down for a haircut on Wednesday, August 26 at 5 PM. Should I confirm it?",
+      false,
+      "date_mismatch",
+    ],
+    [
+      "missing expected time",
+      "I have Danielle Hernandez down for a haircut on Tuesday, August 25. Should I confirm it?",
+      false,
+      "missing_expected_time",
+    ],
+    [
+      "conflicting second time",
+      "I have Danielle Hernandez down for a haircut on Tuesday, August 25 at 5 PM, not 4 PM. Should I confirm it?",
+      false,
+      "conflicting_time",
+    ],
+    [
+      "missing confirmation question",
+      "I have Danielle Hernandez down for a haircut on Tuesday, August 25 at 5 PM.",
+      false,
+      "missing_confirmation_question",
+    ],
+    [
+      "premature booking-success claim",
+      "Your appointment is confirmed. I have Danielle Hernandez down for a haircut on Tuesday, August 25 at 5 PM. Should I confirm it?",
+      false,
+      "premature_success",
+    ],
+  ];
+
+  for (const [label, transcript, valid, failedInvariant] of cases) {
+    const record = { ...baseRecord, completedOutputTranscript: transcript };
+    const diagnostic = diagnosePreBookingConfirmationTranscript(record);
+    assert.equal(diagnostic.valid, valid, label);
+    assert.equal(diagnostic.failedInvariant, failedInvariant, label);
+    assert.equal(
+      validatePreBookingConfirmationTranscript(record),
+      diagnostic.valid,
+      `${label}: boolean/structured equivalence`
+    );
+  }
+
+  const safe = diagnosePreBookingConfirmationTranscript({
+    ...baseRecord,
+    completedOutputTranscript: cases[1][1],
+  });
+  assert.deepEqual(safe.generatedSignals.services, ["haircut"]);
+  assert.deepEqual(safe.generatedSignals.weekdays, ["tuesday"]);
+  assert.deepEqual(safe.generatedSignals.months, ["august"]);
+  assert.deepEqual(safe.generatedSignals.times, ["5:00 pm"]);
+  assert.equal(safe.nameMatched, true);
+  assert.equal(safe.confirmationQuestionDetected, true);
+  assert.equal(safe.prematureSuccessDetected, false);
+
+  const conflicting = diagnosePreBookingConfirmationTranscript({
+    ...baseRecord,
+    completedOutputTranscript: cases[7][1],
+  });
+  assert.equal(conflicting.timeMatched, true);
+  assert.equal(conflicting.conflictingTimeDetected, true);
 });
 
 test("purpose-aware ordinary deterministic validation accepts safe collection and availability rewording", () => {

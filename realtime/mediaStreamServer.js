@@ -201,19 +201,26 @@ const transcriptContainsNormalizedPhrase = (completed, expected) => {
   return new RegExp(`(?:^|\\s)${escaped}(?:$|\\s)`).test(completed);
 };
 
-const transcriptContainsExpectedService = (completed, expectedService) => {
+const confirmationServiceMatchDetails = (completed, expectedService) => {
   const service = normalizeDeterministicSpeech(expectedService);
-  if (!service) return false;
+  if (!service) return { matched: false, conflicting: false, signals: [] };
 
   const hasHaircut = /\b(?:haircut|hair cut|cut|fade|lineup|corte|pelo|cabello)\b/.test(completed);
   const hasBeard = /\b(?:beard|shave|barba)\b/.test(completed);
   const expectsHaircut = /\b(?:haircut|hair cut|cut|fade|lineup|corte|pelo|cabello)\b/.test(service);
   const expectsBeard = /\b(?:beard|shave|barba)\b/.test(service);
+  const signals = [hasHaircut ? "haircut" : "", hasBeard ? "beard" : ""].filter(Boolean);
 
-  if (expectsHaircut && expectsBeard) return hasHaircut && hasBeard;
-  if (expectsHaircut) return hasHaircut && !hasBeard;
-  if (expectsBeard) return hasBeard && !hasHaircut;
-  return completed.includes(service);
+  if (expectsHaircut && expectsBeard) {
+    return { matched: hasHaircut && hasBeard, conflicting: false, signals };
+  }
+  if (expectsHaircut) {
+    return { matched: hasHaircut && !hasBeard, conflicting: hasBeard, signals };
+  }
+  if (expectsBeard) {
+    return { matched: hasBeard && !hasHaircut, conflicting: hasHaircut, signals };
+  }
+  return { matched: completed.includes(service), conflicting: false, signals };
 };
 
 const transcriptContainsExpectedDate = (completed, expectedDate) => {
@@ -245,20 +252,17 @@ const transcriptContainsExpectedDate = (completed, expectedDate) => {
   return new RegExp(`\\b${expectedDay}(?:st|nd|rd|th)?\\b`).test(completed);
 };
 
-export const validatePreBookingConfirmationTranscript = (record) => {
+export const diagnosePreBookingConfirmationTranscript = (record) => {
   const rawCompleted = String(record?.completedOutputTranscript || "");
   const completed = normalizeConfirmationFactText(rawCompleted);
   const intended = normalizeConfirmationFactText(record?.intendedSpeech);
   const bookingState = record?.bookingSnapshot?.bookingState;
-  if (!completed || !bookingState) return false;
 
   const prematureSuccess =
     /\b(?:appointment|booking|cita)\s+(?:is|has been|esta|ha sido)\s+(?:confirmed|booked|scheduled|finalized|all set|confirmada|reservada|programada|finalizada)\b/.test(completed) ||
     /\b(?:you are|you're|estas)\s+(?:confirmed|booked|scheduled|all set|confirmado|confirmada|programado|programada)\b/.test(completed) ||
     /\b(?:locked in|successfully (?:booked|scheduled)|ya (?:esta|quedo) confirmad[oa])\b/.test(completed);
-  if (prematureSuccess) return false;
-
-  if (/\bnext\b/.test(completed) && !/\bnext\b/.test(intended)) return false;
+  const unexpectedNext = /\bnext\b/.test(completed) && !/\bnext\b/.test(intended);
 
   const confirmationQuestion =
     /\b(?:should|shall|can|may) i (?:go ahead and )?confirm\b/.test(completed) ||
@@ -270,19 +274,58 @@ export const validatePreBookingConfirmationTranscript = (record) => {
       /[?¿]/.test(rawCompleted) &&
       /\bconfirmo (?:esa|esta|la) cita\b/.test(completed)
     );
-  if (!confirmationQuestion) return false;
-
-  if (!transcriptContainsNormalizedPhrase(completed, bookingState.name)) return false;
-  if (!transcriptContainsExpectedService(completed, bookingState.service)) return false;
-  if (!transcriptContainsExpectedDate(completed, bookingState.parsedDate)) return false;
-
-  const expectedTime = expectedConfirmationTimeKey(bookingState.parsedTime);
+  const nameMatched = Boolean(bookingState) &&
+    transcriptContainsNormalizedPhrase(completed, bookingState.name);
+  const serviceDetails = confirmationServiceMatchDetails(completed, bookingState?.service);
+  const dateMatched = Boolean(bookingState) &&
+    transcriptContainsExpectedDate(completed, bookingState.parsedDate);
+  const expectedTime = expectedConfirmationTimeKey(bookingState?.parsedTime);
   const mentionedTimes = extractConfirmationTimeKeys(completed);
-  if (!expectedTime || !mentionedTimes.has(expectedTime)) return false;
-  if ([...mentionedTimes].some((time) => time !== expectedTime)) return false;
+  const timeMatched = Boolean(expectedTime) && mentionedTimes.has(expectedTime);
+  const conflictingTimeDetected = [...mentionedTimes].some((time) => time !== expectedTime);
 
-  return true;
+  let failedInvariant = null;
+  if (!completed) failedInvariant = "missing_transcript";
+  else if (!bookingState) failedInvariant = "missing_booking_snapshot";
+  else if (prematureSuccess) failedInvariant = "premature_success";
+  else if (unexpectedNext) failedInvariant = "unexpected_next";
+  else if (!confirmationQuestion) failedInvariant = "missing_confirmation_question";
+  else if (!nameMatched) failedInvariant = "missing_name";
+  else if (!serviceDetails.matched) {
+    failedInvariant = serviceDetails.conflicting ? "conflicting_service" : "missing_service";
+  } else if (!dateMatched) failedInvariant = "date_mismatch";
+  else if (!timeMatched) failedInvariant = "missing_expected_time";
+  else if (conflictingTimeDetected) failedInvariant = "conflicting_time";
+
+  const generatedWeekdays = CONFIRMATION_WEEKDAYS
+    .filter((aliases) => aliases.some((alias) => new RegExp(`\\b${alias}\\b`).test(completed)))
+    .map((aliases) => aliases[0]);
+  const generatedMonths = CONFIRMATION_MONTHS
+    .filter((aliases) => aliases.some((alias) => new RegExp(`\\b${alias}\\b`).test(completed)))
+    .map((aliases) => aliases[0]);
+
+  return {
+    valid: failedInvariant === null,
+    failedInvariant,
+    nameMatched,
+    serviceMatched: serviceDetails.matched,
+    dateMatched,
+    timeMatched,
+    confirmationQuestionDetected: confirmationQuestion,
+    prematureSuccessDetected: prematureSuccess,
+    conflictingTimeDetected,
+    unexpectedNextDetected: unexpectedNext,
+    generatedSignals: {
+      services: serviceDetails.signals,
+      weekdays: generatedWeekdays,
+      months: generatedMonths,
+      times: [...mentionedTimes],
+    },
+  };
 };
+
+export const validatePreBookingConfirmationTranscript = (record) =>
+  diagnosePreBookingConfirmationTranscript(record).valid;
 
 const mentionedRoutineCalendarTerms = (value) => {
   const normalized = normalizeConfirmationFactText(value);
@@ -415,12 +458,12 @@ export const validateOrdinaryDeterministicTranscript = (record) => {
   }
 };
 
-const deterministicTranscriptMatches = (record) => {
+const deterministicTranscriptMatches = (record, preBookingDiagnostic = null) => {
   const intended = normalizeDeterministicSpeech(record?.intendedSpeech);
   const completed = normalizeDeterministicSpeech(record?.completedOutputTranscript);
   if (intended === completed) return true;
   if (record?.purpose === RESPONSE_PURPOSE.PRE_BOOKING_CONFIRMATION) {
-    return validatePreBookingConfirmationTranscript(record);
+    return preBookingDiagnostic?.valid ?? validatePreBookingConfirmationTranscript(record);
   }
   if (
     normalizeRoutineDeterministicMeaning(record?.intendedSpeech) ===
@@ -7420,7 +7463,45 @@ RULES:
           ) {
             transcriptLifecycle.completedOutputTranscript = String(evt.transcript || "");
             transcriptLifecycle.outputTranscriptEnded = true;
-            transcriptLifecycle.transcriptMatches = deterministicTranscriptMatches(transcriptLifecycle);
+            const preBookingDiagnostic =
+              transcriptLifecycle.purpose === RESPONSE_PURPOSE.PRE_BOOKING_CONFIRMATION
+                ? diagnosePreBookingConfirmationTranscript(transcriptLifecycle)
+                : null;
+            transcriptLifecycle.transcriptMatches = deterministicTranscriptMatches(
+              transcriptLifecycle,
+              preBookingDiagnostic
+            );
+            if (preBookingDiagnostic) {
+              const expectedState = transcriptLifecycle.bookingSnapshot?.bookingState || {};
+              console.log("[PRE_BOOKING_CONFIRMATION_VALIDATION]", {
+                event: "PRE_BOOKING_CONFIRMATION_VALIDATION",
+                CallSid: callSid || null,
+                responseId: transcriptLifecycle.responseId || null,
+                retryCount: Number(transcriptLifecycle.retryCount || 0),
+                valid: transcriptLifecycle.transcriptMatches === true,
+                failedInvariant: transcriptLifecycle.transcriptMatches
+                  ? null
+                  : preBookingDiagnostic.failedInvariant,
+                expected: {
+                  service: expectedState.service || null,
+                  date: expectedState.parsedDate || null,
+                  time: expectedState.parsedTime || null,
+                },
+                generatedSignals: preBookingDiagnostic.generatedSignals,
+                nameMatched: preBookingDiagnostic.nameMatched,
+                serviceMatched: preBookingDiagnostic.serviceMatched,
+                dateMatched: preBookingDiagnostic.dateMatched,
+                timeMatched: preBookingDiagnostic.timeMatched,
+                confirmationQuestionDetected:
+                  preBookingDiagnostic.confirmationQuestionDetected,
+                prematureSuccessDetected: preBookingDiagnostic.prematureSuccessDetected,
+                conflictingTimeDetected: preBookingDiagnostic.conflictingTimeDetected,
+                unexpectedNextDetected: preBookingDiagnostic.unexpectedNextDetected,
+                deliveryDecision: transcriptLifecycle.transcriptMatches === true
+                  ? "allow_if_lifecycle_complete"
+                  : "discard_and_retry",
+              });
+            }
             await reconcileDeterministicResponse(transcriptLifecycle);
           }
         }
