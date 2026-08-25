@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import {
   CONFIRMATION_MAX_OUTPUT_TOKENS,
+  classifyConfirmationResponse,
   DETERMINISTIC_RESPONSE_POLICY,
   RESPONSE_PURPOSE,
   buildDeterministicResponseRequest,
@@ -14,6 +15,7 @@ import {
   isConfirmationPromptText,
   materializeQueuedExactResponse,
   normalizeDeterministicSpeech,
+  normalizeMeridiemNotation,
   restoreBookingDomainSnapshot,
   attachMediaWebSocketServer,
   validateOrdinaryDeterministicTranscript,
@@ -77,6 +79,8 @@ const createProductionSession = ({
   bookAppointment,
   deterministicCompletionTimeoutMs,
   isSlotAvailable,
+  getAvailableSlots,
+  suggestClosestSlots,
   CallTranscriptModel,
   barberDoc,
 } = {}) => {
@@ -89,6 +93,8 @@ const createProductionSession = ({
     bookAppointment,
     deterministicCompletionTimeoutMs,
     isSlotAvailable,
+    getAvailableSlots,
+    suggestClosestSlots,
     CallTranscriptModel,
     onSessionReady: (value) => { controls = value; },
   });
@@ -2481,6 +2487,132 @@ test("natural correction forms continuously require a fresh marked confirmation 
   }
 });
 
+test("ASR meridiem variants normalize and classify consistently without changing ordinary confirmation answers", () => {
+  for (const suffix of ["PM", "pm", "P.M.", "p.m.", "P.M", "p.m"]) {
+    assert.equal(normalizeMeridiemNotation(`5 ${suffix}`), "5 pm", suffix);
+    assert.equal(
+      classifyConfirmationResponse(`Actually, can I change the time to 5 ${suffix}`).kind,
+      "modification",
+      suffix
+    );
+  }
+  for (const suffix of ["AM", "am", "A.M.", "a.m.", "A.M", "a.m"]) {
+    assert.equal(normalizeMeridiemNotation(`9 ${suffix}`), "9 am", suffix);
+    assert.equal(
+      classifyConfirmationResponse(`Move it to 9 ${suffix}`).kind,
+      "modification",
+      suffix
+    );
+  }
+  for (const [answer, expected] of [
+    ["yes", "affirmative"],
+    ["yeah", "unclear"],
+    ["correct", "affirmative"],
+    ["no", "rejection"],
+  ]) {
+    assert.equal(classifyConfirmationResponse(answer).kind, expected, answer);
+  }
+  for (const statement of ["I am ready", "Pam handles appointments", "The example is unrelated"]) {
+    assert.notEqual(classifyConfirmationResponse(statement).kind, "modification", statement);
+  }
+});
+
+test("production ASR punctuated time correction after selected-alternative confirmation requires a fresh proposal", async () => {
+  const alternatives = [
+    { date: "2026-08-27", time: "4:00 PM" },
+    { date: "2026-08-27", time: "4:30 PM" },
+    { date: "2026-08-27", time: "5:00 PM" },
+  ];
+  let availabilityChecks = 0;
+  const availabilityTimes = [];
+  let appointments = 0;
+  let smsSubmissions = 0;
+  const { ai, twilio, controls } = createProductionSession({
+    barberDoc: {
+      _id: "507f1f77bcf86cd799439011",
+      services: [{ name: "Haircut", durationMinutes: 30 }],
+      availability: { timezone: "America/New_York", defaultServiceDurationMinutes: 30 },
+    },
+    isSlotAvailable: async ({ time }) => {
+      availabilityChecks += 1;
+      availabilityTimes.push(time);
+      return availabilityChecks > 1;
+    },
+    getAvailableSlots: async () => alternatives,
+    suggestClosestSlots: async () => [],
+    bookAppointment: async () => {
+      appointments += 1;
+      smsSubmissions += 1;
+      return { success: true, appointment: { _id: "punctuated-meridiem-booking" } };
+    },
+  });
+  const deliverLatest = async (responseId) => {
+    await emitOpenAi(ai, { type: "response.created", response: { id: responseId } });
+    await emitOpenAi(ai, { type: "response.output_audio.delta", response_id: responseId, delta: "AA==" });
+    await completeDeterministicResponse(ai, responseId);
+    await emitTwilio(twilio, { event: "mark", mark: { name: controls.getState().pendingAssistantMarkName } });
+  };
+  controls.seedBookingState({
+    state: {
+      ...baseBookingState(), intent: null, name: "", service: "",
+      requestedDateText: "", requestedTimeText: "", parsedDate: "", parsedTime: "",
+      askedConfirm: false, confirmationPromptRequested: false,
+      awaitingAlternativeSelection: false, alternatives: [], selectedAlternative: null,
+    },
+    availability: { slotChecked: false, slotAvailable: false, slotAlternatives: [] },
+  });
+
+  await controls.handleCallerTranscript("I want to book a haircut on August 27, 2026 at 3 PM");
+  assert.equal(availabilityChecks, 1);
+  await deliverLatest("production-order-alternatives");
+  await controls.handleCallerTranscript("Four o'clock.");
+  assert.equal(availabilityChecks, 2);
+  await deliverLatest("production-order-name");
+  await controls.handleCallerTranscript("Prolando");
+  await deliverLatest("production-order-confirmation");
+  assert.equal(controls.getState().confirmationDeliveryReady, true);
+
+  await emitOpenAi(ai, {
+    type: "input_audio_buffer.speech_started",
+    event_id: "production-correction-start",
+    audio_start_ms: 50416,
+    item_id: "production-correction-item",
+  });
+  await emitOpenAi(ai, {
+    type: "input_audio_buffer.speech_stopped",
+    event_id: "production-correction-stop",
+    audio_end_ms: 55328,
+    item_id: "production-correction-item",
+  });
+  await emitOpenAi(ai, {
+    type: "input_audio_buffer.committed",
+    event_id: "production-correction-commit",
+    previous_item_id: "production-order-confirmation-item",
+    item_id: "production-correction-item",
+  });
+  await emitOpenAi(ai, {
+    type: "conversation.item.input_audio_transcription.completed",
+    item_id: "production-correction-item",
+    transcript: "Actually, can I change the time to 5 p.m",
+  });
+
+  assert.equal(controls.getState().bookingState.parsedTime, "5:00 PM");
+  assert.equal(availabilityChecks, 3);
+  assert.deepEqual(availabilityTimes, ["3:00 PM", "4:00 PM", "5:00 PM"]);
+  assert.equal(controls.getState().confirmationDeliveryReady, false);
+  assert.deepEqual([appointments, smsSubmissions], [0, 0]);
+
+  const freshConfirmation = extractIntendedSpeech(
+    ai.sent.filter((message) => message.type === "response.create").at(-1).response.instructions
+  );
+  assert.match(freshConfirmation, /5:00 PM/);
+  assert.doesNotMatch(freshConfirmation, /4:00 PM/);
+  await deliverLatest("production-order-fresh-confirmation");
+  assert.equal(controls.getState().confirmationDeliveryReady, true);
+  await controls.handleCallerTranscript("yes");
+  assert.deepEqual([appointments, smsSubmissions], [1, 1]);
+});
+
 test("no-value change-the-time request preserves clean-baseline clarification behavior", async () => {
   let availabilityChecks = 0;
   let appointments = 0;
@@ -2646,6 +2778,7 @@ test("active routine barge-in cancels A before creating B and late A events cann
   }
   const { ai, twilio, controls } = createProductionSession({
     CallTranscriptModel: ActiveBargeTranscript,
+    barberDoc: { _id: "507f1f77bcf86cd799439011", services: [] },
     bookAppointment: async () => {
       bookings += 1;
       sms += 1;
@@ -2742,6 +2875,7 @@ test("completed OpenAI generation interrupted during Twilio playback retires cle
   }
   const { ai, twilio, controls } = createProductionSession({
     CallTranscriptModel: LiveOrderTranscript,
+    barberDoc: { _id: "507f1f77bcf86cd799439011", services: [] },
     bookAppointment: async () => {
       bookings += 1;
       sms += 1;
@@ -2828,6 +2962,7 @@ test("correlated barge-in transcript may clear completed playback before speech_
   }
   const { ai, twilio, controls } = createProductionSession({
     CallTranscriptModel: TranscriptBeforeStopModel,
+    barberDoc: { _id: "507f1f77bcf86cd799439011", services: [] },
   });
   controls.seedBookingState({
     state: {

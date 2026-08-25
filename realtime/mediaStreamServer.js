@@ -83,6 +83,9 @@ export const normalizeDeterministicSpeech = (value) => String(value || "")
   .replace(/\s+/g, " ")
   .trim();
 
+export const normalizeMeridiemNotation = (value) => String(value || "")
+  .replace(/\b([ap])\s*\.?\s*m\.?(?!\w)/gi, (_match, meridiem) => `${meridiem.toLowerCase()}m`);
+
 const normalizeRoutineDeterministicMeaning = (value) => normalizeDeterministicSpeech(value)
   .replace(/\b(?:por favor|please)\b/g, "")
   .replace(/\b(?:perfecto|perfect|claro|of course)\b/g, "")
@@ -1169,7 +1172,7 @@ const containsDateSignal = (text) => {
 };
 
 const containsTimeSignal = (text) => {
-  const t = String(text || "").toLowerCase();
+  const t = normalizeMeridiemNotation(text).toLowerCase();
   // Bare "mañana" is a date (tomorrow), never an exact appointment time.
   if (/^\s*ma.{0,2}ana\s*$/.test(t)) return false;
   return (
@@ -1188,7 +1191,7 @@ const normalizeSpanishDateTimeText = (text) => {
     "tres": "3", "dos": "2", "uno": "1",
   };
 
-  let t = String(text || "");
+  let t = normalizeMeridiemNotation(text);
 
   // Convert Spanish number words to digits before digit-based replacements
   for (const [word, digit] of Object.entries(spanishNumbers)) {
@@ -1455,7 +1458,6 @@ const normalizeAlternativeSelectionText = (text) =>
     .toLowerCase()
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
-    .replace(/\b([ap])\s*\.?\s*m\.?\b/g, "$1m")
     .replace(/[.?!,]+$/g, "")
     .replace(/\s+/g, " ")
     .trim();
@@ -1778,11 +1780,11 @@ const isLikelyAlternativeSelectionResponse = (text, alternatives = []) =>
   );
 
 const containsLooseTimeSignal = (text) =>
-  /\b(?:at|a las)\s*\d{1,2}(?::\d{2})?\b/i.test(String(text || ""));
+  /\b(?:at|a las)\s*\d{1,2}(?::\d{2})?\b/i.test(normalizeMeridiemNotation(text));
 
 const hasNumericTimeSignal = (text) =>
-  /\b\d{1,2}\s*(:\d{2})?\s*(am|pm)?\b/i.test(String(text || "")) ||
-  /\b(?:at|a las)\s*\d{1,2}(?::\d{2})?\b/i.test(String(text || ""));
+  /\b\d{1,2}\s*(:\d{2})?\s*(am|pm)?\b/i.test(normalizeMeridiemNotation(text)) ||
+  /\b(?:at|a las)\s*\d{1,2}(?::\d{2})?\b/i.test(normalizeMeridiemNotation(text));
 
 const normalizeServiceName = (text) => {
   const t = String(text || "").toLowerCase();
@@ -2344,7 +2346,7 @@ export const attachMediaWebSocketServer = (server, dependencies = {}) => {
       if (!barberDoc && barberId && !dependencies.parseNaturalDateTime) {
         barberDoc = await Barber.findById(barberId).lean();
       }
-      return parseNaturalDateTimeForCall(text, {
+      return parseNaturalDateTimeForCall(normalizeMeridiemNotation(text), {
         timeZone: barberDoc?.availability?.timezone || "America/New_York",
       });
     };
