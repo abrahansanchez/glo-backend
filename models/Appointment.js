@@ -55,11 +55,26 @@ const appointmentSchema = new mongoose.Schema(
       default: "ai",
       set: normalizeSource,
     },
+    bookingCommand: {
+      commandId: { type: String },
+      idempotencyKey: { type: String },
+      proposalVersion: { type: Number },
+      requestHash: { type: String },
+    },
   },
   { timestamps: true }
 );
 
 appointmentSchema.index({ barberId: 1, startAt: 1 });
+appointmentSchema.index(
+  { barberId: 1, "bookingCommand.idempotencyKey": 1 },
+  {
+    unique: true,
+    partialFilterExpression: {
+      "bookingCommand.idempotencyKey": { $type: "string" },
+    },
+  }
+);
 
 appointmentSchema.pre("validate", function normalizeAppointment(next) {
   if (this.status) this.status = normalizeStatus(this.status);
