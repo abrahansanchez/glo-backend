@@ -20,6 +20,7 @@ connectDB();
 // REALTIME TWILIO MEDIA STREAM SERVER
 // ---------------------------------------------------------
 import { attachMediaWebSocketServer } from "./realtime/mediaStreamServer.js";
+import { attachIsolatedVoiceRoutes } from "./realtime/voice-v2/routing/attachIsolatedVoiceRoutes.js";
 import { startAppointmentReminderJob } from "./jobs/appointmentReminders.js";
 
 // ---------------------------------------------------------
@@ -203,7 +204,13 @@ if (enableQaRoutes) {
 // ---------------------------------------------------------
 // ATTACH TWILIO MEDIA STREAM WEBSOCKET SERVER
 // ---------------------------------------------------------
-attachMediaWebSocketServer(server);
+attachIsolatedVoiceRoutes({
+  server,
+  attachV1: attachMediaWebSocketServer,
+  v2EnabledValue: process.env.ENABLE_VOICE_V2_ROUTE,
+  initializeV2Session: null,
+  buildSha: process.env.RENDER_GIT_COMMIT || process.env.GIT_COMMIT || "unknown",
+});
 startAppointmentReminderJob();
 
 // ---------------------------------------------------------
