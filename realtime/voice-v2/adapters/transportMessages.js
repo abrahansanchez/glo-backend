@@ -1,0 +1,55 @@
+export const TransportEvent = Object.freeze({
+  TWILIO_STREAM_STARTED: "TWILIO_STREAM_STARTED",
+  CALLER_AUDIO: "CALLER_AUDIO",
+  PLAYBACK_MARK_ACKNOWLEDGED: "PLAYBACK_MARK_ACKNOWLEDGED",
+  TWILIO_STREAM_STOPPED: "TWILIO_STREAM_STOPPED",
+  TWILIO_CONNECTION_CLOSED: "TWILIO_CONNECTION_CLOSED",
+  TWILIO_TRANSPORT_ERROR: "TWILIO_TRANSPORT_ERROR",
+  OPENAI_CONNECTED: "OPENAI_CONNECTED",
+  OPENAI_SESSION_CONFIGURED: "OPENAI_SESSION_CONFIGURED",
+  USER_TRANSCRIPT_COMPLETED: "USER_TRANSCRIPT_COMPLETED",
+  USER_TRANSCRIPT_FAILED: "USER_TRANSCRIPT_FAILED",
+  CALLER_SPEECH_STARTED: "CALLER_SPEECH_STARTED",
+  CALLER_SPEECH_STOPPED: "CALLER_SPEECH_STOPPED",
+  RESPONSE_CREATED: "RESPONSE_CREATED",
+  RESPONSE_AUDIO_DELTA: "RESPONSE_AUDIO_DELTA",
+  RESPONSE_AUDIO_COMPLETED: "RESPONSE_AUDIO_COMPLETED",
+  RESPONSE_TRANSCRIPT_COMPLETED: "RESPONSE_TRANSCRIPT_COMPLETED",
+  RESPONSE_COMPLETED: "RESPONSE_COMPLETED",
+  RESPONSE_FAILED: "RESPONSE_FAILED",
+  RESPONSE_CANCEL_REQUESTED: "RESPONSE_CANCEL_REQUESTED",
+  RESPONSE_CANCELLED: "RESPONSE_CANCELLED",
+  RESPONSE_CANCEL_FAILED: "RESPONSE_CANCEL_FAILED",
+  ACTIVE_RESPONSE_REJECTED: "ACTIVE_RESPONSE_REJECTED",
+  STALE_RESPONSE_EVENT_QUARANTINED: "STALE_RESPONSE_EVENT_QUARANTINED",
+  OPENAI_CONNECTION_CLOSED: "OPENAI_CONNECTION_CLOSED",
+  OPENAI_TRANSPORT_ERROR: "OPENAI_TRANSPORT_ERROR",
+  CRITICAL_AUDIO_BUFFERED: "CRITICAL_AUDIO_BUFFERED",
+  CRITICAL_AUDIO_RELEASED: "CRITICAL_AUDIO_RELEASED",
+  CRITICAL_AUDIO_DISCARDED: "CRITICAL_AUDIO_DISCARDED",
+});
+
+export function transportEvent(type, details = {}) {
+  if (!Object.values(TransportEvent).includes(type)) throw new TypeError("unknown_transport_event");
+  return Object.freeze({ type, ...details });
+}
+
+export function parseJsonMessage(raw) {
+  const value = raw?.data ?? raw;
+  const text = Buffer.isBuffer(value) ? value.toString("utf8") : String(value);
+  try { return JSON.parse(text); } catch { throw new TypeError("invalid_transport_json"); }
+}
+
+export function sendJson(socket, message) {
+  if (!socket || socket.readyState === 2 || socket.readyState === 3) throw new TypeError("transport_not_writable");
+  socket.send(JSON.stringify(message));
+  return Object.freeze(message);
+}
+
+export function bindSocket(socket, handlers) {
+  for (const [name, handler] of Object.entries(handlers)) {
+    if (typeof socket.on === "function") socket.on(name, handler);
+    else if (typeof socket.addEventListener === "function") socket.addEventListener(name, handler);
+    else throw new TypeError("unsupported_socket_interface");
+  }
+}
