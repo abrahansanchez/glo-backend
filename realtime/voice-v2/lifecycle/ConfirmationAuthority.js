@@ -20,12 +20,15 @@ export class ConfirmationAuthority {
     this.#revokedProposals.set(proposalVersion, reason);
     for (const [key, grant] of this.#grants) if (grant.proposalVersion === proposalVersion) { this.#grants.delete(key); this.#revoked.set(key, reason); }
   }
-  evaluateAffirmative({ proposal, action, responseId, markId, responseRegistry, playbackRegistry }) {
-    if (action?.action !== "AFFIRM_CONFIRMATION") return denied("NOT_AFFIRMATIVE");
-    const key = authorityKey(proposal.proposalVersion, responseId, markId);
+  verifyGrant({ proposalVersion, responseId, markId, responseRegistry, playbackRegistry }) {
+    const key = authorityKey(proposalVersion, responseId, markId);
     if (this.#revoked.has(key)) return denied(this.#revoked.get(key));
     if (!this.#grants.has(key)) return denied("NO_CURRENT_CONFIRMATION");
-    return inspectLifecycle({ proposalVersion: proposal.proposalVersion, responseId, markId, responseRegistry, playbackRegistry, revoked: this.#revoked, revokedProposals: this.#revokedProposals });
+    return inspectLifecycle({ proposalVersion, responseId, markId, responseRegistry, playbackRegistry, revoked: this.#revoked, revokedProposals: this.#revokedProposals });
+  }
+  evaluateAffirmative({ proposal, action, responseId, markId, responseRegistry, playbackRegistry }) {
+    if (action?.action !== "AFFIRM_CONFIRMATION") return denied("NOT_AFFIRMATIVE");
+    return this.verifyGrant({ proposalVersion: proposal.proposalVersion, responseId, markId, responseRegistry, playbackRegistry });
   }
 }
 

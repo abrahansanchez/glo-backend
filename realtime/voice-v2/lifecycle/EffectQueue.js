@@ -4,6 +4,9 @@ export class EffectQueue {
   constructor({ handlers = {} } = {}) { this.handlers = { ...handlers }; }
   enqueue(effect) {
     const command = Object.freeze({ attempt: 1, ...effect });
+    const identity = `${command.commandId}:${command.attempt}`;
+    const existing = this.#queue.find((item) => `${item.commandId}:${item.attempt}` === identity) || this.#results.get(identity)?.command;
+    if (existing) return existing;
     this.#queue.push(command); return command;
   }
   retry(commandId) {

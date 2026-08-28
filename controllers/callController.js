@@ -1,5 +1,6 @@
 import twilio from "twilio";
 import Barber from "../models/Barber.js";
+import { findBarberByInboundNumber } from "../services/business/resolveBusinessByCalledNumber.js";
 import {
   clearActiveCall,
   clearActiveCallBySid,
@@ -24,18 +25,6 @@ const getMediaWebsocketUrl = (req) => {
   const rawBase = process.env.APP_BASE_URL || req.headers.host || "";
   const normalized = rawBase.replace(/(^\w+:|^)\/\//, "").replace(/\/$/, "");
   return `wss://${normalized}/ws/media`;
-};
-
-const findBarberByInboundNumber = async (phoneNumber) => {
-  if (!phoneNumber) return null;
-
-  return Barber.findOne({
-    $or: [
-      { twilioNumber: phoneNumber },
-      { assignedTwilioNumber: phoneNumber },
-      { twilioPhoneNumber: phoneNumber },
-    ],
-  }).sort({ updatedAt: -1, createdAt: -1 });
 };
 
 const buildInitialPrompt = (barberName, options = {}) => {
