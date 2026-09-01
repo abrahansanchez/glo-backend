@@ -716,12 +716,22 @@ It is the sole authority for pre-booking proposal transitions.
 
 ## PostBookingReducer
 
-Separate reducer for post-booking actions such as:
+Owns deterministic interpretation of authoritative completed booking-effect results, including:
+
+- successful creation and idempotent replay
+- idempotency conflict and booking failure
+- terminal booking outcome
+- post-booking follow-up effect decisions
+- response-purpose selection
+
+It may also remain the separate reducer for post-booking actions such as:
 
 - cancel
 - reschedule
 
-Do not overload the pre-booking reducer into another giant switch.
+It does not execute appointments, send SMS, interpret caller speech, own confirmation authority or business identity, call Twilio/OpenAI, or replace `BookingReducer`'s pre-booking responsibility. Booking terminality does not itself finalize the voice session or transcript; session lifecycle owns final response delivery/persistence and transcript finalization. If the final response fails, times out, or is interrupted by disconnect after booking succeeds, session recovery/termination must still finalize the transcript exactly once rather than wait indefinitely for successful delivery.
+
+Do not overload either reducer into another giant switch.
 
 ---
 

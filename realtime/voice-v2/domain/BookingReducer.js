@@ -31,6 +31,7 @@ const fieldByAction = new Map([
 export function reduceBooking(currentProposal, action) {
   const currentValidation = validateBookingProposal(currentProposal);
   if (!currentValidation.valid) throw new TypeError(`invalid_current_proposal:${currentValidation.reason}`);
+  if (currentProposal.terminal) return rejected(currentProposal, "booking_already_terminal");
   const actionValidation = validateCallerAction(action);
   if (!actionValidation.valid) return rejected(currentProposal, actionValidation.reason);
 

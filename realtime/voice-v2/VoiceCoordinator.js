@@ -3,10 +3,11 @@ import { reduceBooking } from "./domain/BookingReducer.js";
 import { planResponse } from "./planning/ResponsePlanner.js";
 import { validateSpeech } from "./planning/SpeechValidator.js";
 import { applyConfirmationAuthority } from "./domain/BookingLifecycleTransitions.js";
+import { reduceBookingResult } from "./domain/PostBookingReducer.js";
 import { ResponseStatus } from "./lifecycle/ResponseRegistry.js";
 
 export class VoiceCoordinator {
-  constructor({ interpreter = interpretTurn, reducer = reduceBooking, responsePlanner = planResponse, speechValidator = validateSpeech } = {}) { this.interpreter = interpreter; this.reducer = reducer; this.responsePlanner = responsePlanner; this.speechValidator = speechValidator; }
+  constructor({ interpreter = interpretTurn, reducer = reduceBooking, postBookingReducer = reduceBookingResult, responsePlanner = planResponse, speechValidator = validateSpeech } = {}) { this.interpreter = interpreter; this.reducer = reducer; this.postBookingReducer = postBookingReducer; this.responsePlanner = responsePlanner; this.speechValidator = speechValidator; }
   receiveFinalizedTurn(session, turn, context = {}) {
     session.record("TURN_RECEIVED", { turnId: turn.turnId });
     const existing = session.turnRegistry.get(turn.turnId);
@@ -42,6 +43,14 @@ export class VoiceCoordinator {
     return Object.freeze({ interrupted: true, cancelled: shouldCancel, cleared: shouldClear, reason: null });
   }
   async executeNextEffect(session) { const entry = await session.effectQueue.executeNext({ currentProposalVersion: session.proposal.proposalVersion }); if (entry) { session.record("EFFECT_EXECUTED", { commandId: entry.command.commandId || null, effectType: entry.command.type, proposalVersion: entry.command.proposalVersion, result: entry.result }); const event = EFFECT_RESULT_EVENT[entry.command.type]; if (event) session.record(event, { commandId: entry.command.commandId || null, proposalVersion: entry.command.proposalVersion, result: entry.result }); } return entry; }
+  applyBookingExecution(session, execution) {
+    const transition = this.postBookingReducer({ proposal: session.proposal, execution, effectQueue: session.effectQueue });
+    if (transition.applied) session.replaceProposal(session.proposal, transition.nextProposal, { event: "POST_BOOKING_RESULT_APPLIED" });
+    for (const effect of transition.effects) { session.effectQueue.enqueue(effect); session.record("EFFECT_QUEUED", { commandId: effect.commandId, effectType: effect.type, proposalVersion: effect.proposalVersion }); }
+    const event = transition.outcome === "BOOKED" ? "BOOKING_SUCCEEDED" : transition.applied ? "BOOKING_FAILED" : "BOOKING_RESULT_REJECTED";
+    session.record(event, { commandId: execution?.command?.commandId || null, proposalVersion: execution?.command?.proposalVersion ?? null, outcome: transition.outcome, reason: transition.reason, appointmentId: transition.appointmentId });
+    return transition;
+  }
   async deliverResponse(session, { purpose, language = "en", generator, transport }) {
     const plan = this.responsePlanner({ proposal: session.proposal, purpose, language }); session.record("RESPONSE_PLANNED", { purpose: plan.purpose, proposalVersion: plan.proposalVersion });
     const generated = await generator.generate(plan); session.responseRegistry.register({ responseId: generated.responseId, proposalVersion: plan.proposalVersion, purpose: plan.purpose }); session.responseRegistry.request(generated.responseId); session.record("RESPONSE_GENERATED", { responseId: generated.responseId, proposalVersion: plan.proposalVersion });

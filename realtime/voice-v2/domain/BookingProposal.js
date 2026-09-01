@@ -61,7 +61,7 @@ export function createBookingProposal({
     }),
     availability: nextAvailability,
     confirmation: nextConfirmation,
-    terminal: Boolean(terminal),
+    terminal: normalizeTerminal(terminal),
   };
   const validation = validateBookingProposal(proposal);
   if (!validation.valid) throw new TypeError(validation.reason);
@@ -80,6 +80,9 @@ export function validateBookingProposal(proposal) {
   if (!proposal.availability || proposal.availability.proposalVersion !== proposal.proposalVersion) return { valid: false, reason: "stale_availability" };
   if (proposal.availability.slotKey !== deriveSlotKey(proposal)) return { valid: false, reason: "availability_slot_mismatch" };
   if (!proposal.confirmation || proposal.confirmation.proposalVersion !== proposal.proposalVersion) return { valid: false, reason: "stale_confirmation" };
+  if (proposal.terminal !== false && (!proposal.terminal || typeof proposal.terminal !== "object" || !Object.isFrozen(proposal.terminal))) {
+    return { valid: false, reason: "invalid_terminal_state" };
+  }
   return { valid: true, reason: null };
 }
 
@@ -100,3 +103,9 @@ export function hasRequiredBookingFacts(proposal) {
 }
 
 export { AvailabilityStatus, ConfirmationStatus };
+
+function normalizeTerminal(terminal) {
+  if (terminal === false || terminal === null || terminal === undefined) return false;
+  if (typeof terminal !== "object") throw new TypeError("invalid_terminal_state");
+  return Object.freeze({ ...terminal });
+}

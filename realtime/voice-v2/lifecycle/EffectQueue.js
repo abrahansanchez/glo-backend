@@ -15,6 +15,15 @@ export class EffectQueue {
     return this.enqueue({ ...previous, attempt: previous.attempt + 1 });
   }
   pending() { return Object.freeze([...this.#queue]); }
+  verifyExecution(entry, identity = {}) {
+    if (!entry || typeof entry !== "object" || !entry.command || !entry.result) return Object.freeze({ verified: false, reason: "EXECUTION_PROOF_REQUIRED" });
+    const key = `${entry.command.commandId}:${entry.command.attempt}`;
+    if (this.#results.get(key) !== entry) return Object.freeze({ verified: false, reason: "EXECUTION_NOT_RECORDED" });
+    for (const field of ["commandId", "proposalVersion", "idempotencyKey"]) {
+      if (identity[field] !== undefined && entry.command[field] !== identity[field]) return Object.freeze({ verified: false, reason: `EXECUTION_${field.toUpperCase()}_MISMATCH` });
+    }
+    return Object.freeze({ verified: true, reason: null });
+  }
   async executeNext({ currentProposalVersion } = {}) {
     const command = this.#queue.shift(); if (!command) return null;
     if (Number.isInteger(command.proposalVersion) && command.proposalVersion !== currentProposalVersion) {
