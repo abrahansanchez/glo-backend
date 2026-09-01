@@ -22,7 +22,7 @@ export class VoiceCoordinator {
       }
       const previous = session.proposal; const reduced = this.reducer(previous, interpreted.interpretation);
       if (reduced.proposalChanged) { session.responseRegistry.invalidateProposal(previous.proposalVersion); session.playbackRegistry.invalidateProposal(previous.proposalVersion); session.confirmationAuthority.revokeProposal(previous.proposalVersion); session.record("CONFIRMATION_REVOKED", { proposalVersion: previous.proposalVersion, reason: "PROPOSAL_CHANGED" }); session.replaceProposal(previous, reduced.nextProposal); }
-      for (const effect of reduced.effects) { session.effectQueue.enqueue(effect); session.record("EFFECT_QUEUED", { commandId: effect.commandId || null, effectType: effect.type, proposalVersion: effect.proposalVersion ?? session.proposal.proposalVersion }); }
+      for (const effect of reduced.effects) { const command = effect.commandId ? effect : { ...effect, commandId: `${effect.type.toLowerCase()}:${turn.turnId}` }; session.effectQueue.enqueue(command); session.record("EFFECT_QUEUED", { commandId: command.commandId, effectType: command.type, proposalVersion: command.proposalVersion ?? session.proposal.proposalVersion }); }
       return Object.freeze({ interpreted, reduced });
     });
   }

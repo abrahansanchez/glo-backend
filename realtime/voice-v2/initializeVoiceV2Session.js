@@ -24,7 +24,7 @@ export function initializeVoiceV2Session({
 } = {}) {
   requireSessionInputs({ callSid, callerNumber, businessContext, buildSha, twilioSocket, openaiSocketFactory });
   let lifecycle; let processing = Promise.resolve(); let effectsProcessing = Promise.resolve(); let turnSequence = 0; let responseSequence = 0; let markSequence = 0;
-  const providerTurns = new Set(); const requests = new Map(); const responses = new Map(); const marks = new Map(); const superseded = new Set();
+  const providerTurns = new Set(); const requests = new Map(); const responses = new Map(); const marks = new Map(); const superseded = new Set(); const ambiguityPurposes = [];
   const effectHandlers = {
     CHECK_AVAILABILITY: async (command) => { const slotKey = deriveSlotKey(session.proposal); return timedEffect(command, "AVAILABILITY_TIMEOUT", 15000, () => checkAvailability(command), () => ({ proposalVersion: command.proposalVersion, slotKey, available: false, alternatives: [], reason: "TIMEOUT" })); },
     CREATE_APPOINTMENT: async (command) => timedEffect(command, "EFFECT_TIMEOUT", 20000, () => bookingAdapter.createAppointment(command), () => ({ success: false, reason: "TIMEOUT" })),
@@ -86,7 +86,7 @@ export function initializeVoiceV2Session({
   }
 
   async function acceptTurn(event) {
-    if (lifecycle.terminated || session.proposal.terminal) return;
+    if (lifecycle.terminated || session.proposal.terminal || session.ambiguityRecovery.limitReached) return;
     const providerId = event.itemId || event.eventId;
     if (!providerId || providerTurns.has(providerId)) return;
     providerTurns.add(providerId);
@@ -99,6 +99,9 @@ export function initializeVoiceV2Session({
       confirmationContext: { responseId: current?.responseId || null, markId: current?.markId || null },
     });
     const outcome = registered?.result || registered;
+    const recovery = session.ambiguityRecovery.observe({ action: outcome?.interpreted?.interpretation?.action, turnId, proposal: session.proposal, accepted: outcome?.reduced?.rejected !== true });
+    recordAmbiguity(recovery, turnId);
+    if (recovery.responsePurpose) ambiguityPurposes.push(recovery.responsePurpose);
     if (session.proposal.proposalVersion !== previousVersion) supersedeProposal(previousVersion);
     kickEffects();
     if (!outcome?.reduced?.effects?.length && !outcome?.reduced?.rejected && outcome?.interpreted?.interpretation?.action !== "AFFIRM_CONFIRMATION") {
@@ -134,7 +137,8 @@ export function initializeVoiceV2Session({
         await lifecycle.settleDurableBooking(pending.commandId);
         if (transition.responsePurpose) await requestResponse(coordinator.responsePlanner({ proposal: session.proposal, purpose: transition.responsePurpose, language: turnContext.language || "en" }));
       } else if (["REQUEST_CLARIFICATION", "CONFIRMATION_REJECTED", "REQUEST_LATER_TIME", "REQUEST_AVAILABLE_TIMES_FOR_DATE"].includes(pending.type)) {
-        await requestResponse(coordinator.responsePlanner({ proposal: session.proposal, purpose: ResponsePurpose.CLARIFICATION, language: turnContext.language || "en" }));
+        const purpose = pending.type === "REQUEST_CLARIFICATION" ? ambiguityPurposes.shift() || ResponsePurpose.CLARIFICATION : ResponsePurpose.CLARIFICATION;
+        await requestResponse(coordinator.responsePlanner({ proposal: session.proposal, purpose, language: turnContext.language || "en" }));
       }
     }
   }
@@ -204,7 +208,7 @@ export function initializeVoiceV2Session({
       const grant = session.confirmationAuthority.grant({ proposalVersion: state.plan.proposalVersion, responseId: state.responseId, markId, responseRegistry: session.responseRegistry, playbackRegistry: session.playbackRegistry });
       session.record(grant.authorized ? "CONFIRMATION_AUTHORITY_GRANTED" : "CONFIRMATION_AUTHORITY_WITHHELD", { responseId: state.responseId, markId, reason: grant.reason || null });
     }
-    if (state.plan.purpose === ResponsePurpose.BOOKING_SUCCESS || (state.plan.purpose === ResponsePurpose.ERROR_RECOVERY && session.proposal.terminal)) await lifecycle.terminate("RESPONSE_DELIVERED");
+    if (state.plan.purpose === ResponsePurpose.BOOKING_SUCCESS || state.plan.purpose === ResponsePurpose.AMBIGUITY_LIMIT_REACHED || (state.plan.purpose === ResponsePurpose.ERROR_RECOVERY && session.proposal.terminal)) await lifecycle.terminate("RESPONSE_DELIVERED");
   }
 
   async function responseFailed(responseId, reason) {
@@ -212,12 +216,19 @@ export function initializeVoiceV2Session({
     session.watchdog.cancel(`response:${state.requestId}`);
     session.responseRegistry.fail(responseId, { valid: false, failedInvariant: reason });
     session.record("RESPONSE_DELIVERY_FAILED", { responseId, purpose: state.plan.purpose, reason });
-    if (session.proposal.terminal) await lifecycle.terminate(reason);
+    if (session.proposal.terminal || state.plan.purpose === ResponsePurpose.AMBIGUITY_LIMIT_REACHED) await lifecycle.terminate(reason);
   }
 
   async function interruptCurrent() {
     const state = currentLifecycle(); if (!state || lifecycle.terminated) return;
     await coordinator.handleCallerSpeechStarted(session, { responseId: state.responseId, markId: state.markId, cancelResponse: () => { superseded.add(state.responseId); return openai.supersedeResponse({ requestId: state.requestId, responseId: state.responseId, reason: "CALLER_INTERRUPTION" }); }, clearPlayback: () => twilio.clearPlayback() });
+    if (state.plan.purpose === ResponsePurpose.AMBIGUITY_LIMIT_REACHED) await lifecycle.terminate("AMBIGUITY_LIMIT_INTERRUPTED");
+  }
+
+  function recordAmbiguity(recovery, turnId) {
+    if (recovery.kind === "unchanged" || recovery.kind === "blocked") return;
+    const event = recovery.kind === "reset" ? "AMBIGUITY_RESET" : recovery.kind === "recorded" ? "AMBIGUITY_RECORDED" : recovery.kind === "escalated" ? "AMBIGUITY_ESCALATED" : "AMBIGUITY_LIMIT_REACHED";
+    session.record(event, { turnId, count: recovery.consecutiveAmbiguousTurns, escalationLevel: recovery.escalationLevel, proposalVersion: session.proposal.proposalVersion, responsePurpose: recovery.responsePurpose });
   }
 
   function supersedeProposal(proposalVersion) {
@@ -248,14 +259,14 @@ export function initializeVoiceV2Session({
     const tracked = requests.get(requestId); if (!tracked || lifecycle.terminated) return;
     if (tracked.responseId) session.responseRegistry.invalidate(tracked.responseId, "RESPONSE_GENERATION_TIMEOUT");
     session.record("TIMEOUT_RECOVERY_PLANNED", { timeoutType: "RESPONSE_GENERATION_TIMEOUT", responseId: tracked.responseId || null, proposalVersion: tracked.plan.proposalVersion });
-    if (session.proposal.terminal) return lifecycle.terminate("RESPONSE_GENERATION_TIMEOUT");
+    if (session.proposal.terminal || tracked.plan.purpose === ResponsePurpose.AMBIGUITY_LIMIT_REACHED) return lifecycle.terminate("RESPONSE_GENERATION_TIMEOUT");
     if (tracked.plan.purpose !== ResponsePurpose.ERROR_RECOVERY) await requestResponse(coordinator.responsePlanner({ proposal: session.proposal, purpose: ResponsePurpose.ERROR_RECOVERY, language: tracked.plan.language }));
   }
 
   async function playbackTimedOut(markId) {
     const state = marks.get(markId); if (!state || lifecycle.terminated) return;
     coordinator.handleTimeout(session, "PLAYBACK_TIMEOUT", { responseId: state.responseId, markId });
-    if (session.proposal.terminal) return lifecycle.terminate("PLAYBACK_TIMEOUT");
+    if (session.proposal.terminal || state.plan.purpose === ResponsePurpose.AMBIGUITY_LIMIT_REACHED) return lifecycle.terminate("PLAYBACK_TIMEOUT");
     if (state.plan.purpose !== ResponsePurpose.ERROR_RECOVERY) await requestResponse(coordinator.responsePlanner({ proposal: session.proposal, purpose: ResponsePurpose.ERROR_RECOVERY, language: state.plan.language }));
   }
 
