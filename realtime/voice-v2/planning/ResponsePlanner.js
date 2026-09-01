@@ -2,7 +2,7 @@ import { deriveBookingRequirement } from "../domain/BookingProposal.js";
 
 export const ResponsePurpose = Object.freeze({
   ASK_SERVICE: "ASK_SERVICE", ASK_DATE: "ASK_DATE", ASK_TIME: "ASK_TIME", ASK_NAME: "ASK_NAME",
-  OFFER_ALTERNATIVES: "OFFER_ALTERNATIVES", PRE_BOOKING_CONFIRMATION: "PRE_BOOKING_CONFIRMATION",
+  OFFER_ALTERNATIVES: "OFFER_ALTERNATIVES", SLOT_UNAVAILABLE: "SLOT_UNAVAILABLE", PRE_BOOKING_CONFIRMATION: "PRE_BOOKING_CONFIRMATION",
   BOOKING_SUCCESS: "BOOKING_SUCCESS", CLARIFICATION: "CLARIFICATION", ERROR_RECOVERY: "ERROR_RECOVERY",
 });
 
@@ -21,7 +21,11 @@ export function planResponse({ proposal, purpose, language = "en" }) {
     language,
     critical: resolvedPurpose === ResponsePurpose.PRE_BOOKING_CONFIRMATION,
     expectedFacts,
-    speechContract: Object.freeze({ semanticValidationRequired: resolvedPurpose === ResponsePurpose.PRE_BOOKING_CONFIRMATION }),
+    speechContract: Object.freeze({
+      semanticValidationRequired: resolvedPurpose === ResponsePurpose.PRE_BOOKING_CONFIRMATION,
+      alternativesClaimAllowed: resolvedPurpose === ResponsePurpose.OFFER_ALTERNATIVES,
+      inviteAnotherSlot: resolvedPurpose === ResponsePurpose.SLOT_UNAVAILABLE,
+    }),
   });
 }
 

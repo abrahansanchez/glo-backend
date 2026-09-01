@@ -4,8 +4,8 @@ export class EffectQueue {
   constructor({ handlers = {} } = {}) { this.handlers = { ...handlers }; }
   enqueue(effect) {
     const command = Object.freeze({ attempt: 1, ...effect });
-    const identity = `${command.commandId}:${command.attempt}`;
-    const existing = this.#queue.find((item) => `${item.commandId}:${item.attempt}` === identity) || this.#results.get(identity)?.command;
+    const identity = commandIdentity(command);
+    const existing = this.#queue.find((item) => commandIdentity(item) === identity) || this.#results.get(identity)?.command;
     if (existing) return existing;
     this.#queue.push(command); return command;
   }
@@ -17,7 +17,7 @@ export class EffectQueue {
   pending() { return Object.freeze([...this.#queue]); }
   verifyExecution(entry, identity = {}) {
     if (!entry || typeof entry !== "object" || !entry.command || !entry.result) return Object.freeze({ verified: false, reason: "EXECUTION_PROOF_REQUIRED" });
-    const key = `${entry.command.commandId}:${entry.command.attempt}`;
+    const key = commandIdentity(entry.command);
     if (this.#results.get(key) !== entry) return Object.freeze({ verified: false, reason: "EXECUTION_NOT_RECORDED" });
     for (const field of ["commandId", "proposalVersion", "idempotencyKey"]) {
       if (identity[field] !== undefined && entry.command[field] !== identity[field]) return Object.freeze({ verified: false, reason: `EXECUTION_${field.toUpperCase()}_MISMATCH` });
@@ -35,5 +35,7 @@ export class EffectQueue {
     catch (error) { return this.#record(command, { success: false, reason: error?.code || "EFFECT_FAILED" }); }
   }
   async drain(context) { const results = []; while (this.#queue.length) results.push(await this.executeNext(context)); return results; }
-  #record(command, result) { const entry = Object.freeze({ command, result: Object.freeze({ ...result }) }); this.#results.set(`${command.commandId}:${command.attempt}`, entry); return entry; }
+  #record(command, result) { const entry = Object.freeze({ command, result: Object.freeze({ ...result }) }); this.#results.set(commandIdentity(command), entry); return entry; }
 }
+
+function commandIdentity(command) { return `${command.type}:${command.commandId}:${command.attempt}`; }

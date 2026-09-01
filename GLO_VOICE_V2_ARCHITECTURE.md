@@ -354,6 +354,8 @@ An availability result is valid only for the exact service/date/time proposal th
 
 Proposal change ⇒ old availability cannot authorize anything.
 
+After an authoritative availability result is applied, that transition also owns deterministic response-purpose selection: `AVAILABLE` derives the next collection or `PRE_BOOKING_CONFIRMATION` purpose from the resulting proposal; `UNAVAILABLE` with alternatives yields `OFFER_ALTERNATIVES`; `UNAVAILABLE` without alternatives yields `SLOT_UNAVAILABLE`; infrastructure failure yields `ERROR_RECOVERY`; and a stale result yields no response. The pre-check `NEEDS_AVAILABILITY` requirement remains distinct from every completed availability outcome.
+
 ---
 
 ## INV-10 — Confirmation belongs to a proposal version
