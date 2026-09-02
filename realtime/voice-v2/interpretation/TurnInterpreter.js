@@ -68,6 +68,8 @@ export function classifyOneAction(normalizedTurn, context) {
     || matchesRuleGroup("quarter_hour_forms", text);
   const dateSignal = matchesRuleGroup("day_date_requests", text);
   const serviceSignal = hasServiceSignal(normalizedTurn, context);
+  const nameSignal = matchesRuleGroup("name_setting_cues", text);
+  const bookRequest = matchesRuleGroup("book_request_cues", text);
 
   // Explicit modification owns the turn before confirmation classification.
   if (modification && timeSignal) return CallerActionType.MODIFY_TIME;
@@ -80,11 +82,12 @@ export function classifyOneAction(normalizedTurn, context) {
   if (matchesRuleGroup("day_date_requests", text) && /\b(?:what|available|que|disponible|hay|tienes)\b/.test(text)) {
     return CallerActionType.REQUEST_AVAILABLE_TIMES_FOR_DATE;
   }
+  if ([serviceSignal, dateSignal, timeSignal, nameSignal].filter(Boolean).length > 1) return CallerActionType.BOOK_REQUEST;
   const confirmation = extractConfirmation(normalizedTurn);
   if (confirmation === "affirm") return CallerActionType.AFFIRM_CONFIRMATION;
   if (confirmation === "reject") return CallerActionType.REJECT_CONFIRMATION;
-  if (matchesRuleGroup("name_setting_cues", text)) return CallerActionType.SET_NAME;
-  if (matchesRuleGroup("book_request_cues", text)) return CallerActionType.BOOK_REQUEST;
+  if (nameSignal) return CallerActionType.SET_NAME;
+  if (bookRequest) return CallerActionType.BOOK_REQUEST;
   if (serviceSignal) return context.currentProposal?.service ? CallerActionType.MODIFY_SERVICE : CallerActionType.SET_SERVICE;
   if (timeSignal) return CallerActionType.SET_TIME;
   if (dateSignal) return CallerActionType.SET_DATE;
@@ -116,12 +119,21 @@ function buildInterpretation(action, normalizedTurn, sourceTurnId, context) {
       break;
     case CallerActionType.BOOK_REQUEST: {
       const service = extractService(normalizedTurn, context);
+      const name = nameSignalFor(normalizedTurn) ? extractName(normalizedTurn) : null;
+      const date = matchesRuleGroup("day_date_requests", normalizedTurn.text) ? extractDate(normalizedTurn, context) : null;
+      const time = hasTimeSignal(normalizedTurn.text) ? extractTime(normalizedTurn, { currentTime: context.currentProposal?.time }) : null;
       if (service) value.service = service;
+      if (name) value.name = name;
+      if (date) value.date = date;
+      if (time) value.time = time;
       break;
     }
   }
   return value;
 }
+
+function nameSignalFor(normalizedTurn) { return matchesRuleGroup("name_setting_cues", normalizedTurn.text); }
+function hasTimeSignal(text) { return matchesRuleGroup("time_expressions", text) || matchesRuleGroup("half_hour_forms", text) || matchesRuleGroup("quarter_hour_forms", text); }
 
 function validateOrClarify(candidate, context, source, sourceTurnId, languageEvidence) {
   const validation = validateCandidate(candidate, context, sourceTurnId);

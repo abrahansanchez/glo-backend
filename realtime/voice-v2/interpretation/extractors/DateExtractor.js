@@ -9,7 +9,8 @@ export function extractDate(normalizedTurn, { referenceDate } = {}) {
   const text = normalizedTurn?.text ?? "";
   const base = new Date(`${referenceDate}T12:00:00Z`);
   if (/\b(?:today|hoy)\b/.test(text)) return referenceDate;
-  if (/\b(?:tomorrow|manana)\b/.test(text)) return addDays(base, 1);
+  const textWithoutSpanishDaypart = text.replace(/\b(?:de la|por la) manana\b/g, "");
+  if (/\b(?:tomorrow|manana)\b/.test(textWithoutSpanishDaypart)) return addDays(base, 1);
   const weekday = Object.keys(WEEKDAYS).find((name) => new RegExp(`\\b${name}\\b`).test(text));
   if (!weekday) return null;
   const delta = (WEEKDAYS[weekday] - base.getUTCDay() + 7) % 7 || 7;

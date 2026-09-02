@@ -2,7 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { CallerActionType } from "../../domain/CallerAction.js";
-import { createBookingProposal } from "../../domain/BookingProposal.js";
+import { createBookingProposal, deriveSlotKey } from "../../domain/BookingProposal.js";
+import { applyAvailabilityResult } from "../../domain/BookingLifecycleTransitions.js";
 import { reduceBooking } from "../../domain/BookingReducer.js";
 import {
   InterpretationRuleInventory,
@@ -70,6 +71,11 @@ test("date extractor resolves bilingual weekdays from explicit reference date ra
   assert.equal(extractDate(normalizeTurn("Thursday"), { referenceDate: "2026-08-26" }), "2026-08-27");
   assert.equal(extractDate(normalizeTurn("el jueves"), { referenceDate: "2026-08-26" }), "2026-08-27");
   assert.equal(extractDate(normalizeTurn("mañana"), { referenceDate: "2026-08-26" }), "2026-08-27");
+  assert.equal(extractDate(normalizeTurn("para mañana"), { referenceDate: "2026-08-26" }), "2026-08-27");
+  assert.equal(extractDate(normalizeTurn("a las diez de la mañana"), { referenceDate: "2026-08-20" }), null);
+  assert.equal(extractDate(normalizeTurn("por la mañana"), { referenceDate: "2026-08-20" }), null);
+  assert.equal(extractDate(normalizeTurn("mañana a las diez de la mañana"), { referenceDate: "2026-08-26" }), "2026-08-27");
+  assert.equal(extractTime(normalizeTurn("mañana a las diez de la mañana")), "10:00");
   assert.equal(extractDate(normalizeTurn("Thursday"), {}), null);
 });
 
@@ -163,6 +169,86 @@ test("BOOK_REQUEST and direct date/service modifications produce one reducer-rea
   const service = (await interpret("Change the service to beard trim", { currentProposal })).interpretation;
   assert.deepEqual([date.action, date.date], [CallerActionType.SET_DATE, "2026-08-27"]);
   assert.deepEqual([service.action, service.service], [CallerActionType.MODIFY_SERVICE, "Beard Trim"]);
+});
+
+test("multi-fact booking request remains one action with every explicit canonical fact", async () => {
+  const result = await interpret("I need a Haircut Thursday at 10 AM, my name is Roberto");
+  assert.deepEqual(result.interpretation, {
+    action: CallerActionType.BOOK_REQUEST,
+    confidence: "explicit",
+    sourceTurnId: "turn-1",
+    service: "Haircut",
+    name: "Roberto",
+    date: "2026-08-27",
+    time: "10:00",
+  });
+  assert.equal(result.interpretationSource, "deterministic");
+  const reduced = reduceBooking(emptyProposal(), result.interpretation);
+  assert.equal(reduced.proposalChanged, true); assert.equal(reduced.nextProposal.proposalVersion, 2); assert.equal(reduced.effects.length, 1); assert.equal(reduced.effects[0].type, "CHECK_AVAILABILITY");
+});
+
+test("multi-fact collection preserves explicit facts without guessing missing facts", async () => {
+  const cases = [
+    ["I need a Haircut Thursday at 10 AM", { service: "Haircut", date: "2026-08-27", time: "10:00" }],
+    ["Haircut Thursday", { service: "Haircut", date: "2026-08-27" }],
+    ["Thursday at 10 AM", { date: "2026-08-27", time: "10:00" }],
+    ["Haircut at 10 AM, Roberto", { service: "Haircut", time: "10:00" }],
+    ["Necesito un corte de pelo el jueves a las diez de la manana, me llamo Roberto", { service: "Haircut", name: "Roberto", date: "2026-08-27", time: "10:00" }],
+    ["I need un corte de pelo Thursday at 10 AM, me llamo Roberto", { service: "Haircut", name: "Roberto", date: "2026-08-27", time: "10:00" }],
+  ];
+  for (const [transcript, facts] of cases) {
+    const action = (await interpret(transcript)).interpretation;
+    assert.equal(action.action, CallerActionType.BOOK_REQUEST, transcript);
+    for (const field of ["service", "name", "date", "time"]) assert.equal(action[field] ?? null, facts[field] ?? null, `${transcript}: ${field}`);
+  }
+});
+
+test("ambiguous bare trailing name is not guessed and continues through ASK_NAME and the existing SET_NAME path", async () => {
+  const request = (await interpret("Haircut at 10 AM, Roberto")).interpretation;
+  assert.deepEqual(
+    { action: request.action, service: request.service, time: request.time, name: request.name ?? null },
+    { action: CallerActionType.BOOK_REQUEST, service: "Haircut", time: "10:00", name: null },
+  );
+  const reduced = reduceBooking(emptyProposal(), { ...request, date: "2026-08-27" });
+  const available = applyAvailabilityResult(reduced.nextProposal, {
+    proposalVersion: reduced.nextProposal.proposalVersion,
+    slotKey: deriveSlotKey(reduced.nextProposal),
+    available: true,
+  });
+  assert.equal(available.responsePurpose, "ASK_NAME");
+  const nameAction = (await interpret("my name is Roberto", { currentProposal: available.nextProposal })).interpretation;
+  assert.deepEqual({ action: nameAction.action, name: nameAction.name }, { action: CallerActionType.SET_NAME, name: "Roberto" });
+  assert.equal(reduceBooking(available.nextProposal, nameAction).nextProposal.name, "Roberto");
+});
+
+test("multi-fact BOOK_REQUEST cannot steal correction, alternative, confirmation, or rejection owners", async () => {
+  const currentProposal = createBookingProposal({ proposalId: "precedence-audit", service: "Haircut", name: "Roberto", date: "2026-08-27", time: "10:00" });
+  const alternatives = [{ date: "2026-08-27", time: "11:00" }, { date: "2026-08-27", time: "12:00" }];
+  const cases = [
+    ["actually change the time to 11", { currentProposal }, CallerActionType.MODIFY_TIME],
+    ["actually Friday at 11 instead", { currentProposal }, CallerActionType.MODIFY_TIME],
+    ["change the service to beard trim", { currentProposal }, CallerActionType.MODIFY_SERVICE],
+    ["actually my name is Robert", { currentProposal }, CallerActionType.SET_NAME],
+    ["the second one", { currentProposal, currentAlternatives: alternatives }, CallerActionType.SELECT_ALTERNATIVE],
+    ["yes", { currentProposal, confirmationContext: true }, CallerActionType.AFFIRM_CONFIRMATION],
+    ["no", { currentProposal, confirmationContext: true }, CallerActionType.REJECT_CONFIRMATION],
+  ];
+  for (const [transcript, context, expected] of cases) assert.equal((await interpret(transcript, context)).interpretation.action, expected, transcript);
+});
+
+test("single-signal and ambiguous controls retain their existing semantic owners", async () => {
+  const alternatives = [{ date: "2026-08-27", time: "10:00" }, { date: "2026-08-27", time: "11:00" }];
+  const cases = [
+    ["yes", { confirmationContext: true }, CallerActionType.AFFIRM_CONFIRMATION],
+    ["no", { confirmationContext: true }, CallerActionType.REJECT_CONFIRMATION],
+    ["actually wait", {}, CallerActionType.UNKNOWN],
+    ["my name is Roberto", {}, CallerActionType.SET_NAME],
+    ["Thursday", {}, CallerActionType.SET_DATE],
+    ["at 10 AM", {}, CallerActionType.SET_TIME],
+    ["the second one", { currentAlternatives: alternatives }, CallerActionType.SELECT_ALTERNATIVE],
+    ["can you repeat that?", {}, CallerActionType.CLARIFY],
+  ];
+  for (const [transcript, context, expected] of cases) assert.equal((await interpret(transcript, context)).interpretation.action, expected, transcript);
 });
 
 test("deterministic and fallback source metadata are measurable", async () => {
