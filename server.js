@@ -21,6 +21,7 @@ connectDB();
 // ---------------------------------------------------------
 import { attachMediaWebSocketServer } from "./realtime/mediaStreamServer.js";
 import { attachIsolatedVoiceRoutes } from "./realtime/voice-v2/routing/attachIsolatedVoiceRoutes.js";
+import { createVoiceV2ProductionInitializer } from "./realtime/voice-v2/production/createVoiceV2ProductionInitializer.js";
 import { startAppointmentReminderJob } from "./jobs/appointmentReminders.js";
 
 // ---------------------------------------------------------
@@ -208,7 +209,7 @@ attachIsolatedVoiceRoutes({
   server,
   attachV1: attachMediaWebSocketServer,
   v2EnabledValue: process.env.ENABLE_VOICE_V2_ROUTE,
-  initializeV2Session: null,
+  initializeV2Session: createVoiceV2ProductionInitializer(),
   buildSha: process.env.RENDER_GIT_COMMIT || process.env.GIT_COMMIT || "unknown",
 });
 startAppointmentReminderJob();

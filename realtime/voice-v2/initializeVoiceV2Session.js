@@ -23,7 +23,7 @@ export function initializeVoiceV2Session({
   openaiSession = {}, turnContext = {}, emit = () => {},
 } = {}) {
   requireSessionInputs({ callSid, callerNumber, businessContext, buildSha, twilioSocket, openaiSocketFactory });
-  let lifecycle; let processing = Promise.resolve(); let effectsProcessing = Promise.resolve(); let turnSequence = 0; let responseSequence = 0; let markSequence = 0;
+  let lifecycle; let processing = Promise.resolve(); let effectsProcessing = Promise.resolve(); let turnSequence = 0; let responseSequence = 0; let markSequence = 0; let twilioStarted = false;
   const providerTurns = new Set(); const requests = new Map(); const responses = new Map(); const marks = new Map(); const superseded = new Set(); const ambiguityPurposes = [];
   const effectHandlers = {
     CHECK_AVAILABILITY: async (command) => { const slotKey = deriveSlotKey(session.proposal); return timedEffect(command, "AVAILABILITY_TIMEOUT", 15000, () => checkAvailability(command), () => ({ proposalVersion: command.proposalVersion, slotKey, available: false, alternatives: [], reason: "TIMEOUT" })); },
@@ -62,7 +62,8 @@ export function initializeVoiceV2Session({
     emit(event);
     if (event.type === TransportEvent.TWILIO_STREAM_STARTED) {
       if (event.callSid !== callSid) return lifecycle.terminate("TRANSPORT_IDENTITY_MISMATCH");
-      openai.configureSession(openaiSession);
+      twilioStarted = true;
+      if (openai.connected) openai.configureSession(openaiSession);
     } else if (event.type === TransportEvent.CALLER_AUDIO && !lifecycle.terminated) {
       openai.appendCallerAudio({ payload: event.payload });
     } else if (event.type === TransportEvent.PLAYBACK_MARK_ACKNOWLEDGED) {
@@ -74,6 +75,10 @@ export function initializeVoiceV2Session({
 
   async function onOpenAI(event) {
     emit(event);
+    if (event.type === TransportEvent.OPENAI_CONNECTED) {
+      if (twilioStarted) openai.configureSession(openaiSession);
+      return;
+    }
     if (event.type === TransportEvent.USER_TRANSCRIPT_COMPLETED) { session.watchdog.cancel("caller-silence"); return acceptTurn(event); }
     if (event.type === TransportEvent.CALLER_SPEECH_STARTED) { session.watchdog.cancel("caller-silence"); return interruptCurrent(); }
     if (event.type === TransportEvent.RESPONSE_CREATED) return responseCreated(event);

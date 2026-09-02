@@ -1,6 +1,7 @@
 import twilio from "twilio";
 import Barber from "../models/Barber.js";
 import { findBarberByInboundNumber } from "../services/business/resolveBusinessByCalledNumber.js";
+import { selectVoiceMediaPath } from "../realtime/voice-v2/routing/selectVoiceMediaPath.js";
 import {
   clearActiveCall,
   clearActiveCallBySid,
@@ -21,10 +22,16 @@ const getBaseHttpsUrl = (req) => {
   return `https://${normalized}`;
 };
 
-const getMediaWebsocketUrl = (req) => {
+const getMediaWebsocketUrl = (req, barberId) => {
   const rawBase = process.env.APP_BASE_URL || req.headers.host || "";
   const normalized = rawBase.replace(/(^\w+:|^)\/\//, "").replace(/\/$/, "");
-  return `wss://${normalized}/ws/media`;
+  const mediaPath = selectVoiceMediaPath({
+    resolvedBusinessId: barberId,
+    enabledValue: process.env.ENABLE_VOICE_V2_ROUTE,
+    approvedBusinessId: process.env.VOICE_V2_TEST_BUSINESS_ID,
+  });
+  console.log({ event: "V2_ROUTE_SELECTED", callSid: req.body.CallSid || null, businessId: String(barberId), mediaPath });
+  return `wss://${normalized}${mediaPath}`;
 };
 
 const buildInitialPrompt = (barberName, options = {}) => {
@@ -143,7 +150,7 @@ export const buildSetupCallPrompt = (barberName, language = "en") => {
 };
 
 const buildAiStreamTwiml = ({ req, barberId, initialPrompt }) => {
-  const wsUrl = getMediaWebsocketUrl(req);
+  const wsUrl = getMediaWebsocketUrl(req, barberId);
   const response = new VoiceResponse();
   const connect = response.connect();
   const stream = connect.stream({
