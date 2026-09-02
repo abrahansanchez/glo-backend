@@ -14,6 +14,13 @@ test("ResponsePlanner creates an immutable proposal-bound confirmation contract"
   assert.throws(() => { plan.proposalVersion = 8; }, TypeError);
 });
 
+test("ResponsePlanner authoritatively identifies plans that expect caller input", () => {
+  const interactive = ["ASK_SERVICE", "ASK_DATE", "ASK_TIME", "ASK_NAME", "OFFER_ALTERNATIVES", "SLOT_UNAVAILABLE", "PRE_BOOKING_CONFIRMATION", "CLARIFICATION"];
+  const terminalOrRecovery = ["BOOKING_SUCCESS", "ERROR_RECOVERY", "AMBIGUITY_LIMIT_REACHED"];
+  for (const purpose of interactive) assert.equal(planResponse({ proposal, purpose }).expectsCallerInput, true, purpose);
+  for (const purpose of terminalOrRecovery) assert.equal(planResponse({ proposal, purpose }).expectsCallerInput, false, purpose);
+});
+
 test("CAc9e2539d9a387fae116ae831451da0b0: semantic validator accepts safe bilingual rewording", () => {
   const english = validateSpeech(plan, "Perfect, I have Roberto for a Haircut on Thursday at 2:30 PM. Should I confirm it?");
   const reworded = validateSpeech(plan, "Roberto, shall I confirm your haircut for Thursday at 2:30 pm?");

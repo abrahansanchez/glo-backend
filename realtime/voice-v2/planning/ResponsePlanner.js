@@ -6,6 +6,17 @@ export const ResponsePurpose = Object.freeze({
   BOOKING_SUCCESS: "BOOKING_SUCCESS", CLARIFICATION: "CLARIFICATION", ERROR_RECOVERY: "ERROR_RECOVERY", AMBIGUITY_LIMIT_REACHED: "AMBIGUITY_LIMIT_REACHED",
 });
 
+const CALLER_INPUT_PURPOSES = Object.freeze([
+  ResponsePurpose.ASK_SERVICE,
+  ResponsePurpose.ASK_DATE,
+  ResponsePurpose.ASK_TIME,
+  ResponsePurpose.ASK_NAME,
+  ResponsePurpose.OFFER_ALTERNATIVES,
+  ResponsePurpose.SLOT_UNAVAILABLE,
+  ResponsePurpose.PRE_BOOKING_CONFIRMATION,
+  ResponsePurpose.CLARIFICATION,
+]);
+
 export function planResponse({ proposal, purpose, language = "en" }) {
   if (!proposal || !Number.isInteger(proposal.proposalVersion)) throw new TypeError("invalid_proposal");
   const resolvedPurpose = purpose || purposeForRequirement(deriveBookingRequirement(proposal));
@@ -20,6 +31,7 @@ export function planResponse({ proposal, purpose, language = "en" }) {
     proposalVersion: proposal.proposalVersion,
     language,
     critical: resolvedPurpose === ResponsePurpose.PRE_BOOKING_CONFIRMATION,
+    expectsCallerInput: CALLER_INPUT_PURPOSES.includes(resolvedPurpose),
     expectedFacts,
     speechContract: Object.freeze({
       semanticValidationRequired: resolvedPurpose === ResponsePurpose.PRE_BOOKING_CONFIRMATION,

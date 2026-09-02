@@ -74,8 +74,8 @@ export function initializeVoiceV2Session({
 
   async function onOpenAI(event) {
     emit(event);
-    if (event.type === TransportEvent.USER_TRANSCRIPT_COMPLETED) return acceptTurn(event);
-    if (event.type === TransportEvent.CALLER_SPEECH_STARTED) return interruptCurrent();
+    if (event.type === TransportEvent.USER_TRANSCRIPT_COMPLETED) { session.watchdog.cancel("caller-silence"); return acceptTurn(event); }
+    if (event.type === TransportEvent.CALLER_SPEECH_STARTED) { session.watchdog.cancel("caller-silence"); return interruptCurrent(); }
     if (event.type === TransportEvent.RESPONSE_CREATED) return responseCreated(event);
     if (event.type === TransportEvent.RESPONSE_AUDIO_DELTA) return responseAudio(event);
     if (event.type === TransportEvent.RESPONSE_TRANSCRIPT_COMPLETED) { const state = responses.get(event.responseId); if (state) state.transcript = event.transcript; return; }
@@ -210,6 +210,7 @@ export function initializeVoiceV2Session({
       const grant = session.confirmationAuthority.grant({ proposalVersion: state.plan.proposalVersion, responseId: state.responseId, markId, responseRegistry: session.responseRegistry, playbackRegistry: session.playbackRegistry });
       session.record(grant.authorized ? "CONFIRMATION_AUTHORITY_GRANTED" : "CONFIRMATION_AUTHORITY_WITHHELD", { responseId: state.responseId, markId, reason: grant.reason || null });
     }
+    if (state.plan.expectsCallerInput) session.watchdog.schedule("caller-silence", 30000, () => enqueue(callerSilenceTimedOut));
     if (state.plan.purpose === ResponsePurpose.BOOKING_SUCCESS || state.plan.purpose === ResponsePurpose.AMBIGUITY_LIMIT_REACHED || (state.plan.purpose === ResponsePurpose.ERROR_RECOVERY && session.proposal.terminal)) await lifecycle.terminate("RESPONSE_DELIVERED");
   }
 
@@ -260,6 +261,11 @@ export function initializeVoiceV2Session({
   async function responseTimedOut(requestId) {
     const tracked = requests.get(requestId); if (!tracked || lifecycle.terminated) return;
     if (tracked.responseId) session.responseRegistry.invalidate(tracked.responseId, "RESPONSE_GENERATION_TIMEOUT");
+    const supersessionKey = tracked.responseId || `request:${tracked.requestId}`;
+    if (!superseded.has(supersessionKey)) {
+      superseded.add(supersessionKey);
+      openai.supersedeResponse({ requestId: tracked.requestId, responseId: tracked.responseId || undefined, reason: "RESPONSE_GENERATION_TIMEOUT" });
+    }
     session.record("TIMEOUT_RECOVERY_PLANNED", { timeoutType: "RESPONSE_GENERATION_TIMEOUT", responseId: tracked.responseId || null, proposalVersion: tracked.plan.proposalVersion });
     if (session.proposal.terminal || tracked.plan.purpose === ResponsePurpose.AMBIGUITY_LIMIT_REACHED) return lifecycle.terminate("RESPONSE_GENERATION_TIMEOUT");
     if (tracked.plan.purpose !== ResponsePurpose.ERROR_RECOVERY) await requestResponse(coordinator.responsePlanner({ proposal: session.proposal, purpose: ResponsePurpose.ERROR_RECOVERY, language: tracked.plan.language }));
@@ -270,6 +276,12 @@ export function initializeVoiceV2Session({
     coordinator.handleTimeout(session, "PLAYBACK_TIMEOUT", { responseId: state.responseId, markId });
     if (session.proposal.terminal || state.plan.purpose === ResponsePurpose.AMBIGUITY_LIMIT_REACHED) return lifecycle.terminate("PLAYBACK_TIMEOUT");
     if (state.plan.purpose !== ResponsePurpose.ERROR_RECOVERY) await requestResponse(coordinator.responsePlanner({ proposal: session.proposal, purpose: ResponsePurpose.ERROR_RECOVERY, language: state.plan.language }));
+  }
+
+  async function callerSilenceTimedOut() {
+    if (lifecycle.terminated) return;
+    const recovery = coordinator.handleTimeout(session, "CALLER_SILENCE");
+    await requestResponse(coordinator.responsePlanner({ proposal: session.proposal, purpose: recovery.responsePlan.purpose, language: session.conversationLanguage.currentLanguage }));
   }
 
   function currentLifecycle() { return [...responses.values()].reverse().find((state) => state.plan.proposalVersion === session.proposal.proposalVersion && !session.responseRegistry.get(state.responseId)?.invalidated) || null; }
