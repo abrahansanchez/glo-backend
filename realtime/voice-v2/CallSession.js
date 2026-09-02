@@ -5,15 +5,16 @@ import { ConfirmationAuthority } from "./lifecycle/ConfirmationAuthority.js";
 import { EffectQueue } from "./lifecycle/EffectQueue.js";
 import { SessionWatchdog } from "./lifecycle/SessionWatchdog.js";
 import { AmbiguityRecoveryState } from "./lifecycle/AmbiguityRecoveryState.js";
+import { ConversationLanguageState } from "./lifecycle/ConversationLanguageState.js";
 
 export class CallSession {
   #proposal;
   #journal = [];
-  constructor({ callSid, buildSha, proposal, businessContext = null, effectHandlers = {}, watchdogOptions = {} }) {
+  constructor({ callSid, buildSha, proposal, businessContext = null, effectHandlers = {}, watchdogOptions = {}, preferredLanguage = "en" }) {
     this.callSid = callSid; this.buildSha = buildSha; this.#proposal = proposal;
     Object.defineProperty(this, "businessContext", { value: businessContext === null ? null : deepFreeze(structuredClone(businessContext)), enumerable: true, writable: false, configurable: false });
     this.turnRegistry = new TurnRegistry(); this.responseRegistry = new ResponseRegistry(); this.playbackRegistry = new PlaybackRegistry();
-    this.confirmationAuthority = new ConfirmationAuthority(); this.effectQueue = new EffectQueue({ handlers: effectHandlers }); this.watchdog = new SessionWatchdog(watchdogOptions); this.ambiguityRecovery = new AmbiguityRecoveryState();
+    this.confirmationAuthority = new ConfirmationAuthority(); this.effectQueue = new EffectQueue({ handlers: effectHandlers }); this.watchdog = new SessionWatchdog(watchdogOptions); this.ambiguityRecovery = new AmbiguityRecoveryState(); this.conversationLanguage = new ConversationLanguageState({ preferredLanguage });
     this.record("CALL_STARTED", { proposalVersion: proposal.proposalVersion, buildSha });
   }
   get proposal() { return this.#proposal; }

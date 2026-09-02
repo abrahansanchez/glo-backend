@@ -1444,3 +1444,7 @@ Only then should Phase 1 coding start.
 **Do not reuse V1's multi-owner semantic orchestration.**
 
 **The unit of authority in V2 is: one caller turn → one action → one proposal transition.**
+
+### Conversational language ownership amendment
+
+Each `CallSession` owns exactly one `ConversationLanguageState`. It holds the trusted initial/preferred language and the current authoritative response language; language remains outside `BookingProposal`, business identity, reducers, confirmation authority, availability, and ambiguity recovery. The interpretation layer may attach conservative language evidence to a finalized interpretation. Only strong, single-language evidence on a non-ambiguous semantic action may change the session language; weak, short, mixed, `UNKNOWN`, and `CLARIFY` evidence preserves it. The initializer coordinates observation but performs no language detection. Every `ResponsePlan` snapshots the current language when planned, so later transitions cannot mutate an existing response. A language transition alone changes no proposal facts or version, availability, confirmation authority, or business context. Language owners are isolated per call.

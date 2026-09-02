@@ -89,3 +89,19 @@ export function matchesRuleGroup(id, text) {
 export function countInterpretationRules() {
   return InterpretationRuleInventory.reduce((total, entry) => total + entry.rules.length, 0);
 }
+
+const AMBIGUOUS_LANGUAGE_GROUPS = new Set(["confirmation_cues", "rejection_cues", "time_expressions", "meridiem_forms", "clarification_cues", "surface_normalization"]);
+export function languageEvidenceFor(text) {
+  const matched = { en: [], es: [] };
+  for (const group of InterpretationRuleInventory) {
+    if (AMBIGUOUS_LANGUAGE_GROUPS.has(group.id)) continue;
+    for (const rule of group.rules) {
+      if (!rule.pattern?.test(text)) continue;
+      const label = rule.name.toLowerCase(); const language = label.startsWith("english") ? "en" : label.startsWith("spanish") ? "es" : null;
+      if (language) matched[language].push(`${group.id}:${rule.name}`);
+    }
+  }
+  const languages = Object.entries(matched).filter(([, signals]) => signals.length).map(([language]) => language);
+  if (languages.length !== 1) return Object.freeze({ language: null, confidence: languages.length ? "mixed" : "none", reason: languages.length ? "MIXED_LANGUAGE_SIGNALS" : "NO_STRONG_LANGUAGE_SIGNAL", signals: Object.freeze([]) });
+  const language = languages[0]; return Object.freeze({ language, confidence: "strong", reason: "LANGUAGE_SPECIFIC_INTERPRETATION_RULE", signals: Object.freeze([...matched[language]]) });
+}

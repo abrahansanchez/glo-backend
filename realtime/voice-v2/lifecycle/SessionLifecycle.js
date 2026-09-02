@@ -30,6 +30,7 @@ export class SessionLifecycle {
       this.#session.playbackRegistry.invalidateProposal(this.#session.proposal.proposalVersion, reason);
       this.#session.watchdog.cancelAll();
       this.#session.ambiguityRecovery?.terminate();
+      this.#session.conversationLanguage?.terminate();
       this.#session.record("SESSION_TERMINATING", { reason, proposalVersion: this.#session.proposal.proposalVersion });
       await this.#cleanup();
     }

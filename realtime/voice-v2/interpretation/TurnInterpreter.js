@@ -5,7 +5,7 @@ import {
   validateCallerAction,
 } from "../domain/CallerAction.js";
 import { normalizeTurn } from "./TurnNormalizer.js";
-import { matchesRuleGroup } from "./InterpretationRules.js";
+import { languageEvidenceFor, matchesRuleGroup } from "./InterpretationRules.js";
 import { extractAlternativeIndex } from "./extractors/AlternativeExtractor.js";
 import { extractConfirmation } from "./extractors/ConfirmationExtractor.js";
 import { extractDate } from "./extractors/DateExtractor.js";
@@ -37,11 +37,12 @@ export async function interpretTurn({
   fallbackClassifier = null,
 }) {
   const normalizedTurn = normalizeTurn(transcript);
+  const languageEvidence = languageEvidenceFor(normalizedTurn.text);
   const context = Object.freeze({ currentProposal, currentAlternatives, confirmationContext, referenceDate, businessTimeZone, availableServices });
   const selectedAction = classifyOneAction(normalizedTurn, context);
   if (selectedAction !== CallerActionType.UNKNOWN) {
     const candidate = buildInterpretation(selectedAction, normalizedTurn, sourceTurnId, context);
-    return validateOrClarify(candidate, context, "deterministic", sourceTurnId);
+    return validateOrClarify(candidate, context, "deterministic", sourceTurnId, languageEvidence);
   }
 
   if (fallbackClassifier?.classify) {
@@ -49,13 +50,13 @@ export async function interpretTurn({
     try {
       fallback = await fallbackClassifier.classify({ normalizedTranscript: normalizedTurn.text, sourceTurnId, context: limitedFallbackContext(context) });
     } catch {
-      return result(unknown(sourceTurnId), "llm_fallback", "failure");
+      return result(unknown(sourceTurnId), "llm_fallback", "failure", languageEvidence);
     }
     const validated = validateCandidate(fallback, context, sourceTurnId);
-    if (validated.valid) return result(createCallerAction(validated.value), "llm_fallback", "success");
-    return result(clarify(sourceTurnId), "llm_fallback", "failure");
+    if (validated.valid) return result(createCallerAction(validated.value), "llm_fallback", "success", languageEvidence);
+    return result(clarify(sourceTurnId), "llm_fallback", "failure", languageEvidence);
   }
-  return result(unknown(sourceTurnId), "deterministic", "not_used");
+  return result(unknown(sourceTurnId), "deterministic", "not_used", languageEvidence);
 }
 
 export function classifyOneAction(normalizedTurn, context) {
@@ -122,11 +123,11 @@ function buildInterpretation(action, normalizedTurn, sourceTurnId, context) {
   return value;
 }
 
-function validateOrClarify(candidate, context, source, sourceTurnId) {
+function validateOrClarify(candidate, context, source, sourceTurnId, languageEvidence) {
   const validation = validateCandidate(candidate, context, sourceTurnId);
   return validation.valid
-    ? result(createCallerAction(validation.value), source, "not_used")
-    : result(clarify(sourceTurnId), source, "not_used");
+    ? result(createCallerAction(validation.value), source, "not_used", languageEvidence)
+    : result(clarify(sourceTurnId), source, "not_used", languageEvidence);
 }
 
 function validateCandidate(candidate, context, sourceTurnId) {
@@ -160,8 +161,8 @@ function limitedFallbackContext(context) {
   });
 }
 
-function result(interpretation, interpretationSource, fallbackStatus) {
-  return Object.freeze({ interpretation, interpretationSource, fallbackStatus });
+function result(interpretation, interpretationSource, fallbackStatus, languageEvidence) {
+  return Object.freeze({ interpretation, interpretationSource, fallbackStatus, languageEvidence });
 }
 
 function unknown(sourceTurnId) {

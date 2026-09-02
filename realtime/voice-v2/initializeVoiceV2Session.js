@@ -33,7 +33,7 @@ export function initializeVoiceV2Session({
       timeZone: businessContext.timeZone,
     }), () => ({ success: false, submitted: false, reason: "TIMEOUT" })),
   };
-  const session = new CallSession({ callSid, buildSha, proposal, businessContext, effectHandlers, watchdogOptions: scheduler });
+  const session = new CallSession({ callSid, buildSha, proposal, businessContext, effectHandlers, watchdogOptions: scheduler, preferredLanguage: turnContext.language || "en" });
   const twilio = new TwilioMediaAdapter({ socket: twilioSocket, onEvent: (event) => enqueue(() => onTwilio(event)) });
   const openai = new OpenAIRealtimeAdapter({ socketFactory: openaiSocketFactory, onEvent: (event) => enqueue(() => onOpenAI(event)) });
   lifecycle = new SessionLifecycle({ session, transcriptAdapter, callerNumber, cleanup });
@@ -99,13 +99,15 @@ export function initializeVoiceV2Session({
       confirmationContext: { responseId: current?.responseId || null, markId: current?.markId || null },
     });
     const outcome = registered?.result || registered;
+    const languageTransition = session.conversationLanguage.observe({ languageEvidence: outcome?.interpreted?.languageEvidence, turnId, action: outcome?.interpreted?.interpretation?.action });
+    if (languageTransition.changed) session.record("CONVERSATION_LANGUAGE_CHANGED", { turnId, previousLanguage: languageTransition.previousLanguage, currentLanguage: languageTransition.currentLanguage, reason: languageTransition.reason, confidence: languageTransition.languageEvidence?.confidence || null });
     const recovery = session.ambiguityRecovery.observe({ action: outcome?.interpreted?.interpretation?.action, turnId, proposal: session.proposal, accepted: outcome?.reduced?.rejected !== true });
     recordAmbiguity(recovery, turnId);
     if (recovery.responsePurpose) ambiguityPurposes.push(recovery.responsePurpose);
     if (session.proposal.proposalVersion !== previousVersion) supersedeProposal(previousVersion);
     kickEffects();
     if (!outcome?.reduced?.effects?.length && !outcome?.reduced?.rejected && outcome?.interpreted?.interpretation?.action !== "AFFIRM_CONFIRMATION") {
-      await requestResponse(coordinator.responsePlanner({ proposal: session.proposal, language: turnContext.language || "en" }));
+      await requestResponse(coordinator.responsePlanner({ proposal: session.proposal, language: session.conversationLanguage.currentLanguage }));
     }
   }
 
@@ -131,14 +133,14 @@ export function initializeVoiceV2Session({
         const transition = applyAvailabilityResult(session.proposal, execution.result);
         if (transition.applied) { const previous = session.proposal; session.replaceProposal(previous, transition.nextProposal, { event: "AVAILABILITY_RESULT_APPLIED" }); }
         else session.record("AVAILABILITY_RESULT_REJECTED", { reason: transition.reason, stale: transition.stale });
-        if (transition.responsePurpose) await requestResponse(coordinator.responsePlanner({ proposal: session.proposal, purpose: transition.responsePurpose, language: turnContext.language || "en" }));
+        if (transition.responsePurpose) await requestResponse(coordinator.responsePlanner({ proposal: session.proposal, purpose: transition.responsePurpose, language: session.conversationLanguage.currentLanguage }));
       } else if (pending.type === "CREATE_APPOINTMENT") {
         const transition = coordinator.applyBookingExecution(session, execution);
         await lifecycle.settleDurableBooking(pending.commandId);
-        if (transition.responsePurpose) await requestResponse(coordinator.responsePlanner({ proposal: session.proposal, purpose: transition.responsePurpose, language: turnContext.language || "en" }));
+        if (transition.responsePurpose) await requestResponse(coordinator.responsePlanner({ proposal: session.proposal, purpose: transition.responsePurpose, language: session.conversationLanguage.currentLanguage }));
       } else if (["REQUEST_CLARIFICATION", "CONFIRMATION_REJECTED", "REQUEST_LATER_TIME", "REQUEST_AVAILABLE_TIMES_FOR_DATE"].includes(pending.type)) {
         const purpose = pending.type === "REQUEST_CLARIFICATION" ? ambiguityPurposes.shift() || ResponsePurpose.CLARIFICATION : ResponsePurpose.CLARIFICATION;
-        await requestResponse(coordinator.responsePlanner({ proposal: session.proposal, purpose, language: turnContext.language || "en" }));
+        await requestResponse(coordinator.responsePlanner({ proposal: session.proposal, purpose, language: session.conversationLanguage.currentLanguage }));
       }
     }
   }
