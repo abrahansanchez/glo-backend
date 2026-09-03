@@ -10,7 +10,10 @@ export function canonicalizeCalledNumber(value) {
   return typeof value === "string" ? value.trim() : "";
 }
 
-export async function findBarberByInboundNumber(phoneNumber, { findOneFn = (filter) => Barber.findOne(filter) } = {}) {
+export async function findBarberByInboundNumber(
+  phoneNumber,
+  { findOneFn = (filter) => Barber.findOne(filter), lean = false } = {}
+) {
   if (!phoneNumber) return null;
   const query = findOneFn({
     $or: [
@@ -19,15 +22,21 @@ export async function findBarberByInboundNumber(phoneNumber, { findOneFn = (filt
       { twilioPhoneNumber: phoneNumber },
     ],
   });
-  return typeof query?.sort === "function"
+  const sortedQuery = typeof query?.sort === "function"
     ? query.sort({ updatedAt: -1, createdAt: -1 })
     : query;
+  return lean && typeof sortedQuery?.lean === "function"
+    ? sortedQuery.lean({ flattenObjectIds: true })
+    : sortedQuery;
 }
 
 export async function resolveBusinessByCalledNumber(calledNumber, dependencies = {}) {
   const canonicalCalledNumber = canonicalizeCalledNumber(calledNumber);
   if (!canonicalCalledNumber) return null;
-  const barber = await findBarberByInboundNumber(canonicalCalledNumber, dependencies);
+  const barber = await findBarberByInboundNumber(canonicalCalledNumber, {
+    ...dependencies,
+    lean: true,
+  });
   if (!barber) return null;
   const businessId = String(barber._id);
   return deepFreeze({

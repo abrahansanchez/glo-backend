@@ -5,6 +5,7 @@ import { createBookingProposal } from "../../domain/BookingProposal.js";
 import { reduceBooking } from "../../domain/BookingReducer.js";
 import { prepareVoiceV2SessionStart } from "../../application/prepareVoiceV2SessionStart.js";
 import { INBOUND_NUMBER_FIELDS, findBarberByInboundNumber, resolveBusinessByCalledNumber } from "../../../../services/business/resolveBusinessByCalledNumber.js";
+import Barber from "../../../../models/Barber.js";
 
 const context = (id = "barber-1") => ({ businessId: id, barberId: id, timeZone: "America/New_York", services: [{ name: "Haircut" }], calledNumber: "+18135550100" });
 const proposal = (id = "p") => createBookingProposal({ proposalId: id });
@@ -26,6 +27,93 @@ test("all currently accepted Twilio number fields resolve through the one shared
     const resolved = await resolveBusinessByCalledNumber("  +18135550100  ", { findOneFn: (filter) => ({ sort: () => filter.$or.some((term) => term[field] === barber[field]) ? barber : null }) });
     assert.equal(resolved.businessId, `${field}-id`); assert.equal(resolved.calledNumber, "+18135550100"); assert.equal(Object.isFrozen(resolved.services[0]), true);
   }
+});
+
+test("production resolver converts a hydrated Mongoose result to plain data before deep freezing", async () => {
+  const hydrated = new Barber({
+    name: "Probando",
+    email: "probando@glo.com",
+    phone: "+18135550123",
+    password: "not-returned",
+    twilioNumber: "+12602523232",
+    availability: { timezone: "America/New_York" },
+    services: [{ name: "Haircut", durationMinutes: 30 }],
+  });
+  const bsonBytes = hydrated.services[0]._id.id;
+  assert.ok(ArrayBuffer.isView(bsonBytes));
+  assert.throws(() => Object.freeze(bsonBytes), TypeError);
+
+  let leanCalls = 0;
+  let leanOptions;
+  const resolved = await resolveBusinessByCalledNumber("+12602523232", {
+    findOneFn: () => ({
+      sort: () => ({
+        lean: (options) => {
+          leanCalls += 1;
+          leanOptions = options;
+          return hydrated.toObject(options);
+        },
+      }),
+    }),
+  });
+
+  assert.equal(leanCalls, 1);
+  assert.deepEqual(leanOptions, { flattenObjectIds: true });
+  assert.equal(resolved.businessId, String(hydrated._id));
+  assert.equal(resolved.barberId, String(hydrated._id));
+  assert.equal(resolved.calledNumber, "+12602523232");
+  assert.equal(resolved.timeZone, "America/New_York");
+  assert.deepEqual(resolved.services.map(({ name }) => name), ["Haircut"]);
+  assert.equal(Object.isFrozen(resolved), true);
+  assert.equal(Object.isFrozen(resolved.services), true);
+  assert.equal(Object.isFrozen(resolved.services[0]), true);
+});
+
+test("resolver preserves descending update/create ordering for ambiguous numbers", async () => {
+  const candidates = [
+    { _id: "older", updatedAt: new Date("2026-04-08T21:27:59Z"), createdAt: new Date("2026-03-31T16:25:49Z"), services: [] },
+    { _id: "probando", updatedAt: new Date("2026-08-25T15:34:13Z"), createdAt: new Date("2026-04-08T20:19:13Z"), services: [] },
+  ];
+  let receivedSort;
+  const resolved = await resolveBusinessByCalledNumber("+18132952433", {
+    findOneFn: () => ({
+      sort: (sort) => {
+        receivedSort = sort;
+        return {
+          lean: () => [...candidates].sort((a, b) => b.updatedAt - a.updatedAt || b.createdAt - a.createdAt)[0],
+        };
+      },
+    }),
+  });
+
+  assert.deepEqual(receivedSort, { updatedAt: -1, createdAt: -1 });
+  assert.equal(resolved.businessId, "probando");
+});
+
+test("resolved business context remains deeply immutable", async () => {
+  const resolved = await resolveBusinessByCalledNumber("+12602523232", {
+    findOneFn: () => ({
+      sort: () => ({
+        lean: () => ({
+          _id: "69d6b84155368d54a594b55a",
+          availability: { timezone: "America/New_York" },
+          services: [{ name: "Haircut", durationMinutes: 30 }],
+        }),
+      }),
+    }),
+  });
+  const expected = structuredClone(resolved);
+
+  for (const mutate of [
+    () => { resolved.businessId = "other"; },
+    () => { resolved.barberId = "other"; },
+    () => { resolved.calledNumber = "+10000000000"; },
+    () => { resolved.timeZone = "UTC"; },
+    () => { resolved.services.push({ name: "Other" }); },
+    () => { resolved.services[0].name = "Other"; },
+  ]) assert.throws(mutate, TypeError);
+
+  assert.deepEqual(resolved, expected);
 });
 
 test("CallSession businessContext is copied, deeply frozen, non-reassignable, and proposal-independent", () => {
