@@ -2,7 +2,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { readFile } from "node:fs/promises";
+import twilio from "twilio";
 import { attachIsolatedVoiceRoutes, isVoiceV2RouteEnabled } from "../../routing/attachIsolatedVoiceRoutes.js";
+
+const AUTH_TOKEN = "offline-test-token";
+const APP_BASE_URL = "https://glo.example.com";
 
 class FakeWebSocketServer extends EventEmitter {
   constructor() { super(); this.upgrades = []; FakeWebSocketServer.instances.push(this); }
@@ -12,12 +16,14 @@ class FakeWebSocketServer extends EventEmitter {
 class FakeWebSocket { constructor() { this.closeCalls = []; } close(code, reason) { this.closeCalls.push({ code, reason }); } }
 class FakeNetworkSocket { constructor(webSocket = new FakeWebSocket()) { this.destroyed = 0; this.webSocket = webSocket; } destroy() { this.destroyed += 1; } }
 
-function request(url, upgrade = "websocket") { return { url, headers: { upgrade } }; }
+function request(url, upgrade = "websocket", signatureUrl = `wss://glo.example.com${url}`) {
+  return { url, headers: { upgrade, "x-twilio-signature": twilio.getExpectedTwilioSignature(AUTH_TOKEN, signatureUrl, {}) } };
+}
 function logger() { const entries = []; return { entries, info: (entry) => entries.push(entry), error: (entry) => entries.push(entry) }; }
 function setup({ flag, initializeV2Session, log = logger() } = {}) {
   FakeWebSocketServer.instances = []; const server = new EventEmitter(); const v1 = { upgrades: [], connections: 0 };
   const attachV1 = (target) => { target.on("upgrade", (req, socket, head) => { v1.upgrades.push({ req, socket, head }); v1.connections += 1; }); return Object.freeze({ owner: "v1" }); };
-  const routes = attachIsolatedVoiceRoutes({ server, attachV1, v2EnabledValue: flag, initializeV2Session, logger: log, buildSha: "build-test", WebSocketServerClass: FakeWebSocketServer });
+  const routes = attachIsolatedVoiceRoutes({ server, attachV1, v2EnabledValue: flag, initializeV2Session, logger: log, buildSha: "build-test", WebSocketServerClass: FakeWebSocketServer, twilioAuthToken: AUTH_TOKEN, appBaseUrl: APP_BASE_URL });
   return { server, v1, routes, log, v2: FakeWebSocketServer.instances[0] };
 }
 function upgrade(state, url, socket = new FakeNetworkSocket(), header = "websocket") { state.server.emit("upgrade", request(url, header), socket, Buffer.alloc(0)); return socket; }
@@ -43,7 +49,7 @@ test("enabled V2 path routes only to V2 and emits build-aware route observabilit
   const sessions = []; const state = setup({ flag: "true", initializeV2Session: (values) => sessions.push(values) });
   upgrade(state, "/ws/media-v2?test-number=dedicated"); await Promise.resolve();
   assert.equal(state.v1.connections, 0); assert.equal(state.v2.upgrades.length, 1); assert.equal(sessions.length, 1);
-  assert.deepEqual(state.log.entries.map((entry) => entry.event), ["V2_ROUTE_CONFIGURED", "V2_ROUTE_SESSION_ACCEPTED", "V2_ROUTE_SESSION_STARTED"]);
+  assert.deepEqual(state.log.entries.map((entry) => entry.event), ["V2_ROUTE_CONFIGURED", "V2_TWILIO_TRANSPORT_AUTH_ACCEPTED", "V2_ROUTE_SESSION_ACCEPTED", "V2_ROUTE_SESSION_STARTED"]);
   assert.equal(state.log.entries.every((entry) => entry.buildSha === "build-test"), true);
 });
 

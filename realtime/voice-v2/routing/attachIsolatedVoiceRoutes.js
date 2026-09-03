@@ -1,5 +1,6 @@
 import { EventEmitter } from "node:events";
 import { WebSocketServer } from "ws";
+import { validateTwilioTransportRequest } from "../../../services/security/twilioTransportAuth.js";
 
 export const V1_MEDIA_PATH = "/ws/media";
 export const V2_MEDIA_PATH = "/ws/media-v2";
@@ -16,6 +17,9 @@ export function attachIsolatedVoiceRoutes({
   logger = console,
   buildSha = "unknown",
   WebSocketServerClass = WebSocketServer,
+  twilioAuthToken,
+  appBaseUrl,
+  validateTwilioRequest,
 }) {
   if (!server || typeof server.on !== "function") throw new TypeError("server_required");
   if (typeof attachV1 !== "function") throw new TypeError("attach_v1_required");
@@ -85,6 +89,32 @@ export function attachIsolatedVoiceRoutes({
       return;
     }
 
+    const authentication = validateTwilioTransportRequest({
+      authToken: twilioAuthToken,
+      signature: request?.headers?.["x-twilio-signature"],
+      appBaseUrl,
+      requestPath,
+      websocket: true,
+      validateRequest: validateTwilioRequest,
+    });
+    if (!authentication.valid) {
+      emitLog(logger, {
+        event: "V2_TWILIO_TRANSPORT_AUTH_REJECTED",
+        route: V2_MEDIA_PATH,
+        requestPath: observablePath(requestPath),
+        reason: authentication.reason,
+        buildSha,
+      }, "error");
+      destroySafely(socket);
+      return;
+    }
+    emitLog(logger, {
+      event: "V2_TWILIO_TRANSPORT_AUTH_ACCEPTED",
+      route: V2_MEDIA_PATH,
+      requestPath: observablePath(requestPath),
+      buildSha,
+    });
+
     try {
       v2WebSocketServer.handleUpgrade(request, socket, head, (webSocket) => {
         v2WebSocketServer.emit("connection", webSocket, request);
@@ -111,6 +141,10 @@ export function attachIsolatedVoiceRoutes({
 
 function matchesPath(requestPath, routePath) {
   return requestPath === routePath || requestPath.startsWith(`${routePath}?`) || requestPath.startsWith(`${routePath}/`);
+}
+
+function observablePath(requestPath) {
+  return String(requestPath || "").split("?", 1)[0];
 }
 
 function failInitialization({ logger, socket, error, buildSha }) {

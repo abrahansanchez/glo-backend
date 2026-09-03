@@ -211,6 +211,8 @@ attachIsolatedVoiceRoutes({
   v2EnabledValue: process.env.ENABLE_VOICE_V2_ROUTE,
   initializeV2Session: createVoiceV2ProductionInitializer(),
   buildSha: process.env.RENDER_GIT_COMMIT || process.env.GIT_COMMIT || "unknown",
+  twilioAuthToken: process.env.TWILIO_AUTH_TOKEN,
+  appBaseUrl: process.env.APP_BASE_URL,
 });
 startAppointmentReminderJob();
 
