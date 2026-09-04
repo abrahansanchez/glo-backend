@@ -6,7 +6,7 @@ import { FakeSocket } from "../helpers/FakeSocket.js";
 function setup() {
   const socket = new FakeSocket(); const events = [];
   const adapter = new OpenAIRealtimeAdapter({ socketFactory: () => socket, onEvent: (event) => events.push(event) });
-  adapter.connect(); socket.open(); adapter.configureSession({ instructions: "injected", voice: "alloy", modalities: ["audio", "text"] });
+  adapter.connect(); socket.open(); adapter.configureSession({ model: "gpt-realtime", instructions: "injected", voice: "alloy", input_audio_transcription: { model: "gpt-4o-mini-transcribe" } }); socket.receive({ type: "session.updated", event_id: "configured" });
   return { socket, events, adapter };
 }
 function create(state, requestId = "local-1", eventId = "create-1") { return state.adapter.createResponse({ requestId, eventId, response: { instructions: "say hello" } }); }
@@ -14,9 +14,24 @@ function created(state, requestId = "local-1", responseId = "resp-1") { state.so
 
 test("connects and configures PCMU server VAD without provider lifecycle ownership", () => {
   const state = setup(); const update = state.socket.sent[0];
-  assert.deepEqual(state.events.slice(0, 4).map((event) => event.type), ["OPENAI_SOCKET_CREATE_REQUESTED", "OPENAI_SOCKET_CREATED", "OPENAI_SOCKET_OPENED", "OPENAI_CONNECTED"]); assert.equal(update.session.input_audio_format, "g711_ulaw"); assert.equal(update.session.output_audio_format, "g711_ulaw");
-  assert.deepEqual(update.session.turn_detection, { type: "server_vad", create_response: false, interrupt_response: false }); assert.equal(update.session.instructions, "injected");
+  assert.deepEqual(state.events.slice(0, 4).map((event) => event.type), ["OPENAI_SOCKET_CREATE_REQUESTED", "OPENAI_SOCKET_CREATED", "OPENAI_SOCKET_OPENED", "OPENAI_CONNECTED"]); assert.deepEqual(update.session.audio.input.format, { type: "audio/pcmu" }); assert.deepEqual(update.session.audio.output.format, { type: "audio/pcmu" });
+  assert.deepEqual(update.session.audio.input.turn_detection, { type: "server_vad", create_response: false, interrupt_response: false }); assert.equal(update.session.instructions, "injected"); assert.deepEqual(update.session.output_modalities, ["audio"]); assert.equal(update.session.model, "gpt-realtime"); assert.deepEqual(update.session.audio.input.transcription, { model: "gpt-4o-mini-transcribe" });
   state.socket.receive({ type: "session.updated", event_id: "e" }); assert.equal(state.events.at(-1).type, "OPENAI_SESSION_CONFIGURED");
+});
+
+test("configuration is requested once and caller operations remain blocked until session.updated", () => {
+  const socket = new FakeSocket(); const adapter = new OpenAIRealtimeAdapter({ socketFactory: () => socket }); adapter.connect(); socket.open();
+  const update = adapter.configureSession({ model: "gpt-realtime", voice: "alloy" });
+  assert.equal(update.type, "session.update"); assert.equal(adapter.configurationRequested, true); assert.equal(adapter.configured, false);
+  assert.equal(adapter.configureSession({ model: "gpt-realtime", voice: "alloy" }), null); assert.equal(socket.sent.length, 1);
+  assert.throws(() => adapter.appendCallerAudio({ payload: "AQID" }), /openai_session_not_configured/);
+  socket.receive({ type: "session.updated", event_id: "configured" }); assert.equal(adapter.configured, true);
+  assert.doesNotThrow(() => adapter.appendCallerAudio({ payload: "AQID" }));
+});
+
+test("provider validation errors expose safe identity and omit message content", () => {
+  const state = setup(); state.socket.receive({ type: "error", event_id: "server-error", error: { event_id: "session-update-1", type: "invalid_request_error", code: "invalid_value", param: "session.audio.input.format", message: "secret conversational content" } });
+  const event = state.events.at(-1); assert.equal(event.type, "OPENAI_TRANSPORT_ERROR"); assert.equal(event.eventId, "session-update-1"); assert.equal(event.providerType, "error"); assert.equal(event.parameter, "session.audio.input.format"); assert.deepEqual(event.error, { code: "invalid_value", name: "invalid_request_error" }); assert.equal(JSON.stringify(event).includes("secret conversational content"), false);
 });
 
 test("serializes caller audio, commit, response create, and specific cancellation", () => {

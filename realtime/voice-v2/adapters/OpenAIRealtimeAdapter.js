@@ -7,6 +7,7 @@ export class OpenAIRealtimeAdapter {
   #socket = null;
   #emit;
   #connected = false;
+  #configurationRequested = false;
   #configured = false;
   #sequence = 0;
   #activeRequestId = null;
@@ -26,6 +27,8 @@ export class OpenAIRealtimeAdapter {
   }
 
   get connected() { return this.#connected; }
+  get configurationRequested() { return this.#configurationRequested; }
+  get configured() { return this.#configured; }
   get activeRequestId() { return this.#activeRequestId; }
 
   connect(options = {}) {
@@ -39,10 +42,21 @@ export class OpenAIRealtimeAdapter {
     return this.#socket;
   }
 
-  configureSession({ instructions, voice, turnDetection = {}, ...session } = {}) {
+  configureSession({ model, instructions, voice, turnDetection = {}, input_audio_transcription: transcription } = {}) {
     this.#requireWritable();
-    const message = { type: "session.update", session: { ...session, instructions, voice, input_audio_format: "g711_ulaw", output_audio_format: "g711_ulaw", turn_detection: { type: "server_vad", ...turnDetection, create_response: false, interrupt_response: false } } };
-    sendJson(this.#socket, message); this.#configured = true; return message;
+    if (this.#configurationRequested) return null;
+    const message = { type: "session.update", session: {
+      type: "realtime", model, instructions, output_modalities: ["audio"],
+      audio: {
+        input: {
+          format: { type: "audio/pcmu" },
+          ...(transcription ? { transcription } : {}),
+          turn_detection: { type: "server_vad", ...turnDetection, create_response: false, interrupt_response: false },
+        },
+        output: { format: { type: "audio/pcmu" }, voice },
+      },
+    } };
+    sendJson(this.#socket, message); this.#configurationRequested = true; return message;
   }
 
   appendCallerAudio({ payload, eventId = this.#id("audio") }) { this.#requireConfigured(); return sendJson(this.#socket, { event_id: eventId, type: "input_audio_buffer.append", audio: payload }); }
@@ -82,7 +96,8 @@ export class OpenAIRealtimeAdapter {
   #onMessage(raw) {
     let message; try { message = parseJsonMessage(raw); } catch (error) { return this.#onError(error); }
     const type = message.type; const identity = providerIdentity(message);
-    if (type === "session.updated") return this.#publish(TransportEvent.OPENAI_SESSION_CONFIGURED, identity);
+    if (type === "session.created") return this.#publish(TransportEvent.OPENAI_SESSION_CREATED, identity);
+    if (type === "session.updated" && this.#configurationRequested) { this.#configured = true; return this.#publish(TransportEvent.OPENAI_SESSION_CONFIGURED, identity); }
     if (type === "input_audio_buffer.speech_started") return this.#publish(TransportEvent.CALLER_SPEECH_STARTED, identity);
     if (type === "input_audio_buffer.speech_stopped") return this.#publish(TransportEvent.CALLER_SPEECH_STOPPED, identity);
     if (isTranscriptDone(type)) return this.#publish(TransportEvent.USER_TRANSCRIPT_COMPLETED, { ...identity, transcript: message.transcript ?? "" });
@@ -125,14 +140,14 @@ export class OpenAIRealtimeAdapter {
   }
 
   #providerError(message, identity) {
-    const error = normalizeError(message.error); const request = [...this.#requests.values()].find((item) => item.createEventId === message.error?.event_id || item.createEventId === message.event_id);
+    const error = normalizeError(message.error); const safeError = normalizeProviderError(message.error); const failedEventId = message.error?.event_id || message.event_id || null; const providerDetails = { ...identity, eventId: failedEventId, parameter: safeString(message.error?.param), error: safeError }; const request = [...this.#requests.values()].find((item) => item.createEventId === message.error?.event_id || item.createEventId === message.event_id);
     if (request && ACTIVE_ERROR.test(`${message.error?.code || ""} ${error.message}`)) {
       if (this.#activeRequestId === request.requestId) this.#activeRequestId = null; request.status = "provider_rejected";
-      return this.#publish(TransportEvent.ACTIVE_RESPONSE_REJECTED, { ...identity, requestId: request.requestId, reason: "PROVIDER_ACTIVE_RESPONSE", error });
+      return this.#publish(TransportEvent.ACTIVE_RESPONSE_REJECTED, { ...providerDetails, requestId: request.requestId, reason: "PROVIDER_ACTIVE_RESPONSE" });
     }
-    const failedEventId = message.error?.event_id || message.event_id; const cancelledResponseId = this.#cancellations.get(failedEventId);
-    if (cancelledResponseId) { this.#cancellations.delete(failedEventId); return this.#publish(TransportEvent.RESPONSE_CANCEL_FAILED, { ...identity, responseId: cancelledResponseId, error }); }
-    return this.#publish(TransportEvent.OPENAI_TRANSPORT_ERROR, { ...identity, error });
+    const cancelledResponseId = this.#cancellations.get(failedEventId);
+    if (cancelledResponseId) { this.#cancellations.delete(failedEventId); return this.#publish(TransportEvent.RESPONSE_CANCEL_FAILED, { ...providerDetails, responseId: cancelledResponseId }); }
+    return this.#publish(TransportEvent.OPENAI_TRANSPORT_ERROR, providerDetails);
   }
 
   #onClose(details) { if (!this.#connected && !this.#socket) return; const type = this.#opened ? TransportEvent.OPENAI_SOCKET_CLOSED : TransportEvent.OPENAI_SOCKET_CLOSED_BEFORE_READY; this.#connected = false; this.#publish(type, { ...this.#startupMetadata(), readyState: this.#socket?.readyState ?? null, closeCode: details?.code ?? null, closeReason: details?.reason?.toString?.() || null }); this.#publish(TransportEvent.OPENAI_CONNECTION_CLOSED, { code: details?.code ?? null, reason: details?.reason?.toString?.() || null }); }
@@ -148,4 +163,5 @@ function providerIdentity(message) { return { eventId: message.event_id ?? null,
 function isTranscriptDone(type) { return ["conversation.item.input_audio_transcription.completed", "conversation.item.input_audio_transcription.done"].includes(type); }
 function isTranscriptFailed(type) { return ["conversation.item.input_audio_transcription.failed", "conversation.item.input_audio_transcription.error"].includes(type); }
 function normalizeError(error) { return Object.freeze({ code: error?.code || null, name: error?.name || "Error", message: error?.message || String(error || "unknown_error") }); }
+function normalizeProviderError(error) { return Object.freeze({ code: safeString(error?.code), name: safeString(error?.type || error?.name) || "ProviderError" }); }
 function safeString(value) { return typeof value === "string" && value.trim() ? value.trim() : null; }

@@ -16,19 +16,19 @@ test("CA2bad... buffers connecting-state caller audio, flushes it once in order,
   assert.equal(f.openai.closeCalls.length, 0);
   f.openai.open(); await settle(f.app);
   assert.equal(creates(f).length, 0);
-  configured(f); await settle(f.app);
+  await configured(f); await settle(f.app);
   assert.deepEqual(appends(f), frames);
   assert.equal(events(f, "STARTUP_CALLER_AUDIO_FLUSHED").length, 1);
   assert.equal(events(f, "STARTUP_CALLER_AUDIO_FLUSHED")[0].flushedFrames, 3);
   assert.equal(events(f, "STARTUP_CALLER_AUDIO_FLUSHED")[0].flushedBytes, 9);
   assert.equal(creates(f).length, 1);
   assert.ok(f.openai.sent.findIndex((item) => item.type === "input_audio_buffer.append") < f.openai.sent.findIndex((item) => item.type === "response.create"));
-  configured(f); await settle(f.app);
+  await configured(f); await settle(f.app);
   assert.deepEqual(appends(f), frames); assert.equal(creates(f).length, 1);
 });
 
 test("configured calls bypass startup buffering and append each later frame exactly once", async () => {
-  const f = fixture("CA-direct"); f.openai.open(); start(f); configured(f); await settle(f.app);
+  const f = fixture("CA-direct"); f.openai.open(); start(f); await configured(f); await settle(f.app);
   media(f, "AQID"); media(f, "BAUG"); await settle(f.app);
   assert.deepEqual(appends(f), ["AQID", "BAUG"]);
   assert.equal(events(f, "STARTUP_CALLER_AUDIO_BUFFERED").length, 0);
@@ -59,7 +59,7 @@ test("termination before OpenAI readiness clears buffered audio and late readine
   assert.equal(events(f, "STARTUP_CALLER_AUDIO_CLEARED")[0].clearedFrames, 2);
   assert.equal(events(f, "STARTUP_CALLER_AUDIO_CLEARED")[0].clearedBytes, 6);
   assert.equal(f.app.session.watchdog.pendingCount, 0);
-  f.openai.open(); configured(f); await settle(f.app);
+  f.openai.open(); await configured(f); await settle(f.app);
   assert.deepEqual(appends(f), []); assert.equal(creates(f).length, 0);
 });
 
@@ -81,7 +81,7 @@ function fixture(callSid, schedulerOptions) {
 }
 function start(f) { f.twilio.receive({ event: "start", start: { callSid: f.app.session.callSid, streamSid: "MZ1" } }); }
 function media(f, payload) { f.twilio.receive({ event: "media", streamSid: "MZ1", media: { track: "inbound", payload } }); }
-function configured(f) { f.openai.receive({ type: "session.updated", event_id: "configured" }); }
+async function configured(f) { f.openai.receive({ type: "session.created", event_id: "created" }); await settle(f.app); f.openai.receive({ type: "session.updated", event_id: "configured" }); }
 function appends(f) { return f.openai.sent.filter((item) => item.type === "input_audio_buffer.append").map((item) => item.audio); }
 function creates(f) { return f.openai.sent.filter((item) => item.type === "response.create"); }
 function events(f, name) { return f.app.session.journal().filter((entry) => entry.event === name); }

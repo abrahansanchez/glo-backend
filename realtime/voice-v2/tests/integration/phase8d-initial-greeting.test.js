@@ -14,15 +14,15 @@ test("Twilio-first and OpenAI-first ordering each request exactly one initial gr
     else { f.openai.open(); start(f); }
     await settle(f.app);
     assert.equal(creates(f).length, 0, `${ordering}: configuration acknowledgement is required`);
-    configured(f); await settle(f.app);
+    await configured(f); await settle(f.app);
     assertGreetingOnce(f);
   }
 });
 
 test("duplicate and reordered supported startup events cannot duplicate greeting ownership", async () => {
   const clock = manualScheduler(); const f = fixture({ callSid: "CA-duplicate", openImmediately: false, scheduler: clock.options });
-  f.openai.open(); start(f); configured(f); await settle(f.app);
-  start(f); f.openai.open(); configured(f); configured(f); await settle(f.app);
+  f.openai.open(); start(f); await configured(f); await settle(f.app);
+  start(f); f.openai.open(); await configured(f); await configured(f); await settle(f.app);
   assertGreetingOnce(f);
   start(f); await settle(f.app);
   assert.equal(clock.active(10000).length, 0, "late duplicate start cannot re-arm startup timeout");
@@ -45,7 +45,7 @@ test("OpenAI never connecting or never acknowledging configuration emits no gree
 
 test("CA06d... live-silence regression delivers greeting through response and playback registries before caller-silence ownership", async () => {
   const clock = manualScheduler(); const f = fixture({ callSid: LIVE_CALL_SID, scheduler: clock.options });
-  start(f); configured(f); await settle(f.app); assertGreetingOnce(f);
+  start(f); await configured(f); await settle(f.app); assertGreetingOnce(f);
   const create = creates(f)[0];
   assert.equal(create.response.metadata.proposalVersion, f.app.session.proposal.proposalVersion);
   assert.equal(f.app.session.proposal.proposalVersion, 1, "the existing domain's initial version is 1");
@@ -79,7 +79,7 @@ test("CA06d... live-silence regression delivers greeting through response and pl
 });
 
 test("caller interruption supersedes greeting without regeneration and late greeting events remain quarantined", async () => {
-  const f = fixture({ callSid: "CA-greeting-interruption" }); start(f); configured(f); await settle(f.app);
+  const f = fixture({ callSid: "CA-greeting-interruption" }); start(f); await configured(f); await settle(f.app);
   const create = creates(f)[0];
   f.openai.receive({ type: "response.created", response: { id: "old-greeting", metadata: { v2RequestId: create.response.metadata.v2RequestId } } });
   f.openai.receive({ type: "response.output_audio.delta", response_id: "old-greeting", delta: "AQID" });
@@ -105,7 +105,7 @@ function fixture({ callSid, scheduler, openImmediately = true } = {}) {
   return { app, twilio, openai, availabilityCalls, bookingCalls, smsCalls, failures };
 }
 function start(f) { f.twilio.receive({ event: "start", start: { callSid: f.app.session.callSid, streamSid: "MZ1" } }); }
-function configured(f) { f.openai.receive({ type: "session.updated", event_id: "configured" }); }
+async function configured(f) { f.openai.receive({ type: "session.created", event_id: "created" }); await settle(f.app); f.openai.receive({ type: "session.updated", event_id: "configured" }); }
 function creates(f) { return f.openai.sent.filter((message) => message.type === "response.create"); }
 function assertGreetingOnce(f) { const list = creates(f); assert.equal(list.length, 1); assert.equal(list[0].response.metadata.purpose, ResponsePurpose.INITIAL_GREETING); }
 function respond(f, create, responseId, transcript) { const requestId = create.response.metadata.v2RequestId; f.openai.receive({ type: "response.created", response: { id: responseId, metadata: { v2RequestId: requestId } } }); f.openai.receive({ type: "response.output_audio.delta", response_id: responseId, delta: "AQID" }); f.openai.receive({ type: "response.output_audio_transcript.done", response_id: responseId, transcript }); f.openai.receive({ type: "response.done", response: { id: responseId, status: "completed" } }); }

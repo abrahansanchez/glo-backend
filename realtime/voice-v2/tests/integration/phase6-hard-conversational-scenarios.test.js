@@ -349,7 +349,7 @@ for (const entry of scenarios) test(`Scenario ${entry.number} - ${entry.name}`, 
 
 function fixture({ callSid, proposal, availabilityAdapter, bookingAdapter, smsAdapter, transcriptAdapter, scheduler, language = "en", businessContext = BUSINESS } = {}) {
   const number = scenarios.length + 1; callSid ||= `CA-${number}`; proposal ||= createBookingProposal({ proposalId: `proposal:${callSid}` });
-  const twilio = new FakeSocket(); const openai = new FakeSocket(); openai.readyState = 0;
+  const twilio = new AutoStartupTwilioSocket(); const openai = new AutoConfiguredOpenAISocket(); openai.readyState = 0;
   const availabilityCalls = []; const alternativeCalls = []; const bookingCalls = []; const smsCalls = []; const turnsPersisted = []; const finalized = [];
   availabilityAdapter ||= availability({ calls: availabilityCalls, alternativeCalls });
   bookingAdapter ||= { createAppointment: async () => ({ success: true, appointmentId: `appt:${callSid}` }) };
@@ -359,7 +359,24 @@ function fixture({ callSid, proposal, availabilityAdapter, bookingAdapter, smsAd
   const wrappedBooking = { createAppointment: async (command) => { bookingCalls.push(command); return bookingAdapter.createAppointment(command); } };
   const wrappedSms = { sendAppointmentConfirmation: async (command) => { smsCalls.push(command); return smsAdapter.sendAppointmentConfirmation(command); } };
   const app = initializeVoiceV2Session({ callSid, callerNumber: "+18135550100", businessContext, buildSha: "phase6-test", twilioSocket: twilio, openaiSocketFactory: () => openai, proposal, availabilityAdapter: wrappedAvailability, bookingAdapter: wrappedBooking, smsAdapter: wrappedSms, transcriptAdapter, scheduler, turnContext: { language, referenceDate: REFERENCE_DATE, availableServices: [{ canonical: "Haircut", aliases: ["haircut", "corte de pelo"] }, { canonical: "Beard Trim", aliases: ["beard trim", "recorte de barba"] }] } });
-  openai.open(); return { app, twilio, openai, availabilityCalls, alternativeCalls, bookingCalls, smsCalls, turnsPersisted, finalized };
+  openai.open(); openai.receive({ type: "session.created", event_id: "session-created" }); return { app, twilio, openai, availabilityCalls, alternativeCalls, bookingCalls, smsCalls, turnsPersisted, finalized };
+}
+
+class AutoConfiguredOpenAISocket extends FakeSocket {
+  send(value) {
+    super.send(value); const message = this.sent.at(-1);
+    if (message?.type === "session.update") queueMicrotask(() => this.receive({ type: "session.updated", event_id: "session-updated" }));
+    if (message?.type === "response.create" && message.response?.metadata?.purpose === ResponsePurpose.INITIAL_GREETING) queueMicrotask(() => {
+      this.receive({ type: "response.created", response: { id: "startup-greeting", metadata: { v2RequestId: message.response.metadata.v2RequestId } } });
+      this.receive({ type: "response.output_audio.delta", response_id: "startup-greeting", delta: "AQID" });
+      this.receive({ type: "response.output_audio_transcript.done", response_id: "startup-greeting", transcript: "Thanks for calling Probando. This is Glō, the AI receptionist. How can I help?" });
+      this.receive({ type: "response.done", response: { id: "startup-greeting", status: "completed" } });
+    });
+  }
+}
+class AutoStartupTwilioSocket extends FakeSocket {
+  #startupAcknowledged = false;
+  send(value) { super.send(value); const message = this.sent.at(-1); if (message?.event === "mark" && !this.#startupAcknowledged) { this.#startupAcknowledged = true; queueMicrotask(() => this.receive({ event: "mark", streamSid: message.streamSid, mark: { name: message.mark.name } })); } }
 }
 
 function wrapAvailability(adapter, calls, alternativeCalls) { return {
@@ -375,7 +392,7 @@ function availability({ available = true, reason = available ? null : "UNAVAILAB
 function start(f, streamSid = "MZ1") { f.twilio.receive({ event: "start", start: { callSid: f.app.session.callSid, streamSid } }); }
 function stop(f, streamSid = "MZ1") { f.twilio.receive({ event: "stop", streamSid }); }
 function transcript(id, text) { return { type: "conversation.item.input_audio_transcription.completed", event_id: `evt:${id}`, item_id: id, transcript: text }; }
-async function caller(f, text, id = `turn-${events(f, "TURN_ACCEPTED").length + 1}`) { f.openai.receive(transcript(id, text)); await settle(f.app); }
+async function caller(f, text, id = `turn-${events(f, "TURN_ACCEPTED").length + 1}`) { await prepareScenario(f); f.openai.receive(transcript(id, text)); await settle(f.app); }
 async function turns(f, values) { for (const value of values) await caller(f, value); }
 async function settle(app, cycles = 8) { for (let i = 0; i < cycles; i += 1) { await Promise.resolve(); await app.ready(); } }
 function creates(f, purpose) { return f.openai.sent.filter((x) => x.type === "response.create" && (!purpose || x.response?.metadata?.purpose === purpose)); }
@@ -385,10 +402,15 @@ function events(f, event) { return f.app.session.journal().filter((x) => x.event
 function authorizations(f) { return events(f, "BOOKING_AUTHORIZED").length; }
 function safeConfirmation() { return "Roberto, should I confirm your Haircut for Thursday at 10:00 AM?"; }
 async function beginConfirmation(f) {
+  await prepareScenario(f);
   if (!lastCreate(f, ResponsePurpose.PRE_BOOKING_CONFIRMATION)) await f.app.requestResponse(planResponse({ proposal: f.app.session.proposal, purpose: ResponsePurpose.PRE_BOOKING_CONFIRMATION, language: f.app.session.conversationLanguage.currentLanguage }));
   const create = lastCreate(f, ResponsePurpose.PRE_BOOKING_CONFIRMATION); const responseId = `resp:${create.response.metadata.v2RequestId}`;
   f.openai.receive({ type: "response.created", response: { id: responseId, metadata: { v2RequestId: create.response.metadata.v2RequestId } } });
   f.openai.receive({ type: "response.output_audio.delta", response_id: responseId, delta: "AQID" }); await settle(f.app); return responseId;
+}
+async function prepareScenario(f) {
+  if (f.startupPrepared) return;
+  await settle(f.app); f.app.session.watchdog.cancel("caller-silence"); f.openai.sent.length = 0; f.twilio.sent.length = 0; f.startupPrepared = true;
 }
 function finishResponse(f, responseId, responseTranscript) {
   f.openai.receive({ type: "response.output_audio_transcript.done", response_id: responseId, transcript: responseTranscript });

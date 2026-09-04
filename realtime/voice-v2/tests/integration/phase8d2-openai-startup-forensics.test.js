@@ -47,7 +47,7 @@ test("adapter distinguishes synchronous factory failure, connecting, pre-open er
 
 for (const mode of ["connecting", "opened-without-session-updated", "error-before-open", "close-before-open"]) test(`${mode} fails safely without greeting, duplicate session, or retained startup audio`, async () => {
   const clock = scheduler(); const emitted = []; const f = fixture(mode, clock.options, emitted); startSocket(f); callerAudio(f); await settle(f.app);
-  if (mode === "opened-without-session-updated") f.openai.open();
+  if (mode === "opened-without-session-updated") { f.openai.open(); f.openai.receive({ type: "session.created", event_id: "created" }); }
   if (mode === "error-before-open") f.openai.fail(Object.assign(new Error("DNS failed"), { code: "ENOTFOUND" }));
   if (mode === "close-before-open") f.openai.close(1006, "upgrade rejected");
   await settle(f.app);

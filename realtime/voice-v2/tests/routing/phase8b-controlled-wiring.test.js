@@ -117,7 +117,9 @@ test("production startup composes the real V2 lifecycle through its real SharedS
       turnContext: { language: "en", referenceDate: "2026-08-20", availableServices: ["Haircut"] },
     }),
   });
-  const appPromise = initialize({ socket: twilioSocket, request: { url: "/ws/media-v2?to=attacker&email=probando%40glo.test" }, buildSha: "sha" }); twilioSocket.receive(JSON.parse(start())); const app = await appPromise; openai.open(); await settle(app);
+  const appPromise = initialize({ socket: twilioSocket, request: { url: "/ws/media-v2?to=attacker&email=probando%40glo.test" }, buildSha: "sha" }); twilioSocket.receive(JSON.parse(start())); const app = await appPromise; openai.open(); openai.receive({ type: "session.created", event_id: "created" }); await settle(app); openai.receive({ type: "session.updated", event_id: "configured" }); await settle(app);
+  const greetingCreate = lastCreate(openai); openai.receive({ type: "response.created", response: { id: "startup-greeting", metadata: { v2RequestId: greetingCreate.response.metadata.v2RequestId } } }); await settle(app);
+  openai.receive({ type: "input_audio_buffer.speech_started", event_id: "speech-before-confirmation" }); await settle(app);
   await app.requestResponse(planResponse({ proposal: app.session.proposal, purpose: ResponsePurpose.PRE_BOOKING_CONFIRMATION, language: "en" }));
   const confirmationCreate = lastCreate(openai); const confirmationRequestId = confirmationCreate.response.metadata.v2RequestId;
   openai.receive({ type: "response.created", response: { id: "confirm", metadata: { v2RequestId: confirmationRequestId } } });

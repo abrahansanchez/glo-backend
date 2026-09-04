@@ -25,12 +25,12 @@ test("offline production startup resolves trusted called number before construct
 });
 
 test("caller audio follows Twilio to OpenAI without semantic handling", async () => {
-  const f = fixture(); start(f); f.openai.receive({ type: "session.updated", event_id: "configured-audio" }); await settle(f.app); f.twilio.receive({ event: "media", streamSid: "MZ1", media: { track: "inbound", payload: "AQID" } }); await settle(f.app);
+  const f = fixture(); await start(f); f.twilio.receive({ event: "media", streamSid: "MZ1", media: { track: "inbound", payload: "AQID" } }); await settle(f.app);
   assert.ok(f.openai.sent.some((item) => item.type === "input_audio_buffer.append" && item.audio === "AQID"));
 });
 
 test("critical confirmation is fully buffered and validated before Twilio release and mark authority", async () => {
-  const f = fixture({ proposal: completeProposal() }); start(f);
+  const f = fixture({ proposal: completeProposal() }); await start(f);
   const plan = planResponse({ proposal: f.app.session.proposal, purpose: ResponsePurpose.PRE_BOOKING_CONFIRMATION });
   await f.app.requestResponse(plan); const request = lastCreate(f.openai); const requestId = request.response.metadata.v2RequestId;
   f.openai.receive({ type: "response.created", response: { id: "resp-1", metadata: { v2RequestId: requestId } } });
@@ -46,7 +46,7 @@ test("critical confirmation is fully buffered and validated before Twilio releas
 });
 
 test("unsafe critical confirmation releases zero audio and grants no authority", async () => {
-  const f = fixture({ proposal: completeProposal() }); start(f);
+  const f = fixture({ proposal: completeProposal() }); await start(f);
   await f.app.requestResponse(planResponse({ proposal: f.app.session.proposal, purpose: ResponsePurpose.PRE_BOOKING_CONFIRMATION }));
   const requestId = lastCreate(f.openai).response.metadata.v2RequestId;
   f.openai.receive({ type: "response.created", response: { id: "unsafe", metadata: { v2RequestId: requestId } } });
@@ -58,20 +58,20 @@ test("unsafe critical confirmation releases zero audio and grants no authority",
 });
 
 test("provider finalized transcript is deduplicated by provider identity", async () => {
-  const f = fixture(); start(f);
+  const f = fixture(); await start(f);
   const event = { type: "conversation.item.input_audio_transcription.completed", event_id: "evt-turn", item_id: "item-turn", transcript: "haircut" };
   f.openai.receive(event); f.openai.receive(event); await settle(f.app);
   assert.equal(f.app.session.journal().filter((entry) => entry.event === "TURN_ACCEPTED").length, 1);
 });
 
 test("successful zero alternatives and alternative infrastructure failure remain distinct", async () => {
-  const zero = fixture({ proposal: slotProposal(), availabilityAdapter: availability({ alternatives: [], alternativeReason: null }) }); start(zero); await emitTimeTurn(zero); assert.ok(purposes(zero.openai).includes(ResponsePurpose.SLOT_UNAVAILABLE));
-  const failed = fixture({ callSid: "CA-FAIL", proposal: slotProposal(), availabilityAdapter: availability({ alternatives: [], alternativeReason: "PERSISTENCE_ERROR" }) }); start(failed); await emitTimeTurn(failed); assert.ok(purposes(failed.openai).includes(ResponsePurpose.ERROR_RECOVERY));
+  const zero = fixture({ proposal: slotProposal(), availabilityAdapter: availability({ alternatives: [], alternativeReason: null }) }); await start(zero); await emitTimeTurn(zero); assert.ok(purposes(zero.openai).includes(ResponsePurpose.SLOT_UNAVAILABLE));
+  const failed = fixture({ callSid: "CA-FAIL", proposal: slotProposal(), availabilityAdapter: availability({ alternatives: [], alternativeReason: "PERSISTENCE_ERROR" }) }); await start(failed); await emitTimeTurn(failed); assert.ok(purposes(failed.openai).includes(ResponsePurpose.ERROR_RECOVERY));
 });
 
 test("stale availability execution cannot mutate a corrected proposal", async () => {
   let release; const adapter = availability({ wait: new Promise((resolve) => { release = resolve; }) });
-  const f = fixture({ proposal: slotProposal(), availabilityAdapter: adapter }); start(f); f.openai.receive(transcript("old", "at 10 AM")); await Promise.resolve();
+  const f = fixture({ proposal: slotProposal(), availabilityAdapter: adapter }); await start(f); f.openai.receive(transcript("old", "at 10 AM")); await Promise.resolve();
   f.openai.receive(transcript("new", "actually make it 11 AM"));
   for (let i = 0; i < 10 && f.app.session.proposal.time !== "11:00"; i += 1) await Promise.resolve();
   release(); await settle(f.app);
@@ -81,14 +81,14 @@ test("stale availability execution cannot mutate a corrected proposal", async ()
 });
 
 test("disconnect rejects new turns, revokes authority, cleans up, and finalizes exactly once", async () => {
-  const f = fixture(); start(f); f.twilio.receive({ event: "stop", streamSid: "MZ1" }); f.twilio.receive({ event: "stop", streamSid: "MZ1" }); await settle(f.app);
+  const f = fixture(); await start(f); f.twilio.receive({ event: "stop", streamSid: "MZ1" }); f.twilio.receive({ event: "stop", streamSid: "MZ1" }); await settle(f.app);
   f.openai.receive(transcript("late", "haircut")); await settle(f.app);
   assert.equal(f.finalized.length, 1); assert.equal(f.app.lifecycle.terminated, true);
   assert.equal(f.app.session.journal().filter((entry) => entry.event === "TURN_ACCEPTED").length, 0);
 });
 
 test("active provider response rejection schedules exactly one watchdog-owned retry", async () => {
-  const scheduled = []; const f = fixture({ scheduler: { schedule: (fn, delay) => { scheduled.push({ fn, delay }); return scheduled.length; }, cancel: () => {} } }); start(f);
+  const scheduled = []; const f = fixture({ scheduler: { schedule: (fn, delay) => { scheduled.push({ fn, delay }); return scheduled.length; }, cancel: () => {} } }); await start(f);
   await f.app.requestResponse(planResponse({ proposal: f.app.session.proposal, purpose: ResponsePurpose.ASK_SERVICE })); const first = lastCreate(f.openai);
   f.openai.receive({ type: "error", error: { event_id: first.event_id, code: "conversation_already_has_active_response", message: "active response" } }); await settle(f.app);
   assert.equal(scheduled.filter((task) => task.delay === 25).length, 1); scheduled.find((task) => task.delay === 25).fn(); await settle(f.app);
@@ -98,7 +98,7 @@ test("active provider response rejection schedules exactly one watchdog-owned re
 });
 
 test("terminal success response failure still finalizes transcript exactly once", async () => {
-  const f = fixture({ proposal: terminalProposal() }); start(f);
+  const f = fixture({ proposal: terminalProposal() }); await start(f);
   await f.app.requestResponse(planResponse({ proposal: f.app.session.proposal, purpose: ResponsePurpose.BOOKING_SUCCESS })); const requestId = lastCreate(f.openai).response.metadata.v2RequestId;
   f.openai.receive({ type: "response.created", response: { id: "success-fail", metadata: { v2RequestId: requestId } } });
   f.openai.receive({ type: "response.done", response: { id: "success-fail", status: "failed", status_details: { error: { message: "generation failed" } } } }); await settle(f.app);
@@ -108,7 +108,7 @@ test("terminal success response failure still finalizes transcript exactly once"
 for (const [language, affirmative] of [["en", "yes"], ["es", "sí"]]) test(`${language} real-initializer happy path books once, sends SMS once, persists success speech, then finalizes`, async () => {
   const bookingCalls = []; const smsCalls = [];
   const f = fixture({ proposal: completeProposal(), language, bookingAdapter: { createAppointment: async (command) => { bookingCalls.push(command); return { success: true, appointmentId: "appt-1" }; } }, smsAdapter: { sendAppointmentConfirmation: async (command) => { smsCalls.push(command); return { success: true, submitted: true }; } } });
-  start(f); await grantConfirmation(f);
+  await start(f); await grantConfirmation(f);
   f.openai.receive(transcript("affirm", affirmative)); await settle(f.app);
   assert.equal(bookingCalls.length, 1); assert.equal(smsCalls.length, 1); assert.equal(f.app.session.proposal.terminal.outcome, "BOOKED");
   const successCreate = f.openai.sent.filter((item) => item.type === "response.create" && item.response.metadata.purpose === ResponsePurpose.BOOKING_SUCCESS).at(-1); assert.ok(successCreate);
@@ -124,7 +124,7 @@ for (const [language, affirmative] of [["en", "yes"], ["es", "sí"]]) test(`${la
 test("disconnect after durable booking command reconciles the late result without duplicate booking or finalization", async () => {
   let resolveBooking; const bookingCalls = [];
   const f = fixture({ proposal: completeProposal(), bookingAdapter: { createAppointment: (command) => { bookingCalls.push(command); return new Promise((resolve) => { resolveBooking = resolve; }); } } });
-  start(f); await grantConfirmation(f); f.openai.receive(transcript("affirm-late", "yes"));
+  await start(f); await grantConfirmation(f); f.openai.receive(transcript("affirm-late", "yes"));
   for (let i = 0; i < 20 && !resolveBooking; i += 1) await Promise.resolve();
   assert.equal(bookingCalls.length, 1); f.twilio.receive({ event: "stop", streamSid: "MZ1" }); await Promise.resolve();
   assert.equal(f.finalized.length, 0); resolveBooking({ success: true, appointmentId: "appt-late" }); await settle(f.app);
@@ -137,7 +137,11 @@ function fixture({ callSid = "CA1", proposal = createBookingProposal({ proposalI
   const app = initializeVoiceV2Session({ callSid, callerNumber: "+18135550100", businessContext, buildSha: "test-sha", twilioSocket: twilio, openaiSocketFactory: () => openai, proposal, availabilityAdapter, bookingAdapter, smsAdapter, transcriptAdapter, scheduler, turnContext: { language, referenceDate: new Date("2026-08-20T12:00:00Z"), availableServices: ["Haircut"] } });
   openai.open(); return { app, twilio, openai, turns, finalized };
 }
-function start(f) { f.twilio.receive({ event: "start", start: { callSid: f.app.session.callSid, streamSid: "MZ1" } }); }
+async function start(f) {
+  f.twilio.receive({ event: "start", start: { callSid: f.app.session.callSid, streamSid: "MZ1" } }); f.openai.receive({ type: "session.created", event_id: "created" }); await settle(f.app); f.openai.receive({ type: "session.updated", event_id: "configured" }); await settle(f.app);
+  const greeting = lastCreate(f.openai); if (greeting?.response?.metadata?.purpose === ResponsePurpose.INITIAL_GREETING) { const requestId = greeting.response.metadata.v2RequestId; f.openai.receive({ type: "response.created", response: { id: "startup-greeting", metadata: { v2RequestId: requestId } } }); f.openai.receive({ type: "response.output_audio.delta", response_id: "startup-greeting", delta: "AQID" }); f.openai.receive({ type: "response.done", response: { id: "startup-greeting", status: "completed" } }); await settle(f.app); const mark = f.twilio.sent.find((item) => item.event === "mark"); if (mark) { f.twilio.receive({ event: "mark", streamSid: "MZ1", mark: { name: mark.mark.name } }); await settle(f.app); } }
+  f.app.session.watchdog.cancel("caller-silence"); f.openai.sent.length = 0; f.twilio.sent.length = 0;
+}
 function transcript(id, text) { return { type: "conversation.item.input_audio_transcription.completed", event_id: `evt-${id}`, item_id: id, transcript: text }; }
 async function emitTimeTurn(f) { f.openai.receive(transcript("time", "at 10 AM")); await settle(f.app); }
 async function settle(app) { for (let i = 0; i < 5; i += 1) { await Promise.resolve(); await app.ready(); } }

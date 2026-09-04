@@ -27,7 +27,7 @@ test("second ambiguity while awaiting confirmation requires a fresh PRE_BOOKING_
 });
 
 test("directed confirmation recovery traverses generation, validation, playback, mark, and fresh authority", async () => {
-  const f = fixture({ callSid: "CA-CONFIRM-RECOVERY", proposal: available() }); start(f);
+  const f = fixture({ callSid: "CA-CONFIRM-RECOVERY", proposal: available() }); await start(f);
   f.openai.receive(transcript("confirm-amb-1", "hmm")); await settle(f.app); await finishRoutine(f, latestCreate(f.openai), "confirm-clarify");
   f.openai.receive(transcript("confirm-amb-2", "maybe perhaps")); await settle(f.app); const create = latestCreate(f.openai);
   assert.equal(create.response.metadata.purpose, ResponsePurpose.PRE_BOOKING_CONFIRMATION);
@@ -77,7 +77,7 @@ test("two calls have isolated counters and termination clears only its own state
 });
 
 test("Scenario 55 through real production composition is bounded, side-effect free, heard, and finalized once", async () => {
-  const f = fixture(); start(f);
+  const f = fixture(); await start(f);
   for (let index = 1; index <= 3; index += 1) {
     f.openai.receive(transcript(`amb-${index}`, index === 1 ? "hmm" : "maybe perhaps")); await settle(f.app);
     const create = latestCreate(f.openai); const purpose = create.response.metadata.purpose;
@@ -92,7 +92,7 @@ test("Scenario 55 through real production composition is bounded, side-effect fr
 });
 
 test("valid semantic progress resets the production sequence and normal collection resumes", async () => {
-  const f = fixture({ callSid: "CA-RESET" }); start(f);
+  const f = fixture({ callSid: "CA-RESET" }); await start(f);
   f.openai.receive(transcript("a1", "hmm")); await settle(f.app); await finishRoutine(f, latestCreate(f.openai), "a1-response");
   f.openai.receive(transcript("a2", "maybe perhaps")); await settle(f.app); await finishRoutine(f, latestCreate(f.openai), "a2-response");
   f.openai.receive(transcript("valid", "haircut")); await settle(f.app);
@@ -101,25 +101,25 @@ test("valid semantic progress resets the production sequence and normal collecti
 });
 
 test("ambiguity-limit generation failure terminates and finalizes exactly once", async () => {
-  const f = fixture({ callSid: "CA-FAIL" }); start(f); const create = await reachLimit(f);
+  const f = fixture({ callSid: "CA-FAIL" }); await start(f); const create = await reachLimit(f);
   const requestId = create.response.metadata.v2RequestId; f.openai.receive({ type: "response.created", response: { id: "limit-failed", metadata: { v2RequestId: requestId } } }); f.openai.receive({ type: "response.done", response: { id: "limit-failed", status: "failed" } }); await settle(f.app);
   assert.equal(f.app.lifecycle.terminated, true); assert.equal(f.finalized.length, 1);
 });
 
 test("disconnect after ambiguity limit finalizes once and interruption cannot resume collection", async () => {
-  const f = fixture({ callSid: "CA-DISCONNECT" }); start(f); await reachLimit(f);
+  const f = fixture({ callSid: "CA-DISCONNECT" }); await start(f); await reachLimit(f);
   f.twilio.receive({ event: "stop", streamSid: "MZ1" }); f.twilio.receive({ event: "stop", streamSid: "MZ1" }); await settle(f.app);
   assert.equal(f.finalized.length, 1); assert.equal(f.app.lifecycle.terminated, true);
 });
 
 test("ambiguity-limit playback timeout terminates through SessionWatchdog and finalizes once", async () => {
-  const clock = fakeScheduler(); const f = fixture({ callSid: "CA-PLAYBACK-TIMEOUT", scheduler: clock.options }); start(f); const create = await reachLimit(f);
+  const clock = fakeScheduler(); const f = fixture({ callSid: "CA-PLAYBACK-TIMEOUT", scheduler: clock.options }); await start(f); const create = await reachLimit(f);
   await finishRoutineWithoutAck(f, create, "limit-timeout"); clock.runAllActive(); await settle(f.app);
   assert.equal(f.app.lifecycle.terminated, true); assert.equal(f.finalized.length, 1);
 });
 
 test("caller interruption during ambiguity-limit response terminates and cannot resume booking", async () => {
-  const f = fixture({ callSid: "CA-INTERRUPT" }); start(f); const create = await reachLimit(f); const requestId = create.response.metadata.v2RequestId;
+  const f = fixture({ callSid: "CA-INTERRUPT" }); await start(f); const create = await reachLimit(f); const requestId = create.response.metadata.v2RequestId;
   f.openai.receive({ type: "response.created", response: { id: "limit-interrupt", metadata: { v2RequestId: requestId } } }); f.openai.receive({ type: "response.output_audio.delta", response_id: "limit-interrupt", delta: "AQID" }); await settle(f.app);
   f.openai.receive({ type: "input_audio_buffer.speech_started", event_id: "speech" }); await settle(f.app);
   f.openai.receive(transcript("after-limit", "haircut")); await settle(f.app);
@@ -136,7 +136,11 @@ function fixture({ callSid = "CA-AMB", scheduler, proposal } = {}) {
   const app = initializeVoiceV2Session({ callSid, callerNumber: "+18135550100", businessContext: { businessId: "business", barberId: "barber", timeZone: "America/New_York" }, buildSha: "test", twilioSocket: twilio, openaiSocketFactory: () => openai, availabilityAdapter: { checkAvailability: async () => ({ available: false }), getAlternatives: async () => ({ alternatives: [], reason: null }) }, bookingAdapter: { createAppointment: async (value) => { bookings.push(value); return { success: true, appointmentId: "appt" }; } }, smsAdapter: { sendAppointmentConfirmation: async (value) => { sms.push(value); return { success: true }; } }, transcriptAdapter: { appendTurn: async () => ({ success: true }), finalizeCall: async (value) => { finalized.push(value); return { success: true }; } }, turnContext: { availableServices: ["Haircut"], referenceDate: new Date("2026-08-20T12:00:00Z") }, scheduler, proposal });
   openai.open(); return { app, twilio, openai, finalized, bookings, sms };
 }
-function start(f) { f.twilio.receive({ event: "start", start: { callSid: f.app.session.callSid, streamSid: "MZ1" } }); }
+async function start(f) {
+  f.twilio.receive({ event: "start", start: { callSid: f.app.session.callSid, streamSid: "MZ1" } }); f.openai.receive({ type: "session.created", event_id: "created" }); await settle(f.app); f.openai.receive({ type: "session.updated", event_id: "configured" }); await settle(f.app);
+  const greeting = latestCreate(f.openai); if (greeting?.response?.metadata?.purpose === "INITIAL_GREETING") { const requestId = greeting.response.metadata.v2RequestId; f.openai.receive({ type: "response.created", response: { id: "startup-greeting", metadata: { v2RequestId: requestId } } }); f.openai.receive({ type: "response.output_audio.delta", response_id: "startup-greeting", delta: "AQID" }); f.openai.receive({ type: "response.done", response: { id: "startup-greeting", status: "completed" } }); await settle(f.app); const mark = f.twilio.sent.find((item) => item.event === "mark"); if (mark) { f.twilio.receive({ event: "mark", streamSid: "MZ1", mark: { name: mark.mark.name } }); await settle(f.app); } }
+  f.app.session.watchdog.cancel("caller-silence"); f.openai.sent.length = 0; f.twilio.sent.length = 0;
+}
 function transcript(id, value) { return { type: "conversation.item.input_audio_transcription.completed", event_id: `event-${id}`, item_id: id, transcript: value }; }
 function latestCreate(socket) { return socket.sent.filter((item) => item.type === "response.create").at(-1); }
 async function finishRoutine(f, create, responseId) { const requestId = create.response.metadata.v2RequestId; f.openai.receive({ type: "response.created", response: { id: responseId, metadata: { v2RequestId: requestId } } }); f.openai.receive({ type: "response.output_audio.delta", response_id: responseId, delta: "AQID" }); f.openai.receive({ type: "response.output_audio_transcript.done", response_id: responseId, transcript: "Please try again." }); f.openai.receive({ type: "response.done", response: { id: responseId, status: "completed" } }); await settle(f.app); const mark = f.twilio.sent.filter((item) => item.event === "mark").at(-1); f.twilio.receive({ event: "mark", streamSid: "MZ1", mark: { name: mark.mark.name } }); await settle(f.app); }

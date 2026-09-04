@@ -26,7 +26,7 @@ export function initializeVoiceV2Session({
   openaiSession = {}, turnContext = {}, emit = () => {},
 } = {}) {
   requireSessionInputs({ callSid, callerNumber, businessContext, buildSha, twilioSocket, openaiSocketFactory });
-  let lifecycle; let processing = Promise.resolve(); let effectsProcessing = Promise.resolve(); let turnSequence = 0; let responseSequence = 0; let markSequence = 0; let twilioStarted = false; let openaiConfigured = false; let initialGreetingRequested = false;
+  let lifecycle; let processing = Promise.resolve(); let effectsProcessing = Promise.resolve(); let turnSequence = 0; let responseSequence = 0; let markSequence = 0; let twilioStarted = false; let openaiSessionCreated = false; let openaiConfigured = false; let initialGreetingRequested = false;
   const providerTurns = new Set(); const requests = new Map(); const responses = new Map(); const marks = new Map(); const superseded = new Set(); const ambiguityPurposes = []; const startupAudio = []; let startupAudioBytes = 0;
   const effectHandlers = {
     CHECK_AVAILABILITY: async (command) => { const slotKey = deriveSlotKey(session.proposal); return timedEffect(command, "AVAILABILITY_TIMEOUT", 15000, () => checkAvailability(command), () => ({ proposalVersion: command.proposalVersion, slotKey, available: false, alternatives: [], reason: "TIMEOUT" })); },
@@ -67,7 +67,7 @@ export function initializeVoiceV2Session({
       if (event.callSid !== callSid) return lifecycle.terminate("TRANSPORT_IDENTITY_MISMATCH");
       twilioStarted = true;
       if (!openaiConfigured) session.watchdog.schedule("openai-startup", 10000, () => enqueue(() => lifecycle.terminate("OPENAI_STARTUP_TIMEOUT")));
-      if (openai.connected && !openaiConfigured) openai.configureSession(openaiSession);
+      if (openai.connected && openaiSessionCreated && !openai.configurationRequested) openai.configureSession(openaiSession);
       await maybeRequestInitialGreeting();
     } else if (event.type === TransportEvent.CALLER_AUDIO && !lifecycle.terminated) {
       if (!openaiConfigured) await bufferStartupAudio(event.payload);
@@ -83,7 +83,11 @@ export function initializeVoiceV2Session({
     emit(event);
     if (lifecycle.terminated) return;
     if (event.type === TransportEvent.OPENAI_CONNECTED) {
-      if (twilioStarted && !openaiConfigured) openai.configureSession(openaiSession);
+      return;
+    }
+    if (event.type === TransportEvent.OPENAI_SESSION_CREATED) {
+      openaiSessionCreated = true;
+      if (twilioStarted && !openai.configurationRequested) openai.configureSession(openaiSession);
       return;
     }
     if (event.type === TransportEvent.OPENAI_SESSION_CONFIGURED) {

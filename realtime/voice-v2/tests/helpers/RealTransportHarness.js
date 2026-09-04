@@ -8,7 +8,7 @@ export class RealTransportHarness {
     this.events = []; this.turns = new Map(); this.requests = new Map(); this.responses = new Map(); this.marks = new Map(); this.turnSequence = 0; this.markSequence = 0; this.terminated = false; this.finalized = false;
     this.twilio = new TwilioMediaAdapter({ socket: twilioSocket, onEvent: (event) => this.#twilioEvent(event) });
     this.openai = new OpenAIRealtimeAdapter({ socketFactory: () => openaiSocket, onEvent: (event) => this.#openaiEvent(event) });
-    this.openai.connect(); openaiSocket.open(); this.openai.configureSession({ instructions: "test-only injected instructions", voice: "alloy" });
+    this.openai.connect(); openaiSocket.open(); this.openai.configureSession({ model: "test-realtime", instructions: "test-only injected instructions", voice: "alloy" }); openaiSocket.receive({ type: "session.updated", event_id: "test-session-updated" });
   }
 
   requestResponse({ requestId, plan, response = {} }) {

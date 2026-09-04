@@ -64,7 +64,7 @@ for (const scenario of [
   { name: "English to Spanish", initial: "en", first: "I need a haircut", second: "necesito una cita para manana", expected: "es" },
   { name: "Spanish to English", initial: "es", first: "Necesito un corte", second: "I want an appointment tomorrow", expected: "en" },
 ]) test(`Scenario 56 production composition: ${scenario.name}`, async () => {
-  const f = fixture({ callSid: `CA-${scenario.initial}`, language: scenario.initial }); start(f); const originalSession = f.app.session; const originalBusiness = f.app.session.businessContext;
+  const f = fixture({ callSid: `CA-${scenario.initial}`, language: scenario.initial }); await start(f); const originalSession = f.app.session; const originalBusiness = f.app.session.businessContext;
   f.openai.receive(transcript("first", scenario.first)); await settle(f.app); const firstPlan = latestCreate(f.openai).response.metadata; await finishRoutine(f, latestCreate(f.openai), "first-response"); const version = f.app.session.proposal.proposalVersion;
   f.openai.receive(transcript("second", scenario.second)); await settle(f.app); const secondPlan = latestCreate(f.openai).response.metadata;
   assert.equal(firstPlan.language, undefined); assert.equal(secondPlan.language, undefined); assert.equal(latestInstructions(f.openai).language, scenario.expected); assert.equal(f.app.session.conversationLanguage.currentLanguage, scenario.expected);
@@ -73,14 +73,18 @@ for (const scenario of [
 });
 
 test("production Spanglish evidence preserves current language without proposal restart or oscillation", async () => {
-  const f = fixture({ callSid: "CA-SPANGLISH", language: "en" }); start(f); const session = f.app.session;
+  const f = fixture({ callSid: "CA-SPANGLISH", language: "en" }); await start(f); const session = f.app.session;
   f.openai.receive(transcript("mixed", "I need un corte para manana")); await settle(f.app);
   assert.equal(f.app.session, session); assert.equal(f.app.session.conversationLanguage.currentLanguage, "en"); assert.equal(f.app.session.journal().some((entry) => entry.event === "CONVERSATION_LANGUAGE_CHANGED"), false);
 });
 
 function availableProposal() { const facts = { service: "Haircut", name: "Roberto", date: "2026-08-27", time: "10:00" }; return createBookingProposal({ proposalId: "available", ...facts, availability: { proposalVersion: 1, slotKey: deriveSlotKey(facts), status: "available", alternatives: [] } }); }
 function fixture({ callSid, language }) { const twilio = new FakeSocket(); const openai = new FakeSocket(); openai.readyState = 0; const app = initializeVoiceV2Session({ callSid, callerNumber: "+18135550100", businessContext: { businessId: `business-${callSid}`, barberId: `barber-${callSid}`, timeZone: "America/New_York" }, buildSha: "test", twilioSocket: twilio, openaiSocketFactory: () => openai, availabilityAdapter: { checkAvailability: async (request) => ({ slotKey: request.slotKey, available: true, reason: null }), getAlternatives: async (request) => ({ slotKey: request.slotKey, alternatives: [], reason: null }) }, bookingAdapter: { createAppointment: async () => ({ success: true, appointmentId: "appt" }) }, smsAdapter: { sendAppointmentConfirmation: async () => ({ success: true }) }, transcriptAdapter: { appendTurn: async () => ({ success: true }), finalizeCall: async () => ({ success: true }) }, turnContext: { language, availableServices: ["Haircut"], referenceDate: "2026-08-20" } }); openai.open(); return { app, twilio, openai }; }
-function start(f) { f.twilio.receive({ event: "start", start: { callSid: f.app.session.callSid, streamSid: "MZ1" } }); }
+async function start(f) {
+  f.twilio.receive({ event: "start", start: { callSid: f.app.session.callSid, streamSid: "MZ1" } }); f.openai.receive({ type: "session.created", event_id: "created" }); await settle(f.app); f.openai.receive({ type: "session.updated", event_id: "configured" }); await settle(f.app);
+  const greeting = latestCreate(f.openai); if (greeting?.response?.metadata?.purpose === "INITIAL_GREETING") { const requestId = greeting.response.metadata.v2RequestId; f.openai.receive({ type: "response.created", response: { id: "startup-greeting", metadata: { v2RequestId: requestId } } }); f.openai.receive({ type: "response.output_audio.delta", response_id: "startup-greeting", delta: "AQID" }); f.openai.receive({ type: "response.done", response: { id: "startup-greeting", status: "completed" } }); await settle(f.app); const mark = f.twilio.sent.find((item) => item.event === "mark"); if (mark) { f.twilio.receive({ event: "mark", streamSid: "MZ1", mark: { name: mark.mark.name } }); await settle(f.app); } }
+  f.app.session.watchdog.cancel("caller-silence"); f.openai.sent.length = 0; f.twilio.sent.length = 0;
+}
 function transcript(id, value) { return { type: "conversation.item.input_audio_transcription.completed", event_id: `event-${id}`, item_id: id, transcript: value }; }
 function latestCreate(socket) { return socket.sent.filter((item) => item.type === "response.create").at(-1); }
 function latestInstructions(socket) { return JSON.parse(latestCreate(socket).response.instructions); }
