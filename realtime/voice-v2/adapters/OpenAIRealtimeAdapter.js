@@ -14,10 +14,15 @@ export class OpenAIRealtimeAdapter {
   #responses = new Map();
   #cancellations = new Map();
   #pending = [];
+  #now;
+  #callSid = null;
+  #model = null;
+  #startupStartedAt = null;
+  #opened = false;
 
-  constructor({ socketFactory, onEvent = () => {} }) {
+  constructor({ socketFactory, onEvent = () => {}, now = () => Date.now() }) {
     if (typeof socketFactory !== "function") throw new TypeError("socket_factory_required");
-    this.#socketFactory = socketFactory; this.#emit = onEvent;
+    this.#socketFactory = socketFactory; this.#emit = onEvent; this.#now = now;
   }
 
   get connected() { return this.#connected; }
@@ -25,8 +30,12 @@ export class OpenAIRealtimeAdapter {
 
   connect(options = {}) {
     if (this.#socket) throw new TypeError("openai_socket_already_created");
-    this.#socket = this.#socketFactory(options);
-    bindSocket(this.#socket, { open: () => { this.#connected = true; this.#publish(TransportEvent.OPENAI_CONNECTED); }, message: (raw) => this.#onMessage(raw), close: (details) => this.#onClose(details), error: (error) => this.#onError(error) });
+    this.#callSid = safeString(options.callSid); this.#model = typeof options.model === "string" ? options.model : null; this.#startupStartedAt = this.#now();
+    this.#publish(TransportEvent.OPENAI_SOCKET_CREATE_REQUESTED, this.#startupMetadata());
+    try { this.#socket = this.#socketFactory(options); }
+    catch (error) { this.#publish(TransportEvent.OPENAI_SOCKET_ERROR, { ...this.#startupMetadata(), phase: "CONSTRUCTION", errorCode: safeString(error?.code), errorName: safeString(error?.name) || "Error" }); throw error; }
+    this.#publish(TransportEvent.OPENAI_SOCKET_CREATED, { ...this.#startupMetadata(), readyState: this.#socket?.readyState ?? null });
+    bindSocket(this.#socket, { open: () => { this.#connected = true; this.#opened = true; this.#publish(TransportEvent.OPENAI_SOCKET_OPENED, { ...this.#startupMetadata(), readyState: this.#socket?.readyState ?? null }); this.#publish(TransportEvent.OPENAI_CONNECTED); }, message: (raw) => this.#onMessage(raw), close: (details) => this.#onClose(details), error: (error) => this.#onError(error) });
     return this.#socket;
   }
 
@@ -126,15 +135,17 @@ export class OpenAIRealtimeAdapter {
     return this.#publish(TransportEvent.OPENAI_TRANSPORT_ERROR, { ...identity, error });
   }
 
-  #onClose(details) { if (!this.#connected && !this.#socket) return; this.#connected = false; this.#publish(TransportEvent.OPENAI_CONNECTION_CLOSED, { code: details?.code ?? null, reason: details?.reason?.toString?.() || null }); }
-  #onError(error) { this.#publish(TransportEvent.OPENAI_TRANSPORT_ERROR, { error: normalizeError(error) }); }
+  #onClose(details) { if (!this.#connected && !this.#socket) return; const type = this.#opened ? TransportEvent.OPENAI_SOCKET_CLOSED : TransportEvent.OPENAI_SOCKET_CLOSED_BEFORE_READY; this.#connected = false; this.#publish(type, { ...this.#startupMetadata(), readyState: this.#socket?.readyState ?? null, closeCode: details?.code ?? null, closeReason: details?.reason?.toString?.() || null }); this.#publish(TransportEvent.OPENAI_CONNECTION_CLOSED, { code: details?.code ?? null, reason: details?.reason?.toString?.() || null }); }
+  #onError(error) { this.#publish(TransportEvent.OPENAI_SOCKET_ERROR, { ...this.#startupMetadata(), phase: this.#opened ? "CONNECTED" : "STARTUP", readyState: this.#socket?.readyState ?? null, errorCode: safeString(error?.code), errorName: safeString(error?.name) || "Error" }); this.#publish(TransportEvent.OPENAI_TRANSPORT_ERROR, { error: normalizeError(error) }); }
   #requireWritable() { if (!this.#socket || this.#socket.readyState === 2 || this.#socket.readyState === 3) throw new TypeError("openai_transport_not_writable"); }
   #requireConfigured() { this.#requireWritable(); if (!this.#configured) throw new TypeError("openai_session_not_configured"); }
   #id(prefix) { this.#sequence += 1; return `v2-${prefix}-${this.#sequence}`; }
   #publish(type, details = {}) { const event = transportEvent(type, details); this.#emit(event); return event; }
+  #startupMetadata() { return { callSid: this.#callSid, model: this.#model, elapsedStartupMs: this.#startupStartedAt === null ? null : Math.max(0, this.#now() - this.#startupStartedAt) }; }
 }
 
 function providerIdentity(message) { return { eventId: message.event_id ?? null, itemId: message.item_id || message.item?.id || null, providerType: message.type }; }
 function isTranscriptDone(type) { return ["conversation.item.input_audio_transcription.completed", "conversation.item.input_audio_transcription.done"].includes(type); }
 function isTranscriptFailed(type) { return ["conversation.item.input_audio_transcription.failed", "conversation.item.input_audio_transcription.error"].includes(type); }
 function normalizeError(error) { return Object.freeze({ code: error?.code || null, name: error?.name || "Error", message: error?.message || String(error || "unknown_error") }); }
+function safeString(value) { return typeof value === "string" && value.trim() ? value.trim() : null; }

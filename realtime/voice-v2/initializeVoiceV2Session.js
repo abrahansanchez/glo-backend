@@ -42,7 +42,7 @@ export function initializeVoiceV2Session({
   lifecycle = new SessionLifecycle({ session, transcriptAdapter, callerNumber, cleanup });
   session.record("V2_SESSION_STARTED", { proposalVersion: proposal.proposalVersion });
   session.record("BUSINESS_CONTEXT_BOUND", { businessId: businessContext.businessId, barberId: businessContext.barberId });
-  openai.connect({ callSid });
+  openai.connect({ callSid, model: openaiSession.model });
 
   function enqueue(operation) {
     processing = processing.then(operation, operation).catch((error) => {

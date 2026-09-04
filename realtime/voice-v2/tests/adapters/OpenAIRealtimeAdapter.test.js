@@ -14,7 +14,7 @@ function created(state, requestId = "local-1", responseId = "resp-1") { state.so
 
 test("connects and configures PCMU server VAD without provider lifecycle ownership", () => {
   const state = setup(); const update = state.socket.sent[0];
-  assert.equal(state.events[0].type, "OPENAI_CONNECTED"); assert.equal(update.session.input_audio_format, "g711_ulaw"); assert.equal(update.session.output_audio_format, "g711_ulaw");
+  assert.deepEqual(state.events.slice(0, 4).map((event) => event.type), ["OPENAI_SOCKET_CREATE_REQUESTED", "OPENAI_SOCKET_CREATED", "OPENAI_SOCKET_OPENED", "OPENAI_CONNECTED"]); assert.equal(update.session.input_audio_format, "g711_ulaw"); assert.equal(update.session.output_audio_format, "g711_ulaw");
   assert.deepEqual(update.session.turn_detection, { type: "server_vad", create_response: false, interrupt_response: false }); assert.equal(update.session.instructions, "injected");
   state.socket.receive({ type: "session.updated", event_id: "e" }); assert.equal(state.events.at(-1).type, "OPENAI_SESSION_CONFIGURED");
 });
@@ -85,6 +85,6 @@ test("local supersession permits replacement before cancellation ack; provider a
 });
 
 test("socket close and error are terminal typed events with no reconnect", () => {
-  const state = setup(); state.socket.fail(new Error("network")); assert.equal(state.events.at(-1).type, "OPENAI_TRANSPORT_ERROR");
-  state.socket.emit("close", { code: 1006, reason: "lost" }); assert.equal(state.events.at(-1).type, "OPENAI_CONNECTION_CLOSED"); assert.equal(state.adapter.connected, false);
+  const state = setup(); state.socket.fail(new Error("network")); assert.deepEqual(state.events.slice(-2).map((event) => event.type), ["OPENAI_SOCKET_ERROR", "OPENAI_TRANSPORT_ERROR"]);
+  state.socket.emit("close", { code: 1006, reason: "lost" }); assert.deepEqual(state.events.slice(-2).map((event) => event.type), ["OPENAI_SOCKET_CLOSED", "OPENAI_CONNECTION_CLOSED"]); assert.equal(state.adapter.connected, false);
 });
