@@ -1,12 +1,14 @@
 import { deriveBookingRequirement } from "../domain/BookingProposal.js";
 
 export const ResponsePurpose = Object.freeze({
+  INITIAL_GREETING: "INITIAL_GREETING",
   ASK_SERVICE: "ASK_SERVICE", ASK_DATE: "ASK_DATE", ASK_TIME: "ASK_TIME", ASK_NAME: "ASK_NAME",
   OFFER_ALTERNATIVES: "OFFER_ALTERNATIVES", SLOT_UNAVAILABLE: "SLOT_UNAVAILABLE", PRE_BOOKING_CONFIRMATION: "PRE_BOOKING_CONFIRMATION",
   BOOKING_SUCCESS: "BOOKING_SUCCESS", CLARIFICATION: "CLARIFICATION", ERROR_RECOVERY: "ERROR_RECOVERY", AMBIGUITY_LIMIT_REACHED: "AMBIGUITY_LIMIT_REACHED",
 });
 
 const CALLER_INPUT_PURPOSES = Object.freeze([
+  ResponsePurpose.INITIAL_GREETING,
   ResponsePurpose.ASK_SERVICE,
   ResponsePurpose.ASK_DATE,
   ResponsePurpose.ASK_TIME,
@@ -17,12 +19,14 @@ const CALLER_INPUT_PURPOSES = Object.freeze([
   ResponsePurpose.CLARIFICATION,
 ]);
 
-export function planResponse({ proposal, purpose, language = "en" }) {
+export function planResponse({ proposal, purpose, language = "en", businessName = null }) {
   if (!proposal || !Number.isInteger(proposal.proposalVersion)) throw new TypeError("invalid_proposal");
   const resolvedPurpose = purpose || purposeForRequirement(deriveBookingRequirement(proposal));
   const expectedFacts = resolvedPurpose === ResponsePurpose.PRE_BOOKING_CONFIRMATION
     ? Object.freeze({ service: proposal.service, name: proposal.name, date: proposal.date, time: proposal.time })
-    : Object.freeze({});
+    : resolvedPurpose === ResponsePurpose.INITIAL_GREETING
+      ? greetingFacts(businessName)
+      : Object.freeze({});
   if (resolvedPurpose === ResponsePurpose.PRE_BOOKING_CONFIRMATION && Object.values(expectedFacts).some((value) => !value)) {
     throw new TypeError("incomplete_confirmation_facts");
   }
@@ -41,7 +45,22 @@ export function planResponse({ proposal, purpose, language = "en" }) {
       availabilityClaimsAllowed: [ResponsePurpose.OFFER_ALTERNATIVES, ResponsePurpose.SLOT_UNAVAILABLE].includes(resolvedPurpose),
       confirmationClaimsAllowed: resolvedPurpose === ResponsePurpose.PRE_BOOKING_CONFIRMATION,
       ambiguityLimitReached: resolvedPurpose === ResponsePurpose.AMBIGUITY_LIMIT_REACHED,
+      sessionIntroduction: resolvedPurpose === ResponsePurpose.INITIAL_GREETING,
+      identityClaimsAllowed: resolvedPurpose === ResponsePurpose.INITIAL_GREETING,
     }),
+  });
+}
+
+function canonicalBusinessName(value) {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function greetingFacts(businessName) {
+  const canonical = canonicalBusinessName(businessName);
+  const prefix = canonical ? `Thanks for calling ${canonical}.` : "Thanks for calling.";
+  return Object.freeze({
+    businessName: canonical,
+    greeting: `${prefix} This is Glō, the AI receptionist. How can I help you today?`,
   });
 }
 

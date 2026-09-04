@@ -7,7 +7,7 @@ import { prepareVoiceV2SessionStart } from "../../application/prepareVoiceV2Sess
 import { INBOUND_NUMBER_FIELDS, findBarberByInboundNumber, resolveBusinessByCalledNumber } from "../../../../services/business/resolveBusinessByCalledNumber.js";
 import Barber from "../../../../models/Barber.js";
 
-const context = (id = "barber-1") => ({ businessId: id, barberId: id, timeZone: "America/New_York", services: [{ name: "Haircut" }], calledNumber: "+18135550100" });
+const context = (id = "barber-1", businessName = "Test Shop") => ({ businessId: id, barberId: id, businessName, timeZone: "America/New_York", services: [{ name: "Haircut" }], calledNumber: "+18135550100" });
 const proposal = (id = "p") => createBookingProposal({ proposalId: id });
 
 test("shared lookup preserves the exact V1 model query, sort, no-input, and no-match behavior", async () => {
@@ -26,6 +26,7 @@ test("all currently accepted Twilio number fields resolve through the one shared
     const barber = { _id: `${field}-id`, [field]: "+18135550100", availability: { timezone: "America/Chicago" }, services: [{ name: "Haircut" }] };
     const resolved = await resolveBusinessByCalledNumber("  +18135550100  ", { findOneFn: (filter) => ({ sort: () => filter.$or.some((term) => term[field] === barber[field]) ? barber : null }) });
     assert.equal(resolved.businessId, `${field}-id`); assert.equal(resolved.calledNumber, "+18135550100"); assert.equal(Object.isFrozen(resolved.services[0]), true);
+    assert.equal(resolved.businessName, null);
   }
 });
 
@@ -61,6 +62,7 @@ test("production resolver converts a hydrated Mongoose result to plain data befo
   assert.deepEqual(leanOptions, { flattenObjectIds: true });
   assert.equal(resolved.businessId, String(hydrated._id));
   assert.equal(resolved.barberId, String(hydrated._id));
+  assert.equal(resolved.businessName, "Probando");
   assert.equal(resolved.calledNumber, "+12602523232");
   assert.equal(resolved.timeZone, "America/New_York");
   assert.deepEqual(resolved.services.map(({ name }) => name), ["Haircut"]);
@@ -96,6 +98,7 @@ test("resolved business context remains deeply immutable", async () => {
       sort: () => ({
         lean: () => ({
           _id: "69d6b84155368d54a594b55a",
+          name: "Probando",
           availability: { timezone: "America/New_York" },
           services: [{ name: "Haircut", durationMinutes: 30 }],
         }),
@@ -109,6 +112,7 @@ test("resolved business context remains deeply immutable", async () => {
     () => { resolved.barberId = "other"; },
     () => { resolved.calledNumber = "+10000000000"; },
     () => { resolved.timeZone = "UTC"; },
+    () => { resolved.businessName = "Other"; },
     () => { resolved.services.push({ name: "Other" }); },
     () => { resolved.services[0].name = "Other"; },
   ]) assert.throws(mutate, TypeError);
@@ -125,9 +129,10 @@ test("CallSession businessContext is copied, deeply frozen, non-reassignable, an
 });
 
 test("caller-derived proposal changes and simultaneous calls cannot alter or share business identity", () => {
-  const a = new CallSession({ callSid: "A", buildSha: "sha", proposal: proposal("a"), businessContext: context("business-a") }); const b = new CallSession({ callSid: "B", buildSha: "sha", proposal: proposal("b"), businessContext: context("business-b") });
+  const a = new CallSession({ callSid: "A", buildSha: "sha", proposal: proposal("a"), businessContext: context("business-a", "Shop A") }); const b = new CallSession({ callSid: "B", buildSha: "sha", proposal: proposal("b"), businessContext: context("business-b", "Shop B") });
   const callerClaim = reduceBooking(a.proposal, { action: "SET_SERVICE", confidence: "explicit", sourceTurnId: "caller-claim", service: "Other Shop Haircut" }).nextProposal; a.replaceProposal(a.proposal, callerClaim);
   assert.equal(a.businessContext.businessId, "business-a"); assert.equal(b.businessContext.businessId, "business-b"); assert.notEqual(a.businessContext, b.businessContext);
+  assert.equal(a.businessContext.businessName, "Shop A"); assert.equal(b.businessContext.businessName, "Shop B");
 });
 
 test("unresolved or failed business identity prevents all partial session construction", async () => {

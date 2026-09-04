@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createBookingProposal } from "../../domain/BookingProposal.js";
-import { planResponse } from "../../planning/ResponsePlanner.js";
+import { planResponse, ResponsePurpose } from "../../planning/ResponsePlanner.js";
 import { validateSpeech } from "../../planning/SpeechValidator.js";
 
 const proposal = createBookingProposal({ proposalId: "p1", proposalVersion: 7, service: "Haircut", name: "Roberto", date: "2026-08-27", time: "14:30" });
@@ -15,10 +15,28 @@ test("ResponsePlanner creates an immutable proposal-bound confirmation contract"
 });
 
 test("ResponsePlanner authoritatively identifies plans that expect caller input", () => {
-  const interactive = ["ASK_SERVICE", "ASK_DATE", "ASK_TIME", "ASK_NAME", "OFFER_ALTERNATIVES", "SLOT_UNAVAILABLE", "PRE_BOOKING_CONFIRMATION", "CLARIFICATION"];
+  const interactive = ["INITIAL_GREETING", "ASK_SERVICE", "ASK_DATE", "ASK_TIME", "ASK_NAME", "OFFER_ALTERNATIVES", "SLOT_UNAVAILABLE", "PRE_BOOKING_CONFIRMATION", "CLARIFICATION"];
   const terminalOrRecovery = ["BOOKING_SUCCESS", "ERROR_RECOVERY", "AMBIGUITY_LIMIT_REACHED"];
   for (const purpose of interactive) assert.equal(planResponse({ proposal, purpose }).expectsCallerInput, true, purpose);
   for (const purpose of terminalOrRecovery) assert.equal(planResponse({ proposal, purpose }).expectsCallerInput, false, purpose);
+});
+
+test("INITIAL_GREETING is a non-critical proposal-bound session introduction with a safe identity fallback", () => {
+  const named = planResponse({ proposal, purpose: ResponsePurpose.INITIAL_GREETING, businessName: "  Probando  " });
+  assert.equal(named.proposalVersion, 7);
+  assert.equal(named.critical, false);
+  assert.equal(named.expectsCallerInput, true);
+  assert.deepEqual(named.expectedFacts, {
+    businessName: "Probando",
+    greeting: "Thanks for calling Probando. This is Glō, the AI receptionist. How can I help you today?",
+  });
+  assert.equal(named.speechContract.sessionIntroduction, true);
+  assert.equal(named.speechContract.confirmationClaimsAllowed, false);
+  assert.equal(named.speechContract.availabilityClaimsAllowed, false);
+  assert.equal(named.speechContract.bookingSuccessClaimsAllowed, false);
+  const generic = planResponse({ proposal, purpose: ResponsePurpose.INITIAL_GREETING });
+  assert.equal(generic.expectedFacts.businessName, null);
+  assert.equal(generic.expectedFacts.greeting, "Thanks for calling. This is Glō, the AI receptionist. How can I help you today?");
 });
 
 test("CAc9e2539d9a387fae116ae831451da0b0: semantic validator accepts safe bilingual rewording", () => {

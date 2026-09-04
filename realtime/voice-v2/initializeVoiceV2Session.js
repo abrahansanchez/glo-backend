@@ -23,7 +23,7 @@ export function initializeVoiceV2Session({
   openaiSession = {}, turnContext = {}, emit = () => {},
 } = {}) {
   requireSessionInputs({ callSid, callerNumber, businessContext, buildSha, twilioSocket, openaiSocketFactory });
-  let lifecycle; let processing = Promise.resolve(); let effectsProcessing = Promise.resolve(); let turnSequence = 0; let responseSequence = 0; let markSequence = 0; let twilioStarted = false;
+  let lifecycle; let processing = Promise.resolve(); let effectsProcessing = Promise.resolve(); let turnSequence = 0; let responseSequence = 0; let markSequence = 0; let twilioStarted = false; let openaiConfigured = false; let initialGreetingRequested = false;
   const providerTurns = new Set(); const requests = new Map(); const responses = new Map(); const marks = new Map(); const superseded = new Set(); const ambiguityPurposes = [];
   const effectHandlers = {
     CHECK_AVAILABILITY: async (command) => { const slotKey = deriveSlotKey(session.proposal); return timedEffect(command, "AVAILABILITY_TIMEOUT", 15000, () => checkAvailability(command), () => ({ proposalVersion: command.proposalVersion, slotKey, available: false, alternatives: [], reason: "TIMEOUT" })); },
@@ -63,7 +63,9 @@ export function initializeVoiceV2Session({
     if (event.type === TransportEvent.TWILIO_STREAM_STARTED) {
       if (event.callSid !== callSid) return lifecycle.terminate("TRANSPORT_IDENTITY_MISMATCH");
       twilioStarted = true;
-      if (openai.connected) openai.configureSession(openaiSession);
+      if (!openaiConfigured) session.watchdog.schedule("openai-startup", 10000, () => enqueue(() => lifecycle.terminate("OPENAI_STARTUP_TIMEOUT")));
+      if (openai.connected && !openaiConfigured) openai.configureSession(openaiSession);
+      await maybeRequestInitialGreeting();
     } else if (event.type === TransportEvent.CALLER_AUDIO && !lifecycle.terminated) {
       openai.appendCallerAudio({ payload: event.payload });
     } else if (event.type === TransportEvent.PLAYBACK_MARK_ACKNOWLEDGED) {
@@ -76,8 +78,13 @@ export function initializeVoiceV2Session({
   async function onOpenAI(event) {
     emit(event);
     if (event.type === TransportEvent.OPENAI_CONNECTED) {
-      if (twilioStarted) openai.configureSession(openaiSession);
+      if (twilioStarted && !openaiConfigured) openai.configureSession(openaiSession);
       return;
+    }
+    if (event.type === TransportEvent.OPENAI_SESSION_CONFIGURED) {
+      openaiConfigured = true;
+      session.watchdog.cancel("openai-startup");
+      return maybeRequestInitialGreeting();
     }
     if (event.type === TransportEvent.USER_TRANSCRIPT_COMPLETED) { session.watchdog.cancel("caller-silence"); return acceptTurn(event); }
     if (event.type === TransportEvent.CALLER_SPEECH_STARTED) { session.watchdog.cancel("caller-silence"); return interruptCurrent(); }
@@ -160,15 +167,31 @@ export function initializeVoiceV2Session({
     return { ...checked, proposalVersion: command.proposalVersion, alternatives: alternatives.alternatives, reason: checked.reason };
   }
 
-  async function requestResponse(plan, attempt = 1) {
+  async function requestResponse(plan, attempt = 1, requestIdentity = null) {
     if (lifecycle.terminated) return { accepted: false, reason: "CALL_TERMINATED" };
-    const requestId = `${callSid}:response:${++responseSequence}`;
+    const requestId = requestIdentity || `${callSid}:response:${++responseSequence}`;
+    if (requests.has(requestId)) return { accepted: false, reason: "DUPLICATE_REQUEST_ID" };
     const tracked = { requestId, plan, attempt, retried: false, response: buildRealtimeResponseRequest(plan) };
     requests.set(requestId, tracked);
     session.record("RESPONSE_PLANNED", { requestId, purpose: plan.purpose, proposalVersion: plan.proposalVersion });
     const result = openai.createResponse({ requestId, eventId: `${requestId}:create`, response: tracked.response });
     if (result.accepted) session.watchdog.schedule(`response:${requestId}`, 15000, () => enqueue(() => responseTimedOut(requestId)));
     return result;
+  }
+
+  async function maybeRequestInitialGreeting() {
+    if (!twilioStarted || !openaiConfigured || lifecycle.terminated || initialGreetingRequested) return { accepted: false, reason: "STARTUP_NOT_ELIGIBLE" };
+    initialGreetingRequested = true;
+    session.watchdog.cancel("openai-startup");
+    const requestIdentity = `${callSid}:startup:initial-greeting`;
+    const plan = coordinator.responsePlanner({
+      proposal: session.proposal,
+      purpose: ResponsePurpose.INITIAL_GREETING,
+      language: session.conversationLanguage.currentLanguage,
+      businessName: businessContext.businessName,
+    });
+    session.record("INITIAL_GREETING_REQUESTED", { requestIdentity, proposalVersion: plan.proposalVersion });
+    return requestResponse(plan, 1, requestIdentity);
   }
 
   function responseCreated(event) {

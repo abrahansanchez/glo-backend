@@ -88,10 +88,10 @@ test("disconnect rejects new turns, revokes authority, cleans up, and finalizes 
 });
 
 test("active provider response rejection schedules exactly one watchdog-owned retry", async () => {
-  const scheduled = []; const f = fixture({ scheduler: { schedule: (fn) => { scheduled.push(fn); return scheduled.length; }, cancel: () => {} } }); start(f);
+  const scheduled = []; const f = fixture({ scheduler: { schedule: (fn, delay) => { scheduled.push({ fn, delay }); return scheduled.length; }, cancel: () => {} } }); start(f);
   await f.app.requestResponse(planResponse({ proposal: f.app.session.proposal, purpose: ResponsePurpose.ASK_SERVICE })); const first = lastCreate(f.openai);
   f.openai.receive({ type: "error", error: { event_id: first.event_id, code: "conversation_already_has_active_response", message: "active response" } }); await settle(f.app);
-  assert.equal(scheduled.length, 2); scheduled.at(-1)(); await settle(f.app);
+  assert.equal(scheduled.filter((task) => task.delay === 25).length, 1); scheduled.find((task) => task.delay === 25).fn(); await settle(f.app);
   const count = f.openai.sent.filter((item) => item.type === "response.create").length;
   f.openai.receive({ type: "error", error: { event_id: lastCreate(f.openai).event_id, code: "conversation_already_has_active_response", message: "active response" } }); await settle(f.app);
   assert.equal(f.openai.sent.filter((item) => item.type === "response.create").length, count);

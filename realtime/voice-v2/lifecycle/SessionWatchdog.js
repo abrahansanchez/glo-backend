@@ -18,6 +18,7 @@ export class SessionWatchdog {
     this.cancelScheduled(handle); this.#tasks.delete(key); return true;
   }
   cancelAll() { for (const key of [...this.#tasks.keys()]) this.cancel(key); }
+  has(key) { return this.#tasks.has(key); }
   get pendingCount() { return this.#tasks.size; }
   trigger(timeoutType, context = {}) {
     if (!Object.values(TimeoutType).includes(timeoutType)) throw new TypeError("unknown_timeout_type");

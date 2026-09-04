@@ -42,10 +42,15 @@ export async function resolveBusinessByCalledNumber(calledNumber, dependencies =
   return deepFreeze({
     businessId,
     barberId: businessId,
+    businessName: canonicalBusinessName(barber.name),
     timeZone: barber.availability?.timezone || "America/New_York",
     services: Array.from(barber.services || [], toPlainService),
     calledNumber: canonicalCalledNumber,
   });
+}
+
+function canonicalBusinessName(value) {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
 }
 
 function toPlainService(service) {
