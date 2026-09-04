@@ -14,6 +14,9 @@ import { SharedBookingAdapter } from "./adapters/SharedBookingAdapter.js";
 import { SharedSmsAdapter } from "./adapters/SharedSmsAdapter.js";
 import { SharedTranscriptAdapter } from "./adapters/SharedTranscriptAdapter.js";
 
+const STARTUP_AUDIO_MAX_FRAMES = 500;
+const STARTUP_AUDIO_MAX_BYTES = 80000;
+
 export function initializeVoiceV2Session({
   callSid, callerNumber, businessContext, buildSha, twilioSocket, openaiSocketFactory,
   availabilityAdapter = new V1AvailabilityAdapter(), bookingAdapter = new SharedBookingAdapter(),
@@ -24,7 +27,7 @@ export function initializeVoiceV2Session({
 } = {}) {
   requireSessionInputs({ callSid, callerNumber, businessContext, buildSha, twilioSocket, openaiSocketFactory });
   let lifecycle; let processing = Promise.resolve(); let effectsProcessing = Promise.resolve(); let turnSequence = 0; let responseSequence = 0; let markSequence = 0; let twilioStarted = false; let openaiConfigured = false; let initialGreetingRequested = false;
-  const providerTurns = new Set(); const requests = new Map(); const responses = new Map(); const marks = new Map(); const superseded = new Set(); const ambiguityPurposes = [];
+  const providerTurns = new Set(); const requests = new Map(); const responses = new Map(); const marks = new Map(); const superseded = new Set(); const ambiguityPurposes = []; const startupAudio = []; let startupAudioBytes = 0;
   const effectHandlers = {
     CHECK_AVAILABILITY: async (command) => { const slotKey = deriveSlotKey(session.proposal); return timedEffect(command, "AVAILABILITY_TIMEOUT", 15000, () => checkAvailability(command), () => ({ proposalVersion: command.proposalVersion, slotKey, available: false, alternatives: [], reason: "TIMEOUT" })); },
     CREATE_APPOINTMENT: async (command) => timedEffect(command, "EFFECT_TIMEOUT", 20000, () => bookingAdapter.createAppointment(command), () => ({ success: false, reason: "TIMEOUT" })),
@@ -67,7 +70,8 @@ export function initializeVoiceV2Session({
       if (openai.connected && !openaiConfigured) openai.configureSession(openaiSession);
       await maybeRequestInitialGreeting();
     } else if (event.type === TransportEvent.CALLER_AUDIO && !lifecycle.terminated) {
-      openai.appendCallerAudio({ payload: event.payload });
+      if (!openaiConfigured) await bufferStartupAudio(event.payload);
+      else openai.appendCallerAudio({ payload: event.payload });
     } else if (event.type === TransportEvent.PLAYBACK_MARK_ACKNOWLEDGED) {
       await acknowledgePlayback(event.markId);
     } else if ([TransportEvent.TWILIO_STREAM_STOPPED, TransportEvent.TWILIO_CONNECTION_CLOSED, TransportEvent.TWILIO_TRANSPORT_ERROR].includes(event.type)) {
@@ -77,6 +81,7 @@ export function initializeVoiceV2Session({
 
   async function onOpenAI(event) {
     emit(event);
+    if (lifecycle.terminated) return;
     if (event.type === TransportEvent.OPENAI_CONNECTED) {
       if (twilioStarted && !openaiConfigured) openai.configureSession(openaiSession);
       return;
@@ -84,6 +89,7 @@ export function initializeVoiceV2Session({
     if (event.type === TransportEvent.OPENAI_SESSION_CONFIGURED) {
       openaiConfigured = true;
       session.watchdog.cancel("openai-startup");
+      flushStartupAudio();
       return maybeRequestInitialGreeting();
     }
     if (event.type === TransportEvent.USER_TRANSCRIPT_COMPLETED) { session.watchdog.cancel("caller-silence"); return acceptTurn(event); }
@@ -192,6 +198,24 @@ export function initializeVoiceV2Session({
     });
     session.record("INITIAL_GREETING_REQUESTED", { requestIdentity, proposalVersion: plan.proposalVersion });
     return requestResponse(plan, 1, requestIdentity);
+  }
+
+  async function bufferStartupAudio(payload) {
+    const bytes = Buffer.from(payload, "base64").length;
+    if (startupAudio.length + 1 > STARTUP_AUDIO_MAX_FRAMES || startupAudioBytes + bytes > STARTUP_AUDIO_MAX_BYTES) {
+      session.record("STARTUP_CALLER_AUDIO_LIMIT_EXCEEDED", { bufferedFrames: startupAudio.length, bufferedBytes: startupAudioBytes, incomingBytes: bytes, maxFrames: STARTUP_AUDIO_MAX_FRAMES, maxBytes: STARTUP_AUDIO_MAX_BYTES });
+      startupAudio.length = 0; startupAudioBytes = 0;
+      return lifecycle.terminate("STARTUP_AUDIO_BUFFER_LIMIT_EXCEEDED");
+    }
+    startupAudio.push(payload); startupAudioBytes += bytes;
+    session.record("STARTUP_CALLER_AUDIO_BUFFERED", { bufferedFrames: startupAudio.length, bufferedBytes: startupAudioBytes });
+  }
+
+  function flushStartupAudio() {
+    if (!startupAudio.length || lifecycle.terminated) return;
+    const frames = startupAudio.splice(0); const bytes = startupAudioBytes; startupAudioBytes = 0;
+    for (const payload of frames) openai.appendCallerAudio({ payload });
+    session.record("STARTUP_CALLER_AUDIO_FLUSHED", { flushedFrames: frames.length, flushedBytes: bytes });
   }
 
   function responseCreated(event) {
@@ -314,6 +338,8 @@ export function initializeVoiceV2Session({
 
   function currentLifecycle() { return [...responses.values()].reverse().find((state) => state.plan.proposalVersion === session.proposal.proposalVersion && !session.responseRegistry.get(state.responseId)?.invalidated) || null; }
   async function cleanup() {
+    if (startupAudio.length) session.record("STARTUP_CALLER_AUDIO_CLEARED", { clearedFrames: startupAudio.length, clearedBytes: startupAudioBytes });
+    startupAudio.length = 0; startupAudioBytes = 0;
     const state = currentLifecycle();
     if (state?.responseId) { try { openai.supersedeResponse({ requestId: state.requestId, responseId: state.responseId, reason: "CALL_TERMINATED" }); } catch {} }
     if (twilio.identity.streamSid && !twilio.closed) { try { twilio.clearPlayback(); } catch {} }

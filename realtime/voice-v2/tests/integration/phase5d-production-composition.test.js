@@ -25,7 +25,7 @@ test("offline production startup resolves trusted called number before construct
 });
 
 test("caller audio follows Twilio to OpenAI without semantic handling", async () => {
-  const f = fixture(); start(f); f.twilio.receive({ event: "media", streamSid: "MZ1", media: { track: "inbound", payload: "AQID" } }); await settle(f.app);
+  const f = fixture(); start(f); f.openai.receive({ type: "session.updated", event_id: "configured-audio" }); await settle(f.app); f.twilio.receive({ event: "media", streamSid: "MZ1", media: { track: "inbound", payload: "AQID" } }); await settle(f.app);
   assert.ok(f.openai.sent.some((item) => item.type === "input_audio_buffer.append" && item.audio === "AQID"));
 });
 
