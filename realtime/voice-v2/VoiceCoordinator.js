@@ -14,13 +14,17 @@ export class VoiceCoordinator {
     if (existing) return session.turnRegistry.replay(turn.turnId);
     return session.turnRegistry.acquire(turn, async () => {
       session.record("TURN_PROCESSING_STARTED", { turnId: turn.turnId, proposalVersion: session.proposal.proposalVersion });
+      const interpretationTiming = context.timing?.start("INTERPRETATION", { turnId: turn.turnId });
       const interpreted = await this.interpreter({ transcript: turn.transcript, sourceTurnId: turn.turnId, currentProposal: session.proposal, confirmationContext: context.confirmationContext, referenceDate: context.referenceDate, businessTimeZone: context.businessTimeZone, availableServices: context.availableServices || [] });
+      context.timing?.end("INTERPRETATION", interpretationTiming, { turnId: turn.turnId });
       session.record("TURN_INTERPRETED", { turnId: turn.turnId, action: interpreted.interpretation.action, proposalVersion: session.proposal.proposalVersion });
       if (interpreted.interpretation.action === "AFFIRM_CONFIRMATION") {
         const gated = this.#synchronizeAffirmativeAuthority(session, interpreted.interpretation, context.confirmationContext);
         if (!gated.authorized) return Object.freeze({ interpreted, reduced: authorizationRefused(session.proposal, gated.reason), authority: gated });
       }
+      const reductionTiming = context.timing?.start("REDUCTION", { turnId: turn.turnId });
       const previous = session.proposal; const reduced = this.reducer(previous, interpreted.interpretation);
+      context.timing?.end("REDUCTION", reductionTiming, { turnId: turn.turnId });
       if (reduced.proposalChanged) { session.responseRegistry.invalidateProposal(previous.proposalVersion); session.playbackRegistry.invalidateProposal(previous.proposalVersion); session.confirmationAuthority.revokeProposal(previous.proposalVersion); session.record("CONFIRMATION_REVOKED", { proposalVersion: previous.proposalVersion, reason: "PROPOSAL_CHANGED" }); session.replaceProposal(previous, reduced.nextProposal); }
       for (const effect of reduced.effects) { const command = effect.commandId ? effect : { ...effect, commandId: `${effect.type.toLowerCase()}:${turn.turnId}` }; session.effectQueue.enqueue(command); session.record("EFFECT_QUEUED", { commandId: command.commandId, effectType: command.type, proposalVersion: command.proposalVersion ?? session.proposal.proposalVersion }); }
       return Object.freeze({ interpreted, reduced });
