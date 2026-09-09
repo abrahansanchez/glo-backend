@@ -47,7 +47,7 @@ test("CA06d... live-silence regression delivers greeting through response and pl
   const clock = manualScheduler(); const f = fixture({ callSid: LIVE_CALL_SID, scheduler: clock.options });
   start(f); await configured(f); await settle(f.app); assertGreetingOnce(f);
   const create = creates(f)[0];
-  assert.equal(create.response.metadata.proposalVersion, f.app.session.proposal.proposalVersion);
+  assert.equal(create.response.metadata.proposalVersion, String(f.app.session.proposal.proposalVersion));
   assert.equal(f.app.session.proposal.proposalVersion, 1, "the existing domain's initial version is 1");
   assert.match(JSON.parse(create.response.instructions).expectedFacts.greeting, /Probando.*Glō.*AI receptionist/i);
   respond(f, create, "greeting-response", "Thanks for calling Probando. This is Glō, the AI receptionist. How can I help you today?");
