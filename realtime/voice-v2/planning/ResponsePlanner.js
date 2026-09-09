@@ -1,4 +1,4 @@
-import { deriveBookingRequirement } from "../domain/BookingProposal.js";
+import { deriveBookingRequirement, AvailabilityStatus } from "../domain/BookingProposal.js";
 
 export const ResponsePurpose = Object.freeze({
   INITIAL_GREETING: "INITIAL_GREETING",
@@ -47,6 +47,40 @@ export function planResponse({ proposal, purpose, language = "en", businessName 
       ambiguityLimitReached: resolvedPurpose === ResponsePurpose.AMBIGUITY_LIMIT_REACHED,
       sessionIntroduction: resolvedPurpose === ResponsePurpose.INITIAL_GREETING,
       identityClaimsAllowed: resolvedPurpose === ResponsePurpose.INITIAL_GREETING,
+    }),
+  });
+}
+
+// A refused affirmative supplies no booking facts or authority. Only current
+// facts determine the continuation; a later confirmation needs a new turn.
+export function planAuthorityRefusalContinuation({ proposal, turnId, language }) {
+  if (proposal.terminal) return null;
+  const requirement = deriveBookingRequirement(proposal);
+  if (requirement === "NEEDS_AVAILABILITY") {
+    if (proposal.availability.status === AvailabilityStatus.UNAVAILABLE) {
+      return { plan: planResponse({ proposal, language, purpose: proposal.availability.alternatives.length ? ResponsePurpose.OFFER_ALTERNATIVES : ResponsePurpose.SLOT_UNAVAILABLE }) };
+    }
+    const commandId = `check_availability:authority-refusal:${turnId}`;
+    return { effect: { type: "CHECK_AVAILABILITY", commandId, idempotencyKey: commandId, proposalVersion: proposal.proposalVersion, attempt: 1 } };
+  }
+  return { plan: planResponse({ proposal, language, purpose: requirement === "READY_FOR_BOOKING_AUTHORIZATION" ? ResponsePurpose.PRE_BOOKING_CONFIRMATION : undefined }) };
+}
+
+// Scoped to the one-shot terminal response-failure recovery, not ordinary
+// ERROR_RECOVERY plans. Make no booking-status claim, including "not booked".
+export function planTerminalResponseRecovery({ proposal, language = "en" }) {
+  const plan = planResponse({ proposal, language, purpose: ResponsePurpose.ERROR_RECOVERY });
+  return Object.freeze({
+    ...plan,
+    speechContract: Object.freeze({
+      ...plan.speechContract,
+      terminalRecovery: true,
+      questionsAllowed: false,
+      bookingStatusClaimsAllowed: false,
+      instruction: "Deliver the terminal message below briefly, then stop. Do not ask a question, invite a reply, or claim any appointment was created, not created, changed, or cancelled.",
+      terminalMessage: language === "es"
+        ? "Lo siento, no puedo continuar esta llamada. Por favor, vuelve a llamar más tarde. Adiós."
+        : "I'm sorry, I can't continue this call. Please call again later. Goodbye.",
     }),
   });
 }
