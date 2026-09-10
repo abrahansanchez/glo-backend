@@ -2,6 +2,7 @@ import { requireNonEmpty } from "./PortErrors.js";
 
 export class BookingPort {
   async createAppointment(_request) { throw new Error("createAppointment_not_implemented"); }
+  async reconcileAppointment(_request) { throw new Error("reconcileAppointment_not_implemented"); }
 }
 
 export function validateBookingRequest(request) {

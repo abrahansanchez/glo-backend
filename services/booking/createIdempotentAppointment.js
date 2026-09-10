@@ -110,6 +110,27 @@ export async function createIdempotentAppointment(request, dependencies = {}) {
   }
 }
 
+// Read-only settlement lookup for a command whose create result was not observed.
+// Absence is intentionally UNKNOWN: an in-flight write may still become durable.
+export async function reconcileIdempotentAppointment(request, dependencies = {}) {
+  const findByIdempotencyKey = dependencies.findByIdempotencyKey
+    || ((barberId, idempotencyKey) => Appointment.findOne({
+      barberId,
+      "bookingCommand.idempotencyKey": idempotencyKey,
+    }));
+  const existing = await findByIdempotencyKey(request.barberId, request.idempotencyKey);
+  if (!existing) return Object.freeze({ settled: false, success: false, appointment: null, appointmentId: null, replayed: false, reason: "SETTLEMENT_UNKNOWN", requestHash: null });
+  const durationMinutes = durationFromAppointment(existing);
+  if (!durationMinutes) return settled(failure("IDEMPOTENCY_CONFLICT"));
+  let requestHash;
+  try {
+    requestHash = computeBookingRequestHash(request, durationMinutes);
+  } catch {
+    return settled(failure("INVALID_SLOT"));
+  }
+  return settled(replayOrConflict(existing, requestHash));
+}
+
 function replayOrConflict(appointment, requestHash) {
   if (appointment?.bookingCommand?.requestHash !== requestHash) return failure("IDEMPOTENCY_CONFLICT");
   return success(appointment, true, requestHash);
@@ -128,6 +149,15 @@ function success(appointment, replayed, requestHash) {
 
 function failure(reason) {
   return Object.freeze({ success: false, appointment: null, appointmentId: null, replayed: false, reason });
+}
+
+function settled(result) { return Object.freeze({ ...result, settled: true }); }
+
+function durationFromAppointment(appointment) {
+  const start = new Date(appointment?.startAt).getTime();
+  const end = new Date(appointment?.endAt).getTime();
+  const minutes = (end - start) / 60000;
+  return Number.isInteger(minutes) && minutes > 0 ? minutes : null;
 }
 
 function normalizeCallerNumber(value) {

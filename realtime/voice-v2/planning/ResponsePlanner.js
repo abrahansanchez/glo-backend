@@ -66,8 +66,9 @@ export function planAuthorityRefusalContinuation({ proposal, turnId, language })
   return { plan: planResponse({ proposal, language, purpose: requirement === "READY_FOR_BOOKING_AUTHORIZATION" ? ResponsePurpose.PRE_BOOKING_CONFIRMATION : undefined }) };
 }
 
-// Scoped to the one-shot terminal response-failure recovery, not ordinary
-// ERROR_RECOVERY plans. Make no booking-status claim, including "not booked".
+// Terminal recovery makes no booking-status claim, including "not booked".
+// Production composition may use it for response failure or an unresolved
+// infrastructure deadline; successful playback has explicit termination ownership.
 export function planTerminalResponseRecovery({ proposal, language = "en" }) {
   const plan = planResponse({ proposal, language, purpose: ResponsePurpose.ERROR_RECOVERY });
   return Object.freeze({

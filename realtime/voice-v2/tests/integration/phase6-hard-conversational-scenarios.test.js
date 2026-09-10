@@ -240,9 +240,13 @@ scenario(41, "Availability timeout", async () => {
 });
 
 scenario(42, "Booking timeout or failure", async () => {
-  const clock = manualScheduler(); const f = fixture({ proposal: completeProposal(), scheduler: clock.options, bookingAdapter: { createAppointment: async () => new Promise(() => {}) } }); start(f); await grantLatestConfirmation(f); f.openai.receive(transcript("book-timeout", "yes"));
-  for (let i = 0; i < 20 && !clock.active(20000).length; i += 1) await Promise.resolve(); clock.fire(20000); await settle(f.app);
-  assert.equal(f.app.session.proposal.terminal?.outcome, "BOOKING_FAILED"); assert.equal(f.smsCalls.length, 0); assert.equal(lastPurpose(f), ResponsePurpose.ERROR_RECOVERY); assert.equal(f.bookingCalls.length, 1);
+  let settleBooking; const clock = manualScheduler(); const f = fixture({ proposal: completeProposal(), scheduler: clock.options, bookingAdapter: { createAppointment: async () => new Promise((resolve) => { settleBooking = resolve; }), reconcileAppointment: async () => ({ settled: false, success: false, reason: "SETTLEMENT_UNKNOWN" }) } }); start(f); await grantLatestConfirmation(f); f.openai.receive(transcript("book-timeout", "yes"));
+  for (let i = 0; i < 20 && !clock.active(20000).length; i += 1) await Promise.resolve(); clock.fire(20000);
+  for (let i = 0; i < 20 && lastPurpose(f) !== ResponsePurpose.ERROR_RECOVERY; i += 1) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(f.app.session.proposal.terminal, false); assert.equal(f.smsCalls.length, 0); assert.equal(lastPurpose(f), ResponsePurpose.ERROR_RECOVERY); assert.equal(f.bookingCalls.length, 1);
+  settleBooking({ success: false, reason: "PERSISTENCE_ERROR" }); await settle(f.app);
+  assert.equal(f.app.session.proposal.terminal?.outcome, "BOOKING_FAILED"); assert.equal(f.smsCalls.length, 0);
+  await deliverTerminal(f, ResponsePurpose.ERROR_RECOVERY, "I'm sorry, I can't continue this call. Please call again later. Goodbye.");
 });
 
 scenario(43, "SMS DELIVERY_UNKNOWN", async () => {
@@ -356,7 +360,12 @@ function fixture({ callSid, proposal, availabilityAdapter, bookingAdapter, smsAd
   smsAdapter ||= { sendAppointmentConfirmation: async () => ({ success: true, submitted: true }) };
   transcriptAdapter ||= { appendTurn: async (turn) => { turnsPersisted.push(turn); return { success: true }; }, finalizeCall: async (outcome) => { finalized.push(outcome); return { success: true, replayed: finalized.length > 1 }; } };
   const wrappedAvailability = wrapAvailability(availabilityAdapter, availabilityCalls, alternativeCalls);
-  const wrappedBooking = { createAppointment: async (command) => { bookingCalls.push(command); return bookingAdapter.createAppointment(command); } };
+  const wrappedBooking = {
+    createAppointment: async (command) => { bookingCalls.push(command); return bookingAdapter.createAppointment(command); },
+    reconcileAppointment: async (command) => typeof bookingAdapter.reconcileAppointment === "function"
+      ? bookingAdapter.reconcileAppointment(command)
+      : { settled: false, success: false, reason: "SETTLEMENT_UNKNOWN" },
+  };
   const wrappedSms = { sendAppointmentConfirmation: async (command) => { smsCalls.push(command); return smsAdapter.sendAppointmentConfirmation(command); } };
   const app = initializeVoiceV2Session({ callSid, callerNumber: "+18135550100", businessContext, buildSha: "phase6-test", twilioSocket: twilio, openaiSocketFactory: () => openai, proposal, availabilityAdapter: wrappedAvailability, bookingAdapter: wrappedBooking, smsAdapter: wrappedSms, transcriptAdapter, scheduler, turnContext: { language, referenceDate: REFERENCE_DATE, availableServices: [{ canonical: "Haircut", aliases: ["haircut", "corte de pelo"] }, { canonical: "Beard Trim", aliases: ["beard trim", "recorte de barba"] }] } });
   openai.open(); openai.receive({ type: "session.created", event_id: "session-created" }); return { app, twilio, openai, availabilityCalls, alternativeCalls, bookingCalls, smsCalls, turnsPersisted, finalized };
