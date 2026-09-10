@@ -137,6 +137,7 @@ export function initializeVoiceV2Session({
     const semanticTiming = timing.start("INTERPRETATION_REDUCTION", { turnId });
     const registered = await coordinator.receiveFinalizedTurn(session, { turnId, transcript: event.transcript }, {
       ...turnContext, businessTimeZone: businessContext.timeZone,
+      referenceDate: turnContext.referenceDate || new Intl.DateTimeFormat('en-CA', { timeZone: businessContext.timeZone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(now()),
       timing,
       confirmationContext: { responseId: current?.responseId || null, markId: current?.markId || null },
     });
@@ -228,7 +229,7 @@ export function initializeVoiceV2Session({
     if (lifecycle.terminated) return { accepted: false, reason: "CALL_TERMINATED" };
     const requestId = requestIdentity || `${callSid}:response:${++responseSequence}`;
     if (requests.has(requestId)) return { accepted: false, reason: "DUPLICATE_REQUEST_ID" };
-    const tracked = { requestId, plan, attempt, retried: false, response: buildRealtimeResponseRequest(plan), timingContext };
+    const tracked = { requestId, plan, attempt, retried: false, response: buildRealtimeResponseRequest(plan, { businessContext, availableServices: turnContext.availableServices }), timingContext };
     requests.set(requestId, tracked);
     session.record("RESPONSE_PLANNED", { requestId, purpose: plan.purpose, proposalVersion: plan.proposalVersion });
     timing.point("RESPONSE_CREATE_DISPATCH", timingDetails({ requestId }));

@@ -1,4 +1,4 @@
-import { deriveBookingRequirement, AvailabilityStatus } from "../domain/BookingProposal.js";
+import { deriveBookingRequirement, deriveSlotKey, AvailabilityStatus } from "../domain/BookingProposal.js";
 
 export const ResponsePurpose = Object.freeze({
   INITIAL_GREETING: "INITIAL_GREETING",
@@ -25,8 +25,8 @@ export function planResponse({ proposal, purpose, language = "en", businessName 
   const expectedFacts = resolvedPurpose === ResponsePurpose.PRE_BOOKING_CONFIRMATION
     ? Object.freeze({ service: proposal.service, name: proposal.name, date: proposal.date, time: proposal.time })
     : resolvedPurpose === ResponsePurpose.INITIAL_GREETING
-      ? greetingFacts(businessName)
-      : Object.freeze({});
+      ? greetingFacts(businessName, language)
+      : ordinaryFacts(proposal, resolvedPurpose);
   if (resolvedPurpose === ResponsePurpose.PRE_BOOKING_CONFIRMATION && Object.values(expectedFacts).some((value) => !value)) {
     throw new TypeError("incomplete_confirmation_facts");
   }
@@ -89,13 +89,32 @@ function canonicalBusinessName(value) {
   return typeof value === "string" && value.trim() ? value.trim() : null;
 }
 
-function greetingFacts(businessName) {
+function greetingFacts(businessName, language) {
   const canonical = canonicalBusinessName(businessName);
+  if (language === 'es') return Object.freeze({ businessName: canonical, greeting: `${canonical ? `Gracias por llamar a ${canonical}.` : 'Gracias por llamar.'} Soy Glō, la recepcionista virtual. ¿En qué puedo ayudarte hoy?` });
   const prefix = canonical ? `Thanks for calling ${canonical}.` : "Thanks for calling.";
   return Object.freeze({
     businessName: canonical,
     greeting: `${prefix} This is Glō, the AI receptionist. How can I help you today?`,
   });
+}
+
+function ordinaryFacts(proposal, purpose) {
+  const facts = {};
+  const relevant = {
+    ASK_DATE: ['service'], ASK_TIME: ['service', 'date'], ASK_NAME: ['service', 'date', 'time'],
+    OFFER_ALTERNATIVES: ['service', 'date', 'time'], SLOT_UNAVAILABLE: ['service', 'date', 'time'],
+    BOOKING_SUCCESS: ['service', 'name', 'date', 'time'],
+  }[purpose] || [];
+  for (const field of relevant) if (proposal[field]) facts[field] = proposal[field];
+  if (purpose === ResponsePurpose.CLARIFICATION) facts.nextRequired = deriveBookingRequirement(proposal);
+  if ([ResponsePurpose.OFFER_ALTERNATIVES, ResponsePurpose.SLOT_UNAVAILABLE].includes(purpose)
+    && proposal.availability.slotKey === deriveSlotKey(proposal) && proposal.availability.status === AvailabilityStatus.UNAVAILABLE) {
+    facts.availability = 'unavailable';
+    if (purpose === ResponsePurpose.OFFER_ALTERNATIVES) facts.alternatives = Object.freeze(proposal.availability.alternatives.map(({ date, time }) => Object.freeze({ date, time })));
+  }
+  if (purpose === ResponsePurpose.BOOKING_SUCCESS && proposal.terminal?.outcome === 'BOOKED') facts.outcome = 'BOOKED';
+  return Object.freeze(facts);
 }
 
 function purposeForRequirement(requirement) {

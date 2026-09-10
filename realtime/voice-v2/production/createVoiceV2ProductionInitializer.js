@@ -6,6 +6,8 @@ import { SharedSmsAdapter } from "../adapters/SharedSmsAdapter.js";
 import { prepareVoiceV2SessionStart } from "../application/prepareVoiceV2SessionStart.js";
 import { initializeVoiceV2Session } from "../initializeVoiceV2Session.js";
 import { isValidVoiceV2BusinessId } from "../routing/selectVoiceMediaPath.js";
+import { buildServiceCatalogue } from "../interpretation/buildServiceCatalogue.js";
+import { buildBusinessSessionInstructions } from "../planning/businessGrounding.js";
 
 export function createVoiceV2ProductionInitializer({
   env = process.env,
@@ -63,7 +65,8 @@ export function createVoiceV2ProductionInitializer({
                 callSid: identity.callSid, callerNumber: identity.callerNumber, businessContext, buildSha,
                 twilioSocket: socket, openaiSocketFactory: dependencies.openaiSocketFactory,
                 smsAdapter: dependencies.smsAdapter,
-                openaiSession: dependencies.openaiSession,
+                openaiSession: { ...dependencies.openaiSession, instructions: buildBusinessSessionInstructions(businessContext) },
+                turnContext: Object.freeze({ availableServices: buildServiceCatalogue(businessContext.services) }),
                 emit,
               });
             },

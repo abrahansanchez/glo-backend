@@ -39,7 +39,12 @@ test("all purposes in English and Spanish preserve plan semantics while emitting
     const plan = planResponse({ proposal, purpose, language }); const response = buildRealtimeResponseRequest(plan);
     assert.equal(validateRequest({ response }), null, `${purpose}/${language}`);
     assert.deepEqual(Object.keys(response).sort(), ["instructions", "metadata"]);
-    assert.deepEqual(JSON.parse(response.instructions), { purpose, language, expectedFacts: plan.expectedFacts, speechContract: plan.speechContract });
+    const { instruction, taskInstruction, languageInstruction, business, availableServices, ...planInstructions } = JSON.parse(response.instructions);
+    assert.deepEqual(planInstructions, { purpose, language, expectedFacts: plan.expectedFacts, speechContract: plan.speechContract });
+    assert.match(instruction, /receptionist/); assert.ok(taskInstruction.length > 30);
+    assert.match(languageInstruction, language === 'es' ? /Spanish only/ : /English only/);
+    assert.deepEqual(business, { businessId: null, businessName: null, timeZone: null });
+    assert.deepEqual(availableServices, ['ASK_SERVICE', 'CLARIFICATION'].includes(purpose) ? [] : undefined);
     assert.deepEqual(response.metadata, { purpose, proposalVersion: "7" });
     assert.equal(plan.proposalVersion, 7); assert.ok(Object.isFrozen(response)); assert.ok(Object.isFrozen(response.metadata));
     const socket = new ContractSocket(); const adapter = new OpenAIRealtimeAdapter({ socketFactory: () => socket });
