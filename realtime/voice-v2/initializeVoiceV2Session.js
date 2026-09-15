@@ -4,7 +4,7 @@ import { VoiceCoordinator } from "./VoiceCoordinator.js";
 import { createBookingProposal, deriveSlotKey } from "./domain/BookingProposal.js";
 import { applyAvailabilityResult, applySchedulingSearchResult } from "./domain/BookingLifecycleTransitions.js";
 import { buildCreateAppointmentCommand } from "./application/buildCreateAppointmentCommand.js";
-import { ResponsePurpose, planAuthorityRefusalContinuation, planTerminalResponseRecovery } from "./planning/ResponsePlanner.js";
+import { ResponsePurpose, bindServiceValidationContext, planAuthorityRefusalContinuation, planTerminalResponseRecovery } from "./planning/ResponsePlanner.js";
 import { buildRealtimeResponseRequest } from "./planning/buildRealtimeResponseRequest.js";
 import { SessionLifecycle } from "./lifecycle/SessionLifecycle.js";
 import { OpenAIRealtimeAdapter } from "./adapters/OpenAIRealtimeAdapter.js";
@@ -330,9 +330,10 @@ export function initializeVoiceV2Session({
 
   async function requestResponse(plan, attempt = 1, requestIdentity = null, timingContext = {}) {
     if (lifecycle.terminated) return { accepted: false, reason: "CALL_TERMINATED" };
-    const ownedPlan = plan.purpose === ResponsePurpose.ERROR_RECOVERY && !plan.speechContract?.terminalRecovery
+    const contextualPlan = bindServiceValidationContext(plan, turnContext.availableServices);
+    const ownedPlan = contextualPlan.purpose === ResponsePurpose.ERROR_RECOVERY && !contextualPlan.speechContract?.terminalRecovery
       ? planTerminalResponseRecovery({ proposal: session.proposal, language: plan.language })
-      : plan;
+      : contextualPlan;
     const requestId = requestIdentity || `${callSid}:response:${++responseSequence}`;
     if (requests.has(requestId)) return { accepted: false, reason: "DUPLICATE_REQUEST_ID" };
     const tracked = { requestId, plan: ownedPlan, attempt, retried: false, response: buildRealtimeResponseRequest(ownedPlan, { businessContext, availableServices: turnContext.availableServices }), timingContext };

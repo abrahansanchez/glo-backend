@@ -56,6 +56,25 @@ export function planResponse({ proposal, purpose, language = "en", businessName 
   });
 }
 
+// Bind the already-approved interpreter catalogue to critical validation.
+// This is an immutable response-plan snapshot, not a second catalogue owner.
+export function bindServiceValidationContext(plan, availableServices = []) {
+  if (plan?.purpose !== ResponsePurpose.PRE_BOOKING_CONFIRMATION) return plan;
+  const services = Object.freeze(availableServices.flatMap((entry) => {
+    const canonical = typeof entry === "string" ? entry.trim() : String(entry?.canonical || "").trim();
+    if (!canonical) return [];
+    const aliases = typeof entry === "string" ? [] : Array.from(entry.aliases || [], String);
+    return [Object.freeze({ canonical, aliases: Object.freeze(aliases) })];
+  }));
+  // Legacy/manual compositions that supply no catalogue keep the existing
+  // validator vocabulary. Production always supplies the resolved catalogue.
+  if (!services.length) return plan;
+  return Object.freeze({
+    ...plan,
+    validationContext: Object.freeze({ availableServices: services }),
+  });
+}
+
 // A refused affirmative supplies no booking facts or authority. Only current
 // facts determine the continuation; a later confirmation needs a new turn.
 export function planAuthorityRefusalContinuation({ proposal, turnId, language }) {

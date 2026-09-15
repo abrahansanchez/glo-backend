@@ -1,7 +1,9 @@
-const SERVICE_ALIASES = Object.freeze({
-  haircut: ["haircut", "hair cut", "corte de pelo", "corte"],
-  "beard trim": ["beard trim", "recorte de barba", "barba"],
-});
+import { matchServiceCatalogue } from "../interpretation/extractors/ServiceExtractor.js";
+
+const LEGACY_SERVICE_CATALOGUE = Object.freeze([
+  Object.freeze({ canonical: "Haircut", aliases: Object.freeze(["hair cut", "corte de pelo", "corte"]) }),
+  Object.freeze({ canonical: "Beard Trim", aliases: Object.freeze(["recorte de barba", "barba"]) }),
+]);
 const WEEKDAYS = Object.freeze({
   0: ["sunday", "domingo"], 1: ["monday", "lunes"], 2: ["tuesday", "martes"],
   3: ["wednesday", "miercoles"], 4: ["thursday", "jueves"], 5: ["friday", "viernes"], 6: ["saturday", "sabado"],
@@ -13,7 +15,10 @@ export function validateSpeech(plan, transcript) {
   const text = normalize(transcript);
   const expected = plan.expectedFacts;
   const timeSignals = extractTimes(text);
-  const serviceSignals = extractServices(text);
+  const serviceMatch = matchServiceCatalogue(text, {
+    availableServices: plan.validationContext?.availableServices || LEGACY_SERVICE_CATALOGUE,
+  });
+  const serviceSignals = serviceMatch.candidates.map(({ canonical }) => normalize(canonical));
   const dateSignals = extractDates(text);
   const expectedTime = expected.time;
   const expectedService = normalize(expected.service);
@@ -24,7 +29,7 @@ export function validateSpeech(plan, transcript) {
   const confirmationQuestionDetected = /\b(confirm|confirmation|confirmo|confirmar|correct|right|reserve|book it)\b/.test(text);
   const prematureSuccessDetected = /\b(is booked|has been booked|appointment is confirmed|cita (esta|ha sido) confirmada|ya reserve)\b/.test(text);
   const conflictingTimeDetected = timeSignals.some((time) => time !== expectedTime);
-  const conflictingServiceDetected = serviceSignals.some((service) => service !== expectedService);
+  const conflictingServiceDetected = serviceMatch.ambiguous || serviceSignals.some((service) => service !== expectedService);
   const expectedWeekdaySignal = `weekday:${new Date(`${expected.date}T12:00:00Z`).getUTCDay()}`;
   const conflictingDateDetected = dateSignals.some((date) => date !== expected.date && date !== expectedWeekdaySignal);
   const extractionFailures = Object.freeze([
@@ -67,9 +72,6 @@ function invalid(failedInvariant) {
 
 function normalize(value) { return String(value || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[¿?¡!,;.]/g, " ").replace(/\s+/g, " ").trim(); }
 function containsPhrase(text, phrase) { return ` ${text} `.includes(` ${phrase} `); }
-function extractServices(text) {
-  return Object.entries(SERVICE_ALIASES).flatMap(([canonical, aliases]) => aliases.some((alias) => containsPhrase(text, alias)) ? [canonical] : []);
-}
 function extractTimes(text) {
   const found = [];
   const regex = /(?<![\d-])\b(\d{1,2})(?::(\d{2}))?\s*(a\s*m|p\s*m)?\b(?![\d-])/g;

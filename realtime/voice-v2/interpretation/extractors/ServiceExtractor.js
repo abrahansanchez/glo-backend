@@ -1,5 +1,12 @@
 export function extractService(normalizedTurn, { availableServices = [] } = {}) {
-  const text = normalize(normalizedTurn?.text ?? "");
+  return matchServiceCatalogue(normalizedTurn, { availableServices }).canonical;
+}
+
+// Shared deterministic catalogue matching. Interpretation consumes `canonical`;
+// confirmation validation also inspects all surviving candidates so collisions
+// and explicit competing choices remain fail-closed.
+export function matchServiceCatalogue(normalizedTurn, { availableServices = [] } = {}) {
+  const text = normalize(normalizedTurn?.text ?? normalizedTurn ?? "");
   const matches = [];
   for (const [entryId, entry] of availableServices.entries()) {
     const canonical = typeof entry === "string" ? entry : entry?.canonical;
@@ -18,7 +25,15 @@ export function extractService(normalizedTurn, { availableServices = [] } = {}) 
     other.explicitCanonical && other.start <= match.start && other.end >= match.end
     && (other.start < match.start || other.end > match.end)));
   const selections = new Set(remaining.map(match => match.entryId));
-  return selections.size === 1 ? remaining[0].canonical : null;
+  const candidates = Object.freeze([...selections].map(entryId => Object.freeze({
+    entryId,
+    canonical: remaining.find(match => match.entryId === entryId).canonical,
+  })));
+  return Object.freeze({
+    canonical: selections.size === 1 ? candidates[0].canonical : null,
+    candidates,
+    ambiguous: selections.size > 1,
+  });
 }
 
 export function hasServiceSignal(normalizedTurn, context) {
