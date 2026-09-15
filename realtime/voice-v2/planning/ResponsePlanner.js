@@ -25,7 +25,12 @@ const CALLER_INPUT_PURPOSES = Object.freeze([
 ]);
 const PRE_DELIVERY_VALIDATION_PURPOSES = new Set([
   ResponsePurpose.OFFER_ALTERNATIVES,
+  ResponsePurpose.ASK_TIME,
   ResponsePurpose.ASK_NAME,
+  ResponsePurpose.CLARIFICATION,
+]);
+const REQUIREMENT_RESPONSE_PURPOSES = new Set([
+  ResponsePurpose.ASK_TIME,
   ResponsePurpose.CLARIFICATION,
 ]);
 
@@ -55,6 +60,9 @@ export function planResponse({ proposal, purpose, language = "en", businessName 
       inviteAnotherSlot: resolvedPurpose === ResponsePurpose.SLOT_UNAVAILABLE,
       bookingSuccessClaimsAllowed: resolvedPurpose === ResponsePurpose.BOOKING_SUCCESS,
       availabilityClaimsAllowed: [ResponsePurpose.OFFER_ALTERNATIVES, ResponsePurpose.SCHEDULING_ALTERNATIVES, ResponsePurpose.NO_AVAILABLE_TIMES, ResponsePurpose.SLOT_UNAVAILABLE].includes(resolvedPurpose),
+      specificTimeClaimsAllowed: !REQUIREMENT_RESPONSE_PURPOSES.has(resolvedPurpose),
+      availabilityOperationClaimsAllowed: false,
+      availabilityResultClaimsAllowed: [ResponsePurpose.OFFER_ALTERNATIVES, ResponsePurpose.SCHEDULING_ALTERNATIVES, ResponsePurpose.NO_AVAILABLE_TIMES, ResponsePurpose.SLOT_UNAVAILABLE].includes(resolvedPurpose),
       confirmationClaimsAllowed: resolvedPurpose === ResponsePurpose.PRE_BOOKING_CONFIRMATION,
       ambiguityLimitReached: resolvedPurpose === ResponsePurpose.AMBIGUITY_LIMIT_REACHED,
       sessionIntroduction: resolvedPurpose === ResponsePurpose.INITIAL_GREETING,

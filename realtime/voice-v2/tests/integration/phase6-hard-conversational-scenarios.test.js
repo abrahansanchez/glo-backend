@@ -315,11 +315,11 @@ scenario(54, "OpenAI output attempts to alter business identity", async () => {
 });
 
 scenario(55, "Bounded ambiguity recovery", async () => {
-  const f = fixture(); start(f); await caller(f, "maybe", "amb-1"); await deliverLatest(f, ResponsePurpose.CLARIFICATION, "Could you clarify that?"); await caller(f, "not sure", "amb-2"); await deliverLatest(f, ResponsePurpose.ASK_SERVICE, "Which service would you like?"); await caller(f, "maybe", "amb-3");
-  assert.deepEqual(creates(f).slice(-3).map((x) => x.response.metadata.purpose), [ResponsePurpose.CLARIFICATION, ResponsePurpose.ASK_SERVICE, ResponsePurpose.AMBIGUITY_LIMIT_REACHED]);
+  const f = fixture(); start(f); await caller(f, "maybe", "amb-1"); await deliverLatest(f, ResponsePurpose.ASK_SERVICE, "Which service would you like?"); await caller(f, "not sure", "amb-2"); await deliverLatest(f, ResponsePurpose.ASK_SERVICE, "Which service would you like?"); await caller(f, "maybe", "amb-3");
+  assert.deepEqual(creates(f).slice(-3).map((x) => x.response.metadata.purpose), [ResponsePurpose.ASK_SERVICE, ResponsePurpose.ASK_SERVICE, ResponsePurpose.AMBIGUITY_LIMIT_REACHED]);
   assert.equal(f.bookingCalls.length, 0); assert.equal(f.smsCalls.length, 0); assert.equal(f.app.session.proposal.proposalVersion, 1);
   await deliverTerminal(f, ResponsePurpose.AMBIGUITY_LIMIT_REACHED, "I could not understand. Please call again."); assert.equal(f.finalized.length, 1);
-  const reset = fixture({ callSid: "CA-55-reset" }); start(reset); await caller(reset, "maybe", "r1"); await deliverLatest(reset, ResponsePurpose.CLARIFICATION, "Could you clarify that?"); await caller(reset, "not sure", "r2"); await deliverLatest(reset, ResponsePurpose.ASK_SERVICE, "Which service would you like?"); await caller(reset, "haircut", "r3"); assert.equal(reset.app.session.ambiguityRecovery.snapshot.consecutiveAmbiguousTurns, 0); assert.equal(reset.app.session.proposal.service, "Haircut");
+  const reset = fixture({ callSid: "CA-55-reset" }); start(reset); await caller(reset, "maybe", "r1"); await deliverLatest(reset, ResponsePurpose.ASK_SERVICE, "Which service would you like?"); await caller(reset, "not sure", "r2"); await deliverLatest(reset, ResponsePurpose.ASK_SERVICE, "Which service would you like?"); await caller(reset, "haircut", "r3"); assert.equal(reset.app.session.ambiguityRecovery.snapshot.consecutiveAmbiguousTurns, 0); assert.equal(reset.app.session.proposal.service, "Haircut");
 });
 
 scenario(56, "Mid-call language switch", async () => {

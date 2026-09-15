@@ -6,11 +6,27 @@ import { ResponsePurpose, planResponse } from "../../planning/ResponsePlanner.js
 import { initializeVoiceV2Session } from "../../initializeVoiceV2Session.js";
 import { FakeSocket } from "../helpers/FakeSocket.js";
 
-test("first UNKNOWN and first CLARIFY produce ordinary clarification without proposal state", () => {
+test("first UNKNOWN and CLARIFY ask for the single authoritative missing requirement", () => {
   for (const action of ["UNKNOWN", "CLARIFY"]) {
     const state = new AmbiguityRecoveryState(); const proposal = missing(); const before = structuredClone(proposal);
-    assert.equal(state.observe({ action, turnId: "t1", proposal }).responsePurpose, ResponsePurpose.CLARIFICATION);
+    assert.equal(state.observe({ action, turnId: "t1", proposal }).responsePurpose, ResponsePurpose.ASK_SERVICE);
     assert.deepEqual(proposal, before); assert.equal(state.snapshot.consecutiveAmbiguousTurns, 1);
+  }
+});
+
+test("first ambiguity remains generic when no field-level continuation exists", () => {
+  const proposal = facts({ service: "Haircut", date: "2026-08-27", time: "10:00" });
+  for (const action of ["UNKNOWN", "CLARIFY"]) {
+    const state = new AmbiguityRecoveryState();
+    assert.equal(state.observe({ action, turnId: "t1", proposal }).responsePurpose, ResponsePurpose.CLARIFICATION);
+  }
+});
+
+test("first UNKNOWN directs service, date, time, name, and safe confirmation from authoritative state", () => {
+  const cases = [[missing(), "ASK_SERVICE"], [facts({ service: "Haircut" }), "ASK_DATE"], [facts({ service: "Haircut", date: "2026-08-27" }), "ASK_TIME"], [available({ name: null }), "ASK_NAME"], [available(), "PRE_BOOKING_CONFIRMATION"]];
+  for (const [proposal, expected] of cases) {
+    const state = new AmbiguityRecoveryState();
+    assert.equal(state.observe({ action: "UNKNOWN", turnId: "t1", proposal }).responsePurpose, expected);
   }
 });
 
@@ -28,8 +44,7 @@ test("second ambiguity while awaiting confirmation requires a fresh PRE_BOOKING_
 
 test("directed confirmation recovery traverses generation, validation, playback, mark, and fresh authority", async () => {
   const f = fixture({ callSid: "CA-CONFIRM-RECOVERY", proposal: available() }); await start(f);
-  f.openai.receive(transcript("confirm-amb-1", "hmm")); await settle(f.app); await finishRoutine(f, latestCreate(f.openai), "confirm-clarify");
-  f.openai.receive(transcript("confirm-amb-2", "maybe perhaps")); await settle(f.app); const create = latestCreate(f.openai);
+  f.openai.receive(transcript("confirm-amb-1", "hmm")); await settle(f.app); const create = latestCreate(f.openai);
   assert.equal(create.response.metadata.purpose, ResponsePurpose.PRE_BOOKING_CONFIRMATION);
   const requestId = create.response.metadata.v2RequestId; f.openai.receive({ type: "response.created", response: { id: "fresh-confirm", metadata: { v2RequestId: requestId } } }); f.openai.receive({ type: "response.output_audio.delta", response_id: "fresh-confirm", delta: "AQID" });
   f.openai.receive({ type: "response.output_audio_transcript.done", response_id: "fresh-confirm", transcript: "Roberto, should I confirm your Haircut for Thursday at 10:00 AM?" }); f.openai.receive({ type: "response.done", response: { id: "fresh-confirm", status: "completed" } }); await settle(f.app);
@@ -81,7 +96,7 @@ test("Scenario 55 through real production composition is bounded, side-effect fr
   for (let index = 1; index <= 3; index += 1) {
     f.openai.receive(transcript(`amb-${index}`, index === 1 ? "hmm" : "maybe perhaps")); await settle(f.app);
     const create = latestCreate(f.openai); const purpose = create.response.metadata.purpose;
-    assert.equal(purpose, index === 1 ? ResponsePurpose.CLARIFICATION : index === 2 ? ResponsePurpose.ASK_SERVICE : ResponsePurpose.AMBIGUITY_LIMIT_REACHED, JSON.stringify({ purposes: f.openai.sent.filter((item) => item.type === "response.create").map((item) => item.response.metadata.purpose), journal: f.app.session.journal().filter((entry) => entry.event.startsWith("AMBIGUITY_")) }));
+    assert.equal(purpose, index < 3 ? ResponsePurpose.ASK_SERVICE : ResponsePurpose.AMBIGUITY_LIMIT_REACHED, JSON.stringify({ purposes: f.openai.sent.filter((item) => item.type === "response.create").map((item) => item.response.metadata.purpose), journal: f.app.session.journal().filter((entry) => entry.event.startsWith("AMBIGUITY_")) }));
     await finishRoutine(f, create, `resp-${index}`);
   }
   assert.equal(f.app.lifecycle.terminated, true); assert.equal(f.finalized.length, 1); assert.equal(f.bookings.length, 0); assert.equal(f.sms.length, 0);

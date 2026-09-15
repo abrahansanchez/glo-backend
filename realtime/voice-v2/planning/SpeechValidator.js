@@ -1,4 +1,6 @@
 import { matchServiceCatalogue } from "../interpretation/extractors/ServiceExtractor.js";
+import { normalizeTurn } from "../interpretation/TurnNormalizer.js";
+import { extractTime } from "../interpretation/extractors/TimeExtractor.js";
 
 const LEGACY_SERVICE_CATALOGUE = Object.freeze([
   Object.freeze({ canonical: "Haircut", aliases: Object.freeze(["hair cut", "corte de pelo", "corte"]) }),
@@ -10,7 +12,7 @@ const WEEKDAYS = Object.freeze({
 });
 
 export function validateSpeech(plan, transcript) {
-  if (plan?.speechContract?.prematureBookingClaimForbidden) return validateOrdinarySpeech(transcript);
+  if (plan?.speechContract?.prematureBookingClaimForbidden) return validateOrdinarySpeech(plan, transcript);
   if (plan?.purpose !== "PRE_BOOKING_CONFIRMATION") return invalid("unsupported_purpose");
   if (typeof transcript !== "string" || !transcript.trim()) return invalid("missing_transcript");
   const text = normalize(transcript);
@@ -54,11 +56,62 @@ export function validateSpeech(plan, transcript) {
   return Object.freeze(result);
 }
 
-function validateOrdinarySpeech(transcript) {
+function validateOrdinarySpeech(plan, transcript) {
   if (typeof transcript !== "string" || !transcript.trim()) return invalid("missing_transcript");
   const text = normalize(transcript);
+  const normalizedTurn = normalizeTurn(transcript);
   const prohibited = /\b(?:confirmed|booked|scheduled|confirmada|confirmado|reservada|reservado|programada|programado)\b|\b(?:i(?:'ll| will)\s+(?:go ahead and\s+)?(?:confirm|book|schedule)|got you down|have you down)\b/.test(text);
-  return Object.freeze({ ...invalid(prohibited ? "premature_booking_claim" : null), valid: !prohibited, failedInvariant: prohibited ? "premature_booking_claim" : null, prematureSuccessDetected: prohibited });
+  const unsupportedTime = plan.speechContract.specificTimeClaimsAllowed === false
+    && containsUnsupportedTimeClaim(normalizedTurn, plan.expectedFacts);
+  const unsupportedAvailabilityOperation = plan.speechContract.availabilityOperationClaimsAllowed !== true
+    && containsAvailabilityOperationClaim(text);
+  const unsupportedAvailabilityResult = plan.speechContract.availabilityResultClaimsAllowed !== true
+    && containsAvailabilityResultClaim(text);
+  const failedInvariant = prohibited ? "premature_booking_claim"
+    : unsupportedTime ? "unsupported_time_claim"
+      : unsupportedAvailabilityOperation ? "unsupported_availability_operation_claim"
+        : unsupportedAvailabilityResult ? "unsupported_availability_result_claim"
+          : null;
+  return Object.freeze({
+    ...invalid(failedInvariant),
+    valid: failedInvariant === null,
+    failedInvariant,
+    prematureSuccessDetected: prohibited,
+    unsupportedTimeDetected: unsupportedTime,
+    unsupportedAvailabilityOperationDetected: unsupportedAvailabilityOperation,
+    unsupportedAvailabilityResultDetected: unsupportedAvailabilityResult,
+  });
+}
+
+function containsUnsupportedTimeClaim(normalizedTurn, expectedFacts = {}) {
+  if (!hasSpecificTimeSignal(normalizedTurn.text)) return false;
+  const claimed = extractTime(normalizedTurn);
+  const allowed = collectExpectedTimes(expectedFacts);
+  return !claimed || !allowed.has(claimed);
+}
+
+function hasSpecificTimeSignal(text) {
+  const hours = "one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|una|uno|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez|once|doce";
+  const clock = `[01]?\\d|2[0-3]|${hours}`;
+  return new RegExp(`\\b(?:[01]?\\d|2[0-3])(?::[0-5]\\d|\\s*(?:am|pm))\\b|\\b(?:at|a las|las|hora(?: es)?|time(?: is)?)\\s+(?:${clock})\\b|\\b(?:${clock})\\s*(?:am|pm|o clock|thirty|fifteen|y media|y cuarto|en punto|in the morning|in the afternoon|de la manana|de la tarde)\\b`).test(text);
+}
+
+function collectExpectedTimes(value, found = new Set()) {
+  if (!value || typeof value !== "object") return found;
+  for (const [key, entry] of Object.entries(value)) {
+    if (["time", "afterTime"].includes(key) && typeof entry === "string" && /^([01]\d|2[0-3]):[0-5]\d$/.test(entry)) found.add(entry);
+    else if (Array.isArray(entry)) entry.forEach((item) => collectExpectedTimes(item, found));
+    else if (entry && typeof entry === "object") collectExpectedTimes(entry, found);
+  }
+  return found;
+}
+
+function containsAvailabilityOperationClaim(text) {
+  return /\b(?:check|checking|search|searching|look|looking|find|finding)\b.{0,28}\b(?:availability|available|openings?|slots?|times?)\b|\b(?:revisar|revisando|buscar|buscando|comprobar)\b.{0,28}\b(?:disponibilidad|horarios?|turnos?)\b/.test(text);
+}
+
+function containsAvailabilityResultClaim(text) {
+  return /\b(?:unavailable|not available|no availability|available slot|available time|open slot|opening|found (?:another |an )?(?:opening|slot|time)|have availability)\b|\b(?:no esta disponible|sin disponibilidad|horario disponible|turno disponible|encontre (?:otro )?(?:horario|turno))\b/.test(text);
 }
 
 function firstFailure(r) {

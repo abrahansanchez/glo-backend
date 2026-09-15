@@ -70,3 +70,19 @@ test("speech extraction failure and confirmed mismatch are diagnostically distin
   assert.equal(wrong.generatedSignals.timeStatus, "mismatch");
   assert.equal(garbled.valid, false); assert.equal(wrong.valid, false);
 });
+
+test("ASK_TIME and CLARIFICATION buffer and reject invented time or availability claims", () => {
+  const incomplete = createBookingProposal({ proposalId: "ordinary-safety", proposalVersion: 2, service: "Haircut", date: "2026-09-18" });
+  for (const purpose of [ResponsePurpose.ASK_TIME, ResponsePurpose.CLARIFICATION]) {
+    const ordinary = planResponse({ proposal: incomplete, purpose });
+    assert.equal(ordinary.deliveryValidationRequired, true);
+    assert.equal(validateSpeech(ordinary, "What time would you like?").valid, true);
+    assert.equal(validateSpeech(ordinary, "What time works for you on Friday?").valid, true);
+    assert.equal(validateSpeech(ordinary, "Sorry, I didn't catch the time.").valid, true);
+    assert.equal(validateSpeech(ordinary, "You said 9 a.m.").failedInvariant, "unsupported_time_claim");
+    assert.equal(validateSpeech(ordinary, "Let me check 9 a.m.").valid, false);
+    assert.equal(validateSpeech(ordinary, "I'm looking for availability now.").failedInvariant, "unsupported_availability_operation_claim");
+    assert.equal(validateSpeech(ordinary, "That time is unavailable.").failedInvariant, "unsupported_availability_result_claim");
+    assert.equal(validateSpeech(ordinary, "I found another opening.").failedInvariant, "unsupported_availability_result_claim");
+  }
+});
