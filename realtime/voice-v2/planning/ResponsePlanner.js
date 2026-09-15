@@ -3,8 +3,10 @@ import { deriveBookingRequirement, deriveSlotKey, AvailabilityStatus } from "../
 export const ResponsePurpose = Object.freeze({
   INITIAL_GREETING: "INITIAL_GREETING",
   ASK_SERVICE: "ASK_SERVICE", ASK_DATE: "ASK_DATE", ASK_TIME: "ASK_TIME", ASK_NAME: "ASK_NAME",
-  OFFER_ALTERNATIVES: "OFFER_ALTERNATIVES", SLOT_UNAVAILABLE: "SLOT_UNAVAILABLE", PRE_BOOKING_CONFIRMATION: "PRE_BOOKING_CONFIRMATION",
-  BOOKING_SUCCESS: "BOOKING_SUCCESS", CLARIFICATION: "CLARIFICATION", ERROR_RECOVERY: "ERROR_RECOVERY", AMBIGUITY_LIMIT_REACHED: "AMBIGUITY_LIMIT_REACHED",
+  OFFER_ALTERNATIVES: "OFFER_ALTERNATIVES", SCHEDULING_ALTERNATIVES: "SCHEDULING_ALTERNATIVES", NO_AVAILABLE_TIMES: "NO_AVAILABLE_TIMES",
+  SLOT_UNAVAILABLE: "SLOT_UNAVAILABLE", PRE_BOOKING_CONFIRMATION: "PRE_BOOKING_CONFIRMATION",
+  BOOKING_SUCCESS: "BOOKING_SUCCESS", CLARIFICATION: "CLARIFICATION", CLARIFY_LATER_REFERENCE: "CLARIFY_LATER_REFERENCE",
+  ERROR_RECOVERY: "ERROR_RECOVERY", AMBIGUITY_LIMIT_REACHED: "AMBIGUITY_LIMIT_REACHED",
 });
 
 const CALLER_INPUT_PURPOSES = Object.freeze([
@@ -14,19 +16,22 @@ const CALLER_INPUT_PURPOSES = Object.freeze([
   ResponsePurpose.ASK_TIME,
   ResponsePurpose.ASK_NAME,
   ResponsePurpose.OFFER_ALTERNATIVES,
+  ResponsePurpose.SCHEDULING_ALTERNATIVES,
+  ResponsePurpose.NO_AVAILABLE_TIMES,
   ResponsePurpose.SLOT_UNAVAILABLE,
   ResponsePurpose.PRE_BOOKING_CONFIRMATION,
   ResponsePurpose.CLARIFICATION,
+  ResponsePurpose.CLARIFY_LATER_REFERENCE,
 ]);
 
-export function planResponse({ proposal, purpose, language = "en", businessName = null }) {
+export function planResponse({ proposal, purpose, language = "en", businessName = null, availabilitySearch = null }) {
   if (!proposal || !Number.isInteger(proposal.proposalVersion)) throw new TypeError("invalid_proposal");
   const resolvedPurpose = purpose || purposeForRequirement(deriveBookingRequirement(proposal));
   const expectedFacts = resolvedPurpose === ResponsePurpose.PRE_BOOKING_CONFIRMATION
     ? Object.freeze({ service: proposal.service, name: proposal.name, date: proposal.date, time: proposal.time })
     : resolvedPurpose === ResponsePurpose.INITIAL_GREETING
       ? greetingFacts(businessName, language)
-      : ordinaryFacts(proposal, resolvedPurpose);
+      : ordinaryFacts(proposal, resolvedPurpose, availabilitySearch);
   if (resolvedPurpose === ResponsePurpose.PRE_BOOKING_CONFIRMATION && Object.values(expectedFacts).some((value) => !value)) {
     throw new TypeError("incomplete_confirmation_facts");
   }
@@ -39,10 +44,10 @@ export function planResponse({ proposal, purpose, language = "en", businessName 
     expectedFacts,
     speechContract: Object.freeze({
       semanticValidationRequired: resolvedPurpose === ResponsePurpose.PRE_BOOKING_CONFIRMATION,
-      alternativesClaimAllowed: resolvedPurpose === ResponsePurpose.OFFER_ALTERNATIVES,
+      alternativesClaimAllowed: [ResponsePurpose.OFFER_ALTERNATIVES, ResponsePurpose.SCHEDULING_ALTERNATIVES].includes(resolvedPurpose),
       inviteAnotherSlot: resolvedPurpose === ResponsePurpose.SLOT_UNAVAILABLE,
       bookingSuccessClaimsAllowed: resolvedPurpose === ResponsePurpose.BOOKING_SUCCESS,
-      availabilityClaimsAllowed: [ResponsePurpose.OFFER_ALTERNATIVES, ResponsePurpose.SLOT_UNAVAILABLE].includes(resolvedPurpose),
+      availabilityClaimsAllowed: [ResponsePurpose.OFFER_ALTERNATIVES, ResponsePurpose.SCHEDULING_ALTERNATIVES, ResponsePurpose.NO_AVAILABLE_TIMES, ResponsePurpose.SLOT_UNAVAILABLE].includes(resolvedPurpose),
       confirmationClaimsAllowed: resolvedPurpose === ResponsePurpose.PRE_BOOKING_CONFIRMATION,
       ambiguityLimitReached: resolvedPurpose === ResponsePurpose.AMBIGUITY_LIMIT_REACHED,
       sessionIntroduction: resolvedPurpose === ResponsePurpose.INITIAL_GREETING,
@@ -100,19 +105,37 @@ function greetingFacts(businessName, language) {
   });
 }
 
-function ordinaryFacts(proposal, purpose) {
+function ordinaryFacts(proposal, purpose, availabilitySearch) {
   const facts = {};
   const relevant = {
     ASK_DATE: ['service'], ASK_TIME: ['service', 'date'], ASK_NAME: ['service', 'date', 'time'],
-    OFFER_ALTERNATIVES: ['service', 'date', 'time'], SLOT_UNAVAILABLE: ['service', 'date', 'time'],
+    OFFER_ALTERNATIVES: ['service', 'date', 'time'], SCHEDULING_ALTERNATIVES: ['service', 'date'], NO_AVAILABLE_TIMES: ['service', 'date'],
+    CLARIFY_LATER_REFERENCE: ['service', 'date'], SLOT_UNAVAILABLE: ['service', 'date', 'time'],
     BOOKING_SUCCESS: ['service', 'name', 'date', 'time'],
   }[purpose] || [];
   for (const field of relevant) if (proposal[field]) facts[field] = proposal[field];
   if (purpose === ResponsePurpose.CLARIFICATION) facts.nextRequired = deriveBookingRequirement(proposal);
+  if (purpose === ResponsePurpose.CLARIFY_LATER_REFERENCE) {
+    const reference = proposal.availability.schedulingReference;
+    facts.searchType = reference?.searchType || null;
+    facts.requestedDate = reference?.requestedDate || proposal.date;
+    facts.afterTime = reference?.afterTime || null;
+    facts.alternatives = Object.freeze(proposal.availability.alternatives.map(({ date, time }) => Object.freeze({ date, time })));
+  }
   if ([ResponsePurpose.OFFER_ALTERNATIVES, ResponsePurpose.SLOT_UNAVAILABLE].includes(purpose)
     && proposal.availability.slotKey === deriveSlotKey(proposal) && proposal.availability.status === AvailabilityStatus.UNAVAILABLE) {
     facts.availability = 'unavailable';
     if (purpose === ResponsePurpose.OFFER_ALTERNATIVES) facts.alternatives = Object.freeze(proposal.availability.alternatives.map(({ date, time }) => Object.freeze({ date, time })));
+  }
+  if ([ResponsePurpose.SCHEDULING_ALTERNATIVES, ResponsePurpose.NO_AVAILABLE_TIMES].includes(purpose)
+    && proposal.availability.slotKey === deriveSlotKey(proposal) && proposal.availability.status === AvailabilityStatus.UNAVAILABLE) {
+    facts.requestedDate = availabilitySearch?.requestedDate || proposal.date;
+    facts.searchType = availabilitySearch?.searchType || null;
+    facts.afterTime = availabilitySearch?.afterTime || null;
+    facts.availabilityReason = availabilitySearch?.reason || null;
+    facts.alternatives = purpose === ResponsePurpose.SCHEDULING_ALTERNATIVES
+      ? Object.freeze(proposal.availability.alternatives.map(({ date, time }) => Object.freeze({ date, time })))
+      : Object.freeze([]);
   }
   if (purpose === ResponsePurpose.BOOKING_SUCCESS && proposal.terminal?.outcome === 'BOOKED') facts.outcome = 'BOOKED';
   return Object.freeze(facts);

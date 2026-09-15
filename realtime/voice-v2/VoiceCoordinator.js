@@ -15,7 +15,7 @@ export class VoiceCoordinator {
     return session.turnRegistry.acquire(turn, async () => {
       session.record("TURN_PROCESSING_STARTED", { turnId: turn.turnId, proposalVersion: session.proposal.proposalVersion });
       const interpretationTiming = context.timing?.start("INTERPRETATION", { turnId: turn.turnId });
-      const interpreted = await this.interpreter({ transcript: turn.transcript, sourceTurnId: turn.turnId, currentProposal: session.proposal, confirmationContext: context.confirmationContext, referenceDate: context.referenceDate, businessTimeZone: context.businessTimeZone, availableServices: context.availableServices || [] });
+      const interpreted = await this.interpreter({ transcript: turn.transcript, sourceTurnId: turn.turnId, currentProposal: session.proposal, confirmationContext: context.confirmationContext, referenceDate: context.referenceDate, businessTimeZone: context.businessTimeZone, availableServices: context.availableServices || [], laterReferenceClarification: context.laterReferenceClarification === true });
       context.timing?.end("INTERPRETATION", interpretationTiming, { turnId: turn.turnId });
       session.record("TURN_INTERPRETED", { turnId: turn.turnId, action: interpreted.interpretation.action, proposalVersion: session.proposal.proposalVersion });
       if (interpreted.interpretation.action === "AFFIRM_CONFIRMATION") {

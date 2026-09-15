@@ -2,7 +2,7 @@ import { CallSession } from "./CallSession.js";
 import { LatencyDiagnostics } from "./diagnostics/LatencyDiagnostics.js";
 import { VoiceCoordinator } from "./VoiceCoordinator.js";
 import { createBookingProposal, deriveSlotKey } from "./domain/BookingProposal.js";
-import { applyAvailabilityResult } from "./domain/BookingLifecycleTransitions.js";
+import { applyAvailabilityResult, applySchedulingSearchResult } from "./domain/BookingLifecycleTransitions.js";
 import { buildCreateAppointmentCommand } from "./application/buildCreateAppointmentCommand.js";
 import { ResponsePurpose, planAuthorityRefusalContinuation, planTerminalResponseRecovery } from "./planning/ResponsePlanner.js";
 import { buildRealtimeResponseRequest } from "./planning/buildRealtimeResponseRequest.js";
@@ -48,6 +48,8 @@ export function initializeVoiceV2Session({
   }
   const effectHandlers = {
     CHECK_AVAILABILITY: async (command) => { const slotKey = deriveSlotKey(session.proposal); return timedEffect(command, "AVAILABILITY_TIMEOUT", 15000, () => checkAvailability(command), () => ({ proposalVersion: command.proposalVersion, slotKey, available: false, alternatives: [], reason: "TIMEOUT" })); },
+    REQUEST_AVAILABLE_TIMES_FOR_DATE: async (command) => timedEffect(command, "AVAILABILITY_TIMEOUT", 15000, () => searchAvailableTimes(command), () => schedulingTimeoutResult(command)),
+    REQUEST_LATER_TIME: async (command) => timedEffect(command, "AVAILABILITY_TIMEOUT", 15000, () => searchAvailableTimes(command), () => schedulingTimeoutResult(command)),
     CREATE_APPOINTMENT: async (command) => settleBookingEffect(command),
     SEND_CONFIRMATION_SMS: async (command) => timedEffect(command, "EFFECT_TIMEOUT", 20000, () => smsAdapter.sendAppointmentConfirmation({
       ...command, callSid, barberId: businessContext.barberId, to: callerNumber,
@@ -199,6 +201,7 @@ export function initializeVoiceV2Session({
       referenceDate: turnContext.referenceDate || new Intl.DateTimeFormat('en-CA', { timeZone: businessContext.timeZone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(now()),
       timing,
       confirmationContext: { responseId: current?.responseId || null, markId: current?.markId || null },
+      laterReferenceClarification: current?.plan?.purpose === ResponsePurpose.CLARIFY_LATER_REFERENCE,
     });
     timing.end("INTERPRETATION_REDUCTION", semanticTiming, { turnId, proposalVersion: session.proposal.proposalVersion });
     const outcome = registered?.result || registered;
@@ -264,13 +267,25 @@ export function initializeVoiceV2Session({
         if (transition.applied) { const previous = session.proposal; session.replaceProposal(previous, transition.nextProposal, { event: "AVAILABILITY_RESULT_APPLIED" }); }
         else session.record("AVAILABILITY_RESULT_REJECTED", { reason: transition.reason, stale: transition.stale });
         if (transition.responsePurpose) await requestResponse(coordinator.responsePlanner({ proposal: session.proposal, purpose: transition.responsePurpose, language: session.conversationLanguage.currentLanguage }), 1, null, { commandId: pending.commandId });
+      } else if (["REQUEST_LATER_TIME", "REQUEST_AVAILABLE_TIMES_FOR_DATE"].includes(pending.type)) {
+        const transition = applySchedulingSearchResult(session.proposal, execution.result, pending);
+        if (transition.applied) session.replaceProposal(session.proposal, transition.nextProposal, { event: "SCHEDULING_RESULT_APPLIED" });
+        else session.record("SCHEDULING_RESULT_REJECTED", { commandId: pending.commandId, reason: transition.reason, stale: transition.stale });
+        if (transition.responsePurpose) await requestResponse(coordinator.responsePlanner({
+          proposal: session.proposal,
+          purpose: transition.responsePurpose,
+          language: session.conversationLanguage.currentLanguage,
+          availabilitySearch: transition.searchContext,
+        }), 1, null, { commandId: pending.commandId });
       } else if (pending.type === "CREATE_APPOINTMENT") {
         const transition = coordinator.applyBookingExecution(session, execution);
         await lifecycle.settleDurableBooking(pending.commandId);
         if (execution.result.settlementDelayed) session.record("BOOKING_SETTLEMENT_COMPLETED_AFTER_DEADLINE", { commandId: pending.commandId, outcome: transition.outcome, appointmentId: transition.appointmentId || null });
         if (transition.responsePurpose && !execution.result.terminalRecoveryOwned && !lifecycle.terminated) await requestResponse(coordinator.responsePlanner({ proposal: session.proposal, purpose: transition.responsePurpose, language: session.conversationLanguage.currentLanguage }), 1, null, { commandId: pending.commandId });
-      } else if (["REQUEST_CLARIFICATION", "CONFIRMATION_REJECTED", "REQUEST_LATER_TIME", "REQUEST_AVAILABLE_TIMES_FOR_DATE"].includes(pending.type)) {
-        const purpose = pending.type === "REQUEST_CLARIFICATION" ? ambiguityPurposes.shift() || ResponsePurpose.CLARIFICATION : ResponsePurpose.CLARIFICATION;
+      } else if (["REQUEST_CLARIFICATION", "CONFIRMATION_REJECTED"].includes(pending.type)) {
+        const purpose = pending.clarificationKind === "LATER_REFERENCE"
+          ? ResponsePurpose.CLARIFY_LATER_REFERENCE
+          : pending.type === "REQUEST_CLARIFICATION" ? ambiguityPurposes.shift() || ResponsePurpose.CLARIFICATION : ResponsePurpose.CLARIFICATION;
         await requestResponse(coordinator.responsePlanner({ proposal: session.proposal, purpose, language: session.conversationLanguage.currentLanguage }), 1, null, { commandId: pending.commandId });
       }
     }
@@ -284,6 +299,33 @@ export function initializeVoiceV2Session({
     const alternatives = await availabilityAdapter.getAlternatives({ ...request, limit: 3 });
     if (alternatives.reason) return { proposalVersion: command.proposalVersion, slotKey: request.slotKey, available: false, alternatives: [], reason: alternatives.reason };
     return { ...checked, proposalVersion: command.proposalVersion, alternatives: alternatives.alternatives, reason: checked.reason };
+  }
+
+  async function searchAvailableTimes(command) {
+    return availabilityAdapter.searchAvailableTimes({
+      commandId: command.commandId,
+      barberId: businessContext.barberId,
+      service: command.service,
+      requestedDate: command.requestedDate,
+      afterTime: command.afterTime,
+      timeZone: businessContext.timeZone,
+      proposalVersion: command.proposalVersion,
+      proposalSlotKey: command.proposalSlotKey,
+      searchType: command.searchType,
+      limit: 3,
+    });
+  }
+
+  function schedulingTimeoutResult(command) {
+    return {
+      proposalVersion: command.proposalVersion,
+      proposalSlotKey: command.proposalSlotKey,
+      searchType: command.searchType,
+      requestedDate: command.requestedDate,
+      afterTime: command.afterTime,
+      alternatives: [],
+      reason: "TIMEOUT",
+    };
   }
 
   async function requestResponse(plan, attempt = 1, requestIdentity = null, timingContext = {}) {

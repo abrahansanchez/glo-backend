@@ -48,9 +48,9 @@ export function reduceBooking(currentProposal, action) {
     case CallerActionType.SELECT_ALTERNATIVE:
       return selectAlternative(currentProposal, action);
     case CallerActionType.REQUEST_LATER_TIME:
-      return unchanged(currentProposal, [{ type: BookingEffectType.REQUEST_LATER_TIME, proposalVersion: currentProposal.proposalVersion }]);
+      return requestLaterTime(currentProposal, action);
     case CallerActionType.REQUEST_AVAILABLE_TIMES_FOR_DATE:
-      return unchanged(currentProposal, [{ type: BookingEffectType.REQUEST_AVAILABLE_TIMES_FOR_DATE, proposalVersion: currentProposal.proposalVersion }]);
+      return requestAvailableTimesForDate(currentProposal, action);
     case CallerActionType.AFFIRM_CONFIRMATION:
       return affirmConfirmation(currentProposal);
     case CallerActionType.REJECT_CONFIRMATION:
@@ -61,6 +61,98 @@ export function reduceBooking(currentProposal, action) {
     default:
       return rejected(currentProposal, "unsupported_action");
   }
+}
+
+function requestAvailableTimesForDate(current, action) {
+  if (!current.service) return unchanged(current, [{ type: BookingEffectType.REQUEST_CLARIFICATION, proposalVersion: current.proposalVersion }]);
+  return prepareSchedulingSearch(current, action, {
+    type: BookingEffectType.REQUEST_AVAILABLE_TIMES_FOR_DATE,
+    searchType: "DATE",
+    requestedDate: action.date,
+    afterTime: null,
+  });
+}
+
+function requestLaterTime(current, action) {
+  if (!current.service || !current.date) {
+    return unchanged(current, [{ type: BookingEffectType.REQUEST_CLARIFICATION, proposalVersion: current.proposalVersion }]);
+  }
+  const reference = laterSearchReference(current, action);
+  if (reference?.ambiguous) {
+    return unchanged(current, [{
+      type: BookingEffectType.REQUEST_CLARIFICATION,
+      proposalVersion: current.proposalVersion,
+      clarificationKind: "LATER_REFERENCE",
+    }]);
+  }
+  if (!reference) return unchanged(current, [{ type: BookingEffectType.REQUEST_CLARIFICATION, proposalVersion: current.proposalVersion }]);
+  return prepareSchedulingSearch(current, action, {
+    type: BookingEffectType.REQUEST_LATER_TIME,
+    searchType: "LATER",
+    requestedDate: reference.requestedDate,
+    afterTime: reference.afterTime,
+  });
+}
+
+function laterSearchReference(current, action) {
+  if (isValidFieldValue("time", action.time)) return { requestedDate: current.date, afterTime: action.time };
+  if (Number.isInteger(action.referenceAlternativeIndex)) {
+    const alternatives = currentSchedulingAlternatives(current);
+    const referenced = alternatives?.[action.referenceAlternativeIndex];
+    if (!referenced || referenced.date !== current.date) return { ambiguous: true };
+    return { requestedDate: current.date, afterTime: referenced.time };
+  }
+  if (current.time) return { requestedDate: current.date, afterTime: current.time };
+  const currentAlternatives = currentSchedulingAlternatives(current);
+  if (!currentAlternatives?.length) return null;
+  if (currentAlternatives.length !== 1 || currentAlternatives[0].date !== current.date) return { ambiguous: true };
+  return { requestedDate: current.date, afterTime: currentAlternatives[0].time };
+}
+
+function currentSchedulingAlternatives(current) {
+  const scheduling = current.availability.schedulingReference;
+  return current.availability.proposalVersion === current.proposalVersion
+    && current.availability.slotKey === deriveSlotKey(current)
+    && scheduling?.proposalVersion === current.proposalVersion
+    && scheduling?.service === current.service
+    && scheduling?.requestedDate === current.date
+    ? current.availability.alternatives
+    : null;
+}
+
+function prepareSchedulingSearch(current, action, search) {
+  const proposalChanged = current.date !== search.requestedDate || current.time !== null;
+  const nextVersion = proposalChanged ? current.proposalVersion + 1 : current.proposalVersion;
+  const next = proposalChanged
+    ? createBookingProposal({
+        ...current,
+        proposalVersion: nextVersion,
+        date: search.requestedDate,
+        time: null,
+        source: {
+          ...current.source,
+          dateTurnId: current.date !== search.requestedDate ? action.sourceTurnId : current.source.dateTurnId,
+          timeTurnId: null,
+        },
+        availability: {
+          proposalVersion: nextVersion,
+          slotKey: deriveSlotKey({ service: current.service, date: search.requestedDate, time: null }),
+          status: AvailabilityStatus.UNKNOWN,
+          alternatives: [],
+        },
+        confirmation: { proposalVersion: nextVersion, status: ConfirmationStatus.NONE },
+      })
+    : current;
+  const effect = {
+    type: search.type,
+    proposalVersion: next.proposalVersion,
+    proposalSlotKey: deriveSlotKey(next),
+    service: next.service,
+    requestedDate: search.requestedDate,
+    afterTime: search.afterTime,
+    searchType: search.searchType,
+  };
+  return proposalChanged ? changed(next, [effect]) : unchanged(next, [effect]);
 }
 
 function replaceField(current, action, field) {
@@ -175,7 +267,14 @@ function carryForwardAvailability(current, nextVersion) {
   if (current.availability.slotKey !== slotKey) {
     throw new TypeError("cannot_carry_forward_availability_for_different_slot");
   }
-  return { ...current.availability, proposalVersion: nextVersion, slotKey };
+  return {
+    ...current.availability,
+    proposalVersion: nextVersion,
+    slotKey,
+    ...(current.availability.schedulingReference
+      ? { schedulingReference: { ...current.availability.schedulingReference, proposalVersion: nextVersion } }
+      : {}),
+  };
 }
 
 function commandEffect(proposal, type) {

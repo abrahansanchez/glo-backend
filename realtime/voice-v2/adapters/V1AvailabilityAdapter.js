@@ -7,7 +7,7 @@ import {
   suggestClosestSlots,
 } from "../../../utils/ai/availabilityHelpers.js";
 import { deriveSlotKey } from "../domain/BookingProposal.js";
-import { AvailabilityPort, validateAvailabilityRequest } from "../ports/AvailabilityPort.js";
+import { AvailabilityPort, AvailabilitySearchType, validateAvailabilityRequest, validateAvailabilitySearchRequest } from "../ports/AvailabilityPort.js";
 import { BusinessReason, normalizeBusinessError } from "../ports/PortErrors.js";
 
 export const V1_AVAILABILITY_SIGNATURE = Object.freeze({
@@ -90,6 +90,47 @@ export class V1AvailabilityAdapter extends AvailabilityPort {
       return Object.freeze({ slotKey: request?.slotKey ?? null, alternatives: Object.freeze([]), reason: normalizeBusinessError(error, BusinessReason.PERSISTENCE_ERROR) });
     }
   }
+
+  async searchAvailableTimes(request) {
+    try {
+      validateAvailabilitySearchRequest(request);
+      if (request.proposalSlotKey !== deriveSlotKey({ service: request.service, date: request.requestedDate, time: null })) {
+        return schedulingResult(request, [], BusinessReason.INVALID_SLOT);
+      }
+      const barber = await this.findBarberByIdFn(request.barberId);
+      if (!barber) return schedulingResult(request, [], BusinessReason.NOT_FOUND);
+      if (!timeZonesAgree(barber, request.timeZone)) return schedulingResult(request, [], BusinessReason.INVALID_SLOT);
+      const durationMinutes = this.getServiceDurationFn(barber, request.service);
+      const limit = request.limit ?? 3;
+      const startAfterTime = request.searchType === AvailabilitySearchType.LATER
+        ? toV1Time(request.requestedDate, request.afterTime, request.timeZone)
+        : null;
+      if (request.searchType === AvailabilitySearchType.LATER && !startAfterTime) {
+        return schedulingResult(request, [], BusinessReason.INVALID_SLOT, durationMinutes);
+      }
+      const sameDay = await this.getAvailableSlotsFn({
+        barber, date: request.requestedDate, durationMinutes, limit, startAfterTime,
+      });
+      let raw = Array.isArray(sameDay) ? sameDay : [];
+      if (raw.length < limit) {
+        const futureStart = request.searchType === AvailabilitySearchType.LATER
+          ? moment.tz(request.requestedDate, "YYYY-MM-DD", true, request.timeZone).add(1, "day").format("YYYY-MM-DD")
+          : request.requestedDate;
+        const future = await this.findAlternativesFn({ barber, date: futureStart, durationMinutes });
+        raw = [...raw, ...(Array.isArray(future) ? future : [])];
+      }
+      const alternatives = normalizeSearchAlternatives(raw, request).slice(0, limit);
+      const requestedDateReason = closedDateReason(barber, request.requestedDate, request.timeZone);
+      return schedulingResult(
+        request,
+        alternatives,
+        requestedDateReason || (alternatives.length ? null : BusinessReason.UNAVAILABLE),
+        durationMinutes,
+      );
+    } catch (error) {
+      return schedulingResult(request, [], normalizeBusinessError(error, BusinessReason.PERSISTENCE_ERROR));
+    }
+  }
 }
 
 function validateSlotIdentityAndTime(request) {
@@ -133,4 +174,42 @@ function normalizeUnavailableReason(reason) {
 
 function unavailableResult(slotKey, reason) {
   return Object.freeze({ slotKey, available: false, reason, conflictId: null, metadata: Object.freeze({}) });
+}
+
+function normalizeSearchAlternatives(raw, request) {
+  const seen = new Set();
+  const threshold = request.searchType === AvailabilitySearchType.LATER
+    ? `${request.requestedDate}T${request.afterTime}`
+    : null;
+  return raw.flatMap((slot) => {
+    const time = fromV1Time(slot?.date, slot?.time, request.timeZone);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(slot?.date ?? "") || !time) return [];
+    if (threshold && `${slot.date}T${time}` <= threshold) return [];
+    const slotKey = deriveSlotKey({ service: request.service, date: slot.date, time });
+    if (seen.has(slotKey)) return [];
+    seen.add(slotKey);
+    return [Object.freeze({ date: slot.date, time, slotKey })];
+  });
+}
+
+function closedDateReason(barber, date, timeZone) {
+  const parsed = moment.tz(date, "YYYY-MM-DD", true, timeZone);
+  if (!parsed.isValid()) return BusinessReason.INVALID_SLOT;
+  const dayHours = barber.availability?.businessHours?.[["sun", "mon", "tue", "wed", "thu", "fri", "sat"][parsed.day()]];
+  if (!dayHours || dayHours.isClosed) return BusinessReason.BUSINESS_CLOSED;
+  const blackedOut = (barber.availability?.blackoutDates || []).some((entry) => moment.tz(entry?.date, timeZone).format("YYYY-MM-DD") === date);
+  return blackedOut ? BusinessReason.BUSINESS_CLOSED : null;
+}
+
+function schedulingResult(request, alternatives, reason, durationMinutes = null) {
+  return Object.freeze({
+    proposalVersion: request?.proposalVersion ?? null,
+    proposalSlotKey: request?.proposalSlotKey ?? null,
+    searchType: request?.searchType ?? null,
+    requestedDate: request?.requestedDate ?? null,
+    afterTime: request?.afterTime ?? null,
+    alternatives: Object.freeze(alternatives),
+    reason,
+    metadata: Object.freeze({ durationMinutes, timeZone: request?.timeZone ?? null }),
+  });
 }

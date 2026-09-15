@@ -34,11 +34,12 @@ export async function interpretTurn({
   referenceDate,
   businessTimeZone,
   availableServices = [],
+  laterReferenceClarification = false,
   fallbackClassifier = null,
 }) {
   const normalizedTurn = normalizeTurn(transcript);
   const languageEvidence = languageEvidenceFor(normalizedTurn.text);
-  const context = Object.freeze({ currentProposal, currentAlternatives, confirmationContext, referenceDate, businessTimeZone, availableServices });
+  const context = Object.freeze({ currentProposal, currentAlternatives, confirmationContext, referenceDate, businessTimeZone, availableServices, laterReferenceClarification });
   const selectedAction = classifyOneAction(normalizedTurn, context);
   if (selectedAction !== CallerActionType.UNKNOWN) {
     const candidate = buildInterpretation(selectedAction, normalizedTurn, sourceTurnId, context);
@@ -77,6 +78,7 @@ export function classifyOneAction(normalizedTurn, context) {
   if (modification && serviceSignal) return CallerActionType.MODIFY_SERVICE;
   if (matchesRuleGroup("later_requests", text)) return CallerActionType.REQUEST_LATER_TIME;
   if (matchesRuleGroup("ordinal_alternative_references", text)) {
+    if (context.laterReferenceClarification) return CallerActionType.REQUEST_LATER_TIME;
     return context.currentAlternatives?.length ? CallerActionType.SELECT_ALTERNATIVE : CallerActionType.CLARIFY;
   }
   if (matchesRuleGroup("day_date_requests", text) && /\b(?:what|available|que|disponible|hay|tienes)\b/.test(text)) {
@@ -117,6 +119,18 @@ function buildInterpretation(action, normalizedTurn, sourceTurnId, context) {
     case CallerActionType.SELECT_ALTERNATIVE:
       value.alternativeIndex = extractAlternativeIndex(normalizedTurn);
       break;
+    case CallerActionType.REQUEST_LATER_TIME: {
+      const referenceAlternativeIndex = extractAlternativeIndex(normalizedTurn);
+      if (referenceAlternativeIndex !== null) value.referenceAlternativeIndex = referenceAlternativeIndex;
+      // An ordinal supplied while answering CLARIFY_LATER_REFERENCE identifies
+      // the search cursor. Words such as "one" must not also become 1:00.
+      if (referenceAlternativeIndex === null && hasTimeSignal(normalizedTurn.text)) {
+        value.time = extractTime(normalizedTurn, {
+          currentTime: context.currentProposal?.time || context.currentProposal?.availability?.schedulingReference?.afterTime || null,
+        });
+      }
+      break;
+    }
     case CallerActionType.BOOK_REQUEST: {
       const service = extractService(normalizedTurn, context);
       const name = nameSignalFor(normalizedTurn) ? extractName(normalizedTurn) : null;
@@ -153,6 +167,9 @@ function validateCandidate(candidate, context, sourceTurnId) {
   if (value.time !== undefined && !/^([01]\d|2[0-3]):[0-5]\d$/.test(value.time)) return { valid: false };
   if (value.alternativeIndex !== undefined) {
     if (!Number.isInteger(value.alternativeIndex) || value.alternativeIndex < 0 || value.alternativeIndex >= (context.currentAlternatives?.length ?? 0)) return { valid: false };
+  }
+  if (value.referenceAlternativeIndex !== undefined) {
+    if (!Number.isInteger(value.referenceAlternativeIndex) || value.referenceAlternativeIndex < 0 || value.referenceAlternativeIndex >= (context.currentAlternatives?.length ?? 0)) return { valid: false };
   }
   if (value.service !== undefined && !isAllowedService(value.service, context.availableServices)) return { valid: false };
   return { valid: true, value };
