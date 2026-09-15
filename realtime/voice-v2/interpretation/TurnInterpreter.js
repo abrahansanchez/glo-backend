@@ -4,9 +4,11 @@ import {
   createCallerAction,
   validateCallerAction,
 } from "../domain/CallerAction.js";
+import { AvailabilityStatus } from "../domain/AvailabilityState.js";
+import { deriveSlotKey } from "../domain/BookingProposal.js";
 import { normalizeTurn } from "./TurnNormalizer.js";
 import { languageEvidenceFor, matchesRuleGroup } from "./InterpretationRules.js";
-import { extractAlternativeIndex } from "./extractors/AlternativeExtractor.js";
+import { extractAlternativeIndex, matchAlternativeTime } from "./extractors/AlternativeExtractor.js";
 import { extractConfirmation } from "./extractors/ConfirmationExtractor.js";
 import { extractDate } from "./extractors/DateExtractor.js";
 import { extractName } from "./extractors/NameExtractor.js";
@@ -35,11 +37,12 @@ export async function interpretTurn({
   businessTimeZone,
   availableServices = [],
   laterReferenceClarification = false,
+  nameCollectionContext = false,
   fallbackClassifier = null,
 }) {
   const normalizedTurn = normalizeTurn(transcript);
   const languageEvidence = languageEvidenceFor(normalizedTurn.text);
-  const context = Object.freeze({ currentProposal, currentAlternatives, confirmationContext, referenceDate, businessTimeZone, availableServices, laterReferenceClarification });
+  const context = Object.freeze({ currentProposal, currentAlternatives, confirmationContext, referenceDate, businessTimeZone, availableServices, laterReferenceClarification, nameCollectionContext });
   const selectedAction = classifyOneAction(normalizedTurn, context);
   if (selectedAction !== CallerActionType.UNKNOWN) {
     const candidate = buildInterpretation(selectedAction, normalizedTurn, sourceTurnId, context);
@@ -81,6 +84,11 @@ export function classifyOneAction(normalizedTurn, context) {
     if (context.laterReferenceClarification) return CallerActionType.REQUEST_LATER_TIME;
     return context.currentAlternatives?.length ? CallerActionType.SELECT_ALTERNATIVE : CallerActionType.CLARIFY;
   }
+  if (timeSignal) {
+    const offeredTime = matchCurrentAlternativeTime(normalizedTurn, context);
+    if (offeredTime.ambiguous) return CallerActionType.CLARIFY;
+    if (offeredTime.matched) return CallerActionType.SELECT_ALTERNATIVE;
+  }
   if (matchesRuleGroup("day_date_requests", text) && /\b(?:what|available|que|disponible|hay|tienes)\b/.test(text)) {
     return CallerActionType.REQUEST_AVAILABLE_TIMES_FOR_DATE;
   }
@@ -93,6 +101,7 @@ export function classifyOneAction(normalizedTurn, context) {
   if (serviceSignal) return context.currentProposal?.service ? CallerActionType.MODIFY_SERVICE : CallerActionType.SET_SERVICE;
   if (timeSignal) return CallerActionType.SET_TIME;
   if (dateSignal) return CallerActionType.SET_DATE;
+  if (context.nameCollectionContext && extractName(normalizedTurn, { allowBare: true })) return CallerActionType.SET_NAME;
   if (matchesRuleGroup("clarification_cues", text) || /\?$/.test(normalizedTurn.raw.trim())) return CallerActionType.CLARIFY;
   return CallerActionType.UNKNOWN;
 }
@@ -114,10 +123,11 @@ function buildInterpretation(action, normalizedTurn, sourceTurnId, context) {
       value.service = extractService(normalizedTurn, context);
       break;
     case CallerActionType.SET_NAME:
-      value.name = extractName(normalizedTurn);
+      value.name = extractName(normalizedTurn, { allowBare: context.nameCollectionContext });
       break;
     case CallerActionType.SELECT_ALTERNATIVE:
       value.alternativeIndex = extractAlternativeIndex(normalizedTurn);
+      if (value.alternativeIndex === null) value.alternativeIndex = matchCurrentAlternativeTime(normalizedTurn, context).alternativeIndex;
       break;
     case CallerActionType.REQUEST_LATER_TIME: {
       const referenceAlternativeIndex = extractAlternativeIndex(normalizedTurn);
@@ -144,6 +154,17 @@ function buildInterpretation(action, normalizedTurn, sourceTurnId, context) {
     }
   }
   return value;
+}
+
+function matchCurrentAlternativeTime(normalizedTurn, context) {
+  const proposal = context.currentProposal;
+  const availability = proposal?.availability;
+  const current = availability?.proposalVersion === proposal?.proposalVersion
+    && availability?.slotKey === deriveSlotKey(proposal)
+    && availability?.status === AvailabilityStatus.UNAVAILABLE;
+  return current
+    ? matchAlternativeTime(normalizedTurn, context.currentAlternatives)
+    : Object.freeze({ matched: false, ambiguous: false, alternativeIndex: null });
 }
 
 function nameSignalFor(normalizedTurn) { return matchesRuleGroup("name_setting_cues", normalizedTurn.text); }

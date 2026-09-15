@@ -23,6 +23,11 @@ const CALLER_INPUT_PURPOSES = Object.freeze([
   ResponsePurpose.CLARIFICATION,
   ResponsePurpose.CLARIFY_LATER_REFERENCE,
 ]);
+const PRE_DELIVERY_VALIDATION_PURPOSES = new Set([
+  ResponsePurpose.OFFER_ALTERNATIVES,
+  ResponsePurpose.ASK_NAME,
+  ResponsePurpose.CLARIFICATION,
+]);
 
 export function planResponse({ proposal, purpose, language = "en", businessName = null, availabilitySearch = null }) {
   if (!proposal || !Number.isInteger(proposal.proposalVersion)) throw new TypeError("invalid_proposal");
@@ -40,10 +45,12 @@ export function planResponse({ proposal, purpose, language = "en", businessName 
     proposalVersion: proposal.proposalVersion,
     language,
     critical: resolvedPurpose === ResponsePurpose.PRE_BOOKING_CONFIRMATION,
+    deliveryValidationRequired: PRE_DELIVERY_VALIDATION_PURPOSES.has(resolvedPurpose),
     expectsCallerInput: CALLER_INPUT_PURPOSES.includes(resolvedPurpose),
     expectedFacts,
     speechContract: Object.freeze({
       semanticValidationRequired: resolvedPurpose === ResponsePurpose.PRE_BOOKING_CONFIRMATION,
+      prematureBookingClaimForbidden: PRE_DELIVERY_VALIDATION_PURPOSES.has(resolvedPurpose),
       alternativesClaimAllowed: [ResponsePurpose.OFFER_ALTERNATIVES, ResponsePurpose.SCHEDULING_ALTERNATIVES].includes(resolvedPurpose),
       inviteAnotherSlot: resolvedPurpose === ResponsePurpose.SLOT_UNAVAILABLE,
       bookingSuccessClaimsAllowed: resolvedPurpose === ResponsePurpose.BOOKING_SUCCESS,

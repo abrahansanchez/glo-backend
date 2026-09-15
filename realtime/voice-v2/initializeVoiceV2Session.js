@@ -1,7 +1,7 @@
 import { CallSession } from "./CallSession.js";
 import { LatencyDiagnostics } from "./diagnostics/LatencyDiagnostics.js";
 import { VoiceCoordinator } from "./VoiceCoordinator.js";
-import { createBookingProposal, deriveSlotKey } from "./domain/BookingProposal.js";
+import { BookingRequirement, createBookingProposal, deriveBookingRequirement, deriveSlotKey } from "./domain/BookingProposal.js";
 import { applyAvailabilityResult, applySchedulingSearchResult } from "./domain/BookingLifecycleTransitions.js";
 import { buildCreateAppointmentCommand } from "./application/buildCreateAppointmentCommand.js";
 import { ResponsePurpose, bindServiceValidationContext, planAuthorityRefusalContinuation, planTerminalResponseRecovery } from "./planning/ResponsePlanner.js";
@@ -177,7 +177,11 @@ export function initializeVoiceV2Session({
     if (event.type === TransportEvent.CALLER_SPEECH_STARTED) { session.watchdog.cancel("caller-silence"); return interruptCurrent(); }
     if (event.type === TransportEvent.RESPONSE_CREATED) return responseCreated(event);
     if (event.type === TransportEvent.RESPONSE_AUDIO_DELTA) return responseAudio(event);
-    if (event.type === TransportEvent.RESPONSE_TRANSCRIPT_COMPLETED) { const state = responses.get(event.responseId); if (state) state.transcript = event.transcript; return; }
+    if (event.type === TransportEvent.RESPONSE_TRANSCRIPT_COMPLETED) {
+      const state = responses.get(event.responseId);
+      if (state) { state.transcript = event.transcript; state.assistantItemId = event.itemId || null; }
+      return;
+    }
     if (event.type === TransportEvent.RESPONSE_COMPLETED) return responseCompleted(event.responseId);
     if ([TransportEvent.RESPONSE_FAILED, TransportEvent.RESPONSE_CANCELLED].includes(event.type)) return responseFailed(event.responseId, event.type);
     if (event.type === TransportEvent.ACTIVE_RESPONSE_REJECTED) return activeResponseRejected(event);
@@ -191,8 +195,13 @@ export function initializeVoiceV2Session({
     providerTurns.add(providerId);
     const turnId = `${callSid}:turn:${++turnSequence}`;
     const persistenceTiming = timing.start("TRANSCRIPT_PERSISTENCE", { turnId, role: "caller", itemId: providerId });
-    try { await lifecycle.appendTurn({ turnId, role: "caller", text: event.transcript, timestamp: now() }); }
-    finally { timing.end("TRANSCRIPT_PERSISTENCE", persistenceTiming, { turnId, role: "caller", itemId: providerId }); }
+    try {
+      const persisted = await lifecycle.appendTurn({ turnId, role: "caller", text: event.transcript, timestamp: now() });
+      emitPersistenceOutcome({ turnId, role: "caller", itemId: providerId, result: persisted });
+    } catch (error) {
+      emitPersistenceOutcome({ turnId, role: "caller", itemId: providerId, error });
+      throw error;
+    } finally { timing.end("TRANSCRIPT_PERSISTENCE", persistenceTiming, { turnId, role: "caller", itemId: providerId }); }
     session.record("TURN_ACCEPTED", { turnId, providerId });
     const current = currentLifecycle(); const previousVersion = session.proposal.proposalVersion;
     const semanticTiming = timing.start("INTERPRETATION_REDUCTION", { turnId });
@@ -202,6 +211,7 @@ export function initializeVoiceV2Session({
       timing,
       confirmationContext: { responseId: current?.responseId || null, markId: current?.markId || null },
       laterReferenceClarification: current?.plan?.purpose === ResponsePurpose.CLARIFY_LATER_REFERENCE,
+      nameCollectionContext: hasDeliveredNameRequest(),
     });
     timing.end("INTERPRETATION_REDUCTION", semanticTiming, { turnId, proposalVersion: session.proposal.proposalVersion });
     const outcome = registered?.result || registered;
@@ -383,7 +393,7 @@ export function initializeVoiceV2Session({
   function responseCreated(event) {
     const tracked = requests.get(event.requestId); if (!tracked || lifecycle.terminated) return;
     tracked.responseId = event.responseId;
-    const state = { ...tracked, audio: [], audioBytes: 0, transcript: null, markId: null };
+    const state = { ...tracked, audio: [], audioBytes: 0, submittedAudioBytes: 0, transcript: null, assistantItemId: null, markId: null };
     responses.set(event.responseId, state);
     session.responseRegistry.register({ responseId: event.responseId, proposalVersion: tracked.plan.proposalVersion, purpose: tracked.plan.purpose });
     session.responseRegistry.request(event.responseId);
@@ -395,8 +405,12 @@ export function initializeVoiceV2Session({
     const entry = session.responseRegistry.get(event.responseId);
     if (entry?.invalidated || entry?.status !== "requested") return;
     const bytes = Buffer.from(event.delta, "base64").length; state.audioBytes += bytes;
-    if (state.plan.critical) state.audio.push(event.delta); else twilio.submitAudio({ payload: event.delta });
-    if (!state.plan.critical) timing.once("FIRST_TWILIO_AUDIO_SUBMITTED", event.responseId, timingDetails(event));
+    if (requiresBufferedDelivery(state.plan)) state.audio.push(event.delta);
+    else {
+      twilio.submitAudio({ payload: event.delta });
+      state.submittedAudioBytes += bytes;
+      timing.once("FIRST_TWILIO_AUDIO_SUBMITTED", event.responseId, timingDetails(event));
+    }
   }
 
   async function responseCompleted(responseId) {
@@ -405,7 +419,7 @@ export function initializeVoiceV2Session({
     if (lifecycle.terminated || entry?.invalidated || entry?.status !== "requested") return;
     session.watchdog.cancel(`response:${state.requestId}`);
     const current = state.plan.proposalVersion === session.proposal.proposalVersion;
-    const validation = state.plan.critical
+    const validation = requiresBufferedDelivery(state.plan)
       ? (state.transcript == null ? { valid: false, failedInvariant: "missing_transcript", extractionFailed: true } : coordinator.speechValidator(state.plan, state.transcript))
       : { valid: true, failedInvariant: null };
     session.record("SPEECH_VALIDATED", { responseId, valid: validation.valid, failedInvariant: validation.failedInvariant || null });
@@ -413,11 +427,19 @@ export function initializeVoiceV2Session({
     session.responseRegistry.complete(responseId, { validationResult: validation });
     if (state.transcript != null) {
       const persistenceTiming = timing.start("TRANSCRIPT_PERSISTENCE", { ...timingDetails({ responseId }), turnId: `${responseId}:assistant`, role: "assistant" });
-      try { await lifecycle.appendTurn({ turnId: `${responseId}:assistant`, role: "assistant", text: state.transcript, timestamp: now() }); }
-      finally { timing.end("TRANSCRIPT_PERSISTENCE", persistenceTiming, { ...timingDetails({ responseId }), turnId: `${responseId}:assistant`, role: "assistant" }); }
+      try {
+        const persisted = await lifecycle.appendTurn({ turnId: `${responseId}:assistant`, role: "assistant", text: state.transcript, timestamp: now() });
+        emitPersistenceOutcome({ turnId: `${responseId}:assistant`, role: "assistant", itemId: state.assistantItemId, responseId, result: persisted });
+      } catch (error) {
+        emitPersistenceOutcome({ turnId: `${responseId}:assistant`, role: "assistant", itemId: state.assistantItemId, responseId, error });
+        throw error;
+      } finally { timing.end("TRANSCRIPT_PERSISTENCE", persistenceTiming, { ...timingDetails({ responseId }), turnId: `${responseId}:assistant`, role: "assistant" }); }
     }
-    if (state.plan.critical) twilio.submitAudio({ payload: Buffer.concat(state.audio.map((part) => Buffer.from(part, "base64"))).toString("base64") });
-    if (state.plan.critical) timing.once("FIRST_TWILIO_AUDIO_SUBMITTED", responseId, timingDetails({ responseId }));
+    if (requiresBufferedDelivery(state.plan)) {
+      twilio.submitAudio({ payload: Buffer.concat(state.audio.map((part) => Buffer.from(part, "base64"))).toString("base64") });
+      state.submittedAudioBytes = state.audioBytes;
+      timing.once("FIRST_TWILIO_AUDIO_SUBMITTED", responseId, timingDetails({ responseId }));
+    }
     const markId = `${callSid}:mark:${++markSequence}`; twilio.sendMark({ markId });
     timing.point("PLAYBACK_MARK_SUBMITTED", timingDetails({ responseId, markId }));
     session.playbackRegistry.register({ markId, responseId, proposalVersion: state.plan.proposalVersion });
@@ -473,7 +495,7 @@ export function initializeVoiceV2Session({
       return lifecycle.terminate("RESPONSE_RECOVERY_INTERRUPTED");
     }
     const state = currentLifecycle(); if (!state || lifecycle.terminated) return;
-    await coordinator.handleCallerSpeechStarted(session, { responseId: state.responseId, markId: state.markId, cancelResponse: () => { superseded.add(state.responseId); return openai.supersedeResponse({ requestId: state.requestId, responseId: state.responseId, reason: "CALLER_INTERRUPTION" }); }, clearPlayback: () => twilio.clearPlayback() });
+    await coordinator.handleCallerSpeechStarted(session, { responseId: state.responseId, markId: state.markId, submittedAudioBytes: state.submittedAudioBytes, cancelResponse: () => { superseded.add(state.responseId); return openai.supersedeResponse({ requestId: state.requestId, responseId: state.responseId, reason: "CALLER_INTERRUPTION" }); }, clearPlayback: () => twilio.clearPlayback() });
     if (state.plan.purpose === ResponsePurpose.AMBIGUITY_LIMIT_REACHED) await lifecycle.terminate("AMBIGUITY_LIMIT_INTERRUPTED");
     else if (isTerminalRecovery(state)) await lifecycle.terminate("RESPONSE_RECOVERY_INTERRUPTED");
   }
@@ -539,6 +561,31 @@ export function initializeVoiceV2Session({
   }
 
   function currentLifecycle() { return [...responses.values()].reverse().find((state) => state.plan.proposalVersion === session.proposal.proposalVersion && !session.responseRegistry.get(state.responseId)?.invalidated) || null; }
+  function requiresBufferedDelivery(plan) { return plan?.critical === true || plan?.deliveryValidationRequired === true; }
+  function hasDeliveredNameRequest() {
+    if (deriveBookingRequirement(session.proposal) !== BookingRequirement.NEEDS_NAME) return false;
+    const state = [...responses.values()].reverse().find((candidate) => candidate.plan.proposalVersion === session.proposal.proposalVersion);
+    if (state?.plan?.purpose !== ResponsePurpose.ASK_NAME || state.plan.proposalVersion !== session.proposal.proposalVersion || !state.markId) return false;
+    const response = session.responseRegistry.get(state.responseId);
+    const playback = session.playbackRegistry.get(state.markId);
+    return response?.completedAt != null && response.validationResult?.valid === true
+      && playback?.acknowledgedAt != null && playback.submittedBytes > 0;
+  }
+  function emitPersistenceOutcome({ turnId, role, itemId = null, responseId = null, result = null, error = null }) {
+    emit({
+      event: "V2_TRANSCRIPT_PERSISTENCE_OUTCOME",
+      buildSha,
+      callSid,
+      streamSid: twilio?.identity.streamSid || null,
+      turnId,
+      role,
+      itemId,
+      responseId,
+      success: error ? false : result?.success === true,
+      replayed: error ? false : result?.replayed === true,
+      reason: error ? error?.code || error?.message || "PERSISTENCE_ERROR" : result?.reason || null,
+    });
+  }
   async function cleanup() {
     timing.flush();
     if (startupAudio.length) session.record("STARTUP_CALLER_AUDIO_CLEARED", { clearedFrames: startupAudio.length, clearedBytes: startupAudioBytes });

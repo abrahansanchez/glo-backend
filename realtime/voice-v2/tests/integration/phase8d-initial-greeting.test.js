@@ -90,6 +90,7 @@ test("caller interruption supersedes greeting without regeneration and late gree
   assert.equal(creates(f).filter((item) => item.response.metadata.purpose === ResponsePurpose.INITIAL_GREETING).length, 1);
   assert.equal(creates(f).filter((item) => item.response.metadata.purpose === ResponsePurpose.ASK_DATE).length, 1);
   assert.equal(f.app.session.responseRegistry.get("old-greeting").invalidated, true);
+  assert.equal(f.twilio.sent.filter((item) => item.event === "clear").length, 1, "submitted pre-mark greeting audio must be cleared");
   assert.equal(f.app.session.proposal.service, "Haircut");
 });
 

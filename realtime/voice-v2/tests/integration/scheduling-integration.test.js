@@ -486,6 +486,158 @@ test("production-composed closed day converges through verified selection, fresh
   }
 });
 
+test("CA712 natural path selects a spoken offered time, collects a bare name, and completes exactly once", async () => {
+  const originalFindOne = Appointment.findOne;
+  const originalMomentNow = moment.now;
+  moment.now = () => REFERENCE_DATE.getTime();
+  Appointment.findOne = async () => null;
+  try {
+    const barber = ca712Barber();
+    const appointments = [];
+    const availabilityCalls = [];
+    const sharedAvailability = realAdapter(barber);
+    const availabilityAdapter = {
+      checkAvailability: (request) => { availabilityCalls.push(request); return sharedAvailability.checkAvailability(request); },
+      getAlternatives: (request) => sharedAvailability.getAlternatives(request),
+      searchAvailableTimes: (request) => sharedAvailability.searchAvailableTimes(request),
+    };
+    const bookingAdapter = new SharedBookingAdapter({ dependencies: inMemoryBookingDependencies(barber, appointments) });
+    const f = fixture({
+      callSid: "CA712fb437d8fc2839b540dd206a4ef626",
+      proposal: createBookingProposal({ proposalId: "ca712-natural" }),
+      availabilityAdapter,
+      bookingAdapter,
+    });
+    const assertNoSideEffects = (checkpoint) => {
+      assert.equal(appointments.length, 0, `${checkpoint}: appointment count`);
+      assert.equal(f.smsCalls.length, 0, `${checkpoint}: SMS count`);
+    };
+
+    await start(f);
+    assertNoSideEffects("greeting");
+
+    await caller(f, "ca712-request", "I'd like a haircut this Friday.");
+    assert.equal(lastPurpose(f.openai), ResponsePurpose.ASK_TIME);
+    await deliverLastResponse(f, "What time would you like on Friday?");
+    assertNoSideEffects("time requested");
+
+    await caller(f, "ca712-time", "9 a.m.");
+    await waitFor(() => lastPurpose(f.openai) === ResponsePurpose.OFFER_ALTERNATIVES, f.app);
+    const offered = JSON.parse(lastCreate(f.openai).response.instructions).expectedFacts.alternatives;
+    assert.deepEqual(offered, [
+      { date: "2026-10-17", time: "10:00" },
+      { date: "2026-10-17", time: "10:30" },
+      { date: "2026-10-17", time: "11:00" },
+    ]);
+    await deliverLastResponse(f, "Friday is closed. Saturday has 10:00, 10:30, or 11:00 AM. Which works?");
+    assertNoSideEffects("alternatives delivered");
+    const offeredProposalVersion = f.app.session.proposal.proposalVersion;
+    assert.equal(f.app.session.proposal.availability.proposalVersion, offeredProposalVersion);
+    assert.equal(f.app.session.proposal.availability.slotKey, deriveSlotKey(f.app.session.proposal));
+
+    await caller(f, "ca712-spoken-selection", "Ten o'clock a.m.");
+    await waitFor(() => lastPurpose(f.openai) === ResponsePurpose.ASK_NAME, f.app);
+    assert.equal(f.app.session.proposal.date, "2026-10-17");
+    assert.equal(f.app.session.proposal.time, "10:00");
+    assert.equal(f.app.session.proposal.proposalVersion, offeredProposalVersion + 1);
+    assert.equal(f.app.session.proposal.availability.proposalVersion, f.app.session.proposal.proposalVersion);
+    assert.equal(f.app.session.proposal.availability.slotKey, deriveSlotKey({ service: "Haircut", date: "2026-10-17", time: "10:00" }));
+    assert.equal(f.app.session.proposal.availability.status, "available");
+    assert.deepEqual(availabilityCalls.map(({ date, time }) => ({ date, time })), [
+      { date: "2026-10-16", time: "09:00" },
+      { date: "2026-10-17", time: "10:00" },
+    ]);
+    assert.equal(availabilityCalls[1].slotKey, f.app.session.proposal.availability.slotKey);
+    await deliverLastResponse(f, "What name should I use for the appointment?");
+    assertNoSideEffects("name requested");
+
+    f.openai.receive({ type: "input_audio_buffer.speech_started", event_id: "ca712-name-speech" });
+    await settle(f.app);
+    await caller(f, "ca712-name", "Navije");
+    assert.equal(f.app.session.proposal.name, "Navije");
+    assert.equal(lastPurpose(f.openai), ResponsePurpose.PRE_BOOKING_CONFIRMATION);
+    assertNoSideEffects("name collected");
+
+    await deliverLastResponse(f, "Navije, should I confirm your Haircut for Saturday at 10:00 AM?");
+    assert.equal(f.app.session.journal().filter(({ event }) => event === "CONFIRMATION_AUTHORITY_GRANTED").length, 1);
+    assertNoSideEffects("confirmation acknowledged");
+
+    await caller(f, "ca712-fresh-yes", "yes");
+    await waitFor(() => appointments.length === 1 && f.smsCalls.length === 1 && lastPurpose(f.openai) === ResponsePurpose.BOOKING_SUCCESS, f.app);
+    assert.equal(f.app.session.proposal.terminal.outcome, "BOOKED");
+    const stored = appointments[0];
+    assert.equal(stored.barberId, BUSINESS.barberId);
+    assert.equal(stored.service, "Haircut");
+    assert.equal(stored.clientName, "Navije");
+    assert.equal(moment(stored.startAt).tz(BUSINESS.timeZone).format("YYYY-MM-DD HH:mm"), "2026-10-17 10:00");
+    assert.equal((stored.endAt.getTime() - stored.startAt.getTime()) / 60000, 30);
+
+    await deliverLastResponse(f, "Your Haircut appointment is booked for Saturday at 10:00 AM. Goodbye.");
+    assert.equal(f.app.lifecycle.terminated, true);
+    assert.equal(appointments.length, 1);
+    assert.equal(f.smsCalls.length, 1);
+    assert.equal(f.finalized.length, 1);
+    assert.equal(f.twilio.closeCalls.length, 1);
+    assert.equal(f.app.session.watchdog.pendingCount, 0);
+
+    const traceEvents = new Set(["TURN_INTERPRETED", "EFFECT_QUEUED", "AVAILABILITY_RESULT_APPLIED", "RESPONSE_PLANNED", "PLAYBACK_ACKNOWLEDGED", "CONFIRMATION_AUTHORITY_GRANTED", "BOOKING_SUCCEEDED", "SMS_RESULT", "TRANSCRIPT_FINALIZED", "SESSION_TERMINATING"]);
+    const trace = f.app.session.journal().filter(({ event }) => traceEvents.has(event)).map(({ event, callSid: _callSid, buildSha: _buildSha, sequence, ...details }) => ({ sequence, event, details }));
+    console.log("[CA712_NATURAL_ACCEPTANCE_TRACE]", JSON.stringify(trace));
+  } finally {
+    Appointment.findOne = originalFindOne;
+    moment.now = originalMomentNow;
+  }
+});
+
+test("Spanish production path selects the offered slot by spoken time and carries its date into ASK_NAME", async () => {
+  await withSchedulingDatabase([], async () => {
+    const barber = ca712Barber();
+    const f = fixture({
+      callSid: "CA-ca712-spanish",
+      language: "es",
+      proposal: createBookingProposal({ proposalId: "ca712-spanish" }),
+      availabilityAdapter: realAdapter(barber),
+    });
+    await start(f);
+    await caller(f, "es-request", "Quiero un Haircut este viernes.");
+    assert.equal(lastPurpose(f.openai), ResponsePurpose.ASK_TIME);
+    await deliverLastResponse(f, "¿A qué hora lo prefieres el viernes?");
+    await caller(f, "es-time", "A las nueve de la mañana.");
+    await waitFor(() => lastPurpose(f.openai) === ResponsePurpose.OFFER_ALTERNATIVES, f.app);
+    await deliverLastResponse(f, "El viernes está cerrado. El sábado hay a las diez, diez y media u once. ¿Cuál prefieres?");
+    await caller(f, "es-select", "A las diez de la mañana.");
+    await waitFor(() => lastPurpose(f.openai) === ResponsePurpose.ASK_NAME, f.app);
+
+    assert.equal(f.app.session.proposal.date, "2026-10-17");
+    assert.equal(f.app.session.proposal.time, "10:00");
+    assert.equal(f.app.session.proposal.name, null);
+    assert.equal(f.app.session.proposal.availability.status, "available");
+    assert.equal(f.bookingCalls.length, 0);
+    assert.equal(f.smsCalls.length, 0);
+    await f.app.terminate("TEST_DONE");
+  });
+});
+
+test("ambiguous same-time offered slots clarify without changing proposal or restoring authority", async () => {
+  const facts = { service: "Haircut", date: "2026-10-16", time: "09:00" };
+  const alternatives = [
+    { date: "2026-10-17", time: "10:00", slotKey: deriveSlotKey({ service: "Haircut", date: "2026-10-17", time: "10:00" }) },
+    { date: "2026-10-18", time: "10:00", slotKey: deriveSlotKey({ service: "Haircut", date: "2026-10-18", time: "10:00" }) },
+  ];
+  const proposal = createBookingProposal({ proposalId: "ambiguous-time", ...facts, availability: { proposalVersion: 1, slotKey: deriveSlotKey(facts), status: "unavailable", alternatives } });
+  const f = fixture({ proposal });
+  await start(f);
+  const before = f.app.session.proposal;
+  await caller(f, "ambiguous-ten", "10 AM");
+  await waitFor(() => lastPurpose(f.openai) === ResponsePurpose.CLARIFICATION, f.app);
+  assert.equal(f.app.session.proposal, before);
+  assert.equal(f.checkCalls.length, 0);
+  assert.equal(f.bookingCalls.length, 0);
+  assert.equal(f.smsCalls.length, 0);
+  assert.equal(f.app.session.confirmationAuthority.verifyGrant({ proposalVersion: proposal.proposalVersion, responseId: "none", markId: "none", responseRegistry: f.app.session.responseRegistry, playbackRegistry: f.app.session.playbackRegistry }).reason, "NO_CURRENT_CONFIRMATION");
+  await f.app.terminate("TEST_DONE");
+});
+
 function realAdapter(barber) {
   return new V1AvailabilityAdapter({ findBarberByIdFn: async () => barber });
 }
@@ -509,6 +661,18 @@ function schedulingBarber({ durationMinutes = 45, bufferMinutes = 10, hours = {}
   };
 }
 
+function ca712Barber() {
+  return schedulingBarber({
+    durationMinutes: 30,
+    bufferMinutes: 0,
+    blackoutDates: [],
+    hours: {
+      ...closedWeek(),
+      sat: open("10:00", "11:30"),
+    },
+  });
+}
+
 function open(openTime, closeTime) { return { isClosed: false, open: openTime, close: closeTime }; }
 function closedWeek() { return Object.fromEntries(["sun", "mon", "tue", "wed", "thu", "fri", "sat"].map((day) => [day, { isClosed: true, open: "09:00", close: "12:00" }])); }
 
@@ -528,7 +692,7 @@ function searchRequest(changes = {}) {
   return { ...request, proposalSlotKey: changes.proposalSlotKey ?? deriveSlotKey({ service: request.service, date: request.requestedDate, time: null }) };
 }
 
-function fixture({ proposal = serviceProposal(), language = "en", searchResults = [[]], selectedAvailable = false, availabilityAdapter: suppliedAvailability = null, bookingAdapter: suppliedBooking = null, scheduler = undefined } = {}) {
+function fixture({ callSid = null, proposal = serviceProposal(), language = "en", searchResults = [[]], selectedAvailable = false, availabilityAdapter: suppliedAvailability = null, bookingAdapter: suppliedBooking = null, scheduler = undefined, emit = () => {} } = {}) {
   const twilio = new FakeSocket();
   const openai = new FakeSocket();
   openai.readyState = 0;
@@ -550,7 +714,7 @@ function fixture({ proposal = serviceProposal(), language = "en", searchResults 
   };
   const availabilityAdapter = suppliedAvailability || fakeAvailability;
   const app = initializeVoiceV2Session({
-    callSid: `CA-scheduling-${language}`, callerNumber: "+18135550100", businessContext: BUSINESS, buildSha: "scheduling-review",
+    callSid: callSid || `CA-scheduling-${language}`, callerNumber: "+18135550100", businessContext: BUSINESS, buildSha: "scheduling-review",
     twilioSocket: twilio, openaiSocketFactory: () => openai, proposal, availabilityAdapter,
     scheduler,
     bookingAdapter: suppliedBooking || { createAppointment: async (command) => { bookingCalls.push(command); return { success: true, appointmentId: "appt" }; } },
@@ -558,6 +722,7 @@ function fixture({ proposal = serviceProposal(), language = "en", searchResults 
     transcriptAdapter: { appendTurn: async () => ({ success: true }), finalizeCall: async (request) => { finalized.push(request); return { success: true }; } },
     now: () => REFERENCE_DATE,
     turnContext: { language, availableServices: ["Haircut"] },
+    emit,
   });
   openai.open();
   return { app, twilio, openai, searchCalls, checkCalls, bookingCalls, smsCalls, finalized };

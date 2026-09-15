@@ -10,6 +10,7 @@ const WEEKDAYS = Object.freeze({
 });
 
 export function validateSpeech(plan, transcript) {
+  if (plan?.speechContract?.prematureBookingClaimForbidden) return validateOrdinarySpeech(transcript);
   if (plan?.purpose !== "PRE_BOOKING_CONFIRMATION") return invalid("unsupported_purpose");
   if (typeof transcript !== "string" || !transcript.trim()) return invalid("missing_transcript");
   const text = normalize(transcript);
@@ -51,6 +52,13 @@ export function validateSpeech(plan, transcript) {
   result.failedInvariant = firstFailure(result);
   result.valid = result.failedInvariant === null;
   return Object.freeze(result);
+}
+
+function validateOrdinarySpeech(transcript) {
+  if (typeof transcript !== "string" || !transcript.trim()) return invalid("missing_transcript");
+  const text = normalize(transcript);
+  const prohibited = /\b(?:confirmed|booked|scheduled|confirmada|confirmado|reservada|reservado|programada|programado)\b|\b(?:i(?:'ll| will)\s+(?:go ahead and\s+)?(?:confirm|book|schedule)|got you down|have you down)\b/.test(text);
+  return Object.freeze({ ...invalid(prohibited ? "premature_booking_claim" : null), valid: !prohibited, failedInvariant: prohibited ? "premature_booking_claim" : null, prematureSuccessDetected: prohibited });
 }
 
 function firstFailure(r) {

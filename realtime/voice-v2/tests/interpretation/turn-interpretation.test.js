@@ -32,6 +32,7 @@ const interpret = (transcript, values = {}) => interpretTurn({
   referenceDate: values.referenceDate ?? "2026-08-26",
   businessTimeZone: "America/New_York",
   availableServices: SERVICES,
+  nameCollectionContext: values.nameCollectionContext,
   fallbackClassifier: values.fallbackClassifier,
 });
 
@@ -138,6 +139,52 @@ test("alternative selection is context-sensitive and zero-based", async () => {
     assert.equal(selected.alternativeIndex, 0);
   }
   assert.equal((await interpret("The first one.", { currentAlternatives: [] })).interpretation.action, CallerActionType.CLARIFY);
+});
+
+test("a unique spoken time selects the complete verified alternative in English and Spanish", async () => {
+  const alternatives = [
+    { date: "2026-08-29", time: "10:00", slotKey: deriveSlotKey({ service: "Haircut", date: "2026-08-29", time: "10:00" }) },
+    { date: "2026-08-29", time: "10:30", slotKey: deriveSlotKey({ service: "Haircut", date: "2026-08-29", time: "10:30" }) },
+    { date: "2026-08-29", time: "11:00", slotKey: deriveSlotKey({ service: "Haircut", date: "2026-08-29", time: "11:00" }) },
+  ];
+  const currentProposal = createBookingProposal({
+    proposalId: "spoken-alternative",
+    service: "Haircut",
+    date: "2026-08-28",
+    time: "09:00",
+    availability: { proposalVersion: 1, slotKey: deriveSlotKey({ service: "Haircut", date: "2026-08-28", time: "09:00" }), status: "unavailable", alternatives },
+  });
+  for (const transcript of ["Ten o'clock a.m.", "A las diez de la mañana"]) {
+    const result = await interpret(transcript, { currentProposal, currentAlternatives: alternatives });
+    assert.equal(result.interpretation.action, CallerActionType.SELECT_ALTERNATIVE);
+    assert.equal(result.interpretation.alternativeIndex, 0);
+    assert.equal(result.interpretationSource, "deterministic");
+  }
+});
+
+test("a spoken time shared by multiple verified alternatives clarifies without selecting by order", async () => {
+  const alternatives = [
+    { date: "2026-08-29", time: "10:00", slotKey: deriveSlotKey({ service: "Haircut", date: "2026-08-29", time: "10:00" }) },
+    { date: "2026-08-30", time: "10:00", slotKey: deriveSlotKey({ service: "Haircut", date: "2026-08-30", time: "10:00" }) },
+  ];
+  const currentProposal = createBookingProposal({
+    proposalId: "ambiguous-spoken-alternative",
+    service: "Haircut",
+    date: "2026-08-28",
+    time: "09:00",
+    availability: { proposalVersion: 1, slotKey: deriveSlotKey({ service: "Haircut", date: "2026-08-28", time: "09:00" }), status: "unavailable", alternatives },
+  });
+  const result = await interpret("10 AM", { currentProposal, currentAlternatives: alternatives });
+  assert.equal(result.interpretation.action, CallerActionType.CLARIFY);
+});
+
+test("a bare name is accepted only in an authoritative delivered-name context", async () => {
+  const outside = await interpret("Navije");
+  assert.equal(outside.interpretation.action, CallerActionType.UNKNOWN);
+  const inside = await interpret("Navije", { nameCollectionContext: true });
+  assert.equal(inside.interpretation.action, CallerActionType.SET_NAME);
+  assert.equal(inside.interpretation.name, "Navije");
+  assert.equal((await interpret("yes", { nameCollectionContext: true })).interpretation.action, CallerActionType.AFFIRM_CONFIRMATION);
 });
 
 test("later and available-times-for-date requests are bilingual equivalents", async () => {

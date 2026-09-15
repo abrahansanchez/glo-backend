@@ -5,6 +5,7 @@ import { validateSpeech } from "./planning/SpeechValidator.js";
 import { applyConfirmationAuthority } from "./domain/BookingLifecycleTransitions.js";
 import { reduceBookingResult } from "./domain/PostBookingReducer.js";
 import { ResponseStatus } from "./lifecycle/ResponseRegistry.js";
+import { PlaybackStatus } from "./lifecycle/PlaybackRegistry.js";
 
 export class VoiceCoordinator {
   constructor({ interpreter = interpretTurn, reducer = reduceBooking, postBookingReducer = reduceBookingResult, responsePlanner = planResponse, speechValidator = validateSpeech } = {}) { this.interpreter = interpreter; this.reducer = reducer; this.postBookingReducer = postBookingReducer; this.responsePlanner = responsePlanner; this.speechValidator = speechValidator; }
@@ -15,7 +16,7 @@ export class VoiceCoordinator {
     return session.turnRegistry.acquire(turn, async () => {
       session.record("TURN_PROCESSING_STARTED", { turnId: turn.turnId, proposalVersion: session.proposal.proposalVersion });
       const interpretationTiming = context.timing?.start("INTERPRETATION", { turnId: turn.turnId });
-      const interpreted = await this.interpreter({ transcript: turn.transcript, sourceTurnId: turn.turnId, currentProposal: session.proposal, confirmationContext: context.confirmationContext, referenceDate: context.referenceDate, businessTimeZone: context.businessTimeZone, availableServices: context.availableServices || [], laterReferenceClarification: context.laterReferenceClarification === true });
+      const interpreted = await this.interpreter({ transcript: turn.transcript, sourceTurnId: turn.turnId, currentProposal: session.proposal, confirmationContext: context.confirmationContext, referenceDate: context.referenceDate, businessTimeZone: context.businessTimeZone, availableServices: context.availableServices || [], laterReferenceClarification: context.laterReferenceClarification === true, nameCollectionContext: context.nameCollectionContext === true });
       context.timing?.end("INTERPRETATION", interpretationTiming, { turnId: turn.turnId });
       session.record("TURN_INTERPRETED", { turnId: turn.turnId, action: interpreted.interpretation.action, proposalVersion: session.proposal.proposalVersion });
       if (interpreted.interpretation.action === "AFFIRM_CONFIRMATION") {
@@ -30,14 +31,17 @@ export class VoiceCoordinator {
       return Object.freeze({ interpreted, reduced });
     });
   }
-  async handleCallerSpeechStarted(session, { responseId = null, markId = null, cancelResponse = async () => {}, clearPlayback = async () => {} } = {}) {
+  async handleCallerSpeechStarted(session, { responseId = null, markId = null, submittedAudioBytes = 0, cancelResponse = async () => {}, clearPlayback = async () => {} } = {}) {
     const proposal = session.proposal; const response = responseId ? session.responseRegistry.get(responseId) : null; const playback = markId ? session.playbackRegistry.get(markId) : null;
     if ((!response || response.invalidated) && (!playback || playback.invalidated)) {
       session.record("CALLER_INTERRUPTION_IGNORED", { responseId, markId, proposalVersion: proposal.proposalVersion, reason: "NO_CURRENT_LIFECYCLE" });
       return Object.freeze({ interrupted: false, cancelled: false, cleared: false, reason: "NO_CURRENT_LIFECYCLE" });
     }
     const shouldCancel = Boolean(response && !response.invalidated && [ResponseStatus.PLANNED, ResponseStatus.REQUESTED].includes(response.status));
-    const shouldClear = Boolean(playback && !playback.invalidated && playback.submittedBytes > 0);
+    const shouldClear = Boolean(
+      (playback && !playback.invalidated && playback.status === PlaybackStatus.SUBMITTED && playback.submittedBytes > 0)
+      || (!markId && response?.status === ResponseStatus.REQUESTED && submittedAudioBytes > 0),
+    );
     if (response && !response.invalidated) session.responseRegistry.invalidate(responseId, "CALLER_INTERRUPTION");
     if (playback && !playback.invalidated) session.playbackRegistry.interrupt(markId, "CALLER_INTERRUPTION");
     if (responseId && markId) session.confirmationAuthority.revoke({ proposalVersion: response?.proposalVersion ?? playback?.proposalVersion ?? proposal.proposalVersion, responseId, markId, reason: "CALLER_INTERRUPTION" });
