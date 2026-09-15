@@ -55,7 +55,7 @@ test("separate startup, assistant persistence, caller persistence and queued aud
   assert.equal(app.session.effectQueue.pending().length, 0);
   await app.terminate("TEST_DONE");
   assert.equal(app.session.watchdog.pendingCount, 0);
-  assert.equal(logs.find((e) => e.stage === "AUDIO_QUEUE_SUMMARY" && e.transportType === "CALLER_AUDIO").maxQueueWaitMs, 2000);
+  assert.equal(logs.some((e) => e.transportType === "CALLER_AUDIO"), false, "production audio frames are counted only in the final call trace summary");
   assert.ok(logs.every((e) => e.buildSha === "timing-test" && e.callSid === app.session.callSid && e.wallTime));
   assert.doesNotMatch(JSON.stringify(logs), /PRIVATE ASSISTANT TEXT|I need a haircut|AQID|18135550199/);
 });

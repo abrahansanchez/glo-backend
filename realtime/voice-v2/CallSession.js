@@ -10,8 +10,10 @@ import { ConversationLanguageState } from "./lifecycle/ConversationLanguageState
 export class CallSession {
   #proposal;
   #journal = [];
-  constructor({ callSid, buildSha, proposal, businessContext = null, effectHandlers = {}, watchdogOptions = {}, preferredLanguage = "en" }) {
+  #recordObserver;
+  constructor({ callSid, buildSha, proposal, businessContext = null, effectHandlers = {}, watchdogOptions = {}, preferredLanguage = "en", recordObserver = null }) {
     this.callSid = callSid; this.buildSha = buildSha; this.#proposal = proposal;
+    this.#recordObserver = typeof recordObserver === "function" ? recordObserver : null;
     Object.defineProperty(this, "businessContext", { value: businessContext === null ? null : deepFreeze(structuredClone(businessContext)), enumerable: true, writable: false, configurable: false });
     this.turnRegistry = new TurnRegistry(); this.responseRegistry = new ResponseRegistry(); this.playbackRegistry = new PlaybackRegistry();
     this.confirmationAuthority = new ConfirmationAuthority(); this.effectQueue = new EffectQueue({ handlers: effectHandlers }); this.watchdog = new SessionWatchdog(watchdogOptions); this.ambiguityRecovery = new AmbiguityRecoveryState(); this.conversationLanguage = new ConversationLanguageState({ preferredLanguage });
@@ -19,7 +21,7 @@ export class CallSession {
   }
   get proposal() { return this.#proposal; }
   replaceProposal(previous, next, { event = "PROPOSAL_CHANGED" } = {}) { if (this.#proposal !== previous) throw new TypeError("stale_proposal_replacement"); this.#proposal = next; this.record(event, { proposalVersion: next.proposalVersion }); return next; }
-  record(event, details = {}) { const entry = Object.freeze({ sequence: this.#journal.length + 1, event, callSid: this.callSid, buildSha: this.buildSha, ...details }); this.#journal.push(entry); return entry; }
+  record(event, details = {}) { const entry = Object.freeze({ sequence: this.#journal.length + 1, event, callSid: this.callSid, buildSha: this.buildSha, ...details }); this.#journal.push(entry); try { this.#recordObserver?.(entry); } catch { /* Observability cannot affect session behavior. */ } return entry; }
   journal() { return Object.freeze([...this.#journal]); }
 }
 

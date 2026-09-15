@@ -1,5 +1,6 @@
 import { CallSession } from "./CallSession.js";
 import { LatencyDiagnostics } from "./diagnostics/LatencyDiagnostics.js";
+import { CallTrace } from "./diagnostics/CallTrace.js";
 import { VoiceCoordinator } from "./VoiceCoordinator.js";
 import { BookingRequirement, createBookingProposal, deriveBookingRequirement, deriveSlotKey } from "./domain/BookingProposal.js";
 import { applyAvailabilityResult, applySchedulingSearchResult } from "./domain/BookingLifecycleTransitions.js";
@@ -31,12 +32,23 @@ export function initializeVoiceV2Session({
   requireSessionInputs({ callSid, callerNumber, businessContext, buildSha, twilioSocket, openaiSocketFactory });
   let lifecycle; let processing = Promise.resolve(); let effectsProcessing = Promise.resolve(); let turnSequence = 0; let responseSequence = 0; let markSequence = 0; let twilioStarted = false; let openaiSessionCreated = false; let openaiConfigured = false; let initialGreetingRequested = false;
   const providerTurns = new Set(); const requests = new Map(); const responses = new Map(); const marks = new Map(); const superseded = new Set(); const ambiguityPurposes = []; const startupAudio = []; let startupAudioBytes = 0;
-  const timing = new LatencyDiagnostics({ ...timingOptions, callSid, buildSha, emit });
+  const safeEmit = (event) => { try { emit(event); } catch { /* Logging cannot terminate a call. */ } };
+  const timing = new LatencyDiagnostics({ ...timingOptions, callSid, buildSha, emit: safeEmit });
+  const callTrace = new CallTrace({ ...timingOptions, callSid, buildSha, emit: safeEmit });
   const timingDetails = (value = {}) => {
     const state = responses.get(value.responseId) || requests.get(value.requestId) || marks.get(value.markId);
     return { streamSid: twilio?.identity.streamSid || null, ...state?.timingContext, requestId: value.requestId || state?.requestId || null, responseId: value.responseId || state?.responseId || null, markId: value.markId || null, itemId: value.itemId || null, purpose: state?.plan.purpose || null, proposalVersion: state?.plan.proposalVersion ?? null };
   };
   function receive(event, handler) {
+    if ([TransportEvent.CALLER_AUDIO, TransportEvent.RESPONSE_AUDIO_DELTA].includes(event.type)) {
+      if (event.type === TransportEvent.CALLER_AUDIO) callTrace.recordAudio("caller", event.bytes);
+      else {
+        let bytes = 0;
+        try { bytes = Buffer.from(event.delta, "base64").length; } catch { /* Measurement must not alter audio handling. */ }
+        callTrace.recordAudio("assistant", bytes, timingDetails(event));
+      }
+      return enqueue(() => handler(event));
+    }
     const token = timing.receive(event, timingDetails(event));
     return enqueue(() => {
       timing.begin(token);
@@ -56,7 +68,7 @@ export function initializeVoiceV2Session({
       timeZone: businessContext.timeZone,
     }), () => ({ success: false, submitted: false, reason: "TIMEOUT" })),
   };
-  const session = new CallSession({ callSid, buildSha, proposal, businessContext, effectHandlers, watchdogOptions: scheduler, preferredLanguage: turnContext.language || "en" });
+  const session = new CallSession({ callSid, buildSha, proposal, businessContext, effectHandlers, watchdogOptions: scheduler, preferredLanguage: turnContext.language || "en", recordObserver: observeSessionRecord });
   const twilio = new TwilioMediaAdapter({ socket: twilioSocket, onEvent: (event) => receive(event, onTwilio) });
   const openai = new OpenAIRealtimeAdapter({ socketFactory: openaiSocketFactory, onEvent: (event) => receive(event, onOpenAI) });
   lifecycle = new SessionLifecycle({ session, transcriptAdapter, callerNumber, cleanup });
@@ -139,8 +151,9 @@ export function initializeVoiceV2Session({
   }
 
   async function onTwilio(event) {
-    emit(event);
+    if (event.type !== TransportEvent.CALLER_AUDIO) safeEmit(event);
     if (event.type === TransportEvent.TWILIO_STREAM_STARTED) {
+      callTrace.setStreamSid(event.streamSid);
       if (event.callSid !== callSid) return lifecycle.terminate("TRANSPORT_IDENTITY_MISMATCH");
       twilioStarted = true;
       if (!openaiConfigured) session.watchdog.schedule("openai-startup", 10000, () => enqueue(() => lifecycle.terminate("OPENAI_STARTUP_TIMEOUT")));
@@ -152,12 +165,17 @@ export function initializeVoiceV2Session({
     } else if (event.type === TransportEvent.PLAYBACK_MARK_ACKNOWLEDGED) {
       await acknowledgePlayback(event.markId);
     } else if ([TransportEvent.TWILIO_STREAM_STOPPED, TransportEvent.TWILIO_CONNECTION_CLOSED, TransportEvent.TWILIO_TRANSPORT_ERROR].includes(event.type)) {
+      if ([TransportEvent.TWILIO_STREAM_STOPPED, TransportEvent.TWILIO_CONNECTION_CLOSED].includes(event.type)) {
+        callTrace.counters.transportCloses += 1;
+        callTrace.entry("TRANSPORT_CLOSED", { reason: event.type });
+      }
       await lifecycle.terminate(event.type);
     }
   }
 
   async function onOpenAI(event) {
-    emit(event);
+    if (event.type !== TransportEvent.RESPONSE_AUDIO_DELTA) safeEmit(event);
+    if (event.type === TransportEvent.STALE_RESPONSE_EVENT_QUARANTINED) callTrace.entry("STALE_RESULT_IGNORED", { ...timingDetails(event), operation: event.originalType || event.type, reason: event.reason || "STALE_RESPONSE" });
     if (lifecycle.terminated) return;
     if (event.type === TransportEvent.OPENAI_CONNECTED) {
       return;
@@ -169,12 +187,14 @@ export function initializeVoiceV2Session({
     }
     if (event.type === TransportEvent.OPENAI_SESSION_CONFIGURED) {
       openaiConfigured = true;
+      callTrace.entry("OPENAI_SESSION_READY", timingDetails(event));
       session.watchdog.cancel("openai-startup");
       flushStartupAudio();
       return maybeRequestInitialGreeting();
     }
-    if (event.type === TransportEvent.USER_TRANSCRIPT_COMPLETED) { session.watchdog.cancel("caller-silence"); return acceptTurn(event); }
-    if (event.type === TransportEvent.CALLER_SPEECH_STARTED) { session.watchdog.cancel("caller-silence"); return interruptCurrent(); }
+    if (event.type === TransportEvent.USER_TRANSCRIPT_COMPLETED) { callTrace.entry("CALLER_TRANSCRIPT_COMPLETED", { itemId: event.itemId, characterCount: event.transcript.length }); session.watchdog.cancel("caller-silence"); return acceptTurn(event); }
+    if (event.type === TransportEvent.CALLER_SPEECH_STARTED) { callTrace.speechStarted({ itemId: event.itemId }); session.watchdog.cancel("caller-silence"); return interruptCurrent(); }
+    if (event.type === TransportEvent.CALLER_SPEECH_STOPPED) { callTrace.speechStopped({ itemId: event.itemId }); return; }
     if (event.type === TransportEvent.RESPONSE_CREATED) return responseCreated(event);
     if (event.type === TransportEvent.RESPONSE_AUDIO_DELTA) return responseAudio(event);
     if (event.type === TransportEvent.RESPONSE_TRANSCRIPT_COMPLETED) {
@@ -197,9 +217,9 @@ export function initializeVoiceV2Session({
     const persistenceTiming = timing.start("TRANSCRIPT_PERSISTENCE", { turnId, role: "caller", itemId: providerId });
     try {
       const persisted = await lifecycle.appendTurn({ turnId, role: "caller", text: event.transcript, timestamp: now() });
-      emitPersistenceOutcome({ turnId, role: "caller", itemId: providerId, result: persisted });
+      emitPersistenceOutcome({ turnId, role: "caller", itemId: providerId, characterCount: event.transcript.length, result: persisted });
     } catch (error) {
-      emitPersistenceOutcome({ turnId, role: "caller", itemId: providerId, error });
+      emitPersistenceOutcome({ turnId, role: "caller", itemId: providerId, characterCount: event.transcript.length, error });
       throw error;
     } finally { timing.end("TRANSCRIPT_PERSISTENCE", persistenceTiming, { turnId, role: "caller", itemId: providerId }); }
     session.record("TURN_ACCEPTED", { turnId, providerId });
@@ -215,6 +235,8 @@ export function initializeVoiceV2Session({
     });
     timing.end("INTERPRETATION_REDUCTION", semanticTiming, { turnId, proposalVersion: session.proposal.proposalVersion });
     const outcome = registered?.result || registered;
+    callTrace.counters.callerTurns += 1;
+    callTrace.entry("CALLER_TURN_FINALIZED", { turnId, itemId: providerId, proposalVersion: session.proposal.proposalVersion });
     if (outcome?.authority?.authorized === false && !lifecycle.terminated && !session.proposal.terminal) {
       const continuation = planAuthorityRefusalContinuation({ proposal: session.proposal, turnId, language: session.conversationLanguage.currentLanguage });
       // Supersede any earlier speech without changing the proposal or accepting
@@ -260,18 +282,30 @@ export function initializeVoiceV2Session({
       const postTerminationSms = pending.type === "SEND_CONFIRMATION_SMS" && session.proposal.terminal?.outcome === "BOOKED";
       if (lifecycle.terminated && !postTerminationSms) break;
       if (pending.type === "AUTHORIZE_BOOKING") {
+        const traceTiming = callTrace.start();
+        callTrace.entry("EFFECT_STARTED", effectTraceDetails(pending));
         const authorizationTiming = timing.start("EFFECT_EXECUTION", { commandId: pending.commandId, effectType: pending.type, proposalVersion: pending.proposalVersion });
         const authorization = (await coordinator.executeNextEffect(session))?.command || pending;
         timing.end("EFFECT_EXECUTION", authorizationTiming, { commandId: pending.commandId, effectType: pending.type, proposalVersion: pending.proposalVersion });
+        callTrace.entry("EFFECT_COMPLETED", { ...effectTraceDetails(pending), durationMs: callTrace.duration(traceTiming), outcome: "AUTHORIZED" });
         const command = buildCreateAppointmentCommand({ authorization, proposal: session.proposal, callSid, callerNumber, businessContext });
         session.effectQueue.enqueue(command); session.record("CREATE_APPOINTMENT_QUEUED", { commandId: command.commandId, proposalVersion: command.proposalVersion });
         continue;
       }
       if (pending.type === "CREATE_APPOINTMENT") lifecycle.beginDurableBooking(pending.commandId);
+      const traceTiming = callTrace.start();
+      callTrace.entry("EFFECT_STARTED", effectTraceDetails(pending));
+      if (pending.type === "CREATE_APPOINTMENT") callTrace.entry("BOOKING_STARTED", effectTraceDetails(pending));
       const effectTiming = timing.start("EFFECT_EXECUTION", { commandId: pending.commandId, effectType: pending.type, proposalVersion: pending.proposalVersion });
       const execution = await coordinator.executeNextEffect(session);
       timing.end("EFFECT_EXECUTION", effectTiming, { commandId: pending.commandId, effectType: pending.type, proposalVersion: pending.proposalVersion });
       if (!execution) break;
+      const completedDetails = { ...effectTraceDetails(pending), durationMs: callTrace.duration(traceTiming), outcome: effectOutcome(execution.result), reason: execution.result?.reason || null };
+      callTrace.entry(execution.result?.reason === "TIMEOUT" ? "EFFECT_TIMED_OUT" : execution.result?.success === false ? "EFFECT_FAILED" : "EFFECT_COMPLETED", completedDetails);
+      if (["CHECK_AVAILABILITY", "REQUEST_LATER_TIME", "REQUEST_AVAILABLE_TIMES_FOR_DATE"].includes(pending.type)) {
+        callTrace.entry("AVAILABILITY_RESULT", { ...completedDetails, available: execution.result?.available === true, alternativeCount: execution.result?.alternatives?.length || 0 });
+      }
+      if (pending.type === "SEND_CONFIRMATION_SMS") callTrace.entry("SMS_COMMAND_COMPLETED", { ...completedDetails, submitted: execution.result?.submitted === true });
       if (pending.type === "CHECK_AVAILABILITY") {
         const transition = applyAvailabilityResult(session.proposal, execution.result);
         if (transition.applied) { const previous = session.proposal; session.replaceProposal(previous, transition.nextProposal, { event: "AVAILABILITY_RESULT_APPLIED" }); }
@@ -289,6 +323,7 @@ export function initializeVoiceV2Session({
         }), 1, null, { commandId: pending.commandId });
       } else if (pending.type === "CREATE_APPOINTMENT") {
         const transition = coordinator.applyBookingExecution(session, execution);
+        callTrace.entry("BOOKING_SETTLED", { ...completedDetails, outcome: transition.outcome, appointmentId: transition.appointmentId || null });
         await lifecycle.settleDurableBooking(pending.commandId);
         if (execution.result.settlementDelayed) session.record("BOOKING_SETTLEMENT_COMPLETED_AFTER_DEADLINE", { commandId: pending.commandId, outcome: transition.outcome, appointmentId: transition.appointmentId || null });
         if (transition.responsePurpose && !execution.result.terminalRecoveryOwned && !lifecycle.terminated) await requestResponse(coordinator.responsePlanner({ proposal: session.proposal, purpose: transition.responsePurpose, language: session.conversationLanguage.currentLanguage }), 1, null, { commandId: pending.commandId });
@@ -350,6 +385,7 @@ export function initializeVoiceV2Session({
     requests.set(requestId, tracked);
     session.record("RESPONSE_PLANNED", { requestId, purpose: ownedPlan.purpose, proposalVersion: ownedPlan.proposalVersion });
     timing.point("RESPONSE_CREATE_DISPATCH", timingDetails({ requestId }));
+    callTrace.entry("RESPONSE_CREATE_DISPATCHED", { ...timingDetails({ requestId }), attempt });
     const result = openai.createResponse({ requestId, eventId: `${requestId}:create`, response: tracked.response });
     timing.point("RESPONSE_CREATE_RETURN", { ...timingDetails({ requestId }), accepted: result.accepted });
     if (result.accepted) session.watchdog.schedule(`response:${requestId}`, 15000, () => enqueue(() => responseTimedOut(requestId)));
@@ -398,6 +434,8 @@ export function initializeVoiceV2Session({
     session.responseRegistry.register({ responseId: event.responseId, proposalVersion: tracked.plan.proposalVersion, purpose: tracked.plan.purpose });
     session.responseRegistry.request(event.responseId);
     session.record("RESPONSE_GENERATED", { responseId: event.responseId, purpose: tracked.plan.purpose, proposalVersion: tracked.plan.proposalVersion });
+    callTrace.counters.assistantResponses += 1;
+    callTrace.entry("RESPONSE_CREATED", timingDetails(event));
   }
 
   function responseAudio(event) {
@@ -410,6 +448,7 @@ export function initializeVoiceV2Session({
       twilio.submitAudio({ payload: event.delta });
       state.submittedAudioBytes += bytes;
       timing.once("FIRST_TWILIO_AUDIO_SUBMITTED", event.responseId, timingDetails(event));
+      callTrace.recordTwilioAudio(timingDetails(event));
     }
   }
 
@@ -417,6 +456,7 @@ export function initializeVoiceV2Session({
     const state = responses.get(responseId); if (!state) return;
     const entry = session.responseRegistry.get(responseId);
     if (lifecycle.terminated || entry?.invalidated || entry?.status !== "requested") return;
+    callTrace.entry("RESPONSE_COMPLETED", { ...timingDetails({ responseId }), outcome: "PROVIDER_COMPLETED" });
     session.watchdog.cancel(`response:${state.requestId}`);
     const current = state.plan.proposalVersion === session.proposal.proposalVersion;
     const validation = requiresBufferedDelivery(state.plan)
@@ -429,9 +469,9 @@ export function initializeVoiceV2Session({
       const persistenceTiming = timing.start("TRANSCRIPT_PERSISTENCE", { ...timingDetails({ responseId }), turnId: `${responseId}:assistant`, role: "assistant" });
       try {
         const persisted = await lifecycle.appendTurn({ turnId: `${responseId}:assistant`, role: "assistant", text: state.transcript, timestamp: now() });
-        emitPersistenceOutcome({ turnId: `${responseId}:assistant`, role: "assistant", itemId: state.assistantItemId, responseId, result: persisted });
+        emitPersistenceOutcome({ turnId: `${responseId}:assistant`, role: "assistant", itemId: state.assistantItemId, responseId, characterCount: state.transcript.length, result: persisted });
       } catch (error) {
-        emitPersistenceOutcome({ turnId: `${responseId}:assistant`, role: "assistant", itemId: state.assistantItemId, responseId, error });
+        emitPersistenceOutcome({ turnId: `${responseId}:assistant`, role: "assistant", itemId: state.assistantItemId, responseId, characterCount: state.transcript.length, error });
         throw error;
       } finally { timing.end("TRANSCRIPT_PERSISTENCE", persistenceTiming, { ...timingDetails({ responseId }), turnId: `${responseId}:assistant`, role: "assistant" }); }
     }
@@ -439,9 +479,11 @@ export function initializeVoiceV2Session({
       twilio.submitAudio({ payload: Buffer.concat(state.audio.map((part) => Buffer.from(part, "base64"))).toString("base64") });
       state.submittedAudioBytes = state.audioBytes;
       timing.once("FIRST_TWILIO_AUDIO_SUBMITTED", responseId, timingDetails({ responseId }));
+      callTrace.recordTwilioAudio(timingDetails({ responseId }));
     }
     const markId = `${callSid}:mark:${++markSequence}`; twilio.sendMark({ markId });
     timing.point("PLAYBACK_MARK_SUBMITTED", timingDetails({ responseId, markId }));
+    callTrace.entry("PLAYBACK_MARK_SUBMITTED", timingDetails({ responseId, markId }));
     session.playbackRegistry.register({ markId, responseId, proposalVersion: state.plan.proposalVersion });
     session.playbackRegistry.submit(markId, state.audioBytes); state.markId = markId; marks.set(markId, state);
     session.watchdog.schedule(`playback:${markId}`, 30000, () => enqueue(() => playbackTimedOut(markId)));
@@ -461,6 +503,7 @@ export function initializeVoiceV2Session({
     }
     session.playbackRegistry.acknowledge(markId);
     session.watchdog.cancel(`playback:${markId}`);
+    callTrace.playbackEnded();
     session.record("PLAYBACK_ACKNOWLEDGED", { responseId: state.responseId, markId, proposalVersion: state.plan.proposalVersion });
     if (state.plan.purpose === ResponsePurpose.PRE_BOOKING_CONFIRMATION) {
       const grant = session.confirmationAuthority.grant({ proposalVersion: state.plan.proposalVersion, responseId: state.responseId, markId, responseRegistry: session.responseRegistry, playbackRegistry: session.playbackRegistry });
@@ -478,6 +521,8 @@ export function initializeVoiceV2Session({
       || state.plan.proposalVersion !== session.proposal.proposalVersion || superseded.has(responseId)) return;
     session.watchdog.cancel(`response:${state.requestId}`);
     session.responseRegistry.fail(responseId, { valid: false, failedInvariant: reason });
+    callTrace.playbackEnded();
+    callTrace.entry("RESPONSE_COMPLETED", { ...timingDetails({ responseId }), outcome: "FAILED", reason });
     session.record("RESPONSE_DELIVERY_FAILED", { responseId, purpose: state.plan.purpose, reason });
     if (session.proposal.terminal || state.plan.purpose === ResponsePurpose.AMBIGUITY_LIMIT_REACHED || state.plan.purpose === ResponsePurpose.ERROR_RECOVERY) return lifecycle.terminate(reason);
     // The fixed request identity is the call-wide one-shot budget, retained in
@@ -495,7 +540,7 @@ export function initializeVoiceV2Session({
       return lifecycle.terminate("RESPONSE_RECOVERY_INTERRUPTED");
     }
     const state = currentLifecycle(); if (!state || lifecycle.terminated) return;
-    await coordinator.handleCallerSpeechStarted(session, { responseId: state.responseId, markId: state.markId, submittedAudioBytes: state.submittedAudioBytes, cancelResponse: () => { superseded.add(state.responseId); return openai.supersedeResponse({ requestId: state.requestId, responseId: state.responseId, reason: "CALLER_INTERRUPTION" }); }, clearPlayback: () => twilio.clearPlayback() });
+    await coordinator.handleCallerSpeechStarted(session, { responseId: state.responseId, markId: state.markId, submittedAudioBytes: state.submittedAudioBytes, cancelResponse: () => { superseded.add(state.responseId); return openai.supersedeResponse({ requestId: state.requestId, responseId: state.responseId, reason: "CALLER_INTERRUPTION" }); }, clearPlayback: () => clearPlayback("CALLER_INTERRUPTION", state) });
     if (state.plan.purpose === ResponsePurpose.AMBIGUITY_LIMIT_REACHED) await lifecycle.terminate("AMBIGUITY_LIMIT_INTERRUPTED");
     else if (isTerminalRecovery(state)) await lifecycle.terminate("RESPONSE_RECOVERY_INTERRUPTED");
   }
@@ -516,7 +561,7 @@ export function initializeVoiceV2Session({
       if (superseded.has(state.responseId)) continue;
       superseded.add(state.responseId);
       openai.supersedeResponse({ requestId: state.requestId, responseId: state.responseId, reason: "PROPOSAL_CHANGED" });
-      if (state.markId) { try { twilio.clearPlayback(); } catch {} }
+      if (state.markId) { try { clearPlayback("PROPOSAL_CHANGED", state); } catch {} }
     }
   }
 
@@ -571,8 +616,77 @@ export function initializeVoiceV2Session({
     return response?.completedAt != null && response.validationResult?.valid === true
       && playback?.acknowledgedAt != null && playback.submittedBytes > 0;
   }
-  function emitPersistenceOutcome({ turnId, role, itemId = null, responseId = null, result = null, error = null }) {
-    emit({
+  function effectTraceDetails(command) {
+    return {
+      commandId: command.commandId || null,
+      searchId: command.searchId || command.commandId || null,
+      proposalVersion: command.proposalVersion ?? null,
+      operation: command.type,
+    };
+  }
+  function effectOutcome(result) {
+    if (result?.skipped) return "SKIPPED";
+    if (result?.success === false || result?.reason) return result.reason || "FAILED";
+    if (result?.success === true) return "SUCCESS";
+    return "COMPLETED";
+  }
+  function clearPlayback(reason, state = null) {
+    const result = twilio.clearPlayback();
+    callTrace.playbackEnded();
+    callTrace.entry("TWILIO_CLEAR_SUBMITTED", { ...timingDetails({ responseId: state?.responseId, markId: state?.markId }), reason });
+    return result;
+  }
+  function observeSessionRecord(entry) {
+    const common = {
+      turnId: entry.turnId,
+      proposalVersion: entry.proposalVersion,
+      commandId: entry.commandId,
+      requestId: entry.requestId || entry.requestIdentity,
+      responseId: entry.responseId,
+      markId: entry.markId,
+      purpose: entry.purpose || entry.responsePurpose,
+      reason: entry.reason,
+    };
+    if (entry.event === "CALL_STARTED") callTrace.entry("CALL_INITIALIZED", common);
+    else if (entry.event === "BUSINESS_CONTEXT_BOUND") callTrace.entry("BUSINESS_RESOLVED", common);
+    else if (entry.event === "INITIAL_GREETING_REQUESTED") callTrace.entry("INITIAL_GREETING_REQUESTED", common);
+    else if (entry.event === "TURN_INTERPRETED") callTrace.entry("TURN_INTERPRETED", { ...common, operation: entry.action });
+    else if (["PROPOSAL_CHANGED", "AVAILABILITY_RESULT_APPLIED", "SCHEDULING_RESULT_APPLIED"].includes(entry.event)) callTrace.entry("PROPOSAL_UPDATED", { ...common, operation: entry.event });
+    else if (entry.event === "RESPONSE_PLANNED") callTrace.entry("RESPONSE_PLANNED", common);
+    else if (entry.event === "PLAYBACK_ACKNOWLEDGED") callTrace.entry("PLAYBACK_MARK_ACKNOWLEDGED", common);
+    else if (entry.event === "EFFECT_QUEUED" || entry.event === "CREATE_APPOINTMENT_QUEUED") {
+      const type = entry.effectType || "CREATE_APPOINTMENT";
+      callTrace.effectQueued(type);
+      callTrace.entry("EFFECT_QUEUED", { ...common, operation: type });
+      if (type === "SEND_CONFIRMATION_SMS") callTrace.entry("SMS_COMMAND_QUEUED", { ...common, operation: type });
+    } else if (["AVAILABILITY_RESULT_REJECTED", "SCHEDULING_RESULT_REJECTED", "STALE_BOOKING_RECONCILIATION_IGNORED", "STALE_PLAYBACK_EVENT_QUARANTINED"].includes(entry.event)) {
+      callTrace.entry("STALE_RESULT_IGNORED", { ...common, operation: entry.event });
+    } else if (entry.event === "CONFIRMATION_AUTHORITY_GRANTED") callTrace.entry("CONFIRMATION_AUTHORITY_GRANTED", common);
+    else if (entry.event === "CONFIRMATION_REVOKED") callTrace.entry("CONFIRMATION_AUTHORITY_INVALIDATED", common);
+    else if (entry.event === "SESSION_TERMINATING") {
+      callTrace.entry("CONFIRMATION_AUTHORITY_INVALIDATED", common);
+      callTrace.entry("SESSION_TERMINATING", common);
+    } else if (entry.event === "TRANSCRIPT_FINALIZED") {
+      callTrace.counters.finalizations += 1;
+      callTrace.entry("TRANSCRIPT_FINALIZED", { ...common, outcome: entry.outcome, persistenceOutcome: entry.replayed ? "REPLAYED" : entry.success ? "SUCCESS" : "NOT_CONFIRMED" });
+      const activeResponses = [...responses.values()].filter((state) => ["planned", "requested"].includes(session.responseRegistry.get(state.responseId)?.status)).length;
+      const uncreatedActiveRequest = openai.activeRequestId && ![...responses.values()].some((state) => state.requestId === openai.activeRequestId) ? 1 : 0;
+      const activePlaybacks = [...marks.keys()].filter((markId) => ["not_submitted", "submitted"].includes(session.playbackRegistry.get(markId)?.status)).length;
+      callTrace.summary({
+        durationMs: callTrace.stamp().elapsedMs,
+        finalProposalVersion: session.proposal.proposalVersion,
+        finalRequirement: session.proposal.terminal ? null : deriveBookingRequirement(session.proposal),
+        appointmentId: session.proposal.terminal?.appointmentId || null,
+        finalOutcome: entry.outcome,
+        remainingTimerCount: session.watchdog.pendingCount,
+        remainingEffectCount: session.effectQueue.pending().length,
+        remainingResponseCount: activeResponses + uncreatedActiveRequest,
+        remainingPlaybackCount: activePlaybacks,
+      });
+    }
+  }
+  function emitPersistenceOutcome({ turnId, role, itemId = null, responseId = null, characterCount = null, result = null, error = null }) {
+    safeEmit({
       event: "V2_TRANSCRIPT_PERSISTENCE_OUTCOME",
       buildSha,
       callSid,
@@ -585,6 +699,7 @@ export function initializeVoiceV2Session({
       replayed: error ? false : result?.replayed === true,
       reason: error ? error?.code || error?.message || "PERSISTENCE_ERROR" : result?.reason || null,
     });
+    if (role === "caller") callTrace.entry("CALLER_TRANSCRIPT_PERSISTED", { turnId, itemId, characterCount, persistenceOutcome: error ? "FAILED" : result?.replayed ? "REPLAYED" : result?.success === true ? "SUCCESS" : "NOT_CONFIRMED" });
   }
   async function cleanup() {
     timing.flush();
@@ -592,11 +707,15 @@ export function initializeVoiceV2Session({
     startupAudio.length = 0; startupAudioBytes = 0;
     const state = currentLifecycle();
     if (state?.responseId) { try { openai.supersedeResponse({ requestId: state.requestId, responseId: state.responseId, reason: "CALL_TERMINATED" }); } catch {} }
-    if (twilio.identity.streamSid && !twilio.closed) { try { twilio.clearPlayback(); } catch {} }
+    if (twilio.identity.streamSid && !twilio.closed) { try { clearPlayback("CALL_TERMINATED", state); } catch {} }
     try { openai.close(1000, "session_terminated"); } catch {}
     // SessionLifecycle invokes cleanup once, before durable result/finalization
     // settlement. Adapter.close is idempotent; no provider REST hangup needed.
-    try { twilio.close(1000, "session_terminated"); } catch {}
+    const transportWasOpen = !twilio.closed;
+    try {
+      twilio.close(1000, "session_terminated");
+      if (transportWasOpen) { callTrace.counters.transportCloses += 1; callTrace.entry("TRANSPORT_CLOSED", { reason: "session_terminated" }); }
+    } catch {}
   }
 
   function configureSession() {
