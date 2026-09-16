@@ -78,7 +78,7 @@ export function planResponse({ proposal, purpose, language = "en", businessName 
 
 // Bind the already-approved interpreter catalogue to critical validation.
 // This is an immutable response-plan snapshot, not a second catalogue owner.
-export function bindServiceValidationContext(plan, availableServices = []) {
+export function bindServiceValidationContext(plan, availableServices = [], { referenceDate = null, timeZone = null } = {}) {
   if (plan?.purpose !== ResponsePurpose.PRE_BOOKING_CONFIRMATION) return plan;
   const services = Object.freeze(availableServices.flatMap((entry) => {
     const canonical = typeof entry === "string" ? entry.trim() : String(entry?.canonical || "").trim();
@@ -86,12 +86,18 @@ export function bindServiceValidationContext(plan, availableServices = []) {
     const aliases = typeof entry === "string" ? [] : Array.from(entry.aliases || [], String);
     return [Object.freeze({ canonical, aliases: Object.freeze(aliases) })];
   }));
-  // Legacy/manual compositions that supply no catalogue keep the existing
-  // validator vocabulary. Production always supplies the resolved catalogue.
-  if (!services.length) return plan;
+  const temporalContext = /^\d{4}-\d{2}-\d{2}$/.test(referenceDate || "")
+    ? { referenceDate, ...(timeZone ? { timeZone } : {}) }
+    : {};
+  // Legacy/manual compositions that supply no catalogue or temporal context
+  // keep the existing validator vocabulary and behavior.
+  if (!services.length && !temporalContext.referenceDate) return plan;
   return Object.freeze({
     ...plan,
-    validationContext: Object.freeze({ availableServices: services }),
+    validationContext: Object.freeze({
+      ...(services.length ? { availableServices: services } : {}),
+      ...temporalContext,
+    }),
   });
 }
 

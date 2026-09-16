@@ -30,12 +30,12 @@ export function validateSpeech(plan, transcript) {
     availableServices: plan.validationContext?.availableServices || LEGACY_SERVICE_CATALOGUE,
   });
   const serviceSignals = serviceMatch.candidates.map(({ canonical }) => normalize(canonical));
-  const dateSignals = extractDates(text);
+  const dateSignals = extractDates(text, plan.validationContext);
   const expectedTime = expected.time;
   const expectedService = normalize(expected.service);
   const nameMatched = containsPhrase(text, normalize(expected.name));
   const serviceMatched = serviceSignals.includes(expectedService);
-  const dateMatched = matchesDate(text, expected.date);
+  const dateMatched = matchesDate(text, expected.date, plan.validationContext);
   const timeMatched = timeSignals.includes(expectedTime);
   const confirmationQuestionDetected = /\b(confirm|confirmation|confirmo|confirmar|correct|right|reserve|book it)\b/.test(text);
   const prematureSuccessDetected = /\b(is booked|has been booked|appointment is confirmed|cita (esta|ha sido) confirmada|ya reserve)\b/.test(text);
@@ -46,7 +46,7 @@ export function validateSpeech(plan, transcript) {
   const extractionFailures = Object.freeze([
     ...(timeSignals.length ? [] : ["time"]),
     ...(serviceSignals.length ? [] : ["service"]),
-    ...(hasDateSignal(text) ? [] : ["date"]),
+    ...(hasDateSignal(text, plan.validationContext) ? [] : ["date"]),
   ]);
   const result = {
     valid: false, failedInvariant: null, nameMatched, serviceMatched, dateMatched, timeMatched,
@@ -55,7 +55,7 @@ export function validateSpeech(plan, transcript) {
     generatedSignals: Object.freeze({
       services: Object.freeze(serviceSignals), dates: Object.freeze(dateSignals), times: Object.freeze(timeSignals),
       serviceStatus: serviceSignals.length ? (serviceMatched ? "matched" : "mismatch") : "extraction_failed",
-      dateStatus: hasDateSignal(text) ? (dateMatched ? "matched" : "mismatch") : "extraction_failed",
+      dateStatus: hasDateSignal(text, plan.validationContext) ? (dateMatched ? "matched" : "mismatch") : "extraction_failed",
       timeStatus: timeSignals.length ? (timeMatched && !conflictingTimeDetected ? "matched" : "mismatch") : "extraction_failed",
     }),
   };
@@ -185,22 +185,44 @@ function extractTimes(text) {
   return [...new Set(found)];
 }
 function weekdayFor(date) { const parsed = new Date(`${date}T12:00:00Z`); return Number.isNaN(parsed.getTime()) ? [] : WEEKDAYS[parsed.getUTCDay()]; }
-function hasDateSignal(text) { return extractDates(text).length > 0; }
-function matchesDate(text, date) { return extractDates(text).includes(date) || weekdayFor(date).some((day) => containsPhrase(text, day)); }
-function extractDates(text) {
+function hasDateSignal(text, context) { return extractDates(text, context).length > 0; }
+function matchesDate(text, date, context) { return extractDates(text, context).includes(date) || weekdayFor(date).some((day) => containsPhrase(text, day)); }
+function extractDates(text, { referenceDate } = {}) {
   const signals = [...text.matchAll(/\b\d{4}-\d{2}-\d{2}\b/g)].map((match) => match[0]);
   for (const [dayIndex, aliases] of Object.entries(WEEKDAYS)) {
     if (!aliases.some((day) => containsPhrase(text, day))) continue;
     signals.push(`weekday:${dayIndex}`);
   }
   const monthNames = Object.keys(MONTHS).join("|");
-  for (const match of text.matchAll(new RegExp(`\\b(${monthNames})\\s+(\\d{1,2})(?:st|nd|rd|th)?(?:\\s*,?\\s*(\\d{4}))\\b`, "g"))) {
-    signals.push(canonicalDate(match[3], MONTHS[match[1]], match[2]));
+  for (const match of text.matchAll(new RegExp(`\\b(${monthNames})\\s+(\\d{1,2})(?:st|nd|rd|th)?(?:\\s*,?\\s*(\\d{4}))?\\b`, "g"))) {
+    signals.push(match[3]
+      ? canonicalDate(match[3], MONTHS[match[1]], match[2])
+      : inferFutureDate(referenceDate, MONTHS[match[1]], match[2]));
   }
-  for (const match of text.matchAll(new RegExp(`\\b(\\d{1,2})(?:st|nd|rd|th)?\\s+(?:de\\s+)?(${monthNames})(?:\\s+(?:de\\s+)?(\\d{4}))\\b`, "g"))) {
-    signals.push(canonicalDate(match[3], MONTHS[match[2]], match[1]));
+  for (const match of text.matchAll(new RegExp(`\\b(\\d{1,2})(?:st|nd|rd|th)?\\s+(?:de\\s+)?(${monthNames})(?:\\s+(?:de\\s+)?(\\d{4}))?\\b`, "g"))) {
+    signals.push(match[3]
+      ? canonicalDate(match[3], MONTHS[match[2]], match[1])
+      : inferFutureDate(referenceDate, MONTHS[match[2]], match[1]));
+  }
+  if (/^\d{4}-\d{2}-\d{2}$/.test(referenceDate || "")) {
+    const relativeText = text.replace(/\b(?:de la|por la|en la) manana\b/g, "");
+    if (/\b(?:today|hoy)\b/.test(relativeText)) signals.push(referenceDate);
+    if (/\b(?:tomorrow|manana)\b/.test(relativeText)) signals.push(addDays(referenceDate, 1));
   }
   return [...new Set(signals.filter(Boolean))];
+}
+function inferFutureDate(referenceDate, month, day) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(referenceDate || "")) return null;
+  const referenceYear = Number(referenceDate.slice(0, 4));
+  const sameYear = canonicalDate(referenceYear, month, day);
+  if (!sameYear) return null;
+  return sameYear < referenceDate ? canonicalDate(referenceYear + 1, month, day) : sameYear;
+}
+function addDays(date, days) {
+  const parsed = new Date(`${date}T12:00:00Z`);
+  if (Number.isNaN(parsed.getTime())) return null;
+  parsed.setUTCDate(parsed.getUTCDate() + days);
+  return parsed.toISOString().slice(0, 10);
 }
 function canonicalDate(yearValue, monthValue, dayValue) {
   const year = Number(yearValue); const month = Number(monthValue); const day = Number(dayValue);
@@ -212,6 +234,6 @@ function maskDateExpressions(text) {
   const monthNames = Object.keys(MONTHS).join("|");
   return text
     .replace(/\b\d{4}-\d{2}-\d{2}\b/g, " ")
-    .replace(new RegExp(`\\b(?:${monthNames})\\s+\\d{1,2}(?:st|nd|rd|th)?(?:\\s*,?\\s*\\d{4})\\b`, "g"), " ")
-    .replace(new RegExp(`\\b\\d{1,2}(?:st|nd|rd|th)?\\s+(?:de\\s+)?(?:${monthNames})(?:\\s+(?:de\\s+)?\\d{4})\\b`, "g"), " ");
+    .replace(new RegExp(`\\b(?:${monthNames})\\s+\\d{1,2}(?:st|nd|rd|th)?(?:\\s*,?\\s*\\d{4})?\\b`, "g"), " ")
+    .replace(new RegExp(`\\b\\d{1,2}(?:st|nd|rd|th)?\\s+(?:de\\s+)?(?:${monthNames})(?:\\s+(?:de\\s+)?\\d{4})?\\b`, "g"), " ");
 }

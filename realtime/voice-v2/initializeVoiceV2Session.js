@@ -382,7 +382,10 @@ export function initializeVoiceV2Session({
 
   async function requestResponse(plan, attempt = 1, requestIdentity = null, timingContext = {}) {
     if (lifecycle.terminated) return { accepted: false, reason: "CALL_TERMINATED" };
-    const contextualPlan = bindServiceValidationContext(plan, turnContext.availableServices);
+    const contextualPlan = bindServiceValidationContext(plan, turnContext.availableServices, {
+      referenceDate: businessLocalReferenceDate(turnContext.referenceDate, businessContext.timeZone, now),
+      timeZone: businessContext.timeZone,
+    });
     const ownedPlan = contextualPlan.purpose === ResponsePurpose.ERROR_RECOVERY && !contextualPlan.speechContract?.terminalRecovery
       ? planTerminalResponseRecovery({ proposal: session.proposal, language: plan.language })
       : contextualPlan;
@@ -787,4 +790,16 @@ function requireSessionInputs({ callSid, callerNumber, businessContext, buildSha
   if (!businessContext?.businessId || !businessContext?.barberId || !businessContext?.timeZone) throw new TypeError("business_context_required");
   if (!twilioSocket) throw new TypeError("twilio_socket_required");
   if (typeof openaiSocketFactory !== "function") throw new TypeError("openai_socket_factory_required");
+}
+
+function businessLocalReferenceDate(configuredReferenceDate, timeZone, now) {
+  if (/^\d{4}-\d{2}-\d{2}$/.test(configuredReferenceDate || "")) return configuredReferenceDate;
+  const configuredInstant = configuredReferenceDate instanceof Date && !Number.isNaN(configuredReferenceDate.getTime())
+    ? configuredReferenceDate
+    : now();
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone, year: "numeric", month: "2-digit", day: "2-digit",
+  }).formatToParts(configuredInstant);
+  const value = Object.fromEntries(parts.map(({ type, value: part }) => [type, part]));
+  return `${value.year}-${value.month}-${value.day}`;
 }
