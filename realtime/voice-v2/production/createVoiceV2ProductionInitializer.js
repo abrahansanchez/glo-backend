@@ -3,6 +3,7 @@ import twilio from "twilio";
 import Barber from "../../../models/Barber.js";
 import { resolveBusinessByCalledNumber as resolveBusiness } from "../../../services/business/resolveBusinessByCalledNumber.js";
 import { SharedSmsAdapter } from "../adapters/SharedSmsAdapter.js";
+import { TwilioCallControlAdapter } from "../adapters/TwilioCallControlAdapter.js";
 import { prepareVoiceV2SessionStart } from "../application/prepareVoiceV2SessionStart.js";
 import { initializeVoiceV2Session } from "../initializeVoiceV2Session.js";
 import { isValidVoiceV2BusinessId } from "../routing/selectVoiceMediaPath.js";
@@ -65,6 +66,7 @@ export function createVoiceV2ProductionInitializer({
                 callSid: identity.callSid, callerNumber: identity.callerNumber, businessContext, buildSha,
                 twilioSocket: socket, openaiSocketFactory: dependencies.openaiSocketFactory,
                 smsAdapter: dependencies.smsAdapter,
+                callControlAdapter: dependencies.callControlAdapter,
                 openaiSession: { ...dependencies.openaiSession, instructions: buildBusinessSessionInstructions(businessContext) },
                 turnContext: Object.freeze({ availableServices: buildServiceCatalogue(businessContext.services) }),
                 emit,
@@ -109,5 +111,6 @@ function productionDependencies({ env, WebSocketClass, twilioFactory, findBarber
     openaiSocketFactory: () => new WebSocketClass(`wss://api.openai.com/v1/realtime?model=${encodeURIComponent(env.OPENAI_MODEL)}`, { headers: { Authorization: `Bearer ${env.OPENAI_API_KEY}` } }),
     openaiSession: { model: env.OPENAI_MODEL, voice: "alloy", input_audio_transcription: { model: "gpt-4o-mini-transcribe" } },
     smsAdapter: new SharedSmsAdapter({ dependencies: { ...smsServiceDependencies, fromNumber, messagingClient, findBarberById } }),
+    callControlAdapter: new TwilioCallControlAdapter({ client: messagingClient }),
   };
 }

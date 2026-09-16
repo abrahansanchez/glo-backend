@@ -32,7 +32,7 @@ export class SessionLifecycle {
       this.#session.ambiguityRecovery?.terminate();
       this.#session.conversationLanguage?.terminate();
       this.#session.record("SESSION_TERMINATING", { reason, proposalVersion: this.#session.proposal.proposalVersion });
-      await this.#cleanup();
+      await this.#cleanup(reason);
     }
     if (this.#pendingBooking.size) return Object.freeze({ finalized: false, reason: "BOOKING_RESULT_PENDING" });
     return this.finalize(this.#outcome(reason));

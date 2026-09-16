@@ -479,6 +479,7 @@ test("production-composed closed day converges through verified selection, fresh
     assert.equal(f.smsCalls.length, 1);
     assert.equal(f.finalized.length, 1);
     assert.equal(f.twilio.closeCalls.length, 1);
+    assert.deepEqual(f.hangupCalls, [{ callSid: "CA-scheduling-en" }]);
     assert.equal(f.app.session.watchdog.pendingCount, 0);
   } finally {
     Appointment.findOne = originalFindOne;
@@ -578,6 +579,7 @@ test("CA712 natural path selects a spoken offered time, collects a bare name, an
     assert.equal(f.smsCalls.length, 1);
     assert.equal(f.finalized.length, 1);
     assert.equal(f.twilio.closeCalls.length, 1);
+    assert.deepEqual(f.hangupCalls, [{ callSid: "CA712fb437d8fc2839b540dd206a4ef626" }]);
     assert.equal(f.app.session.watchdog.pendingCount, 0);
 
     const traceEvents = new Set(["TURN_INTERPRETED", "EFFECT_QUEUED", "AVAILABILITY_RESULT_APPLIED", "RESPONSE_PLANNED", "PLAYBACK_ACKNOWLEDGED", "CONFIRMATION_AUTHORITY_GRANTED", "BOOKING_SUCCEEDED", "SMS_RESULT", "TRANSCRIPT_FINALIZED", "SESSION_TERMINATING"]);
@@ -701,6 +703,7 @@ function fixture({ callSid = null, proposal = serviceProposal(), language = "en"
   const bookingCalls = [];
   const smsCalls = [];
   const finalized = [];
+  const hangupCalls = [];
   let searchIndex = 0;
   const fakeAvailability = {
     searchAvailableTimes: async (request) => {
@@ -720,12 +723,13 @@ function fixture({ callSid = null, proposal = serviceProposal(), language = "en"
     bookingAdapter: suppliedBooking || { createAppointment: async (command) => { bookingCalls.push(command); return { success: true, appointmentId: "appt" }; } },
     smsAdapter: { sendAppointmentConfirmation: async (command) => { smsCalls.push(command); return { success: true, submitted: true }; } },
     transcriptAdapter: { appendTurn: async () => ({ success: true }), finalizeCall: async (request) => { finalized.push(request); return { success: true }; } },
+    callControlAdapter: { terminateCall: async ({ callSid: terminatedCallSid }) => { hangupCalls.push({ callSid: terminatedCallSid }); return { success: true, submitted: true }; } },
     now: () => REFERENCE_DATE,
     turnContext: { language, availableServices: ["Haircut"] },
     emit,
   });
   openai.open();
-  return { app, twilio, openai, searchCalls, checkCalls, bookingCalls, smsCalls, finalized };
+  return { app, twilio, openai, searchCalls, checkCalls, bookingCalls, smsCalls, finalized, hangupCalls };
 }
 
 function serviceProposal() { return createBookingProposal({ proposalId: "scheduling", service: "Haircut" }); }

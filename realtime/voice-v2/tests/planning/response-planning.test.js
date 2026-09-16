@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createBookingProposal } from "../../domain/BookingProposal.js";
-import { planResponse, ResponsePurpose } from "../../planning/ResponsePlanner.js";
+import { planResponse, planSafeCollectionReprompt, planTerminalResponseRecovery, ResponsePurpose } from "../../planning/ResponsePlanner.js";
 import { validateSpeech } from "../../planning/SpeechValidator.js";
 
 const proposal = createBookingProposal({ proposalId: "p1", proposalVersion: 7, service: "Haircut", name: "Roberto", date: "2026-08-27", time: "14:30" });
@@ -71,6 +71,20 @@ test("speech extraction failure and confirmed mismatch are diagnostically distin
   assert.equal(garbled.valid, false); assert.equal(wrong.valid, false);
 });
 
+test("confirmation validation canonicalizes matching English and Spanish calendar dates without treating the day as a time", () => {
+  const datedProposal = createBookingProposal({ proposalId: "calendar-date", proposalVersion: 3, service: "Haircut", name: "Abraham", date: "2026-09-16", time: "09:00" });
+  const datedPlan = planResponse({ proposal: datedProposal, purpose: ResponsePurpose.PRE_BOOKING_CONFIRMATION });
+  const english = validateSpeech(datedPlan, "Abraham, should I confirm your Haircut for September 16, 2026 at 09:00?");
+  const spanish = validateSpeech({ ...datedPlan, language: "es" }, "Abraham, ¿confirmo tu Haircut para el 16 de septiembre de 2026 a las 09:00?");
+  const wrong = validateSpeech(datedPlan, "Abraham, should I confirm your Haircut for September 17, 2026 at 09:00?");
+  assert.equal(english.valid, true);
+  assert.deepEqual(english.generatedSignals.times, ["09:00"]);
+  assert.equal(spanish.valid, true);
+  assert.deepEqual(spanish.generatedSignals.times, ["09:00"]);
+  assert.equal(wrong.valid, false);
+  assert.equal(wrong.failedInvariant, "date_mismatch");
+});
+
 test("ASK_TIME and CLARIFICATION buffer and reject invented time or availability claims", () => {
   const incomplete = createBookingProposal({ proposalId: "ordinary-safety", proposalVersion: 2, service: "Haircut", date: "2026-09-18" });
   for (const purpose of [ResponsePurpose.ASK_TIME, ResponsePurpose.CLARIFICATION]) {
@@ -85,4 +99,33 @@ test("ASK_TIME and CLARIFICATION buffer and reject invented time or availability
     assert.equal(validateSpeech(ordinary, "That time is unavailable.").failedInvariant, "unsupported_availability_result_claim");
     assert.equal(validateSpeech(ordinary, "I found another opening.").failedInvariant, "unsupported_availability_result_claim");
   }
+});
+
+test("every eligible application-owned collection reprompt has fixed validated English and Spanish text", () => {
+  const incomplete = createBookingProposal({ proposalId: "safe-reprompt", proposalVersion: 2, service: "Haircut", date: "2026-09-18" });
+  const expected = {
+    ASK_TIME: { en: "What time would you like?", es: "¿A qué hora te gustaría?" },
+    ASK_NAME: { en: "What name should I use for the appointment?", es: "¿Qué nombre debo usar para la cita?" },
+    CLARIFICATION: { en: "Could you please repeat that?", es: "¿Podrías repetirlo, por favor?" },
+  };
+  for (const purpose of [ResponsePurpose.ASK_TIME, ResponsePurpose.ASK_NAME, ResponsePurpose.CLARIFICATION]) {
+    for (const language of ["en", "es"]) {
+      const plan = planSafeCollectionReprompt({ proposal: incomplete, purpose, language });
+      assert.equal(plan.speechContract.applicationOwnedReprompt, true, `${purpose}/${language}`);
+      assert.equal(plan.speechContract.requiredMessage, expected[purpose][language]);
+      assert.equal(validateSpeech(plan, `${expected[purpose][language]} `).valid, true);
+      assert.equal(validateSpeech(plan, `Unsafe preface. ${expected[purpose][language]}`).failedInvariant, "application_owned_reprompt_mismatch");
+    }
+  }
+});
+
+test("terminal recovery accepts safe localized rewording but rejects questions and booking-status claims", () => {
+  const english = planTerminalResponseRecovery({ proposal, language: "en" });
+  const spanish = planTerminalResponseRecovery({ proposal, language: "es" });
+  assert.equal(validateSpeech(english, "I'm sorry, I am unable to continue. Please try again later. Goodbye.").valid, true);
+  assert.equal(validateSpeech(english, "Sorry, I can't continue. Please call again later. Bye.").valid, true);
+  assert.equal(validateSpeech(spanish, "Lo siento, no puedo continuar. Intenta de nuevo más tarde. Adiós.").valid, true);
+  assert.equal(validateSpeech(spanish, "Disculpa, no podemos continuar. Vuelve a llamar más tarde. Hasta luego.").valid, true);
+  assert.equal(validateSpeech(english, "Sorry, I can't continue. Could you call again later?").valid, false);
+  assert.equal(validateSpeech(english, "Sorry, I can't continue. Your appointment is cancelled. Call again later. Goodbye.").valid, false);
 });

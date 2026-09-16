@@ -133,11 +133,75 @@ test("duplicate and post-termination events cannot duplicate summary and logging
   assert.equal(final.remainingResponseCount, 1, "the provider request that never received response.created remains observable rather than being hidden");
 });
 
-function fixture(callSid, { proposal, availabilityAdapter, emit } = {}) {
+test("call-leg request, provider acceptance and fetched status remain traceable after transcript finalization", async () => {
+  let finish; let progress; let invocations = 0;
+  const callControlAdapter = {
+    terminateCall: ({ onProgress }) => {
+      invocations += 1; progress = onProgress;
+      return new Promise((resolve) => { finish = resolve; });
+    },
+  };
+  const f = fixture("CA-observe-call-control-late", { callControlAdapter });
+  await startAndConfigure(f);
+  await f.app.terminate("CONTROLLED_TERMINATION");
+  await settle(f.app);
+
+  let traces = traceEvents(f.logs);
+  const finalizedSequence = traces.find((entry) => entry.traceEvent === "TRANSCRIPT_FINALIZED").sequence;
+  assert.equal(invocations, 1);
+  assert.ok(traces.some((entry) => entry.traceEvent === "CALL_LEG_TERMINATION_REQUESTED"));
+  assert.ok(traces.some((entry) => entry.traceEvent === "CALL_LEG_TERMINATION_ADAPTER_INVOKED" && entry.invoked === true));
+  assert.equal(traces.some((entry) => entry.traceEvent === "CALL_LEG_TERMINATION_PROVIDER_REPORTED"), false);
+
+  progress({ stage: "PROVIDER_REPORTED", providerStatus: "completed", providerReportedCompleted: true });
+  progress({ stage: "STATUS_VERIFIED", verifiedStatus: "completed", actualCallStatusVerified: true });
+  finish({ success: true, invoked: true, providerSubmissionConfirmed: true, providerStatus: "completed", providerReportedCompleted: true, verifiedStatus: "completed", actualCallStatusVerified: true });
+  await settle(f.app);
+
+  traces = traceEvents(f.logs);
+  const provider = traces.find((entry) => entry.traceEvent === "CALL_LEG_TERMINATION_PROVIDER_REPORTED");
+  const verified = traces.find((entry) => entry.traceEvent === "CALL_LEG_TERMINATION_STATUS_VERIFIED");
+  const result = traces.find((entry) => entry.traceEvent === "CALL_LEG_TERMINATION_RESULT");
+  assert.ok(provider.sequence > finalizedSequence && verified.sequence > finalizedSequence && result.sequence > finalizedSequence);
+  assert.equal(provider.providerReportedCompleted, true);
+  assert.equal(verified.actualCallStatusVerified, true);
+  assert.equal(result.providerSubmissionConfirmed, true);
+  assert.ok([provider, verified, result].every((entry) => entry.callSid === f.callSid && entry.buildSha === "observe-build"));
+});
+
+test("provider rejection is distinct from adapter invocation in compact call trace", async () => {
+  const f = fixture("CA-observe-call-control-rejected", { callControlAdapter: {
+    terminateCall: async () => ({ success: false, invoked: true, providerSubmissionConfirmed: false, providerReportedCompleted: false, actualCallStatusVerified: false, reason: "PROVIDER_ERROR" }),
+  } });
+  await f.app.terminate("CONTROLLED_TERMINATION"); await settle(f.app);
+  const traces = traceEvents(f.logs);
+  assert.ok(traces.some((entry) => entry.traceEvent === "CALL_LEG_TERMINATION_ADAPTER_INVOKED" && entry.invoked === true));
+  const result = traces.find((entry) => entry.traceEvent === "CALL_LEG_TERMINATION_RESULT");
+  assert.equal(result.success, false); assert.equal(result.providerSubmissionConfirmed, false); assert.equal(result.reason, "PROVIDER_ERROR");
+  assert.equal(traces.some((entry) => entry.traceEvent === "CALL_LEG_TERMINATION_PROVIDER_REPORTED"), false);
+  assert.equal(traces.some((entry) => entry.traceEvent === "CALL_LEG_TERMINATION_STATUS_VERIFIED"), false);
+});
+
+test("never-settling call control leaves a retrievable invocation trace without blocking finalization", async () => {
+  let invocations = 0;
+  const f = fixture("CA-observe-call-control-never", { callControlAdapter: {
+    terminateCall: () => { invocations += 1; return new Promise(() => {}); },
+  } });
+  await f.app.terminate("CONTROLLED_TERMINATION"); await f.app.terminate("DUPLICATE"); await settle(f.app);
+  const traces = traceEvents(f.logs);
+  assert.equal(invocations, 1);
+  assert.ok(traces.some((entry) => entry.traceEvent === "TRANSCRIPT_FINALIZED"));
+  assert.ok(traces.some((entry) => entry.traceEvent === "CALL_SUMMARY"));
+  assert.ok(traces.some((entry) => entry.traceEvent === "CALL_LEG_TERMINATION_REQUESTED"));
+  assert.ok(traces.some((entry) => entry.traceEvent === "CALL_LEG_TERMINATION_ADAPTER_INVOKED"));
+  assert.equal(traces.some((entry) => entry.traceEvent === "CALL_LEG_TERMINATION_RESULT"), false);
+});
+
+function fixture(callSid, { proposal, availabilityAdapter, callControlAdapter, emit } = {}) {
   const twilio = new FakeSocket(); const openai = new FakeSocket(); let milliseconds = 0; const logs = [];
   const app = initializeVoiceV2Session({
     callSid, callerNumber: "+18135550199", businessContext: BUSINESS, buildSha: "observe-build", twilioSocket: twilio, openaiSocketFactory: () => openai,
-    proposal, availabilityAdapter, emit: emit || ((entry) => logs.push(entry)), turnContext: { availableServices: ["Haircut"], referenceDate: "2026-09-15" },
+    proposal, availabilityAdapter, callControlAdapter, emit: emit || ((entry) => logs.push(entry)), turnContext: { availableServices: ["Haircut"], referenceDate: "2026-09-15" },
     timingOptions: { monotonicNow: () => milliseconds, wallNow: () => new Date(1800000000000 + milliseconds).toISOString() },
     transcriptAdapter: { appendTurn: async () => ({ success: true }), finalizeCall: async () => ({ success: true }) },
   });

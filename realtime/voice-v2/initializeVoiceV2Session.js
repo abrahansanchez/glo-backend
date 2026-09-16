@@ -5,7 +5,7 @@ import { VoiceCoordinator } from "./VoiceCoordinator.js";
 import { BookingRequirement, createBookingProposal, deriveBookingRequirement, deriveSlotKey } from "./domain/BookingProposal.js";
 import { applyAvailabilityResult, applySchedulingSearchResult } from "./domain/BookingLifecycleTransitions.js";
 import { buildCreateAppointmentCommand } from "./application/buildCreateAppointmentCommand.js";
-import { ResponsePurpose, bindServiceValidationContext, planAuthorityRefusalContinuation, planTerminalResponseRecovery } from "./planning/ResponsePlanner.js";
+import { ResponsePurpose, bindServiceValidationContext, planAuthorityRefusalContinuation, planSafeCollectionReprompt, planTerminalResponseRecovery } from "./planning/ResponsePlanner.js";
 import { buildRealtimeResponseRequest } from "./planning/buildRealtimeResponseRequest.js";
 import { SessionLifecycle } from "./lifecycle/SessionLifecycle.js";
 import { OpenAIRealtimeAdapter } from "./adapters/OpenAIRealtimeAdapter.js";
@@ -20,18 +20,25 @@ const STARTUP_AUDIO_MAX_FRAMES = 500;
 const STARTUP_AUDIO_MAX_BYTES = 80000;
 const BOOKING_SETTLEMENT_DEADLINE_MS = 20000;
 const BOOKING_RECONCILIATION_DEADLINE_MS = 20000;
+const SAFE_REPROMPT_PURPOSES = new Set([
+  ResponsePurpose.ASK_TIME, ResponsePurpose.ASK_NAME, ResponsePurpose.CLARIFICATION,
+]);
+const SAFE_REPROMPT_FAILURES = new Set([
+  "unsupported_time_claim", "unsupported_availability_operation_claim", "unsupported_availability_result_claim",
+]);
 
 export function initializeVoiceV2Session({
   callSid, callerNumber, businessContext, buildSha, twilioSocket, openaiSocketFactory,
   availabilityAdapter = new V1AvailabilityAdapter(), bookingAdapter = new SharedBookingAdapter(),
   smsAdapter = new SharedSmsAdapter(), transcriptAdapter = new SharedTranscriptAdapter(),
+  callControlAdapter = null,
   coordinator = new VoiceCoordinator(), scheduler = {}, now = () => new Date(),
   proposal = createBookingProposal({ proposalId: `proposal:${callSid}` }),
   openaiSession = {}, turnContext = {}, emit = () => {}, timingOptions = {},
 } = {}) {
   requireSessionInputs({ callSid, callerNumber, businessContext, buildSha, twilioSocket, openaiSocketFactory });
   let lifecycle; let processing = Promise.resolve(); let effectsProcessing = Promise.resolve(); let turnSequence = 0; let responseSequence = 0; let markSequence = 0; let twilioStarted = false; let openaiSessionCreated = false; let openaiConfigured = false; let initialGreetingRequested = false;
-  const providerTurns = new Set(); const requests = new Map(); const responses = new Map(); const marks = new Map(); const superseded = new Set(); const ambiguityPurposes = []; const startupAudio = []; let startupAudioBytes = 0;
+  const providerTurns = new Set(); const requests = new Map(); const responses = new Map(); const marks = new Map(); const superseded = new Set(); const ambiguityPurposes = []; const startupAudio = []; let startupAudioBytes = 0; let callTerminationRequested = false;
   const safeEmit = (event) => { try { emit(event); } catch { /* Logging cannot terminate a call. */ } };
   const timing = new LatencyDiagnostics({ ...timingOptions, callSid, buildSha, emit: safeEmit });
   const callTrace = new CallTrace({ ...timingOptions, callSid, buildSha, emit: safeEmit });
@@ -525,6 +532,12 @@ export function initializeVoiceV2Session({
     callTrace.entry("RESPONSE_COMPLETED", { ...timingDetails({ responseId }), outcome: "FAILED", reason });
     session.record("RESPONSE_DELIVERY_FAILED", { responseId, purpose: state.plan.purpose, reason });
     if (session.proposal.terminal || state.plan.purpose === ResponsePurpose.AMBIGUITY_LIMIT_REACHED || state.plan.purpose === ResponsePurpose.ERROR_RECOVERY) return lifecycle.terminate(reason);
+    if (SAFE_REPROMPT_PURPOSES.has(state.plan.purpose) && SAFE_REPROMPT_FAILURES.has(reason) && state.attempt < 2) {
+      session.record("SAFE_REPROMPT_PLANNED", { responseId, purpose: state.plan.purpose, proposalVersion: state.plan.proposalVersion, reason, attempt: state.attempt + 1 });
+      const safePlan = planSafeCollectionReprompt({ proposal: session.proposal, purpose: state.plan.purpose, language: state.plan.language });
+      const retry = await requestResponse(safePlan, state.attempt + 1);
+      if (retry.accepted) return;
+    }
     // The fixed request identity is the call-wide one-shot budget, retained in
     // the existing request registry. Recovery never retries booking/SMS effects.
     const recoveryId = `${callSid}:response-recovery`;
@@ -683,6 +696,23 @@ export function initializeVoiceV2Session({
         remainingResponseCount: activeResponses + uncreatedActiveRequest,
         remainingPlaybackCount: activePlaybacks,
       });
+    } else if ([
+      "CALL_LEG_TERMINATION_REQUESTED",
+      "CALL_LEG_TERMINATION_ADAPTER_INVOKED",
+      "CALL_LEG_TERMINATION_PROVIDER_REPORTED",
+      "CALL_LEG_TERMINATION_STATUS_VERIFIED",
+      "CALL_LEG_TERMINATION_RESULT",
+    ].includes(entry.event)) {
+      callTrace.entry(entry.event, {
+        ...common,
+        invoked: entry.invoked,
+        providerSubmissionConfirmed: entry.providerSubmissionConfirmed,
+        providerReportedCompleted: entry.providerReportedCompleted,
+        actualCallStatusVerified: entry.actualCallStatusVerified,
+        providerStatus: entry.providerStatus,
+        verifiedStatus: entry.verifiedStatus,
+        success: entry.success,
+      });
     }
   }
   function emitPersistenceOutcome({ turnId, role, itemId = null, responseId = null, characterCount = null, result = null, error = null }) {
@@ -701,7 +731,7 @@ export function initializeVoiceV2Session({
     });
     if (role === "caller") callTrace.entry("CALLER_TRANSCRIPT_PERSISTED", { turnId, itemId, characterCount, persistenceOutcome: error ? "FAILED" : result?.replayed ? "REPLAYED" : result?.success === true ? "SUCCESS" : "NOT_CONFIRMED" });
   }
-  async function cleanup() {
+  async function cleanup(reason) {
     timing.flush();
     if (startupAudio.length) session.record("STARTUP_CALLER_AUDIO_CLEARED", { clearedFrames: startupAudio.length, clearedBytes: startupAudioBytes });
     startupAudio.length = 0; startupAudioBytes = 0;
@@ -716,6 +746,32 @@ export function initializeVoiceV2Session({
       twilio.close(1000, "session_terminated");
       if (transportWasOpen) { callTrace.counters.transportCloses += 1; callTrace.entry("TRANSPORT_CLOSED", { reason: "session_terminated" }); }
     } catch {}
+    requestCallLegTermination(reason);
+  }
+
+  function requestCallLegTermination(reason) {
+    if (callTerminationRequested || !callControlAdapter || [TransportEvent.TWILIO_STREAM_STOPPED, TransportEvent.TWILIO_CONNECTION_CLOSED].includes(reason)) return;
+    callTerminationRequested = true;
+    session.record("CALL_LEG_TERMINATION_REQUESTED", { reason });
+    // Provider call control must not block transcript finalization or create a
+    // second timeout owner during terminal cleanup.
+    let termination;
+    try {
+      termination = callControlAdapter.terminateCall({
+        callSid,
+        onProgress: (progress) => {
+          if (progress?.stage === "PROVIDER_REPORTED") session.record("CALL_LEG_TERMINATION_PROVIDER_REPORTED", { providerStatus: progress.providerStatus || null, providerReportedCompleted: progress.providerReportedCompleted === true });
+          if (progress?.stage === "STATUS_VERIFIED") session.record("CALL_LEG_TERMINATION_STATUS_VERIFIED", { verifiedStatus: progress.verifiedStatus || null, actualCallStatusVerified: progress.actualCallStatusVerified === true });
+        },
+      });
+      session.record("CALL_LEG_TERMINATION_ADAPTER_INVOKED", { reason, invoked: true });
+    } catch (error) {
+      session.record("CALL_LEG_TERMINATION_RESULT", { success: false, invoked: false, providerSubmissionConfirmed: false, providerReportedCompleted: false, actualCallStatusVerified: false, reason: error?.code || "PROVIDER_ERROR" });
+      return;
+    }
+    Promise.resolve(termination)
+      .then((result) => session.record("CALL_LEG_TERMINATION_RESULT", { success: result?.success === true, invoked: result?.invoked === true, providerSubmissionConfirmed: result?.providerSubmissionConfirmed === true, providerReportedCompleted: result?.providerReportedCompleted === true, actualCallStatusVerified: result?.actualCallStatusVerified === true, providerStatus: result?.providerStatus || null, verifiedStatus: result?.verifiedStatus || null, reason: result?.reason || null }),
+        (error) => session.record("CALL_LEG_TERMINATION_RESULT", { success: false, invoked: true, providerSubmissionConfirmed: false, providerReportedCompleted: false, actualCallStatusVerified: false, reason: error?.code || "PROVIDER_ERROR" }));
   }
 
   function configureSession() {

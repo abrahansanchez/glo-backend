@@ -25,9 +25,13 @@ const CALLER_INPUT_PURPOSES = Object.freeze([
 ]);
 const PRE_DELIVERY_VALIDATION_PURPOSES = new Set([
   ResponsePurpose.OFFER_ALTERNATIVES,
+  ResponsePurpose.SCHEDULING_ALTERNATIVES,
+  ResponsePurpose.NO_AVAILABLE_TIMES,
+  ResponsePurpose.SLOT_UNAVAILABLE,
   ResponsePurpose.ASK_TIME,
   ResponsePurpose.ASK_NAME,
   ResponsePurpose.CLARIFICATION,
+  ResponsePurpose.ERROR_RECOVERY,
 ]);
 const REQUIREMENT_RESPONSE_PURPOSES = new Set([
   ResponsePurpose.ASK_TIME,
@@ -55,7 +59,8 @@ export function planResponse({ proposal, purpose, language = "en", businessName 
     expectedFacts,
     speechContract: Object.freeze({
       semanticValidationRequired: resolvedPurpose === ResponsePurpose.PRE_BOOKING_CONFIRMATION,
-      prematureBookingClaimForbidden: PRE_DELIVERY_VALIDATION_PURPOSES.has(resolvedPurpose),
+      prematureBookingClaimForbidden: PRE_DELIVERY_VALIDATION_PURPOSES.has(resolvedPurpose)
+        && resolvedPurpose !== ResponsePurpose.BOOKING_SUCCESS,
       alternativesClaimAllowed: [ResponsePurpose.OFFER_ALTERNATIVES, ResponsePurpose.SCHEDULING_ALTERNATIVES].includes(resolvedPurpose),
       inviteAnotherSlot: resolvedPurpose === ResponsePurpose.SLOT_UNAVAILABLE,
       bookingSuccessClaimsAllowed: resolvedPurpose === ResponsePurpose.BOOKING_SUCCESS,
@@ -105,6 +110,35 @@ export function planAuthorityRefusalContinuation({ proposal, turnId, language })
   return { plan: planResponse({ proposal, language, purpose: requirement === "READY_FOR_BOOKING_AUTHORIZATION" ? ResponsePurpose.PRE_BOOKING_CONFIRMATION : undefined }) };
 }
 
+export function planSafeCollectionReprompt({ proposal, purpose, language = "en" }) {
+  const plan = planResponse({ proposal, purpose, language });
+  const messages = {
+    ASK_TIME: {
+      en: "What time would you like?",
+      es: "\u00bfA qu\u00e9 hora te gustar\u00eda?",
+    },
+    ASK_NAME: {
+      en: "What name should I use for the appointment?",
+      es: "\u00bfQu\u00e9 nombre debo usar para la cita?",
+    },
+    CLARIFICATION: {
+      en: "Could you please repeat that?",
+      es: "\u00bfPodr\u00edas repetirlo, por favor?",
+    },
+  };
+  const message = messages[purpose]?.[language === "es" ? "es" : "en"];
+  if (!message) return plan;
+  return Object.freeze({
+    ...plan,
+    speechContract: Object.freeze({
+      ...plan.speechContract,
+      applicationOwnedReprompt: true,
+      requiredMessage: message,
+      instruction: "Speak the required message exactly. Do not add, omit, or paraphrase any words.",
+    }),
+  });
+}
+
 // Terminal recovery makes no booking-status claim, including "not booked".
 // Production composition may use it for response failure or an unresolved
 // infrastructure deadline; successful playback has explicit termination ownership.
@@ -119,7 +153,7 @@ export function planTerminalResponseRecovery({ proposal, language = "en" }) {
       bookingStatusClaimsAllowed: false,
       instruction: "Deliver the terminal message below briefly, then stop. Do not ask a question, invite a reply, or claim any appointment was created, not created, changed, or cancelled.",
       terminalMessage: language === "es"
-        ? "Lo siento, no puedo continuar esta llamada. Por favor, vuelve a llamar más tarde. Adiós."
+        ? "Lo siento, no puedo continuar esta llamada. Por favor, vuelve a llamar m\u00e1s tarde. Adi\u00f3s."
         : "I'm sorry, I can't continue this call. Please call again later. Goodbye.",
     }),
   });

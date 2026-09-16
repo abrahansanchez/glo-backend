@@ -10,14 +10,22 @@ const WEEKDAYS = Object.freeze({
   0: ["sunday", "domingo"], 1: ["monday", "lunes"], 2: ["tuesday", "martes"],
   3: ["wednesday", "miercoles"], 4: ["thursday", "jueves"], 5: ["friday", "viernes"], 6: ["saturday", "sabado"],
 });
+const MONTHS = Object.freeze({
+  january: 1, enero: 1, february: 2, febrero: 2, march: 3, marzo: 3,
+  april: 4, abril: 4, may: 5, mayo: 5, june: 6, junio: 6,
+  july: 7, julio: 7, august: 8, agosto: 8, september: 9, septiembre: 9,
+  october: 10, octubre: 10, november: 11, noviembre: 11, december: 12, diciembre: 12,
+});
 
 export function validateSpeech(plan, transcript) {
-  if (plan?.speechContract?.prematureBookingClaimForbidden) return validateOrdinarySpeech(plan, transcript);
+  if (plan?.speechContract?.applicationOwnedReprompt === true) return validateApplicationOwnedReprompt(plan, transcript);
+  if (plan?.speechContract?.terminalRecovery === true) return validateTerminalRecovery(plan, transcript);
+  if (plan?.deliveryValidationRequired && plan?.purpose !== "PRE_BOOKING_CONFIRMATION") return validateOrdinarySpeech(plan, transcript);
   if (plan?.purpose !== "PRE_BOOKING_CONFIRMATION") return invalid("unsupported_purpose");
   if (typeof transcript !== "string" || !transcript.trim()) return invalid("missing_transcript");
   const text = normalize(transcript);
   const expected = plan.expectedFacts;
-  const timeSignals = extractTimes(text);
+  const timeSignals = extractTimes(maskDateExpressions(text));
   const serviceMatch = matchServiceCatalogue(text, {
     availableServices: plan.validationContext?.availableServices || LEGACY_SERVICE_CATALOGUE,
   });
@@ -60,9 +68,9 @@ function validateOrdinarySpeech(plan, transcript) {
   if (typeof transcript !== "string" || !transcript.trim()) return invalid("missing_transcript");
   const text = normalize(transcript);
   const normalizedTurn = normalizeTurn(transcript);
-  const prohibited = /\b(?:confirmed|booked|scheduled|confirmada|confirmado|reservada|reservado|programada|programado)\b|\b(?:i(?:'ll| will)\s+(?:go ahead and\s+)?(?:confirm|book|schedule)|got you down|have you down)\b/.test(text);
-  const unsupportedTime = plan.speechContract.specificTimeClaimsAllowed === false
-    && containsUnsupportedTimeClaim(normalizedTurn, plan.expectedFacts);
+  const prohibited = plan.speechContract.prematureBookingClaimForbidden === true
+    && /\b(?:confirmed|booked|scheduled|confirmada|confirmado|reservada|reservado|programada|programado)\b|\b(?:i(?:'ll| will)\s+(?:go ahead and\s+)?(?:confirm|book|schedule)|got you down|have you down)\b/.test(text);
+  const unsupportedTime = containsUnsupportedTimeClaim(normalizedTurn, plan.expectedFacts);
   const unsupportedAvailabilityOperation = plan.speechContract.availabilityOperationClaimsAllowed !== true
     && containsAvailabilityOperationClaim(text);
   const unsupportedAvailabilityResult = plan.speechContract.availabilityResultClaimsAllowed !== true
@@ -81,6 +89,36 @@ function validateOrdinarySpeech(plan, transcript) {
     unsupportedAvailabilityOperationDetected: unsupportedAvailabilityOperation,
     unsupportedAvailabilityResultDetected: unsupportedAvailabilityResult,
   });
+}
+
+function validateTerminalRecovery(plan, transcript) {
+  if (typeof transcript !== "string" || !transcript.trim()) return invalid("missing_transcript");
+  const text = normalize(transcript);
+  const language = plan.language === "es" ? "es" : "en";
+  const apology = language === "es" ? /\b(?:lo siento|disculp)/.test(text) : /\b(?:sorry|apolog)/.test(text);
+  const cannotContinue = language === "es" ? /\bno (?:puedo|podemos) continuar\b/.test(text) : /\b(?:cannot|can't|can not|unable to) continue\b/.test(text);
+  const nextStep = language === "es" ? /\b(?:vuelve a llamar|llama de nuevo|intenta de nuevo)\b/.test(text) : /\b(?:call again|try again)\b/.test(text);
+  const farewell = language === "es" ? /\b(?:adios|hasta luego)\b/.test(text) : /\b(?:goodbye|bye)\b/.test(text);
+  const questionDetected = /[?¿]/.test(String(transcript));
+  const bookingClaimDetected = /\b(?:booked|confirmed|scheduled|reservada|reservado|confirmada|confirmado|programada|programado|cancelled|canceled|cancelada|cancelado)\b/.test(text);
+  const valid = apology && cannotContinue && nextStep && farewell && !questionDetected && !bookingClaimDetected;
+  return Object.freeze({
+    ...invalid(valid ? null : "terminal_recovery_contract_mismatch"),
+    valid,
+    failedInvariant: valid ? null : "terminal_recovery_contract_mismatch",
+    apologyDetected: apology,
+    cannotContinueDetected: cannotContinue,
+    nextStepDetected: nextStep,
+    farewellDetected: farewell,
+    questionDetected,
+    bookingClaimDetected,
+  });
+}
+
+function validateApplicationOwnedReprompt(plan, transcript) {
+  if (typeof transcript !== "string" || !transcript.trim()) return invalid("missing_transcript");
+  const valid = normalize(transcript) === normalize(plan.speechContract.requiredMessage);
+  return Object.freeze({ ...invalid(valid ? null : "application_owned_reprompt_mismatch"), valid, failedInvariant: valid ? null : "application_owned_reprompt_mismatch" });
 }
 
 function containsUnsupportedTimeClaim(normalizedTurn, expectedFacts = {}) {
@@ -147,13 +185,33 @@ function extractTimes(text) {
   return [...new Set(found)];
 }
 function weekdayFor(date) { const parsed = new Date(`${date}T12:00:00Z`); return Number.isNaN(parsed.getTime()) ? [] : WEEKDAYS[parsed.getUTCDay()]; }
-function hasDateSignal(text) { return /\b\d{4}-\d{2}-\d{2}\b/.test(text) || Object.values(WEEKDAYS).flat().some((day) => containsPhrase(text, day)); }
-function matchesDate(text, date) { return containsPhrase(text, date) || weekdayFor(date).some((day) => containsPhrase(text, day)); }
+function hasDateSignal(text) { return extractDates(text).length > 0; }
+function matchesDate(text, date) { return extractDates(text).includes(date) || weekdayFor(date).some((day) => containsPhrase(text, day)); }
 function extractDates(text) {
   const signals = [...text.matchAll(/\b\d{4}-\d{2}-\d{2}\b/g)].map((match) => match[0]);
   for (const [dayIndex, aliases] of Object.entries(WEEKDAYS)) {
     if (!aliases.some((day) => containsPhrase(text, day))) continue;
     signals.push(`weekday:${dayIndex}`);
   }
-  return signals;
+  const monthNames = Object.keys(MONTHS).join("|");
+  for (const match of text.matchAll(new RegExp(`\\b(${monthNames})\\s+(\\d{1,2})(?:st|nd|rd|th)?(?:\\s*,?\\s*(\\d{4}))\\b`, "g"))) {
+    signals.push(canonicalDate(match[3], MONTHS[match[1]], match[2]));
+  }
+  for (const match of text.matchAll(new RegExp(`\\b(\\d{1,2})(?:st|nd|rd|th)?\\s+(?:de\\s+)?(${monthNames})(?:\\s+(?:de\\s+)?(\\d{4}))\\b`, "g"))) {
+    signals.push(canonicalDate(match[3], MONTHS[match[2]], match[1]));
+  }
+  return [...new Set(signals.filter(Boolean))];
+}
+function canonicalDate(yearValue, monthValue, dayValue) {
+  const year = Number(yearValue); const month = Number(monthValue); const day = Number(dayValue);
+  const parsed = new Date(Date.UTC(year, month - 1, day));
+  if (year < 1000 || parsed.getUTCFullYear() !== year || parsed.getUTCMonth() !== month - 1 || parsed.getUTCDate() !== day) return null;
+  return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+}
+function maskDateExpressions(text) {
+  const monthNames = Object.keys(MONTHS).join("|");
+  return text
+    .replace(/\b\d{4}-\d{2}-\d{2}\b/g, " ")
+    .replace(new RegExp(`\\b(?:${monthNames})\\s+\\d{1,2}(?:st|nd|rd|th)?(?:\\s*,?\\s*\\d{4})\\b`, "g"), " ")
+    .replace(new RegExp(`\\b\\d{1,2}(?:st|nd|rd|th)?\\s+(?:de\\s+)?(?:${monthNames})(?:\\s+(?:de\\s+)?\\d{4})\\b`, "g"), " ");
 }

@@ -92,12 +92,13 @@ test('B: recovery interruption before provider response.created terminates and c
 test('B: recovery success, generation timeout and playback timeout each terminate in bounded fashion',async()=>{
  for(const mode of ['success','generation-timeout','playback-timeout']){
   const f=await fixture();await f.turn('Could you repeat that?',1);await f.complete('', 'failed');
-  if(mode==='success')await f.complete('Sorry, please try again later.');
+  if(mode==='success')await f.complete("I'm sorry, I can't continue this call. Please call again later. Goodbye.");
   else if(mode==='generation-timeout'){const task=f.tasks.find(t=>t.delay===15000&&!t.cancelled);assert.ok(task);task.cancelled=true;task.fn();await settle(f.app);}
   else {
    const c=f.creates().at(-1);
    f.openai.receive({type:'response.created',response:{id:'recovery',metadata:c.response.metadata}});
    f.openai.receive({type:'response.output_audio.delta',response_id:'recovery',delta:'AQID'});
+   f.openai.receive({type:'response.output_audio_transcript.done',response_id:'recovery',transcript:"I'm sorry, I can't continue this call. Please call again later. Goodbye."});
    f.openai.receive({type:'response.done',response:{id:'recovery',status:'completed'}});await settle(f.app);
    const task=f.tasks.find(t=>t.delay===30000&&!t.cancelled);assert.ok(task);task.cancelled=true;task.fn();await settle(f.app);
   }
