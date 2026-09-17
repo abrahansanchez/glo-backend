@@ -321,6 +321,7 @@ async function fixture(t, suffix = "default", { proposal, scheduler, hangupError
   const initializer = createVoiceV2ProductionInitializer({
     env: { ENABLE_VOICE_V2_ROUTE: "true", VOICE_V2_TEST_BUSINESS_ID: BUSINESS_ID, OPENAI_API_KEY: "offline", OPENAI_MODEL: "offline", TWILIO_ACCOUNT_SID: "offline", TWILIO_AUTH_TOKEN: "offline", TWILIO_PHONE_NUMBER: "+12602523232" },
     WebSocketClass: class extends FakeSocket { constructor() { super(); openai = this; } },
+    speechAdapter: false,
     twilioFactory: () => ({
       messages: { create: async () => { throw new Error("provider_not_expected"); } },
       calls: (providerCallSid) => ({

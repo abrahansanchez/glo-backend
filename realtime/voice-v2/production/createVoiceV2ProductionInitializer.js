@@ -3,6 +3,7 @@ import twilio from "twilio";
 import Barber from "../../../models/Barber.js";
 import { resolveBusinessByCalledNumber as resolveBusiness } from "../../../services/business/resolveBusinessByCalledNumber.js";
 import { SharedSmsAdapter } from "../adapters/SharedSmsAdapter.js";
+import { OpenAISpeechAdapter } from "../adapters/OpenAISpeechAdapter.js";
 import { TwilioCallControlAdapter } from "../adapters/TwilioCallControlAdapter.js";
 import { prepareVoiceV2SessionStart } from "../application/prepareVoiceV2SessionStart.js";
 import { initializeVoiceV2Session } from "../initializeVoiceV2Session.js";
@@ -18,6 +19,7 @@ export function createVoiceV2ProductionInitializer({
   twilioFactory = twilio,
   findBarberById = (barberId) => Barber.findById(barberId).lean(),
   smsServiceDependencies = {},
+  speechAdapter,
   emit = (event) => console.log(event),
 } = {}) {
   const approvedBusinessId = String(env.VOICE_V2_TEST_BUSINESS_ID || "").trim();
@@ -51,7 +53,7 @@ export function createVoiceV2ProductionInitializer({
         emit({ event: "V2_START_RECEIVED", callSid: identity.callSid, streamSid: identity.streamSid });
         if (env.ENABLE_VOICE_V2_ROUTE !== "true" || !isValidVoiceV2BusinessId(approvedBusinessId)) return rejectStart("MIGRATION_SELECTOR_DISABLED");
         try {
-          const dependencies = productionDependencies({ env, WebSocketClass, twilioFactory, findBarberById, smsServiceDependencies });
+          const dependencies = productionDependencies({ env, WebSocketClass, twilioFactory, findBarberById, smsServiceDependencies, speechAdapter });
           const prepared = await prepareVoiceV2SessionStart({
             calledNumber: identity.calledNumber,
             resolveBusinessByCalledNumber,
@@ -66,6 +68,7 @@ export function createVoiceV2ProductionInitializer({
                 callSid: identity.callSid, callerNumber: identity.callerNumber, businessContext, buildSha,
                 twilioSocket: socket, openaiSocketFactory: dependencies.openaiSocketFactory,
                 smsAdapter: dependencies.smsAdapter,
+                speechAdapter: dependencies.speechAdapter,
                 callControlAdapter: dependencies.callControlAdapter,
                 openaiSession: { ...dependencies.openaiSession, instructions: buildBusinessSessionInstructions(businessContext) },
                 turnContext: Object.freeze({ availableServices: buildServiceCatalogue(businessContext.services) }),
@@ -101,7 +104,7 @@ function startIdentity(message) {
 }
 function sameIdentity(a, b) { return ["callSid", "streamSid", "calledNumber", "callerNumber"].every((key) => a[key] === b[key]); }
 
-function productionDependencies({ env, WebSocketClass, twilioFactory, findBarberById, smsServiceDependencies }) {
+function productionDependencies({ env, WebSocketClass, twilioFactory, findBarberById, smsServiceDependencies, speechAdapter }) {
   const required = ["OPENAI_API_KEY", "OPENAI_MODEL", "TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN"];
   for (const name of required) if (!env[name]) throw Object.assign(new Error(`missing_${name}`), { code: "PROVIDER_CONFIG_MISSING" });
   const fromNumber = env.TWILIO_PHONE_NUMBER || env.GLO_ROUTING_NUMBER;
@@ -110,6 +113,11 @@ function productionDependencies({ env, WebSocketClass, twilioFactory, findBarber
   return {
     openaiSocketFactory: () => new WebSocketClass(`wss://api.openai.com/v1/realtime?model=${encodeURIComponent(env.OPENAI_MODEL)}`, { headers: { Authorization: `Bearer ${env.OPENAI_API_KEY}` } }),
     openaiSession: { model: env.OPENAI_MODEL, voice: "alloy", input_audio_transcription: { model: "gpt-4o-mini-transcribe" } },
+    speechAdapter: speechAdapter === undefined ? new OpenAISpeechAdapter({
+      apiKey: env.OPENAI_API_KEY,
+      model: env.OPENAI_TTS_MODEL || "gpt-4o-mini-tts",
+      voice: env.OPENAI_TTS_VOICE || "alloy",
+    }) : speechAdapter,
     smsAdapter: new SharedSmsAdapter({ dependencies: { ...smsServiceDependencies, fromNumber, messagingClient, findBarberById } }),
     callControlAdapter: new TwilioCallControlAdapter({ client: messagingClient }),
   };

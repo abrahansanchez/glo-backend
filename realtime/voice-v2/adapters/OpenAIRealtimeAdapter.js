@@ -129,14 +129,15 @@ export class OpenAIRealtimeAdapter {
 
   #done(message, identity) {
     const responseId = message.response?.id || message.response_id; const record = this.#responses.get(responseId); const status = message.response?.status || message.status;
+    const completion = summarizeProviderResponse(message.response, status);
     if (!record || record.stale) {
       if (record?.stale && status === "cancelled") this.#publish(TransportEvent.RESPONSE_CANCELLED, { ...identity, responseId, requestId: record.requestId });
       return this.#publish(TransportEvent.STALE_RESPONSE_EVENT_QUARANTINED, { ...identity, responseId, requestId: record?.requestId || null, originalType: message.type });
     }
     if (this.#activeRequestId === record.requestId) this.#activeRequestId = null; record.status = status;
-    if (status === "cancelled") return this.#publish(TransportEvent.RESPONSE_CANCELLED, { ...identity, responseId, requestId: record.requestId });
-    if (status === "completed") return this.#publish(TransportEvent.RESPONSE_COMPLETED, { ...identity, responseId, requestId: record.requestId });
-    return this.#publish(TransportEvent.RESPONSE_FAILED, { ...identity, responseId, requestId: record.requestId, status, error: normalizeError(message.response?.status_details?.error) });
+    if (status === "cancelled") return this.#publish(TransportEvent.RESPONSE_CANCELLED, { ...identity, responseId, requestId: record.requestId, ...completion });
+    if (status === "completed") return this.#publish(TransportEvent.RESPONSE_COMPLETED, { ...identity, responseId, requestId: record.requestId, ...completion });
+    return this.#publish(TransportEvent.RESPONSE_FAILED, { ...identity, responseId, requestId: record.requestId, ...completion, status, error: normalizeError(message.response?.status_details?.error) });
   }
 
   #providerError(message, identity) {
@@ -165,3 +166,35 @@ function isTranscriptFailed(type) { return ["conversation.item.input_audio_trans
 function normalizeError(error) { return Object.freeze({ code: error?.code || null, name: error?.name || "Error", message: error?.message || String(error || "unknown_error") }); }
 function normalizeProviderError(error) { return Object.freeze({ code: safeString(error?.code), name: safeString(error?.type || error?.name) || "ProviderError" }); }
 function safeString(value) { return typeof value === "string" && value.trim() ? value.trim() : null; }
+
+function summarizeProviderResponse(response, status) {
+  const output = Array.isArray(response?.output) ? response.output : [];
+  const types = new Set(); let transcriptPresent = false; let audioPresent = false;
+  for (const item of output) {
+    addProviderType(types, item?.type);
+    for (const content of Array.isArray(item?.content) ? item.content : []) {
+      addProviderType(types, content?.type);
+      if (typeof content?.transcript === "string" && content.transcript.trim()) transcriptPresent = true;
+      if (typeof content?.text === "string" && content.text.trim()) transcriptPresent = true;
+      if (content?.type === "audio" || (typeof content?.audio === "string" && content.audio.length > 0)) audioPresent = true;
+    }
+  }
+  return Object.freeze({
+    providerStatus: safeProviderType(status),
+    providerOutputPresent: Array.isArray(response?.output),
+    providerOutputCount: output.length,
+    providerOutputTypes: Object.freeze([...types]),
+    providerTranscriptPresent: transcriptPresent,
+    providerAudioPresent: audioPresent,
+  });
+}
+
+function addProviderType(types, value) {
+  const safe = safeProviderType(value);
+  if (safe && types.size < 8) types.add(safe);
+}
+function safeProviderType(value) {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim().toLowerCase();
+  return /^[a-z0-9._-]{1,64}$/.test(normalized) ? normalized : null;
+}

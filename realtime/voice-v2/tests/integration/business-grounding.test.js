@@ -19,6 +19,7 @@ async function fixture(t, { services = [{ name: 'Haircut', price: 25, durationMi
     env: { ENABLE_VOICE_V2_ROUTE: 'true', VOICE_V2_TEST_BUSINESS_ID: businessId, OPENAI_API_KEY: 'fake', OPENAI_MODEL: 'unchanged-model', TWILIO_ACCOUNT_SID: 'fake', TWILIO_AUTH_TOKEN: 'fake', TWILIO_PHONE_NUMBER: '+15550000001' },
     WebSocketClass: class extends FakeSocket { constructor() { super(); openai = this; } },
     twilioFactory: () => ({ messages: { create: async () => { throw new Error('unexpected_provider'); } } }),
+    speechAdapter: false,
     resolveBusinessByCalledNumber: (number) => resolveBusinessByCalledNumber(number, { findOneFn: () => ({ sort: () => ({ lean: async () => ({ _id: businessId, name: businessName, services, availability: { timezone: zone } }) }) }) }),
     initializeSession: (args) => { wired = args; return initializeVoiceV2Session({ ...args,
       now: () => new Date('2026-09-11T02:00:00Z'),

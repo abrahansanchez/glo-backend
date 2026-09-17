@@ -67,8 +67,9 @@ export function validateSpeech(plan, transcript) {
 
 function validateApplicationOwnedConfirmation(plan, transcript) {
   if (typeof transcript !== "string" || !transcript.trim()) return invalid("missing_transcript");
-  const valid = normalize(transcript) === normalize(plan.speechContract.requiredMessage);
-  if (!valid) return invalid("application_owned_confirmation_mismatch");
+  const actual = normalize(transcript); const required = normalize(plan.speechContract.requiredMessage);
+  const valid = actual === required;
+  if (!valid) return Object.freeze({ ...invalid("application_owned_confirmation_mismatch"), mismatchCategory: classifyExactSpeechMismatch(required, actual) });
   return Object.freeze({
     ...invalid(null),
     valid: true,
@@ -80,6 +81,19 @@ function validateApplicationOwnedConfirmation(plan, transcript) {
     confirmationQuestionDetected: true,
     generatedSignals: Object.freeze({ source: "application_owned_required_message" }),
   });
+}
+
+function classifyExactSpeechMismatch(required, actual) {
+  const expected = required.split(" ").filter(Boolean); const observed = actual.split(" ").filter(Boolean);
+  if (actual.endsWith(required)) return "extra_prefix";
+  if (actual.startsWith(required)) return "extra_suffix";
+  if (required.endsWith(actual)) return "missing_prefix";
+  if (required.startsWith(actual)) return "missing_suffix";
+  const differences = Math.max(expected.length, observed.length) - expected.filter((word, index) => word === observed[index]).length;
+  if (expected.length === observed.length && differences === 1) return "word_substitution";
+  if (observed.length === expected.length + 1) return "word_insertion";
+  if (expected.length === observed.length + 1) return "word_omission";
+  return "multiple_differences";
 }
 
 function validateOrdinarySpeech(plan, transcript) {

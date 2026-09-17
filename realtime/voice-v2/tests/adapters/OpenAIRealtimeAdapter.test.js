@@ -65,6 +65,35 @@ test("normalizes response identity, audio, transcript, success, failure, cancell
   state.socket.receive({ type: "error", error: { code: "provider", message: "oops" } }); assert.equal(state.events.at(-1).type, "OPENAI_TRANSPORT_ERROR");
 });
 
+test("response completion exports bounded output metadata without speech content", () => {
+  const state = setup(); create(state); created(state);
+  state.socket.receive({
+    type: "response.done", event_id: "done-private",
+    response: {
+      id: "resp-1", status: "completed",
+      output: [{ id: "private-item", type: "message", content: [{ type: "audio", transcript: "Private caller name and confirmation text" }] }],
+    },
+  });
+  const event = state.events.at(-1);
+  assert.equal(event.type, "RESPONSE_COMPLETED");
+  assert.equal(event.providerStatus, "completed");
+  assert.equal(event.providerOutputPresent, true);
+  assert.equal(event.providerOutputCount, 1);
+  assert.deepEqual(event.providerOutputTypes, ["message", "audio"]);
+  assert.equal(event.providerTranscriptPresent, true);
+  assert.equal(event.providerAudioPresent, true);
+  assert.doesNotMatch(JSON.stringify(event), /Private caller|confirmation text|private-item/);
+
+  create(state, "local-empty", "create-empty"); created(state, "local-empty", "resp-empty");
+  state.socket.receive({ type: "response.done", response: { id: "resp-empty", status: "completed", output: [] } });
+  const empty = state.events.at(-1);
+  assert.equal(empty.providerOutputPresent, true);
+  assert.equal(empty.providerOutputCount, 0);
+  assert.deepEqual(empty.providerOutputTypes, []);
+  assert.equal(empty.providerTranscriptPresent, false);
+  assert.equal(empty.providerAudioPresent, false);
+});
+
 test("one active response fails closed until locally superseded", () => {
   const state = setup(); assert.equal(create(state).accepted, true);
   const rejected = create(state, "local-2", "create-2"); assert.equal(rejected.accepted, false); assert.equal(rejected.reason, "LOCAL_ACTIVE_RESPONSE");

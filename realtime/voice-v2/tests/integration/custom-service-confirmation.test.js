@@ -212,6 +212,7 @@ async function fixture(t, { services }) {
       TWILIO_PHONE_NUMBER: "+15550000001",
     },
     WebSocketClass: class extends FakeSocket { constructor() { super(); openai = this; } },
+    speechAdapter: false,
     twilioFactory: () => ({ messages: { create: async () => ({ sid: "SM-fake" }) } }),
     resolveBusinessByCalledNumber: (number) => resolveBusinessByCalledNumber(number, {
       findOneFn: () => ({ sort: () => ({ lean: async () => barber }) }),

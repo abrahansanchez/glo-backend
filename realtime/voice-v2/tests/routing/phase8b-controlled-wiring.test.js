@@ -110,7 +110,7 @@ test("production startup composes the real V2 lifecycle through its real SharedS
   const twilioSocket = new ProviderSocketBase();
   const proposal = createBookingProposal({ proposalId: "phase8b", service: "Haircut", name: "Roberto", date: "2026-08-27", time: "10:00", availability: { proposalVersion: 1, slotKey: deriveSlotKey({ service: "Haircut", date: "2026-08-27", time: "10:00" }), status: "available", alternatives: [] } });
   const initialize = createVoiceV2ProductionInitializer({
-    env, WebSocketClass: ProviderSocket, twilioFactory: () => ({ messages: { create: async (payload) => { providerSubmissions.push(payload); return { sid: "SM-provider", status: "queued" }; } } }), resolveBusinessByCalledNumber: async () => context(APPROVED), findBarberById: async () => ({ name: "Test Barber" }), emit: () => {}, smsServiceDependencies: { deliveryStore },
+    env, WebSocketClass: ProviderSocket, speechAdapter: false, twilioFactory: () => ({ messages: { create: async (payload) => { providerSubmissions.push(payload); return { sid: "SM-provider", status: "queued" }; } } }), resolveBusinessByCalledNumber: async () => context(APPROVED), findBarberById: async () => ({ name: "Test Barber" }), emit: () => {}, smsServiceDependencies: { deliveryStore },
     initializeSession: (args) => initializeVoiceV2Session({ ...args, proposal,
       bookingAdapter: { createAppointment: async (command) => { booking.push(command); return { success: true, appointmentId: "appt-1" }; } },
       transcriptAdapter: { appendTurn: async () => ({ success: true }), finalizeCall: async (result) => { finalized.push(result); return { success: true }; } },

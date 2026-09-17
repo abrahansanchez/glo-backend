@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { initializeVoiceV2Session } from "../../initializeVoiceV2Session.js";
 import { createBookingProposal, deriveSlotKey } from "../../domain/BookingProposal.js";
+import { planResponse, ResponsePurpose } from "../../planning/ResponsePlanner.js";
 import { FakeSocket } from "../helpers/FakeSocket.js";
 
 const BUSINESS = Object.freeze({ businessId: "business-observe", barberId: "barber-observe", businessName: "Observed Shop", timeZone: "America/New_York" });
@@ -148,6 +149,69 @@ test("every affirmative exports a compact authority, reducer and booking-queue d
   assert.equal(Object.hasOwn(decision, "name"), false);
   assert.equal(Object.hasOwn(decision, "service"), false);
   assert.equal(Object.hasOwn(decision, "callerNumber"), false);
+});
+
+test("confirmation diagnostics distinguish altered output from an explicitly empty provider retry without logging speech", async () => {
+  const facts = { service: "Haircut", date: "2026-09-19", time: "10:30" };
+  const proposal = createBookingProposal({
+    proposalId: "diagnostic-confirmation", proposalVersion: 5, ...facts, name: "Abraham",
+    availability: { proposalVersion: 5, slotKey: deriveSlotKey(facts), status: "available" },
+  });
+  const f = fixture("CA-observe-empty-retry", { proposal }); await startAndConfigure(f);
+  const greeting = f.openai.sent.find((message) => message.type === "response.create");
+  f.openai.receive({ type: "response.created", response: { id: "diagnostic-greeting", metadata: { v2RequestId: greeting.response.metadata.v2RequestId } } });
+  f.openai.receive({ type: "response.output_audio.delta", response_id: "diagnostic-greeting", delta: "AQID" });
+  f.openai.receive({ type: "response.output_audio_transcript.done", response_id: "diagnostic-greeting", transcript: "Welcome." });
+  f.openai.receive({ type: "response.done", response: { id: "diagnostic-greeting", status: "completed", output: [{ type: "message", content: [{ type: "audio", transcript: "Welcome." }] }] } });
+  await settle(f.app);
+  const greetingMark = f.twilio.sent.find((message) => message.event === "mark").mark.name;
+  f.twilio.receive({ event: "mark", streamSid: "MZ-observe", mark: { name: greetingMark } }); await settle(f.app);
+
+  await f.app.requestResponse(planResponse({ proposal: f.app.session.proposal, purpose: ResponsePurpose.PRE_BOOKING_CONFIRMATION, language: "en" }));
+  let create = f.openai.sent.filter((message) => message.type === "response.create").at(-1);
+  const required = JSON.parse(create.response.instructions).speechContract.requiredMessage;
+  const altered = `Thank you, Abraham. ${required}`;
+  f.openai.receive({ type: "response.created", response: { id: "confirmation-altered", metadata: { v2RequestId: create.response.metadata.v2RequestId } } });
+  f.openai.receive({ type: "response.output_audio.delta", response_id: "confirmation-altered", item_id: "altered-item", delta: "AQID" });
+  f.openai.receive({ type: "response.output_audio.done", response_id: "confirmation-altered", item_id: "altered-item" });
+  f.openai.receive({ type: "response.output_audio_transcript.done", response_id: "confirmation-altered", item_id: "altered-item", transcript: altered });
+  f.openai.receive({ type: "response.done", response: { id: "confirmation-altered", status: "completed", output: [{ type: "message", content: [{ type: "audio", transcript: altered }] }] } });
+  await settle(f.app);
+
+  create = f.openai.sent.filter((message) => message.type === "response.create").at(-1);
+  assert.equal(create.response.metadata.purpose, ResponsePurpose.PRE_BOOKING_CONFIRMATION);
+  f.openai.receive({ type: "response.created", response: { id: "confirmation-empty", metadata: { v2RequestId: create.response.metadata.v2RequestId } } });
+  f.openai.receive({ type: "response.done", response: { id: "confirmation-empty", status: "completed", output: [] } });
+  await settle(f.app);
+
+  const traces = traceEvents(f.logs);
+  const alteredValidation = traces.find((entry) => entry.traceEvent === "SPEECH_VALIDATED" && entry.responseId === "confirmation-altered");
+  assert.equal(alteredValidation.valid, false);
+  assert.equal(alteredValidation.reason, "application_owned_confirmation_mismatch");
+  assert.equal(alteredValidation.mismatchCategory, "extra_prefix");
+  assert.equal(alteredValidation.transcriptEventReceived, true);
+  assert.equal(alteredValidation.transcriptPresent, true);
+  assert.equal(alteredValidation.audioCompletedEventReceived, true);
+  assert.equal(alteredValidation.audioPresent, true);
+  assert.equal(alteredValidation.providerOutputCount, 1);
+  assert.deepEqual(alteredValidation.providerOutputTypes, ["message", "audio"]);
+
+  const emptyCompletion = traces.find((entry) => entry.traceEvent === "RESPONSE_COMPLETED" && entry.responseId === "confirmation-empty" && entry.outcome === "PROVIDER_COMPLETED");
+  assert.equal(emptyCompletion.providerStatus, "completed");
+  assert.equal(emptyCompletion.providerOutputPresent, true);
+  assert.equal(emptyCompletion.providerOutputCount, 0);
+  assert.deepEqual(emptyCompletion.providerOutputTypes, []);
+  assert.equal(emptyCompletion.providerTranscriptPresent, false);
+  assert.equal(emptyCompletion.providerAudioPresent, false);
+  assert.equal(emptyCompletion.transcriptEventReceived, false);
+  assert.equal(emptyCompletion.transcriptPresent, false);
+  assert.equal(emptyCompletion.audioCompletedEventReceived, false);
+  assert.equal(emptyCompletion.audioPresent, false);
+  const emptyValidation = traces.find((entry) => entry.traceEvent === "SPEECH_VALIDATED" && entry.responseId === "confirmation-empty");
+  assert.equal(emptyValidation.reason, "missing_transcript");
+  assert.equal(emptyValidation.mismatchCategory, "missing_transcript");
+  assert.doesNotMatch(JSON.stringify(traces.filter((entry) => ["confirmation-altered", "confirmation-empty"].includes(entry.responseId))), /Abraham|Haircut|September|Thank you/);
+  await f.app.terminate("TEST_COMPLETE");
 });
 
 test("concurrent calls keep independent sequences, counters and summaries", async () => {
