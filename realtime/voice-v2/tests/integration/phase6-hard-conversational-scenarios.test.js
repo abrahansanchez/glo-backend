@@ -425,13 +425,16 @@ function finishResponse(f, responseId, responseTranscript) {
   f.openai.receive({ type: "response.output_audio_transcript.done", response_id: responseId, transcript: responseTranscript });
   f.openai.receive({ type: "response.done", response: { id: responseId, status: "completed" } });
 }
-async function completeConfirmation(f, { acknowledge: shouldAcknowledge = true, transcript: text = safeConfirmation() } = {}) {
-  const responseId = await beginConfirmation(f); finishResponse(f, responseId, text); await settle(f.app);
+async function completeConfirmation(f, { acknowledge: shouldAcknowledge = true, transcript: text } = {}) {
+  const responseId = await beginConfirmation(f);
+  const create = lastCreate(f, ResponsePurpose.PRE_BOOKING_CONFIRMATION);
+  const requiredMessage = JSON.parse(create.response.instructions).speechContract.requiredMessage;
+  finishResponse(f, responseId, text ?? requiredMessage); await settle(f.app);
   const markId = f.twilio.sent.filter((x) => x.event === "mark").at(-1)?.mark?.name; assert.ok(markId, "confirmation mark required");
   if (shouldAcknowledge) { acknowledge(f, markId); await settle(f.app); }
   return { responseId, markId };
 }
-async function grantLatestConfirmation(f, text = safeConfirmation()) { return completeConfirmation(f, { acknowledge: true, transcript: text }); }
+async function grantLatestConfirmation(f, _legacyText = safeConfirmation()) { return completeConfirmation(f, { acknowledge: true }); }
 function acknowledge(f, markId) { f.twilio.receive({ event: "mark", streamSid: "MZ1", mark: { name: markId } }); }
 async function deliverTerminal(f, purpose, text) {
   const create = lastCreate(f, purpose); assert.ok(create, `${purpose} response required`); const responseId = `resp:terminal:${purpose}`;

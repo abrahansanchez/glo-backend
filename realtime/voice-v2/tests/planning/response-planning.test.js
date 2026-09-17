@@ -119,6 +119,26 @@ test("every eligible application-owned collection reprompt has fixed validated E
   }
 });
 
+test("the eligible pre-booking safe retry renders a fixed validated English and Spanish confirmation", () => {
+  const complete = createBookingProposal({
+    proposalId: "safe-confirmation-retry", proposalVersion: 4,
+    service: "Haircut", date: "2026-09-18", time: "15:00", name: "Roberto",
+  });
+  for (const language of ["en", "es"]) {
+    const plan = planSafeCollectionReprompt({
+      proposal: complete, purpose: ResponsePurpose.PRE_BOOKING_CONFIRMATION, language,
+    });
+    assert.equal(plan.speechContract.applicationOwnedConfirmation, true, language);
+    assert.ok(plan.speechContract.requiredMessage, language);
+    assert.equal(validateSpeech(plan, plan.speechContract.requiredMessage).valid, true, language);
+    assert.equal(
+      validateSpeech(plan, plan.speechContract.requiredMessage.replace(language === "es" ? "Tengo" : "I have", language === "es" ? "Confirmo" : "I confirm")).failedInvariant,
+      "application_owned_confirmation_mismatch",
+      language,
+    );
+  }
+});
+
 test("terminal recovery accepts safe localized rewording but rejects questions and booking-status claims", () => {
   const english = planTerminalResponseRecovery({ proposal, language: "en" });
   const spanish = planTerminalResponseRecovery({ proposal, language: "es" });

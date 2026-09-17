@@ -1,4 +1,5 @@
 import { deriveBookingRequirement, deriveSlotKey, AvailabilityStatus } from "../domain/BookingProposal.js";
+import { renderPreBookingConfirmation } from "./renderPreBookingConfirmation.js";
 
 export const ResponsePurpose = Object.freeze({
   INITIAL_GREETING: "INITIAL_GREETING",
@@ -89,16 +90,16 @@ export function bindServiceValidationContext(plan, availableServices = [], { ref
   const temporalContext = /^\d{4}-\d{2}-\d{2}$/.test(referenceDate || "")
     ? { referenceDate, ...(timeZone ? { timeZone } : {}) }
     : {};
-  // Legacy/manual compositions that supply no catalogue or temporal context
-  // keep the existing validator vocabulary and behavior.
-  if (!services.length && !temporalContext.referenceDate) return plan;
-  return Object.freeze({
+  // Catalogue and temporal context remain optional for legacy/manual plans;
+  // production still binds the application-owned confirmation text below.
+  const contextualPlan = !services.length && !temporalContext.referenceDate ? plan : Object.freeze({
     ...plan,
     validationContext: Object.freeze({
       ...(services.length ? { availableServices: services } : {}),
       ...temporalContext,
     }),
   });
+  return withApplicationOwnedConfirmation(contextualPlan);
 }
 
 // A refused affirmative supplies no booking facts or authority. Only current
@@ -118,6 +119,7 @@ export function planAuthorityRefusalContinuation({ proposal, turnId, language })
 
 export function planSafeCollectionReprompt({ proposal, purpose, language = "en" }) {
   const plan = planResponse({ proposal, purpose, language });
+  if (purpose === ResponsePurpose.PRE_BOOKING_CONFIRMATION) return withApplicationOwnedConfirmation(plan);
   const messages = {
     ASK_TIME: {
       en: "What time would you like?",
@@ -140,6 +142,19 @@ export function planSafeCollectionReprompt({ proposal, purpose, language = "en" 
       ...plan.speechContract,
       applicationOwnedReprompt: true,
       requiredMessage: message,
+      instruction: "Speak the required message exactly. Do not add, omit, or paraphrase any words.",
+    }),
+  });
+}
+
+function withApplicationOwnedConfirmation(plan) {
+  const requiredMessage = renderPreBookingConfirmation(plan.expectedFacts, plan.language);
+  return Object.freeze({
+    ...plan,
+    speechContract: Object.freeze({
+      ...plan.speechContract,
+      applicationOwnedConfirmation: true,
+      requiredMessage,
       instruction: "Speak the required message exactly. Do not add, omit, or paraphrase any words.",
     }),
   });

@@ -22,6 +22,7 @@ async function fixture({ name = null, available = true } = {}) {
  const creates=()=>openai.sent.filter(e=>e.type==='response.create');
  async function complete(text='What name should I use?',status='completed') {
   const c=creates().at(-1), id=`r${++sequence}`;
+  if(c.response.metadata.purpose==='PRE_BOOKING_CONFIRMATION') text=JSON.parse(c.response.instructions).speechContract.requiredMessage;
   openai.receive({type:'response.created',response:{id,metadata:c.response.metadata}});
   if(status==='completed') {
    openai.receive({type:'response.output_audio.delta',response_id:id,delta:'AQID'});
@@ -125,6 +126,13 @@ test('A/B: invalid full confirmation releases no critical audio and authorizes n
  f.openai.receive({type:'response.output_audio_transcript.done',response_id:'invalid',transcript:'Wrong name, Haircut on Thursday at 3:00 PM. Should I book it?'});
  f.openai.receive({type:'response.done',response:{id:'invalid',status:'completed'}});await settle(f.app);
  assert.equal(f.twilio.sent.filter(e=>e.event==='media').length,before);
+ assert.equal(f.writes(),0);assert.equal(f.creates().at(-1).response.metadata.purpose,'PRE_BOOKING_CONFIRMATION');
+ const retry=f.creates().at(-1);
+ f.openai.receive({type:'response.created',response:{id:'invalid-retry',metadata:retry.response.metadata}});
+ f.openai.receive({type:'response.output_audio.delta',response_id:'invalid-retry',delta:'AQID'});
+ f.openai.receive({type:'response.output_audio_transcript.done',response_id:'invalid-retry',transcript:'Wrong name, Haircut on Thursday at 3:00 PM. Should I book it?'});
+ f.openai.receive({type:'response.done',response:{id:'invalid-retry',status:'completed'}});await settle(f.app);
+ assert.equal(f.twilio.sent.filter(e=>e.event==='media').length,before);
  assert.equal(f.writes(),0);assert.equal(f.creates().at(-1).response.metadata.purpose,'ERROR_RECOVERY');
  await f.app.terminate('TEST_END');
 });
@@ -133,7 +141,7 @@ test('A: valid generated full confirmation without mark acknowledgement cannot a
  const f=await fixture({name:'Roberto'});await f.turn('yes',1);const c=f.creates().at(-1);
  f.openai.receive({type:'response.created',response:{id:'unheard',metadata:c.response.metadata}});
  f.openai.receive({type:'response.output_audio.delta',response_id:'unheard',delta:'AQID'});
- f.openai.receive({type:'response.output_audio_transcript.done',response_id:'unheard',transcript:'Roberto, Haircut on Thursday at 2:00 PM. Should I book it?'});
+ f.openai.receive({type:'response.output_audio_transcript.done',response_id:'unheard',transcript:JSON.parse(c.response.instructions).speechContract.requiredMessage});
  f.openai.receive({type:'response.done',response:{id:'unheard',status:'completed'}});await settle(f.app);
  assert.equal(f.app.session.responseRegistry.get('unheard').validationResult.valid,true);
  const oldMark=f.twilio.sent.filter(e=>e.event==='mark').at(-1);

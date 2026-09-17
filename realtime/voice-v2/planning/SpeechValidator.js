@@ -18,6 +18,7 @@ const MONTHS = Object.freeze({
 });
 
 export function validateSpeech(plan, transcript) {
+  if (plan?.speechContract?.applicationOwnedConfirmation === true) return validateApplicationOwnedConfirmation(plan, transcript);
   if (plan?.speechContract?.applicationOwnedReprompt === true) return validateApplicationOwnedReprompt(plan, transcript);
   if (plan?.speechContract?.terminalRecovery === true) return validateTerminalRecovery(plan, transcript);
   if (plan?.deliveryValidationRequired && plan?.purpose !== "PRE_BOOKING_CONFIRMATION") return validateOrdinarySpeech(plan, transcript);
@@ -62,6 +63,23 @@ export function validateSpeech(plan, transcript) {
   result.failedInvariant = firstFailure(result);
   result.valid = result.failedInvariant === null;
   return Object.freeze(result);
+}
+
+function validateApplicationOwnedConfirmation(plan, transcript) {
+  if (typeof transcript !== "string" || !transcript.trim()) return invalid("missing_transcript");
+  const valid = normalize(transcript) === normalize(plan.speechContract.requiredMessage);
+  if (!valid) return invalid("application_owned_confirmation_mismatch");
+  return Object.freeze({
+    ...invalid(null),
+    valid: true,
+    failedInvariant: null,
+    nameMatched: true,
+    serviceMatched: true,
+    dateMatched: true,
+    timeMatched: true,
+    confirmationQuestionDetected: true,
+    generatedSignals: Object.freeze({ source: "application_owned_required_message" }),
+  });
 }
 
 function validateOrdinarySpeech(plan, transcript) {

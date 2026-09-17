@@ -124,7 +124,7 @@ test("production startup composes the real V2 lifecycle through its real SharedS
   const confirmationCreate = lastCreate(openai); const confirmationRequestId = confirmationCreate.response.metadata.v2RequestId;
   openai.receive({ type: "response.created", response: { id: "confirm", metadata: { v2RequestId: confirmationRequestId } } });
   openai.receive({ type: "response.output_audio.delta", response_id: "confirm", delta: "AQID" });
-  openai.receive({ type: "response.output_audio_transcript.done", response_id: "confirm", transcript: "Roberto, should I confirm your Haircut for Thursday at 10:00 AM?" });
+  openai.receive({ type: "response.output_audio_transcript.done", response_id: "confirm", transcript: JSON.parse(confirmationCreate.response.instructions).speechContract.requiredMessage });
   openai.receive({ type: "response.done", response: { id: "confirm", status: "completed" } }); await settle(app);
   const confirmationMark = twilioSocket.sent.find((item) => item.event === "mark"); twilioSocket.receive({ event: "mark", streamSid: "MZ1", mark: { name: confirmationMark.mark.name } }); await settle(app);
   openai.receive({ type: "conversation.item.input_audio_transcription.completed", event_id: "evt-yes", item_id: "item-yes", transcript: "yes" }); await settle(app);

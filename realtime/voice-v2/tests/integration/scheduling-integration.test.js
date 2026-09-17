@@ -812,6 +812,9 @@ function transcriptEvent(id, transcript) { return { type: "conversation.item.inp
 async function deliverLastResponse(f, transcript) {
   const create = lastCreate(f.openai);
   if (!create) return;
+  if (create.response.metadata.purpose === ResponsePurpose.PRE_BOOKING_CONFIRMATION) {
+    transcript = JSON.parse(create.response.instructions).speechContract.requiredMessage;
+  }
   const requestId = create.response.metadata.v2RequestId;
   const responseId = `response-${requestId}`;
   f.openai.receive({ type: "response.created", response: { id: responseId, metadata: { v2RequestId: requestId } } });

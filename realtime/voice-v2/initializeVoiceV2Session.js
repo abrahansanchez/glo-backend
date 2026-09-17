@@ -22,9 +22,11 @@ const BOOKING_SETTLEMENT_DEADLINE_MS = 20000;
 const BOOKING_RECONCILIATION_DEADLINE_MS = 20000;
 const SAFE_REPROMPT_PURPOSES = new Set([
   ResponsePurpose.ASK_TIME, ResponsePurpose.ASK_NAME, ResponsePurpose.CLARIFICATION,
+  ResponsePurpose.PRE_BOOKING_CONFIRMATION,
 ]);
 const SAFE_REPROMPT_FAILURES = new Set([
   "unsupported_time_claim", "unsupported_availability_operation_claim", "unsupported_availability_result_claim",
+  "application_owned_confirmation_mismatch",
 ]);
 
 export function initializeVoiceV2Session({
@@ -700,6 +702,7 @@ export function initializeVoiceV2Session({
         remainingPlaybackCount: activePlaybacks,
       });
     } else if ([
+      "AFFIRMATIVE_DECISION",
       "CALL_LEG_TERMINATION_REQUESTED",
       "CALL_LEG_TERMINATION_ADAPTER_INVOKED",
       "CALL_LEG_TERMINATION_PROVIDER_REPORTED",
@@ -708,6 +711,14 @@ export function initializeVoiceV2Session({
     ].includes(entry.event)) {
       callTrace.entry(entry.event, {
         ...common,
+        authorityDecision: entry.authorityDecision,
+        authorityAccepted: entry.authorityAccepted,
+        authorityReason: entry.authorityReason,
+        reducerRan: entry.reducerRan,
+        reducerAccepted: entry.reducerAccepted,
+        reducerReason: entry.reducerReason,
+        bookingCommandQueued: entry.bookingCommandQueued,
+        bookingCommandId: entry.bookingCommandId,
         invoked: entry.invoked,
         providerSubmissionConfirmed: entry.providerSubmissionConfirmed,
         providerReportedCompleted: entry.providerReportedCompleted,

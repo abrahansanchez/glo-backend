@@ -262,7 +262,8 @@ async function fixture({ proposal = completeProposal(), bookingAdapter = { creat
 
 async function authorizeBooking(f) {
   await f.app.requestResponse(planResponse({ proposal: f.app.session.proposal, purpose: ResponsePurpose.PRE_BOOKING_CONFIRMATION }));
-  await deliverLastResponse(f, "Roberto, should I confirm your Haircut for Thursday at 10:00 AM?");
+  const confirmation = creates(f.openai).at(-1);
+  await deliverLastResponse(f, JSON.parse(confirmation.response.instructions).speechContract.requiredMessage);
   f.openai.receive({ type: "conversation.item.input_audio_transcription.completed", item_id: "affirm", transcript: "yes" });
   await waitFor(() => f.app.session.journal().some((entry) => entry.event === "CREATE_APPOINTMENT_QUEUED"));
 }

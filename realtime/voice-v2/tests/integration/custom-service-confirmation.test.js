@@ -26,7 +26,7 @@ test("production-composed Fade journey validates, waits for playback and fresh y
   assert.equal(f.lastInstructions().expectedFacts.service, "Fade");
   assert.equal(f.availabilityChecks.length, 1);
   assert.equal(f.availabilityChecks[0].durationMinutes, 45);
-  const mark = await f.complete("Roberto, should I confirm your Fade for Friday at 3:00 PM?", { acknowledge: false });
+  const mark = await f.complete(f.lastInstructions().speechContract.requiredMessage, { acknowledge: false });
   assert.ok(mark, "valid critical audio is submitted with a playback mark");
   assert.ok(f.app.session.journal().some((entry) => entry.event === "SPEECH_VALIDATED" && entry.valid === true));
   assert.equal(f.app.session.journal().filter((entry) => entry.event === "CONFIRMATION_AUTHORITY_GRANTED").length, 0);
@@ -119,7 +119,7 @@ test("unacknowledged or interrupted custom-service confirmation never grants aut
   const f = await fixture(t, { services: [{ name: "Fade", durationMinutes: 45 }] });
   await f.complete("Thanks for calling Custom Studio. How can I help?");
   await f.turn("I need a Fade tomorrow at 3 PM, my name is Roberto");
-  const mark = await f.complete("Roberto, should I confirm your Fade for Friday at 3:00 PM?", { acknowledge: false });
+  const mark = await f.complete(f.lastInstructions().speechContract.requiredMessage, { acknowledge: false });
   assert.equal(f.bookings.length, 0);
   f.openai.receive({ type: "input_audio_buffer.speech_started", item_id: "interrupt-confirmation" });
   await settle(f.app);
@@ -137,11 +137,14 @@ test("custom-service validation failure remains on the bounded terminal recovery
   const marksBefore = f.marks().length;
   await f.complete("Roberto, should I confirm your Color for Friday at 3:00 PM?", { acknowledge: false });
   assert.equal(f.marks().length, marksBefore, "failed critical speech is not delivered");
-  assert.equal(f.lastPurpose(), ResponsePurpose.ERROR_RECOVERY);
-  assert.ok(f.app.session.journal().some((entry) => entry.event === "SPEECH_VALIDATED" && entry.failedInvariant === "service_mismatch"));
+  assert.equal(f.lastPurpose(), ResponsePurpose.PRE_BOOKING_CONFIRMATION, "the first mismatch receives one safe confirmation retry");
+  assert.ok(f.app.session.journal().some((entry) => entry.event === "SPEECH_VALIDATED" && entry.failedInvariant === "application_owned_confirmation_mismatch"));
   assert.equal(f.app.session.journal().filter((entry) => entry.event === "CONFIRMATION_AUTHORITY_GRANTED").length, 0);
   assert.equal(f.bookings.length, 0);
   assert.equal(f.sms.length, 0);
+  await f.complete("Roberto, should I confirm your Color for Friday at 3:00 PM?", { acknowledge: false });
+  assert.equal(f.marks().length, marksBefore, "the exhausted retry cannot release invalid audio");
+  assert.equal(f.lastPurpose(), ResponsePurpose.ERROR_RECOVERY, "a second mismatch uses the existing bounded terminal recovery");
   await f.complete("I'm sorry, I can't continue this call. Please call again later. Goodbye.");
   assert.equal(f.app.lifecycle.terminated, true);
   assert.equal(f.twilio.closeCalls.length, 1);
@@ -271,10 +274,8 @@ function validation(services, expectedService, transcript) {
     date: "2026-10-16",
     time: "15:00",
   });
-  const plan = bindServiceValidationContext(
-    planResponse({ proposal, purpose: ResponsePurpose.PRE_BOOKING_CONFIRMATION }),
-    buildServiceCatalogue(services),
-  );
+  const basePlan = planResponse({ proposal, purpose: ResponsePurpose.PRE_BOOKING_CONFIRMATION });
+  const plan = Object.freeze({ ...basePlan, validationContext: Object.freeze({ availableServices: buildServiceCatalogue(services) }) });
   return validateSpeech(plan, transcript);
 }
 

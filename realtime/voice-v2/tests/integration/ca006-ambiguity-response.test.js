@@ -116,7 +116,7 @@ test("CA201 production composition accepts a spoken calendar date equal to the a
     type: "response.output_audio_transcript.done",
     response_id: responseId,
     item_id: `${responseId}:item`,
-    transcript: "Abraham, should I confirm your Haircut for September 16, 2026 at 09:00?",
+    transcript: JSON.parse(lastCreate(f.openai).response.instructions).speechContract.requiredMessage,
   });
   f.openai.receive({ type: "response.done", response: { id: responseId, status: "completed" } });
   await settle(f.app);

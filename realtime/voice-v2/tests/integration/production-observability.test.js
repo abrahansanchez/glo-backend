@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { initializeVoiceV2Session } from "../../initializeVoiceV2Session.js";
-import { createBookingProposal } from "../../domain/BookingProposal.js";
+import { createBookingProposal, deriveSlotKey } from "../../domain/BookingProposal.js";
 import { FakeSocket } from "../helpers/FakeSocket.js";
 
 const BUSINESS = Object.freeze({ businessId: "business-observe", barberId: "barber-observe", businessName: "Observed Shop", timeZone: "America/New_York" });
@@ -100,6 +100,54 @@ test("availability execution traces correlate command, search, proposal and boun
   assert.equal(result.commandId, started.commandId); assert.equal(result.searchId, started.searchId); assert.equal(result.proposalVersion, started.proposalVersion);
   assert.equal(result.alternativeCount, 1); assert.ok(Number.isFinite(result.durationMs));
   await f.app.terminate("TEST_COMPLETE");
+});
+
+test("every affirmative exports a compact authority, reducer and booking-queue decision", async () => {
+  const facts = { service: "Haircut", date: "2026-09-17", time: "15:00" };
+  const proposal = createBookingProposal({
+    proposalId: "affirmative-trace", proposalVersion: 1, ...facts, name: "Abe",
+    availability: { proposalVersion: 1, slotKey: deriveSlotKey(facts), status: "available" },
+  });
+  const f = fixture("CA-observe-affirmative", { proposal });
+  const responseId = "confirmation-trace"; const markId = "confirmation-mark-trace";
+  await f.app.coordinator.receiveFinalizedTurn(f.app.session, { turnId: "turn-premature-yes", transcript: "yes" }, { confirmationContext: {} });
+  const withheld = traceEvents(f.logs).find((entry) => entry.traceEvent === "AFFIRMATIVE_DECISION");
+  assert.equal(withheld.authorityDecision, "WITHHELD");
+  assert.equal(withheld.authorityAccepted, false);
+  assert.equal(withheld.authorityReason, "NO_CURRENT_CONFIRMATION");
+  assert.equal(withheld.reducerRan, false);
+  assert.equal(withheld.bookingCommandQueued, false);
+  f.app.session.responseRegistry.register({ responseId, proposalVersion: 1, purpose: "PRE_BOOKING_CONFIRMATION" });
+  f.app.session.responseRegistry.request(responseId);
+  f.app.session.responseRegistry.complete(responseId, { validationResult: { valid: true } });
+  f.app.session.playbackRegistry.register({ markId, responseId, proposalVersion: 1 });
+  f.app.session.playbackRegistry.submit(markId, 100);
+  f.app.session.playbackRegistry.acknowledge(markId);
+  f.app.session.confirmationAuthority.grant({
+    proposalVersion: 1, responseId, markId,
+    responseRegistry: f.app.session.responseRegistry, playbackRegistry: f.app.session.playbackRegistry,
+  });
+
+  await f.app.coordinator.receiveFinalizedTurn(f.app.session, { turnId: "turn-yes", transcript: "yes" }, { confirmationContext: { responseId, markId } });
+
+  const decision = traceEvents(f.logs).filter((entry) => entry.traceEvent === "AFFIRMATIVE_DECISION").at(-1);
+  assert.deepEqual({
+    callSid: decision.callSid, buildSha: decision.buildSha, turnId: decision.turnId,
+    proposalVersion: decision.proposalVersion, responseId: decision.responseId, markId: decision.markId,
+    authorityDecision: decision.authorityDecision, authorityReason: decision.authorityReason,
+    authorityAccepted: decision.authorityAccepted, reducerRan: decision.reducerRan,
+    reducerAccepted: decision.reducerAccepted, bookingCommandQueued: decision.bookingCommandQueued,
+  }, {
+    callSid: f.callSid, buildSha: "observe-build", turnId: "turn-yes",
+    proposalVersion: 1, responseId, markId,
+    authorityDecision: "ACCEPTED", authorityReason: "AUTHORIZED",
+    authorityAccepted: true, reducerRan: true, reducerAccepted: true, bookingCommandQueued: true,
+  });
+  assert.equal(decision.bookingCommandId, "authorize_booking:affirmative-trace:v1");
+  assert.equal(Object.hasOwn(decision, "transcript"), false);
+  assert.equal(Object.hasOwn(decision, "name"), false);
+  assert.equal(Object.hasOwn(decision, "service"), false);
+  assert.equal(Object.hasOwn(decision, "callerNumber"), false);
 });
 
 test("concurrent calls keep independent sequences, counters and summaries", async () => {

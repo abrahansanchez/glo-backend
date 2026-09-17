@@ -21,13 +21,18 @@ export class VoiceCoordinator {
       session.record("TURN_INTERPRETED", { turnId: turn.turnId, action: interpreted.interpretation.action, proposalVersion: session.proposal.proposalVersion });
       if (interpreted.interpretation.action === "AFFIRM_CONFIRMATION") {
         const gated = this.#synchronizeAffirmativeAuthority(session, interpreted.interpretation, context.confirmationContext);
-        if (!gated.authorized) return Object.freeze({ interpreted, reduced: authorizationRefused(session.proposal, gated.reason), authority: gated });
+        if (!gated.authorized) {
+          const reduced = authorizationRefused(session.proposal, gated.reason);
+          recordAffirmativeDecision(session, { turnId: turn.turnId, proposalVersion: session.proposal.proposalVersion, context: context.confirmationContext, authority: gated, reducerRan: false, reduced });
+          return Object.freeze({ interpreted, reduced, authority: gated });
+        }
       }
       const reductionTiming = context.timing?.start("REDUCTION", { turnId: turn.turnId });
       const previous = session.proposal; const reduced = this.reducer(previous, interpreted.interpretation);
       context.timing?.end("REDUCTION", reductionTiming, { turnId: turn.turnId });
       if (reduced.proposalChanged) { session.responseRegistry.invalidateProposal(previous.proposalVersion); session.playbackRegistry.invalidateProposal(previous.proposalVersion); session.confirmationAuthority.revokeProposal(previous.proposalVersion); session.record("CONFIRMATION_REVOKED", { proposalVersion: previous.proposalVersion, reason: "PROPOSAL_CHANGED" }); session.replaceProposal(previous, reduced.nextProposal); }
       for (const effect of reduced.effects) { const command = effect.commandId ? effect : { ...effect, commandId: `${effect.type.toLowerCase()}:${turn.turnId}` }; session.effectQueue.enqueue(command); session.record("EFFECT_QUEUED", { commandId: command.commandId, effectType: command.type, proposalVersion: command.proposalVersion ?? session.proposal.proposalVersion }); }
+      if (interpreted.interpretation.action === "AFFIRM_CONFIRMATION") recordAffirmativeDecision(session, { turnId: turn.turnId, proposalVersion: session.proposal.proposalVersion, context: context.confirmationContext, authority: { authorized: true, reason: null }, reducerRan: true, reduced });
       return Object.freeze({ interpreted, reduced });
     });
   }
@@ -85,3 +90,21 @@ export class VoiceCoordinator {
 const EFFECT_RESULT_EVENT = Object.freeze({ CHECK_AVAILABILITY: "AVAILABILITY_RESULT", AUTHORIZE_BOOKING: "BOOKING_AUTHORIZED", CREATE_APPOINTMENT: "BOOKING_SUCCEEDED", SEND_CONFIRMATION_SMS: "SMS_RESULT", FINALIZE_TRANSCRIPT: "TRANSCRIPT_FINALIZED" });
 
 function authorizationRefused(nextProposal, reason) { return Object.freeze({ nextProposal, proposalChanged: false, effects: Object.freeze([]), rejected: true, reason }); }
+
+function recordAffirmativeDecision(session, { turnId, proposalVersion, context = {}, authority, reducerRan, reduced }) {
+  const bookingCommand = reduced?.effects?.find((effect) => effect.type === "AUTHORIZE_BOOKING") || null;
+  session.record("AFFIRMATIVE_DECISION", {
+    turnId,
+    proposalVersion,
+    responseId: context?.responseId || null,
+    markId: context?.markId || null,
+    authorityDecision: authority?.authorized === true ? "ACCEPTED" : "WITHHELD",
+    authorityAccepted: authority?.authorized === true,
+    authorityReason: authority?.authorized === true ? "AUTHORIZED" : authority?.reason || "UNKNOWN",
+    reducerRan,
+    reducerAccepted: reducerRan ? reduced?.rejected !== true : false,
+    reducerReason: reduced?.reason || null,
+    bookingCommandQueued: Boolean(bookingCommand),
+    bookingCommandId: bookingCommand?.commandId || null,
+  });
+}

@@ -36,7 +36,7 @@ test("critical confirmation is fully buffered and validated before Twilio releas
   f.openai.receive({ type: "response.created", response: { id: "resp-1", metadata: { v2RequestId: requestId } } });
   f.openai.receive({ type: "response.output_audio.delta", response_id: "resp-1", delta: "AQID" });
   assert.equal(f.twilio.sent.filter((item) => item.event === "media").length, 0);
-  f.openai.receive({ type: "response.output_audio_transcript.done", response_id: "resp-1", transcript: "Roberto, should I confirm your Haircut for Thursday at 10:00 AM?" });
+  f.openai.receive({ type: "response.output_audio_transcript.done", response_id: "resp-1", transcript: JSON.parse(request.response.instructions).speechContract.requiredMessage });
   f.openai.receive({ type: "response.done", response: { id: "resp-1", status: "completed" } }); await settle(f.app);
   assert.equal(f.twilio.sent.filter((item) => item.event === "media").length, 1);
   const mark = f.twilio.sent.find((item) => item.event === "mark"); assert.ok(mark);
@@ -156,7 +156,7 @@ async function grantConfirmation(f) {
   await f.app.requestResponse(planResponse({ proposal: f.app.session.proposal, purpose: ResponsePurpose.PRE_BOOKING_CONFIRMATION, language: "en" })); const create = lastCreate(f.openai); const requestId = create.response.metadata.v2RequestId;
   f.openai.receive({ type: "response.created", response: { id: "confirm", metadata: { v2RequestId: requestId } } });
   f.openai.receive({ type: "response.output_audio.delta", response_id: "confirm", delta: "AQID" });
-  f.openai.receive({ type: "response.output_audio_transcript.done", response_id: "confirm", transcript: "Roberto, should I confirm your Haircut for Thursday at 10:00 AM?" });
+  f.openai.receive({ type: "response.output_audio_transcript.done", response_id: "confirm", transcript: JSON.parse(create.response.instructions).speechContract.requiredMessage });
   f.openai.receive({ type: "response.done", response: { id: "confirm", status: "completed" } }); await settle(f.app);
   const mark = f.twilio.sent.find((item) => item.event === "mark"); f.twilio.receive({ event: "mark", streamSid: "MZ1", mark: { name: mark.mark.name } }); await settle(f.app);
 }

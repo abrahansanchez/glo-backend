@@ -75,7 +75,7 @@ test('production collection executes availability through the real adapter and b
   await f.complete(); await f.turn('My name is Roberto');
   assert.equal(f.instructions().purpose, 'PRE_BOOKING_CONFIRMATION');
   assert.equal(f.bookings.length, 0); assert.equal(f.sms.length, 0);
-  const mark = await f.complete('Roberto, Haircut on Friday at 3:00 PM. Should I book it?', false);
+  const mark = await f.complete(f.instructions().speechContract.requiredMessage, false);
   assert.equal(f.bookings.length, 0); assert.equal(f.sms.length, 0);
   assert.equal(f.app.session.journal().filter(e => e.event === 'CONFIRMATION_AUTHORITY_GRANTED').length, 0);
   f.twilio.receive({ event: 'mark', streamSid: 'MZ1', mark: mark.mark }); await settle(f.app);
@@ -90,10 +90,10 @@ test('premature affirmative does not authorize undelivered confirmation or its r
   const f = await fixture(t); await f.complete();
   await f.turn('I need a haircut tomorrow at 3 PM, my name is Roberto');
   assert.equal(f.instructions().purpose, 'PRE_BOOKING_CONFIRMATION');
-  await f.complete('Roberto, Haircut on Friday at 3:00 PM. Should I book it?', false);
+  await f.complete(f.instructions().speechContract.requiredMessage, false);
   await f.turn('yes'); assert.equal(f.bookings.length, 0); assert.equal(f.sms.length, 0);
   assert.equal(f.instructions().purpose, 'PRE_BOOKING_CONFIRMATION');
-  await f.complete('Roberto, Haircut on Friday at 3:00 PM. Should I book it?');
+  await f.complete(f.instructions().speechContract.requiredMessage);
   assert.equal(f.bookings.length, 0); await f.turn('yes'); assert.equal(f.bookings.length, 1);
 });
 
