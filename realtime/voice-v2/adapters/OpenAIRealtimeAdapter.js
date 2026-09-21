@@ -100,6 +100,7 @@ export class OpenAIRealtimeAdapter {
     if (type === "session.updated" && this.#configurationRequested) { this.#configured = true; return this.#publish(TransportEvent.OPENAI_SESSION_CONFIGURED, identity); }
     if (type === "input_audio_buffer.speech_started") return this.#publish(TransportEvent.CALLER_SPEECH_STARTED, identity);
     if (type === "input_audio_buffer.speech_stopped") return this.#publish(TransportEvent.CALLER_SPEECH_STOPPED, identity);
+    if (type === "input_audio_buffer.committed") return this.#publish(TransportEvent.CALLER_INPUT_COMMITTED, identity);
     if (isTranscriptDone(type)) return this.#publish(TransportEvent.USER_TRANSCRIPT_COMPLETED, { ...identity, transcript: message.transcript ?? "" });
     if (isTranscriptFailed(type)) return this.#publish(TransportEvent.USER_TRANSCRIPT_FAILED, { ...identity, error: normalizeError(message.error) });
     if (type === "response.created") return this.#created(message, identity);

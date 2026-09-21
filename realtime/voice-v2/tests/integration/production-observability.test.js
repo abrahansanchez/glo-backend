@@ -67,6 +67,7 @@ test("caller speech, transcript persistence, interpretation and response dispatc
 
   f.openai.receive({ type: "input_audio_buffer.speech_started", event_id: "speech-start", item_id: "caller-item-1" });
   f.openai.receive({ type: "input_audio_buffer.speech_stopped", event_id: "speech-stop", item_id: "caller-item-1" });
+  f.openai.receive({ type: "input_audio_buffer.committed", event_id: "input-committed", item_id: "caller-item-1" });
   f.openai.receive({ type: "conversation.item.input_audio_transcription.completed", event_id: "transcript-event", item_id: "caller-item-1", transcript: "haircut" });
   await settle(f.app);
   const traces = traceEvents(f.logs);
@@ -79,10 +80,43 @@ test("caller speech, transcript persistence, interpretation and response dispatc
   assert.equal(finalized.turnId, persisted.turnId); assert.equal(interpreted.turnId, persisted.turnId); assert.equal(interpreted.operation, "SET_SERVICE");
   assert.equal(traces.find((entry) => entry.traceEvent === "CALLER_SPEECH_STARTED").itemId, "caller-item-1");
   assert.equal(traces.find((entry) => entry.traceEvent === "CALLER_SPEECH_STOPPED").itemId, "caller-item-1");
+  assert.equal(traces.find((entry) => entry.traceEvent === "CALLER_INPUT_COMMITTED").itemId, "caller-item-1");
+  assert.equal(traces.find((entry) => entry.traceEvent === "CALLER_TRANSCRIPTION_AWAITED").itemId, "caller-item-1");
+  const transcriptionCompleted = traces.find((entry) => entry.traceEvent === "CALLER_TRANSCRIPTION_COMPLETED");
+  assert.equal(transcriptionCompleted.itemId, "caller-item-1"); assert.equal(transcriptionCompleted.providerEventId, "transcript-event");
   assert.ok(traces.some((entry) => entry.traceEvent === "PROPOSAL_UPDATED" && entry.proposalVersion === 2));
   assert.ok(traces.some((entry) => entry.traceEvent === "RESPONSE_CREATE_DISPATCHED" && entry.turnId === persisted.turnId));
-  assert.doesNotMatch(JSON.stringify(traces), /haircut|transcript-event/);
+  assert.doesNotMatch(JSON.stringify(traces), /haircut/);
   await f.app.terminate("TEST_COMPLETE");
+});
+
+test("post-TTS listening diagnostics distinguish failed transcription and caller stream stop without changing control", async () => {
+  const f = fixture("CA-observe-listening"); await startAndConfigure(f);
+  const greeting = f.openai.sent.find((message) => message.type === "response.create");
+  f.openai.receive({ type: "response.created", response: { id: "listening-greeting", metadata: { v2RequestId: greeting.response.metadata.v2RequestId } } });
+  f.openai.receive({ type: "response.output_audio.delta", response_id: "listening-greeting", delta: "AQID" });
+  f.openai.receive({ type: "response.output_audio_transcript.done", response_id: "listening-greeting", transcript: "Welcome." });
+  f.openai.receive({ type: "response.done", response: { id: "listening-greeting", status: "completed" } }); await settle(f.app);
+  const mark = f.twilio.sent.find((message) => message.event === "mark").mark.name;
+  f.twilio.receive({ event: "mark", streamSid: "MZ-observe", mark: { name: mark } }); await settle(f.app);
+
+  f.openai.receive({ type: "input_audio_buffer.speech_started", event_id: "listen-start", item_id: "listen-item" });
+  f.openai.receive({ type: "input_audio_buffer.speech_stopped", event_id: "listen-stop", item_id: "listen-item" });
+  f.openai.receive({ type: "input_audio_buffer.committed", event_id: "listen-commit", item_id: "listen-item" });
+  f.openai.receive({ type: "conversation.item.input_audio_transcription.failed", event_id: "listen-failed", item_id: "listen-item", error: { code: "audio_unintelligible", type: "transcription_error", message: "private provider detail" } });
+  await settle(f.app);
+  f.twilio.receive({ event: "stop", streamSid: "MZ-observe", stop: { callSid: f.callSid } }); await settle(f.app);
+
+  const traces = traceEvents(f.logs);
+  for (const event of ["CALLER_SPEECH_STARTED", "CALLER_SPEECH_STOPPED", "CALLER_INPUT_COMMITTED", "CALLER_TRANSCRIPTION_AWAITED", "CALLER_TRANSCRIPTION_FAILED", "TRANSPORT_CLOSED"]) {
+    assert.ok(traces.some((entry) => entry.traceEvent === event), event);
+  }
+  const failed = traces.find((entry) => entry.traceEvent === "CALLER_TRANSCRIPTION_FAILED");
+  assert.equal(failed.itemId, "listen-item"); assert.equal(failed.errorCode, "audio_unintelligible");
+  assert.equal(failed.callSid, f.callSid); assert.equal(failed.buildSha, "observe-build");
+  const closed = traces.find((entry) => entry.traceEvent === "TRANSPORT_CLOSED");
+  assert.equal(closed.reason, "TWILIO_STREAM_STOPPED"); assert.equal(closed.floorState, "LISTEN");
+  assert.doesNotMatch(JSON.stringify(traces), /private provider detail|Welcome\.|callerNumber|service|name/);
 });
 
 test("availability execution traces correlate command, search, proposal and bounded outcome", async () => {

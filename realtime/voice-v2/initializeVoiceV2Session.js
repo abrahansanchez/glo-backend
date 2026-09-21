@@ -16,6 +16,7 @@ import { SharedBookingAdapter } from "./adapters/SharedBookingAdapter.js";
 import { SharedSmsAdapter } from "./adapters/SharedSmsAdapter.js";
 import { SharedTranscriptAdapter } from "./adapters/SharedTranscriptAdapter.js";
 import { FloorPurpose, FloorState } from "./lifecycle/FloorOwner.js";
+import { PlaybackStatus } from "./lifecycle/PlaybackRegistry.js";
 
 const STARTUP_AUDIO_MAX_FRAMES = 500;
 const STARTUP_AUDIO_MAX_BYTES = 80000;
@@ -180,7 +181,7 @@ export function initializeVoiceV2Session({
     } else if ([TransportEvent.TWILIO_STREAM_STOPPED, TransportEvent.TWILIO_CONNECTION_CLOSED, TransportEvent.TWILIO_TRANSPORT_ERROR].includes(event.type)) {
       if ([TransportEvent.TWILIO_STREAM_STOPPED, TransportEvent.TWILIO_CONNECTION_CLOSED].includes(event.type)) {
         callTrace.counters.transportCloses += 1;
-        callTrace.entry("TRANSPORT_CLOSED", { reason: event.type });
+        callTrace.entry("TRANSPORT_CLOSED", { ...listeningTraceDetails(event), reason: event.type });
       }
       await lifecycle.terminate(event.type);
     }
@@ -205,13 +206,27 @@ export function initializeVoiceV2Session({
       flushStartupAudio();
       return maybeRequestInitialGreeting();
     }
-    if (event.type === TransportEvent.USER_TRANSCRIPT_COMPLETED) { callTrace.entry("CALLER_TRANSCRIPT_COMPLETED", { itemId: event.itemId, characterCount: event.transcript.length }); session.watchdog.cancel("caller-silence"); return acceptTurn(event); }
+    if (event.type === TransportEvent.CALLER_INPUT_COMMITTED) {
+      callTrace.entry("CALLER_INPUT_COMMITTED", listeningTraceDetails(event));
+      callTrace.entry("CALLER_TRANSCRIPTION_AWAITED", listeningTraceDetails(event));
+      return;
+    }
+    if (event.type === TransportEvent.USER_TRANSCRIPT_COMPLETED) {
+      const details = { ...listeningTraceDetails(event), characterCount: event.transcript.length };
+      callTrace.entry("CALLER_TRANSCRIPTION_COMPLETED", details);
+      callTrace.entry("CALLER_TRANSCRIPT_COMPLETED", details);
+      session.watchdog.cancel("caller-silence"); return acceptTurn(event);
+    }
+    if (event.type === TransportEvent.USER_TRANSCRIPT_FAILED) {
+      callTrace.entry("CALLER_TRANSCRIPTION_FAILED", { ...listeningTraceDetails(event), errorCode: event.error?.code || null, errorName: event.error?.name || null });
+      return;
+    }
     if (event.type === TransportEvent.CALLER_SPEECH_STARTED) {
-      session.turnRegistry.speechStarted(event.itemId); callTrace.speechStarted({ itemId: event.itemId }); session.watchdog.cancel("caller-silence");
+      session.turnRegistry.speechStarted(event.itemId); callTrace.speechStarted(listeningTraceDetails(event)); session.watchdog.cancel("caller-silence");
       if (session.floorOwner.snapshot.state === FloorState.AWAIT_CONSENT) return;
       return interruptCurrent();
     }
-    if (event.type === TransportEvent.CALLER_SPEECH_STOPPED) { session.turnRegistry.speechStopped(event.itemId); callTrace.speechStopped({ itemId: event.itemId }); return; }
+    if (event.type === TransportEvent.CALLER_SPEECH_STOPPED) { session.turnRegistry.speechStopped(event.itemId); callTrace.speechStopped(listeningTraceDetails(event)); return; }
     if (event.type === TransportEvent.RESPONSE_CREATED) return responseCreated(event);
     if (event.type === TransportEvent.RESPONSE_AUDIO_DELTA) return responseAudio(event);
     if (event.type === TransportEvent.RESPONSE_AUDIO_COMPLETED) {
@@ -707,6 +722,7 @@ export function initializeVoiceV2Session({
     if (lifecycle.terminated || entry?.invalidated || entry?.status !== "requested"
       || state.plan.proposalVersion !== session.proposal.proposalVersion || superseded.has(responseId)) return;
     session.watchdog.cancel(`response:${state.requestId}`);
+    if (state.markId) session.watchdog.cancel(`playback:${state.markId}`);
     session.responseRegistry.fail(responseId, { valid: false, failedInvariant: reason });
     session.floorOwner.release({ reason, requestId: state.requestId, responseId: state.responseId, markId: state.markId });
     callTrace.playbackEnded();
@@ -750,6 +766,7 @@ export function initializeVoiceV2Session({
       return lifecycle.terminate("RESPONSE_RECOVERY_INTERRUPTED");
     }
     const state = currentLifecycle(); if (!state || lifecycle.terminated) return;
+    if (state.markId) session.watchdog.cancel(`playback:${state.markId}`);
     const result = await coordinator.handleCallerSpeechStarted(session, { responseId: state.responseId, markId: state.markId, submittedAudioBytes: state.submittedAudioBytes, cancelResponse: () => supersedeResponse(state, "CALLER_INTERRUPTION"), clearPlayback: () => clearPlayback("CALLER_INTERRUPTION", state) });
     const owner = session.floorOwner.snapshot;
     if (owner.category === FloorPurpose.REASK) session.floorOwner.releaseReaskForConsent({ reason: "CALLER_INTERRUPTION", requestId: state.requestId, responseId: state.responseId, markId: state.markId, playbackCleared: result.cleared });
@@ -772,7 +789,10 @@ export function initializeVoiceV2Session({
       if (state.plan.proposalVersion !== proposalVersion) continue;
       if (superseded.has(state.responseId)) continue;
       supersedeResponse(state, "PROPOSAL_CHANGED");
-      if (state.markId) { try { clearPlayback("PROPOSAL_CHANGED", state); } catch {} }
+      if (state.markId) {
+        session.watchdog.cancel(`playback:${state.markId}`);
+        try { clearPlayback("PROPOSAL_CHANGED", state); } catch {}
+      }
     }
     session.floorOwner.resetForProposalChange("PROPOSAL_CHANGED");
   }
@@ -809,6 +829,29 @@ export function initializeVoiceV2Session({
 
   async function playbackTimedOut(markId) {
     const state = marks.get(markId); if (!state || lifecycle.terminated) return;
+    const owner = session.floorOwner.snapshot;
+    const playback = session.playbackRegistry.get(markId);
+    const currentPendingPlayback = owner.state === FloorState.SPEAKING
+      && owner.requestId === state.requestId
+      && owner.responseId === state.responseId
+      && owner.markId === markId
+      && playback?.status === PlaybackStatus.SUBMITTED
+      && playback.invalidated !== true
+      && playback.acknowledgedAt == null;
+    if (!currentPendingPlayback) {
+      return session.record("STALE_PLAYBACK_TIMEOUT_IGNORED", {
+        requestId: state.requestId,
+        responseId: state.responseId,
+        markId,
+        proposalVersion: state.plan.proposalVersion,
+        currentRequestId: owner.requestId || null,
+        currentResponseId: owner.responseId || null,
+        currentMarkId: owner.markId || null,
+        currentProposalVersion: owner.proposalVersion ?? null,
+        playbackStatus: playback?.status || null,
+        reason: "NOT_CURRENT_PENDING_PLAYBACK",
+      });
+    }
     coordinator.handleTimeout(session, "PLAYBACK_TIMEOUT", { responseId: state.responseId, markId });
     session.floorOwner.release({ reason: "PLAYBACK_TIMEOUT", requestId: state.requestId, responseId: state.responseId, markId });
     if (session.proposal.terminal || state.plan.purpose === ResponsePurpose.AMBIGUITY_LIMIT_REACHED || state.plan.purpose === ResponsePurpose.ERROR_RECOVERY) return lifecycle.terminate("PLAYBACK_TIMEOUT");
@@ -826,6 +869,18 @@ export function initializeVoiceV2Session({
     if (owner.responseId) return responses.get(owner.responseId) || null;
     if (owner.requestId) return requests.get(owner.requestId) || null;
     return null;
+  }
+  function listeningTraceDetails(event = {}) {
+    const owner = session.floorOwner.snapshot;
+    return {
+      itemId: event.itemId || null,
+      providerEventId: event.eventId || null,
+      floorState: owner.state,
+      requestId: owner.requestId || null,
+      responseId: owner.responseId || null,
+      markId: owner.markId || null,
+      proposalVersion: owner.proposalVersion ?? session.proposal.proposalVersion,
+    };
   }
   function requiresBufferedDelivery(plan) { return plan?.critical === true || plan?.deliveryValidationRequired === true; }
   function usesApplicationSpeech(plan) { return Boolean(speechAdapter && (plan?.speechContract?.applicationOwnedConfirmation === true || plan?.speechContract?.applicationOwnedReprompt === true || plan?.speechContract?.applicationOwnedSpeech === true)); }
@@ -890,8 +945,10 @@ export function initializeVoiceV2Session({
       callTrace.effectQueued(type);
       callTrace.entry("EFFECT_QUEUED", { ...common, operation: type });
       if (type === "SEND_CONFIRMATION_SMS") callTrace.entry("SMS_COMMAND_QUEUED", { ...common, operation: type });
-    } else if (["AVAILABILITY_RESULT_REJECTED", "SCHEDULING_RESULT_REJECTED", "STALE_BOOKING_RECONCILIATION_IGNORED", "STALE_PLAYBACK_EVENT_QUARANTINED"].includes(entry.event)) {
-      callTrace.entry("STALE_RESULT_IGNORED", { ...common, operation: entry.event });
+    } else if (["AVAILABILITY_RESULT_REJECTED", "SCHEDULING_RESULT_REJECTED", "STALE_BOOKING_RECONCILIATION_IGNORED", "STALE_PLAYBACK_EVENT_QUARANTINED", "STALE_PLAYBACK_TIMEOUT_IGNORED"].includes(entry.event)) {
+      callTrace.entry("STALE_RESULT_IGNORED", { ...common, operation: entry.event, currentRequestId: entry.currentRequestId, currentResponseId: entry.currentResponseId, currentMarkId: entry.currentMarkId, currentProposalVersion: entry.currentProposalVersion, playbackStatus: entry.playbackStatus });
+    } else if (entry.event === "SUPERSEDED_CALLER_TRANSCRIPT_IGNORED") {
+      callTrace.entry("CALLER_TRANSCRIPTION_QUARANTINED", { ...common, itemId: entry.providerId, operation: entry.event });
     } else if (entry.event === "CONFIRMATION_AUTHORITY_GRANTED") callTrace.entry("CONFIRMATION_AUTHORITY_GRANTED", common);
     else if (entry.event === "CONFIRMATION_REVOKED") callTrace.entry("CONFIRMATION_AUTHORITY_INVALIDATED", common);
     else if (entry.event === "SESSION_TERMINATING") {

@@ -45,10 +45,11 @@ test("normalizes finalized transcript aliases, transcript failure, and VAD witho
   const state = setup();
   state.socket.receive({ type: "input_audio_buffer.speech_started", event_id: "s1", item_id: "item-1" });
   state.socket.receive({ type: "input_audio_buffer.speech_stopped", event_id: "s2", item_id: "item-1" });
+  state.socket.receive({ type: "input_audio_buffer.committed", event_id: "c1", item_id: "item-1" });
   state.socket.receive({ type: "conversation.item.input_audio_transcription.completed", event_id: "t1", item_id: "item-1", transcript: "yes" });
   state.socket.receive({ type: "conversation.item.input_audio_transcription.done", event_id: "t2", item_id: "item-2", transcript: "no" });
   state.socket.receive({ type: "conversation.item.input_audio_transcription.failed", event_id: "t3", item_id: "item-3", error: { code: "bad_audio", message: "bad" } });
-  assert.deepEqual(state.events.slice(-5).map((event) => event.type), ["CALLER_SPEECH_STARTED", "CALLER_SPEECH_STOPPED", "USER_TRANSCRIPT_COMPLETED", "USER_TRANSCRIPT_COMPLETED", "USER_TRANSCRIPT_FAILED"]);
+  assert.deepEqual(state.events.slice(-6).map((event) => event.type), ["CALLER_SPEECH_STARTED", "CALLER_SPEECH_STOPPED", "CALLER_INPUT_COMMITTED", "USER_TRANSCRIPT_COMPLETED", "USER_TRANSCRIPT_COMPLETED", "USER_TRANSCRIPT_FAILED"]);
   assert.equal("turnId" in state.events.at(-2), false); assert.equal(state.events.at(-2).itemId, "item-2");
 });
 
