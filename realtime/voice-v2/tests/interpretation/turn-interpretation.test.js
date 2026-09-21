@@ -36,13 +36,13 @@ const interpret = (transcript, values = {}) => interpretTurn({
   fallbackClassifier: values.fallbackClassifier,
 });
 
-test("rule inventory contains 39 normalization and interpretation rules in all required review groups", () => {
-  assert.equal(countInterpretationRules(), 39);
+test("rule inventory contains 41 normalization and interpretation rules in all required review groups", () => {
+  assert.equal(countInterpretationRules(), 41);
   assert.deepEqual(
     InterpretationRuleInventory.map(({ id, rules }) => [id, rules.length]),
     [
       ["surface_normalization", 5],
-      ["modification_cues", 4], ["confirmation_cues", 2], ["rejection_cues", 2],
+      ["modification_cues", 4], ["confirmation_cues", 4], ["rejection_cues", 2],
       ["half_hour_forms", 2], ["quarter_hour_forms", 2], ["meridiem_forms", 3],
       ["ordinal_alternative_references", 2],
       ["later_requests", 2], ["day_date_requests", 4], ["service_setting_cues", 3],
@@ -185,6 +185,28 @@ test("a bare name is accepted only in an authoritative delivered-name context", 
   assert.equal(inside.interpretation.action, CallerActionType.SET_NAME);
   assert.equal(inside.interpretation.name, "Navije");
   assert.equal((await interpret("yes", { nameCollectionContext: true })).interpretation.action, CallerActionType.AFFIRM_CONFIRMATION);
+});
+
+test("natural booking affirmatives generalize without accepting corrupted ASR or initial booking requests", async () => {
+  for (const transcript of [
+    "book it",
+    "please book it",
+    "go ahead and book it",
+    "let's do it",
+    "sounds good",
+    "reservalo",
+    "por favor reservalo",
+    "adelante",
+    "hagamoslo",
+  ]) {
+    assert.equal((await interpret(transcript)).interpretation.action, CallerActionType.AFFIRM_CONFIRMATION, transcript);
+  }
+
+  for (const transcript of ["Booket.", "bucket", "I want to book a haircut", "quiero reservar un corte"]) {
+    const action = (await interpret(transcript)).interpretation.action;
+    if (/booket|bucket/i.test(transcript)) assert.equal(action, CallerActionType.UNKNOWN, transcript);
+    else assert.equal(action, CallerActionType.BOOK_REQUEST, transcript);
+  }
 });
 
 test("later and available-times-for-date requests are bilingual equivalents", async () => {

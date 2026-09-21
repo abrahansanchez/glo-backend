@@ -22,6 +22,7 @@ export const PURPOSE_INSTRUCTIONS = Object.freeze({
   PRE_BOOKING_CONFIRMATION: 'Read all four expected facts: caller name, canonical service, date and time. Ask one explicit question whether to book this complete appointment. Do not claim it is already booked. Do not omit or replace facts. The application requires a fresh affirmative after playback.',
   BOOKING_SUCCESS: 'Only if expectedFacts.outcome is BOOKED, briefly confirm the supplied appointment facts. Do not claim SMS delivery or invent additional booking details. Without that outcome do not claim booking success.',
   CLARIFICATION: 'Briefly clarify the nextRequired field or intent using only supplied facts. For service ambiguity ask the caller to choose a supplied service. Never guess a missing value or treat clarification as booking authorization.',
+  CONSENT_REASK: 'Repeat only the application-supplied appointment identity and ask for an explicit yes or no. Do not claim the appointment is booked or change any fact.',
   ERROR_RECOVERY: 'Briefly explain that you cannot complete the current step. Do not invent a cause or any booking status. If a terminalRecovery speech contract is supplied, follow its exact terminal instructions and message.',
   AMBIGUITY_LIMIT_REACHED: 'Briefly explain that you could not understand the booking details, suggest calling again, and end without a question. Do not imply system malfunction or a completed booking.',
 });

@@ -7,6 +7,7 @@ export const ResponsePurpose = Object.freeze({
   OFFER_ALTERNATIVES: "OFFER_ALTERNATIVES", SCHEDULING_ALTERNATIVES: "SCHEDULING_ALTERNATIVES", NO_AVAILABLE_TIMES: "NO_AVAILABLE_TIMES",
   SLOT_UNAVAILABLE: "SLOT_UNAVAILABLE", PRE_BOOKING_CONFIRMATION: "PRE_BOOKING_CONFIRMATION",
   BOOKING_SUCCESS: "BOOKING_SUCCESS", CLARIFICATION: "CLARIFICATION", CLARIFY_LATER_REFERENCE: "CLARIFY_LATER_REFERENCE",
+  CONSENT_REASK: "CONSENT_REASK",
   ERROR_RECOVERY: "ERROR_RECOVERY", AMBIGUITY_LIMIT_REACHED: "AMBIGUITY_LIMIT_REACHED",
 });
 
@@ -23,6 +24,7 @@ const CALLER_INPUT_PURPOSES = Object.freeze([
   ResponsePurpose.PRE_BOOKING_CONFIRMATION,
   ResponsePurpose.CLARIFICATION,
   ResponsePurpose.CLARIFY_LATER_REFERENCE,
+  ResponsePurpose.CONSENT_REASK,
 ]);
 const PRE_DELIVERY_VALIDATION_PURPOSES = new Set([
   ResponsePurpose.OFFER_ALTERNATIVES,
@@ -38,6 +40,11 @@ const REQUIREMENT_RESPONSE_PURPOSES = new Set([
   ResponsePurpose.ASK_TIME,
   ResponsePurpose.CLARIFICATION,
 ]);
+const SAFE_REPROMPT_MESSAGES = Object.freeze({
+  ASK_TIME: Object.freeze({ en: "What time would you like?", es: "\u00bfA qu\u00e9 hora te gustar\u00eda?" }),
+  ASK_NAME: Object.freeze({ en: "What name should I use for the appointment?", es: "\u00bfQu\u00e9 nombre debo usar para la cita?" }),
+  CLARIFICATION: Object.freeze({ en: "Could you please repeat that?", es: "\u00bfPodr\u00edas repetirlo, por favor?" }),
+});
 
 export function planResponse({ proposal, purpose, language = "en", businessName = null, availabilitySearch = null }) {
   if (!proposal || !Number.isInteger(proposal.proposalVersion)) throw new TypeError("invalid_proposal");
@@ -120,21 +127,7 @@ export function planAuthorityRefusalContinuation({ proposal, turnId, language })
 export function planSafeCollectionReprompt({ proposal, purpose, language = "en" }) {
   const plan = planResponse({ proposal, purpose, language });
   if (purpose === ResponsePurpose.PRE_BOOKING_CONFIRMATION) return withApplicationOwnedConfirmation(plan);
-  const messages = {
-    ASK_TIME: {
-      en: "What time would you like?",
-      es: "\u00bfA qu\u00e9 hora te gustar\u00eda?",
-    },
-    ASK_NAME: {
-      en: "What name should I use for the appointment?",
-      es: "\u00bfQu\u00e9 nombre debo usar para la cita?",
-    },
-    CLARIFICATION: {
-      en: "Could you please repeat that?",
-      es: "\u00bfPodr\u00edas repetirlo, por favor?",
-    },
-  };
-  const message = messages[purpose]?.[language === "es" ? "es" : "en"];
+  const message = safeRepromptMessage(purpose, language);
   if (!message) return plan;
   return Object.freeze({
     ...plan,
@@ -145,6 +138,44 @@ export function planSafeCollectionReprompt({ proposal, purpose, language = "en" 
       instruction: "Speak the required message exactly. Do not add, omit, or paraphrase any words.",
     }),
   });
+}
+
+export function planConsentReask({ proposal, language = "en" }) {
+  const plan = planResponse({ proposal, purpose: ResponsePurpose.CONSENT_REASK, language });
+  const confirmation = renderPreBookingConfirmation({ service: proposal.service, name: proposal.name, date: proposal.date, time: proposal.time }, language);
+  const requiredMessage = language === "es"
+    ? `${confirmation} Por favor, responde sí o no.`
+    : `${confirmation} Please answer yes or no.`;
+  return withApplicationOwnedSpeech(plan, requiredMessage, "consent_reask");
+}
+
+export function planConfirmationRejected({ proposal, language = "en" }) {
+  const plan = planResponse({ proposal, purpose: ResponsePurpose.CLARIFICATION, language });
+  const message = language === "es"
+    ? "¿Qué te gustaría cambiar de la cita?"
+    : "What would you like to change about the appointment?";
+  return withApplicationOwnedReprompt(plan, message);
+}
+
+export function bindApplicationOwnedLifecycleSpeech(plan) {
+  if (plan?.speechContract?.applicationOwnedConfirmation || plan?.speechContract?.applicationOwnedSpeech || plan?.speechContract?.applicationOwnedReprompt) return plan;
+  if (plan?.purpose === ResponsePurpose.BOOKING_SUCCESS) {
+    const message = plan.language === "es"
+      ? "Tu cita fue reservada correctamente. Recibirás un mensaje de confirmación. Adiós."
+      : "Your appointment was booked successfully. You will receive a confirmation message. Goodbye.";
+    return withApplicationOwnedSpeech(plan, message, "post_booking");
+  }
+  if (plan?.purpose === ResponsePurpose.AMBIGUITY_LIMIT_REACHED) {
+    const message = plan.language === "es"
+      ? "Lo siento, no pude confirmar tu respuesta de forma segura. Por favor, llama al negocio o vuelve a intentarlo. Adiós."
+      : "I'm sorry, I could not safely confirm your answer. Please contact the shop or try again. Goodbye.";
+    return withApplicationOwnedSpeech(plan, message, "exit");
+  }
+  if (plan?.purpose === ResponsePurpose.ERROR_RECOVERY && plan?.speechContract?.terminalMessage) {
+    return withApplicationOwnedSpeech(plan, plan.speechContract.terminalMessage, "exit");
+  }
+  if (plan?.purpose === ResponsePurpose.CLARIFICATION) return withApplicationOwnedReprompt(plan, safeRepromptMessage(plan.purpose, plan.language));
+  return plan;
 }
 
 function withApplicationOwnedConfirmation(plan) {
@@ -178,6 +209,37 @@ export function planTerminalResponseRecovery({ proposal, language = "en" }) {
         : "I'm sorry, I can't continue this call. Please call again later. Goodbye.",
     }),
   });
+}
+
+function withApplicationOwnedSpeech(plan, requiredMessage, applicationSpeechKind) {
+  return Object.freeze({
+    ...plan,
+    deliveryValidationRequired: true,
+    speechContract: Object.freeze({
+      ...plan.speechContract,
+      applicationOwnedSpeech: true,
+      applicationSpeechKind,
+      requiredMessage,
+      instruction: "Speak the required message exactly. Do not add, omit, or paraphrase any words.",
+    }),
+  });
+}
+
+function withApplicationOwnedReprompt(plan, requiredMessage) {
+  if (!requiredMessage) return plan;
+  return Object.freeze({
+    ...plan,
+    speechContract: Object.freeze({
+      ...plan.speechContract,
+      applicationOwnedReprompt: true,
+      requiredMessage,
+      instruction: "Speak the required message exactly. Do not add, omit, or paraphrase any words.",
+    }),
+  });
+}
+
+function safeRepromptMessage(purpose, language) {
+  return SAFE_REPROMPT_MESSAGES[purpose]?.[language === "es" ? "es" : "en"] || null;
 }
 
 function canonicalBusinessName(value) {

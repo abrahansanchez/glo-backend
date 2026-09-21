@@ -1,6 +1,11 @@
 export class TurnRegistry {
   #records = new Map();
   #tail = Promise.resolve();
+  #activeSpeechItems = new Set();
+  speechStarted(itemId) { if (itemId) this.#activeSpeechItems.add(itemId); }
+  speechStopped(itemId) { if (itemId) this.#activeSpeechItems.delete(itemId); }
+  hasActiveSpeechOtherThan(itemId) { return [...this.#activeSpeechItems].some((activeItemId) => activeItemId !== itemId); }
+  get callerSpeechActive() { return this.#activeSpeechItems.size > 0; }
   acquire({ turnId, transcript }, processor) {
     if (!turnId) throw new TypeError("missing_turn_id");
     const existing = this.#records.get(turnId);

@@ -31,7 +31,26 @@ export class VoiceCoordinator {
       const previous = session.proposal; const reduced = this.reducer(previous, interpreted.interpretation);
       context.timing?.end("REDUCTION", reductionTiming, { turnId: turn.turnId });
       if (reduced.proposalChanged) { session.responseRegistry.invalidateProposal(previous.proposalVersion); session.playbackRegistry.invalidateProposal(previous.proposalVersion); session.confirmationAuthority.revokeProposal(previous.proposalVersion); session.record("CONFIRMATION_REVOKED", { proposalVersion: previous.proposalVersion, reason: "PROPOSAL_CHANGED" }); session.replaceProposal(previous, reduced.nextProposal); }
-      for (const effect of reduced.effects) { const command = effect.commandId ? effect : { ...effect, commandId: `${effect.type.toLowerCase()}:${turn.turnId}` }; session.effectQueue.enqueue(command); session.record("EFFECT_QUEUED", { commandId: command.commandId, effectType: command.type, proposalVersion: command.proposalVersion ?? session.proposal.proposalVersion }); }
+      for (const effect of reduced.effects) {
+        const identity = effect.commandId ? effect : { ...effect, commandId: `${effect.type.toLowerCase()}:${turn.turnId}` };
+        const command = effect.type === "REQUEST_CLARIFICATION"
+          ? { ...identity, sourceTurnId: turn.turnId, suppressResponseForCallerSpeechOverlap: context.callerSpeechOverlap === true, consentTurnClaimed: context.consentTurnClaimed === true }
+          : identity;
+        session.effectQueue.enqueue(command);
+        session.record("EFFECT_QUEUED", { commandId: command.commandId, effectType: command.type, proposalVersion: command.proposalVersion ?? session.proposal.proposalVersion });
+      }
+      if (interpreted.interpretation.action === "REJECT_CONFIRMATION" && context.consentTurnClaimed === true) {
+        const responseId = context.confirmationContext?.responseId || null;
+        const markId = context.confirmationContext?.markId || null;
+        session.confirmationAuthority.revoke({ proposalVersion: previous.proposalVersion, responseId, markId, reason: "CONSENT_REJECTED" });
+        session.record("CONFIRMATION_REVOKED", { proposalVersion: previous.proposalVersion, responseId, markId, reason: "CONSENT_REJECTED" });
+        session.floorOwner.rejectClaimedConsent({ callerItemId: context.consentCallerItemId, reason: "CONSENT_REJECTED" });
+        if (!reduced.effects.some((effect) => effect.type === "CONFIRMATION_REJECTED")) {
+          const command = { type: "CONFIRMATION_REJECTED", commandId: `confirmation_rejected:${turn.turnId}`, proposalVersion: session.proposal.proposalVersion, sourceTurnId: turn.turnId };
+          session.effectQueue.enqueue(command);
+          session.record("EFFECT_QUEUED", { commandId: command.commandId, effectType: command.type, proposalVersion: command.proposalVersion });
+        }
+      }
       if (interpreted.interpretation.action === "AFFIRM_CONFIRMATION") recordAffirmativeDecision(session, { turnId: turn.turnId, proposalVersion: session.proposal.proposalVersion, context: context.confirmationContext, authority: { authorized: true, reason: null }, reducerRan: true, reduced });
       return Object.freeze({ interpreted, reduced });
     });

@@ -71,7 +71,7 @@ test("caller speech after valid playback acknowledgement does not clear complete
 
   assert.equal(f.twilio.sent.filter((entry) => entry.event === "clear").length, 0);
   const interruption = f.app.session.journal().find((entry) => entry.event === "CALLER_INTERRUPTION_APPLIED");
-  assert.equal(interruption?.cleared, false);
+  assert.equal(interruption, undefined, "acknowledged ordinary playback no longer owns the floor");
   await f.app.terminate("TEST_DONE");
 });
 

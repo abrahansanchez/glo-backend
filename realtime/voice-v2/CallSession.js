@@ -6,6 +6,7 @@ import { EffectQueue } from "./lifecycle/EffectQueue.js";
 import { SessionWatchdog } from "./lifecycle/SessionWatchdog.js";
 import { AmbiguityRecoveryState } from "./lifecycle/AmbiguityRecoveryState.js";
 import { ConversationLanguageState } from "./lifecycle/ConversationLanguageState.js";
+import { FloorOwner } from "./lifecycle/FloorOwner.js";
 
 export class CallSession {
   #proposal;
@@ -17,6 +18,7 @@ export class CallSession {
     Object.defineProperty(this, "businessContext", { value: businessContext === null ? null : deepFreeze(structuredClone(businessContext)), enumerable: true, writable: false, configurable: false });
     this.turnRegistry = new TurnRegistry(); this.responseRegistry = new ResponseRegistry(); this.playbackRegistry = new PlaybackRegistry();
     this.confirmationAuthority = new ConfirmationAuthority(); this.effectQueue = new EffectQueue({ handlers: effectHandlers }); this.watchdog = new SessionWatchdog(watchdogOptions); this.ambiguityRecovery = new AmbiguityRecoveryState(); this.conversationLanguage = new ConversationLanguageState({ preferredLanguage });
+    this.floorOwner = new FloorOwner({ record: (event, details) => this.record(event, details) });
     this.record("CALL_STARTED", { proposalVersion: proposal.proposalVersion, buildSha });
   }
   get proposal() { return this.#proposal; }

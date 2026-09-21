@@ -19,6 +19,7 @@ const MONTHS = Object.freeze({
 
 export function validateSpeech(plan, transcript) {
   if (plan?.speechContract?.applicationOwnedConfirmation === true) return validateApplicationOwnedConfirmation(plan, transcript);
+  if (plan?.speechContract?.applicationOwnedSpeech === true) return validateApplicationOwnedSpeech(plan, transcript);
   if (plan?.speechContract?.applicationOwnedReprompt === true) return validateApplicationOwnedReprompt(plan, transcript);
   if (plan?.speechContract?.terminalRecovery === true) return validateTerminalRecovery(plan, transcript);
   if (plan?.deliveryValidationRequired && plan?.purpose !== "PRE_BOOKING_CONFIRMATION") return validateOrdinarySpeech(plan, transcript);
@@ -63,6 +64,17 @@ export function validateSpeech(plan, transcript) {
   result.failedInvariant = firstFailure(result);
   result.valid = result.failedInvariant === null;
   return Object.freeze(result);
+}
+
+function validateApplicationOwnedSpeech(plan, transcript) {
+  if (typeof transcript !== "string" || !transcript.trim()) return invalid("missing_transcript");
+  const valid = normalize(transcript) === normalize(plan.speechContract.requiredMessage);
+  return Object.freeze({
+    ...invalid(valid ? null : "application_owned_speech_mismatch"),
+    valid,
+    failedInvariant: valid ? null : "application_owned_speech_mismatch",
+    mismatchCategory: valid ? null : classifyExactSpeechMismatch(normalize(plan.speechContract.requiredMessage), normalize(transcript)),
+  });
 }
 
 function validateApplicationOwnedConfirmation(plan, transcript) {

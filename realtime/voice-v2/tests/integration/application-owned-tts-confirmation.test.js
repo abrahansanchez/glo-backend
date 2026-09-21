@@ -94,32 +94,36 @@ test("caller interruption aborts pending TTS and late audio cannot reach Twilio 
   await f.app.terminate("TEST_COMPLETE");
 });
 
-for (const [label, speechAdapter, expectedReason] of [
-  ["empty audio", { synthesize: async () => ({ audio: Buffer.alloc(0), format: "audio/pcmu" }) }, "TTS_EMPTY_AUDIO"],
-  ["adapter error", { synthesize: async () => { throw Object.assign(new Error("provider failed"), { code: "TTS_ADAPTER_ERROR" }); } }, "TTS_ADAPTER_ERROR"],
+for (const [label, implementation, expectedReason] of [
+  ["empty audio", async () => ({ audio: Buffer.alloc(0), format: "audio/pcmu" }), "TTS_EMPTY_AUDIO"],
+  ["adapter error", async () => { throw Object.assign(new Error("provider failed"), { code: "TTS_ADAPTER_ERROR" }); }, "TTS_ADAPTER_ERROR"],
 ]) test(`${label} enters the existing one-shot bounded terminal recovery`, async () => {
+  const calls = []; const speechAdapter = { synthesize: async (request) => { calls.push(request); return implementation(request); } };
   const f = await fixture({ speechAdapter });
   await f.app.requestResponse(planResponse({ proposal: f.app.session.proposal, purpose: ResponsePurpose.PRE_BOOKING_CONFIRMATION, language: "en" }));
   await settle(f.app);
   assert.ok(f.app.session.journal().some((entry) => entry.event === "RESPONSE_DELIVERY_FAILED" && entry.reason === expectedReason));
-  const recovery = f.openai.sent.find((event) => event.type === "response.create" && event.response?.metadata?.purpose === ResponsePurpose.ERROR_RECOVERY);
-  assert.ok(recovery, "existing recovery owner receives the failure");
+  assert.equal(calls.length, 2, "application-owned EXIT receives the failure after confirmation TTS");
+  assert.equal(f.app.lifecycle.terminated, true, "failure of the one bounded EXIT attempt terminates cleanly");
   assert.equal(f.twilio.sent.some((event) => event.event === "media" || event.event === "mark"), false);
   assert.equal(f.app.session.journal().some((entry) => entry.event === "CONFIRMATION_AUTHORITY_GRANTED"), false);
   await f.app.terminate("TEST_COMPLETE");
 });
 
 test("SessionWatchdog bounds a never-settling TTS request, aborts it and plans one recovery", async () => {
-  const clock = manualScheduler(); let signal;
-  const speechAdapter = { synthesize: ({ signal: value }) => { signal = value; return new Promise(() => {}); } };
+  const clock = manualScheduler(); const signals = [];
+  const speechAdapter = { synthesize: ({ signal }) => { signals.push(signal); return new Promise(() => {}); } };
   const f = await fixture({ speechAdapter, scheduler: clock.options });
   await f.app.requestResponse(planResponse({ proposal: f.app.session.proposal, purpose: ResponsePurpose.PRE_BOOKING_CONFIRMATION, language: "en" }));
   await Promise.resolve();
   assert.equal(clock.active(15000).length, 1);
   clock.active(15000)[0].run(); await settle(f.app);
-  assert.equal(signal.aborted, true);
+  assert.equal(signals[0].aborted, true);
   assert.equal(f.app.session.journal().filter((entry) => entry.event === "TIMEOUT_RECOVERY_PLANNED" && entry.timeoutType === "RESPONSE_GENERATION_TIMEOUT").length, 1);
-  assert.equal(f.openai.sent.filter((event) => event.type === "response.create" && event.response?.metadata?.purpose === ResponsePurpose.ERROR_RECOVERY).length, 1);
+  assert.equal(signals.length, 2, "the sole recovery attempt is application-owned TTS");
+  clock.active(15000)[0].run(); await settle(f.app);
+  assert.equal(signals[1].aborted, true);
+  assert.equal(f.app.lifecycle.terminated, true);
   assert.equal(f.twilio.sent.some((event) => event.event === "media" || event.event === "mark"), false);
   await f.app.terminate("TEST_COMPLETE");
 });

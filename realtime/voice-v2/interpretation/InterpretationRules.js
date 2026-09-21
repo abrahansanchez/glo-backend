@@ -14,7 +14,9 @@ export const InterpretationRuleInventory = Object.freeze([
   ]),
   group("confirmation_cues", "language-specific", [
     ["English affirmative", /^(?:yes|yeah|yep|correct|right|that works)$/],
+    ["English affirmative booking request", /^(?:(?:yes|yeah) )?(?:please )?(?:book it|go ahead(?: and book it)?|let s do it|do it|please do|sounds good)$/],
     ["Spanish affirmative", /^(?:si|correcto|correcta|esta bien|de acuerdo)$/],
+    ["Spanish affirmative booking request", /^(?:si[ ,]+)?(?:por favor )?(?:reservalo|reserva la cita|adelante|hazlo|hagamoslo|suena bien)$/],
   ]),
   group("rejection_cues", "language-specific", [
     ["English rejection", /^(?:no|nope|incorrect|not correct)$/],

@@ -25,6 +25,7 @@ export class SessionLifecycle {
   async terminate(reason = "CALL_TERMINATED") {
     if (!this.#terminated) {
       this.#terminated = true;
+      this.#session.floorOwner?.terminate({ reason });
       this.#session.confirmationAuthority.revokeProposal(this.#session.proposal.proposalVersion, reason);
       this.#session.responseRegistry.invalidateProposal(this.#session.proposal.proposalVersion, reason);
       this.#session.playbackRegistry.invalidateProposal(this.#session.proposal.proposalVersion, reason);
