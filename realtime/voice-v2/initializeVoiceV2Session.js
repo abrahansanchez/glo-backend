@@ -415,7 +415,10 @@ export function initializeVoiceV2Session({
         const purpose = pending.clarificationKind === "LATER_REFERENCE"
           ? ResponsePurpose.CLARIFY_LATER_REFERENCE
           : pending.type === "REQUEST_CLARIFICATION" ? ambiguityPurposes.shift() || ResponsePurpose.CLARIFICATION : ResponsePurpose.CLARIFICATION;
-        await requestResponse(coordinator.responsePlanner({ proposal: session.proposal, purpose, language: session.conversationLanguage.currentLanguage }), 1, null, { commandId: pending.commandId });
+        const plan = speechAdapter && purpose === ResponsePurpose.ASK_TIME && session.proposal.time == null
+          ? planSafeCollectionReprompt({ proposal: session.proposal, purpose, language: session.conversationLanguage.currentLanguage })
+          : coordinator.responsePlanner({ proposal: session.proposal, purpose, language: session.conversationLanguage.currentLanguage });
+        await requestResponse(plan, 1, null, { commandId: pending.commandId });
       }
     }
   }

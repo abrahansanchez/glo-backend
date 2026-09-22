@@ -27,17 +27,19 @@ export class AmbiguityRecoveryState {
       const previousCount = this.#count; this.#count = 0; this.#lastTurnId = null; this.#level = 0;
       return Object.freeze({ kind: previousCount ? "reset" : "unchanged", previousCount, ...this.snapshot, responsePurpose: null });
     }
-    this.#count += 1; this.#lastTurnId = turnId; this.#level = Math.min(this.#count, 3);
+    this.#count += 1; this.#lastTurnId = turnId;
     // Both ambiguous actions are directed only by the current authoritative
     // requirement. When that state has no field-level continuation (for
     // example, availability is pending), the generic clarification remains.
     const directedPurpose = DIRECTED_PURPOSE[deriveBookingRequirement(proposal)] || null;
-    const responsePurpose = this.#count === 1
-      ? directedPurpose || ResponsePurpose.CLARIFICATION
-      : this.#count === 2
-        ? directedPurpose || ResponsePurpose.CLARIFICATION
-        : ResponsePurpose.AMBIGUITY_LIMIT_REACHED;
-    return Object.freeze({ kind: this.#count === 1 ? "recorded" : this.#count === 2 ? "escalated" : "limit_reached", ...this.snapshot, responsePurpose });
+    // Time collection receives one grounded retry. A second unparseable caller
+    // turn uses the existing controlled exit instead of another model attempt.
+    const timeRepairExhausted = directedPurpose === ResponsePurpose.ASK_TIME && this.#count >= 2;
+    this.#level = timeRepairExhausted ? 3 : Math.min(this.#count, 3);
+    const responsePurpose = this.#level === 3
+      ? ResponsePurpose.AMBIGUITY_LIMIT_REACHED
+      : directedPurpose || ResponsePurpose.CLARIFICATION;
+    return Object.freeze({ kind: this.#level === 3 ? "limit_reached" : this.#count === 1 ? "recorded" : "escalated", ...this.snapshot, responsePurpose });
   }
 
   terminate() { this.#terminated = true; this.#count = 0; this.#lastTurnId = null; this.#level = 0; }

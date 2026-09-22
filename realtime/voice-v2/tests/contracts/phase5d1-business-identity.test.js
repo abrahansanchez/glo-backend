@@ -65,6 +65,7 @@ test("production resolver converts a hydrated Mongoose result to plain data befo
   assert.equal(resolved.businessName, "Probando");
   assert.equal(resolved.calledNumber, "+12602523232");
   assert.equal(resolved.timeZone, "America/New_York");
+  assert.equal(resolved.preferredLanguage, "en");
   assert.deepEqual(resolved.services.map(({ name }) => name), ["Haircut"]);
   assert.equal(Object.isFrozen(resolved), true);
   assert.equal(Object.isFrozen(resolved.services), true);
@@ -99,6 +100,7 @@ test("resolved business context remains deeply immutable", async () => {
         lean: () => ({
           _id: "69d6b84155368d54a594b55a",
           name: "Probando",
+          preferredLanguage: "es",
           availability: { timezone: "America/New_York" },
           services: [{ name: "Haircut", durationMinutes: 30 }],
         }),
@@ -106,6 +108,7 @@ test("resolved business context remains deeply immutable", async () => {
     }),
   });
   const expected = structuredClone(resolved);
+  assert.equal(resolved.preferredLanguage, "es");
 
   for (const mutate of [
     () => { resolved.businessId = "other"; },
@@ -113,6 +116,7 @@ test("resolved business context remains deeply immutable", async () => {
     () => { resolved.calledNumber = "+10000000000"; },
     () => { resolved.timeZone = "UTC"; },
     () => { resolved.businessName = "Other"; },
+    () => { resolved.preferredLanguage = "en"; },
     () => { resolved.services.push({ name: "Other" }); },
     () => { resolved.services[0].name = "Other"; },
   ]) assert.throws(mutate, TypeError);

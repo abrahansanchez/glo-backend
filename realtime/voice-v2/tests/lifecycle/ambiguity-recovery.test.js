@@ -31,8 +31,20 @@ test("first UNKNOWN directs service, date, time, name, and safe confirmation fro
 });
 
 test("second ambiguity directs service, date, time, and name from authoritative proposal requirement", () => {
-  const cases = [[missing(), "ASK_SERVICE"], [facts({ service: "Haircut" }), "ASK_DATE"], [facts({ service: "Haircut", date: "2026-08-27" }), "ASK_TIME"], [available({ name: null }), "ASK_NAME"]];
+  const cases = [[missing(), "ASK_SERVICE"], [facts({ service: "Haircut" }), "ASK_DATE"], [available({ name: null }), "ASK_NAME"]];
   for (const [proposal, expected] of cases) { const state = primed(proposal); assert.equal(state.observe({ action: "CLARIFY", turnId: "t2", proposal }).responsePurpose, expected); }
+});
+
+test("missing-time ambiguity gets one directed repair before the existing controlled exit", () => {
+  const proposal = facts({ service: "Haircut", date: "2026-08-27" });
+  const state = new AmbiguityRecoveryState();
+  const first = state.observe({ action: "UNKNOWN", turnId: "time-1", proposal });
+  const second = state.observe({ action: "UNKNOWN", turnId: "time-2", proposal });
+  assert.equal(first.responsePurpose, ResponsePurpose.ASK_TIME);
+  assert.equal(second.responsePurpose, ResponsePurpose.AMBIGUITY_LIMIT_REACHED);
+  assert.equal(second.kind, "limit_reached");
+  assert.equal(state.limitReached, true);
+  assert.equal(proposal.time, null);
 });
 
 test("second ambiguity while awaiting confirmation requires a fresh PRE_BOOKING_CONFIRMATION contract", () => {

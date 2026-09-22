@@ -64,14 +64,26 @@ export function createVoiceV2ProductionInitializer({
               if (settled) throw Object.assign(new Error("STARTUP_TERMINATED"), { code: "STARTUP_TERMINATED" });
               if (String(businessContext.businessId) !== approvedBusinessId) throw Object.assign(new Error("UNAPPROVED_BUSINESS"), { code: "UNAPPROVED_BUSINESS" });
               cleanup();
+              const preferredLanguage = businessContext.preferredLanguage === "es" ? "es" : "en";
               return initializeSession({
                 callSid: identity.callSid, callerNumber: identity.callerNumber, businessContext, buildSha,
                 twilioSocket: socket, openaiSocketFactory: dependencies.openaiSocketFactory,
                 smsAdapter: dependencies.smsAdapter,
                 speechAdapter: dependencies.speechAdapter,
                 callControlAdapter: dependencies.callControlAdapter,
-                openaiSession: { ...dependencies.openaiSession, instructions: buildBusinessSessionInstructions(businessContext) },
-                turnContext: Object.freeze({ availableServices: buildServiceCatalogue(businessContext.services) }),
+                openaiSession: {
+                  ...dependencies.openaiSession,
+                  instructions: buildBusinessSessionInstructions(businessContext),
+                  input_audio_transcription: Object.freeze({
+                    ...dependencies.openaiSession.input_audio_transcription,
+                    language: preferredLanguage,
+                  }),
+                },
+                turnContext: Object.freeze({
+                  availableServices: buildServiceCatalogue(businessContext.services),
+                  language: preferredLanguage,
+                  preferredLanguageSource: businessContext.preferredLanguage ? "business" : "english_fallback",
+                }),
                 emit,
               });
             },

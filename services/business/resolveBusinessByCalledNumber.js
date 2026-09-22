@@ -44,9 +44,14 @@ export async function resolveBusinessByCalledNumber(calledNumber, dependencies =
     barberId: businessId,
     businessName: canonicalBusinessName(barber.name),
     timeZone: barber.availability?.timezone || "America/New_York",
+    preferredLanguage: normalizePreferredLanguage(barber.preferredLanguage),
     services: Array.from(barber.services || [], toPlainService),
     calledNumber: canonicalCalledNumber,
   });
+}
+
+function normalizePreferredLanguage(value) {
+  return value === "es" ? "es" : "en";
 }
 
 function canonicalBusinessName(value) {
