@@ -1,6 +1,7 @@
 import { CallSession } from "./CallSession.js";
 import { LatencyDiagnostics } from "./diagnostics/LatencyDiagnostics.js";
 import { CallTrace } from "./diagnostics/CallTrace.js";
+import { ConsentBoundaryDiagnostics } from "./diagnostics/ConsentBoundaryDiagnostics.js";
 import { VoiceCoordinator } from "./VoiceCoordinator.js";
 import { BookingRequirement, createBookingProposal, deriveBookingRequirement, deriveSlotKey } from "./domain/BookingProposal.js";
 import { applyAvailabilityResult, applySchedulingSearchResult } from "./domain/BookingLifecycleTransitions.js";
@@ -41,7 +42,7 @@ export function initializeVoiceV2Session({
   openaiSession = {}, turnContext = {}, emit = () => {}, timingOptions = {},
 } = {}) {
   requireSessionInputs({ callSid, callerNumber, businessContext, buildSha, twilioSocket, openaiSocketFactory });
-  let lifecycle; let processing = Promise.resolve(); let effectsProcessing = Promise.resolve(); let turnSequence = 0; let responseSequence = 0; let markSequence = 0; let twilioStarted = false; let openaiSessionCreated = false; let openaiConfigured = false; let initialGreetingRequested = false; let callerTurnSeen = false; let lastAcknowledgedState = null;
+  let lifecycle; let consentDiagnostics; let processing = Promise.resolve(); let effectsProcessing = Promise.resolve(); let turnSequence = 0; let responseSequence = 0; let markSequence = 0; let twilioStarted = false; let openaiSessionCreated = false; let openaiConfigured = false; let initialGreetingRequested = false; let callerTurnSeen = false; let lastAcknowledgedState = null;
   const providerTurns = new Set(); const requests = new Map(); const responses = new Map(); const marks = new Map(); const superseded = new Set(); const ambiguityPurposes = []; const startupAudio = []; let startupAudioBytes = 0; let callTerminationRequested = false;
   const safeEmit = (event) => { try { emit(event); } catch { /* Logging cannot terminate a call. */ } };
   const timing = new LatencyDiagnostics({ ...timingOptions, callSid, buildSha, emit: safeEmit });
@@ -52,7 +53,7 @@ export function initializeVoiceV2Session({
   };
   function receive(event, handler) {
     if ([TransportEvent.CALLER_AUDIO, TransportEvent.RESPONSE_AUDIO_DELTA].includes(event.type)) {
-      if (event.type === TransportEvent.CALLER_AUDIO) callTrace.recordAudio("caller", event.bytes);
+      if (event.type === TransportEvent.CALLER_AUDIO) { callTrace.recordAudio("caller", event.bytes); observeConsent("inboundAudio", event.bytes); }
       else {
         let bytes = 0;
         try { bytes = Buffer.from(event.delta, "base64").length; } catch { /* Measurement must not alter audio handling. */ }
@@ -82,6 +83,17 @@ export function initializeVoiceV2Session({
     CONFIRMATION_REJECTED: async () => ({ success: true }),
   };
   const session = new CallSession({ callSid, buildSha, proposal, businessContext, effectHandlers, watchdogOptions: scheduler, preferredLanguage: turnContext.language || "en", recordObserver: observeSessionRecord });
+  consentDiagnostics = new ConsentBoundaryDiagnostics({
+    trace: callTrace,
+    preferredLanguage: session.conversationLanguage.preferredLanguage,
+    transcriptionLanguage: openaiSession.input_audio_transcription?.language || null,
+    context: () => ({
+      currentRequirement: session.proposal.terminal ? null : deriveBookingRequirement(session.proposal),
+      preferredLanguage: session.conversationLanguage.preferredLanguage,
+      conversationLanguage: session.conversationLanguage.currentLanguage,
+    }),
+  });
+  function observeConsent(method, ...args) { try { return consentDiagnostics?.[method]?.(...args); } catch { /* Diagnostics cannot affect a call. */ } }
   const twilio = new TwilioMediaAdapter({ socket: twilioSocket, onEvent: (event) => receive(event, onTwilio) });
   const openai = new OpenAIRealtimeAdapter({ socketFactory: openaiSocketFactory, onEvent: (event) => receive(event, onOpenAI) });
   lifecycle = new SessionLifecycle({ session, transcriptAdapter, callerNumber, cleanup });
@@ -175,7 +187,7 @@ export function initializeVoiceV2Session({
       await maybeRequestInitialGreeting();
     } else if (event.type === TransportEvent.CALLER_AUDIO && !lifecycle.terminated) {
       if (!openaiConfigured) await bufferStartupAudio(event.payload);
-      else openai.appendCallerAudio({ payload: event.payload });
+      else { openai.appendCallerAudio({ payload: event.payload }); observeConsent("forwardedAudio", event.bytes); }
     } else if (event.type === TransportEvent.PLAYBACK_MARK_ACKNOWLEDGED) {
       await acknowledgePlayback(event.markId);
     } else if ([TransportEvent.TWILIO_STREAM_STOPPED, TransportEvent.TWILIO_CONNECTION_CLOSED, TransportEvent.TWILIO_TRANSPORT_ERROR].includes(event.type)) {
@@ -207,26 +219,30 @@ export function initializeVoiceV2Session({
       return maybeRequestInitialGreeting();
     }
     if (event.type === TransportEvent.CALLER_INPUT_COMMITTED) {
+      observeConsent("committed", event.itemId, listeningTraceDetails(event));
       callTrace.entry("CALLER_INPUT_COMMITTED", listeningTraceDetails(event));
       callTrace.entry("CALLER_TRANSCRIPTION_AWAITED", listeningTraceDetails(event));
       return;
     }
     if (event.type === TransportEvent.USER_TRANSCRIPT_COMPLETED) {
-      const details = { ...listeningTraceDetails(event), characterCount: event.transcript.length };
+      const details = { ...listeningTraceDetails(event), characterCount: event.transcript.length, empty: !event.transcript.trim() };
+      observeConsent("transcriptionCompleted", event.itemId, details);
       callTrace.entry("CALLER_TRANSCRIPTION_COMPLETED", details);
       callTrace.entry("CALLER_TRANSCRIPT_COMPLETED", details);
       session.watchdog.cancel("caller-silence"); return acceptTurn(event);
     }
     if (event.type === TransportEvent.USER_TRANSCRIPT_FAILED) {
+      observeConsent("transcriptionFailed", event.itemId, listeningTraceDetails(event));
       callTrace.entry("CALLER_TRANSCRIPTION_FAILED", { ...listeningTraceDetails(event), errorCode: event.error?.code || null, errorName: event.error?.name || null });
       return;
     }
     if (event.type === TransportEvent.CALLER_SPEECH_STARTED) {
+      observeConsent("speechStarted", event.itemId, listeningTraceDetails(event));
       session.turnRegistry.speechStarted(event.itemId); callTrace.speechStarted(listeningTraceDetails(event)); session.watchdog.cancel("caller-silence");
       if (session.floorOwner.snapshot.state === FloorState.AWAIT_CONSENT) return;
       return interruptCurrent();
     }
-    if (event.type === TransportEvent.CALLER_SPEECH_STOPPED) { session.turnRegistry.speechStopped(event.itemId); callTrace.speechStopped(listeningTraceDetails(event)); return; }
+    if (event.type === TransportEvent.CALLER_SPEECH_STOPPED) { observeConsent("speechStopped", event.itemId, listeningTraceDetails(event)); session.turnRegistry.speechStopped(event.itemId); callTrace.speechStopped(listeningTraceDetails(event)); return; }
     if (event.type === TransportEvent.RESPONSE_CREATED) return responseCreated(event);
     if (event.type === TransportEvent.RESPONSE_AUDIO_DELTA) return responseAudio(event);
     if (event.type === TransportEvent.RESPONSE_AUDIO_COMPLETED) {
@@ -246,12 +262,19 @@ export function initializeVoiceV2Session({
   }
 
   async function acceptTurn(event) {
-    if (lifecycle.terminated || session.proposal.terminal || session.ambiguityRecovery.limitReached) return;
     const providerId = event.itemId || event.eventId;
-    if (!providerId || providerTurns.has(providerId)) return;
+    if (lifecycle.terminated || session.proposal.terminal || session.ambiguityRecovery.limitReached) {
+      observeConsent("admission", providerId, { status: "REJECTED", reason: lifecycle.terminated ? "CALL_TERMINATED" : session.proposal.terminal ? "PROPOSAL_TERMINAL" : "AMBIGUITY_LIMIT_REACHED" });
+      return;
+    }
+    if (!providerId || providerTurns.has(providerId)) {
+      observeConsent("admission", providerId, { status: "STALE", reason: !providerId ? "MISSING_ITEM_ID" : "DUPLICATE_ITEM_ID" });
+      return;
+    }
     providerTurns.add(providerId);
     callerTurnSeen = true;
     const turnId = `${callSid}:turn:${++turnSequence}`;
+    observeConsent("admission", providerId, { status: event.transcript.trim() ? "ACCEPTED" : "EMPTY", reason: event.transcript.trim() ? "TURN_ACCEPTED" : "EMPTY_TRANSCRIPT", turnId });
     const callerSpeechOverlap = session.turnRegistry.hasActiveSpeechOtherThan(providerId);
     // A finalized transcript closes its own speech episode even if the
     // provider omitted or reordered the matching speech_stopped event.
@@ -260,12 +283,15 @@ export function initializeVoiceV2Session({
     try {
       const persisted = await lifecycle.appendTurn({ turnId, role: "caller", text: event.transcript, timestamp: now() });
       emitPersistenceOutcome({ turnId, role: "caller", itemId: providerId, characterCount: event.transcript.length, result: persisted });
+      observeConsent("persistence", providerId, { status: persisted?.success === true ? "SUCCEEDED" : "FAILED", affectedSemanticProcessing: false, turnId });
     } catch (error) {
       emitPersistenceOutcome({ turnId, role: "caller", itemId: providerId, characterCount: event.transcript.length, error });
+      observeConsent("persistence", providerId, { status: "FAILED", affectedSemanticProcessing: true, turnId });
       throw error;
     } finally { timing.end("TRANSCRIPT_PERSISTENCE", persistenceTiming, { turnId, role: "caller", itemId: providerId }); }
     session.record("TURN_ACCEPTED", { turnId, providerId });
     if (callerSpeechOverlap) {
+      observeConsent("admission", providerId, { status: "QUARANTINED", reason: "NEWER_CALLER_SPEECH_ACTIVE", turnId });
       session.record("SUPERSEDED_CALLER_TRANSCRIPT_IGNORED", { turnId, providerId, proposalVersion: session.proposal.proposalVersion, reason: "NEWER_CALLER_SPEECH_ACTIVE" });
       session.record("AMBIGUITY_OVERLAP_IGNORED", { turnId, proposalVersion: session.proposal.proposalVersion, reason: "NEWER_CALLER_SPEECH_ACTIVE" });
       return;
@@ -273,6 +299,7 @@ export function initializeVoiceV2Session({
     if (session.floorOwner.snapshot.state === FloorState.SPEAKING) await interruptCurrent();
     if (lifecycle.terminated) return;
     const consentClaim = session.floorOwner.claimConsent({ callerItemId: providerId, proposalVersion: session.proposal.proposalVersion });
+    observeConsent("consent", providerId, { ownerMatched: consentClaim.claimed === true, authorityExisted: consentClaim.claimed === true, authorityDecision: consentClaim.claimed ? "CLAIMED" : "NOT_CLAIMED", reason: consentClaim.reason || null });
     const current = consentClaim.claimed
       ? { responseId: consentClaim.authority.responseId, markId: consentClaim.authority.markId }
       : currentLifecycle();
@@ -292,6 +319,18 @@ export function initializeVoiceV2Session({
     });
     timing.end("INTERPRETATION_REDUCTION", semanticTiming, { turnId, proposalVersion: session.proposal.proposalVersion });
     const outcome = registered?.result || registered;
+    const interpretedAction = outcome?.interpreted?.interpretation?.action || null;
+    observeConsent("interpretation", providerId, { ran: true, action: interpretedAction, turnId });
+    const bookingAuthorization = outcome?.reduced?.effects?.find((effect) => effect.type === "AUTHORIZE_BOOKING") || null;
+    if (interpretedAction === "AFFIRM_CONFIRMATION") {
+      observeConsent("consent", providerId, {
+        ownerMatched: consentClaim.claimed === true,
+        authorityExisted: consentClaim.claimed === true,
+        authorityDecision: outcome?.authority?.authorized === false ? "WITHHELD" : bookingAuthorization ? "ACCEPTED" : "WITHHELD",
+        reason: outcome?.authority?.reason || (bookingAuthorization ? "AUTHORIZED" : outcome?.reduced?.reason || "BOOKING_NOT_AUTHORIZED"),
+      });
+      observeConsent("booking", providerId, { queued: Boolean(bookingAuthorization), reason: bookingAuthorization ? "AUTHORIZE_BOOKING_QUEUED" : outcome?.authority?.reason || outcome?.reduced?.reason || "NOT_QUEUED" });
+    }
     callTrace.counters.callerTurns += 1;
     callTrace.entry("CALLER_TURN_FINALIZED", { turnId, itemId: providerId, proposalVersion: session.proposal.proposalVersion });
     if (outcome?.authority?.authorized === false && !lifecycle.terminated && !session.proposal.terminal) {
@@ -473,6 +512,7 @@ export function initializeVoiceV2Session({
     // binder conditional preserves transport-only test harnesses that do not
     // construct a TTS boundary; they cannot be used as production evidence.
     const ownedPlan = speechAdapter ? bindApplicationOwnedLifecycleSpeech(terminalizedPlan) : terminalizedPlan;
+    observeConsent("responsePlanned", ownedPlan);
     const requestId = requestIdentity || `${callSid}:response:${++responseSequence}`;
     if (requests.has(requestId)) return { accepted: false, reason: "DUPLICATE_REQUEST_ID" };
     const category = floorPurposeFor(ownedPlan);
@@ -714,6 +754,16 @@ export function initializeVoiceV2Session({
       }
     }
     session.floorOwner.acknowledge({ requestId: state.requestId, responseId: state.responseId, markId });
+    observeConsent("playbackAcknowledged", {
+      ...listeningTraceDetails(),
+      requestId: state.requestId,
+      responseId: state.responseId,
+      markId,
+      proposalVersion: state.plan.proposalVersion,
+      responsePlanLanguage: state.plan.language,
+      responsePurpose: state.plan.purpose,
+      expectsCallerInput: state.plan.expectsCallerInput === true,
+    });
     if (state.plan.expectsCallerInput) session.watchdog.schedule("caller-silence", 30000, () => enqueue(callerSilenceTimedOut));
     if (isTerminalRecovery(state)) return lifecycle.terminate("RESPONSE_RECOVERY_DELIVERED");
     if (state.plan.purpose === ResponsePurpose.BOOKING_SUCCESS || state.plan.purpose === ResponsePurpose.AMBIGUITY_LIMIT_REACHED || (state.plan.purpose === ResponsePurpose.ERROR_RECOVERY && session.proposal.terminal)) await lifecycle.terminate("RESPONSE_DELIVERED");
@@ -960,6 +1010,7 @@ export function initializeVoiceV2Session({
     } else if (entry.event === "TRANSCRIPT_FINALIZED") {
       callTrace.counters.finalizations += 1;
       callTrace.entry("TRANSCRIPT_FINALIZED", { ...common, outcome: entry.outcome, persistenceOutcome: entry.replayed ? "REPLAYED" : entry.success ? "SUCCESS" : "NOT_CONFIRMED" });
+      observeConsent("complete");
       const activeResponses = [...responses.values()].filter((state) => ["planned", "requested"].includes(session.responseRegistry.get(state.responseId)?.status)).length;
       const uncreatedActiveRequest = openai.activeRequestId && ![...responses.values()].some((state) => state.requestId === openai.activeRequestId) ? 1 : 0;
       const activePlaybacks = [...marks.keys()].filter((markId) => ["not_submitted", "submitted"].includes(session.playbackRegistry.get(markId)?.status)).length;
