@@ -45,6 +45,12 @@ const SAFE_REPROMPT_MESSAGES = Object.freeze({
   ASK_NAME: Object.freeze({ en: "What name should I use for the appointment?", es: "\u00bfQu\u00e9 nombre debo usar para la cita?" }),
   CLARIFICATION: Object.freeze({ en: "Could you please repeat that?", es: "\u00bfPodr\u00edas repetirlo, por favor?" }),
 });
+const APPLICATION_COLLECT_MESSAGES = Object.freeze({
+  ASK_SERVICE: Object.freeze({ en: "Which service would you like?", es: "\u00bfQu\u00e9 servicio te gustar\u00eda?" }),
+  ASK_DATE: Object.freeze({ en: "What date would you like?", es: "\u00bfQu\u00e9 fecha te gustar\u00eda?" }),
+  ASK_TIME: Object.freeze({ en: "What time would you like?", es: "\u00bfA qu\u00e9 hora te gustar\u00eda?" }),
+  ASK_NAME: Object.freeze({ en: "What name should I use for the appointment?", es: "\u00bfQu\u00e9 nombre debo usar para la cita?" }),
+});
 
 export function planResponse({ proposal, purpose, language = "en", businessName = null, availabilitySearch = null }) {
   if (!proposal || !Number.isInteger(proposal.proposalVersion)) throw new TypeError("invalid_proposal");
@@ -157,8 +163,12 @@ export function planConfirmationRejected({ proposal, language = "en" }) {
   return withApplicationOwnedReprompt(plan, message);
 }
 
-export function bindApplicationOwnedLifecycleSpeech(plan) {
+export function bindApplicationOwnedLifecycleSpeech(plan, { collect = false, availability = false } = {}) {
   if (plan?.speechContract?.applicationOwnedConfirmation || plan?.speechContract?.applicationOwnedSpeech || plan?.speechContract?.applicationOwnedReprompt) return plan;
+  const collectMessage = APPLICATION_COLLECT_MESSAGES[plan?.purpose];
+  if (collect && collectMessage) return withApplicationOwnedSpeech(plan, collectMessage[plan.language === "es" ? "es" : "en"], "collect");
+  const availabilityMessage = availability ? renderAvailabilitySpeech(plan) : null;
+  if (availabilityMessage) return withApplicationOwnedSpeech(plan, availabilityMessage, "availability");
   if (plan?.purpose === ResponsePurpose.BOOKING_SUCCESS) {
     const message = plan.language === "es"
       ? "Tu cita fue reservada correctamente. Recibirás un mensaje de confirmación. Adiós."
@@ -240,6 +250,53 @@ function withApplicationOwnedReprompt(plan, requiredMessage) {
 
 function safeRepromptMessage(purpose, language) {
   return SAFE_REPROMPT_MESSAGES[purpose]?.[language === "es" ? "es" : "en"] || null;
+}
+
+function renderAvailabilitySpeech(plan) {
+  if (![ResponsePurpose.OFFER_ALTERNATIVES, ResponsePurpose.SCHEDULING_ALTERNATIVES, ResponsePurpose.SLOT_UNAVAILABLE, ResponsePurpose.NO_AVAILABLE_TIMES].includes(plan?.purpose)) return null;
+  const facts = plan.expectedFacts || {};
+  const language = plan.language === "es" ? "es" : "en";
+  if ([ResponsePurpose.OFFER_ALTERNATIVES, ResponsePurpose.SCHEDULING_ALTERNATIVES].includes(plan.purpose)) {
+    if (facts.availability !== "unavailable" || !Array.isArray(facts.alternatives) || !facts.alternatives.length) return null;
+    const alternatives = facts.alternatives.map((alternative) => renderDateTime(alternative.date, alternative.time, language));
+    if (alternatives.some((value) => !value)) return null;
+    if (language === "es") return `${facts.service} no est\u00e1 disponible${facts.date && facts.time ? ` el ${renderDateTime(facts.date, facts.time, language)}` : ""}. Puedo ofrecerte ${alternatives.join(", ")}. \u00bfCu\u00e1l prefieres?`;
+    return `${facts.service} is unavailable${facts.date && facts.time ? ` on ${renderDateTime(facts.date, facts.time, language)}` : ""}. I can offer ${alternatives.join(", ")}. Which would you prefer?`;
+  }
+  if (plan.purpose === ResponsePurpose.SLOT_UNAVAILABLE) {
+    if (facts.availability !== "unavailable" || !facts.service || !facts.date || !facts.time) return null;
+    if (language === "es") return `${facts.service} no est\u00e1 disponible el ${renderDateTime(facts.date, facts.time, language)}. \u00bfQu\u00e9 otro horario prefieres?`;
+    return `${facts.service} is unavailable on ${renderDateTime(facts.date, facts.time, language)}. What other time would you prefer?`;
+  }
+  const requestedDate = facts.requestedDate || facts.date;
+  if (!requestedDate) return null;
+  if (language === "es") return `No encontr\u00e9 horarios disponibles para ${renderDate(requestedDate, language)}. \u00bfQu\u00e9 otra fecha u hora te gustar\u00eda?`;
+  return `No available times were found for ${renderDate(requestedDate, language)}. What other date or time would you like?`;
+}
+
+function renderDateTime(date, time, language) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date || "") || !/^([01]\d|2[0-3]):[0-5]\d$/.test(time || "")) return null;
+  return `${renderDate(date, language)} ${language === "es" ? "a las" : "at"} ${renderTime(time, language)}`;
+}
+
+function renderDate(value, language) {
+  const [year, month, day] = value.split("-").map(Number);
+  const parsed = new Date(Date.UTC(year, month - 1, day, 12));
+  if (parsed.getUTCFullYear() !== year || parsed.getUTCMonth() !== month - 1 || parsed.getUTCDate() !== day) return null;
+  const weekday = language === "es"
+    ? ["domingo", "lunes", "martes", "mi\u00e9rcoles", "jueves", "viernes", "s\u00e1bado"][parsed.getUTCDay()]
+    : ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"][parsed.getUTCDay()];
+  const monthName = language === "es"
+    ? ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"][month - 1]
+    : ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"][month - 1];
+  return language === "es" ? `${weekday} ${day} de ${monthName} de ${year}` : `${weekday}, ${monthName} ${day}, ${year}`;
+}
+
+function renderTime(value, language) {
+  const [hour24, minute] = value.split(":").map(Number);
+  const hour12 = hour24 % 12 || 12;
+  const meridiem = hour24 < 12 ? "AM" : "PM";
+  return language === "es" ? `${hour12}:${String(minute).padStart(2, "0")} ${meridiem === "AM" ? "a. m." : "p. m."}` : `${hour12}:${String(minute).padStart(2, "0")} ${meridiem}`;
 }
 
 function canonicalBusinessName(value) {

@@ -15,6 +15,7 @@ export const CallerActionType = Object.freeze({
   CANCEL: "CANCEL",
   RESCHEDULE: "RESCHEDULE",
   CLARIFY: "CLARIFY",
+  NO_INFORMATION: "NO_INFORMATION",
   UNKNOWN: "UNKNOWN",
 });
 

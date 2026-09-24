@@ -35,7 +35,7 @@ export function reduceBooking(currentProposal, action) {
   const actionValidation = validateCallerAction(action);
   if (!actionValidation.valid) return rejected(currentProposal, actionValidation.reason);
 
-  if (action.action === CallerActionType.UNKNOWN || action.action === CallerActionType.CLARIFY) {
+  if ([CallerActionType.UNKNOWN, CallerActionType.CLARIFY, CallerActionType.NO_INFORMATION].includes(action.action)) {
     return unchanged(currentProposal, [{ type: BookingEffectType.REQUEST_CLARIFICATION }]);
   }
   if (fieldByAction.has(action.action)) {

@@ -43,6 +43,7 @@ test("bounded consent uncertainty preserves authority for one re-ask then exits"
   floor.bindMark({ requestId: "reask", responseId: "reask-response", markId: "reask-mark" });
   floor.acknowledge({ requestId: "reask", responseId: "reask-response", markId: "reask-mark" });
   assert.equal(floor.snapshot.state, FloorState.AWAIT_CONSENT);
+  assert.deepEqual({ requestId: floor.snapshot.requestId, responseId: floor.snapshot.responseId, markId: floor.snapshot.markId }, { requestId: "reask", responseId: "reask-response", markId: "reask-mark" });
   floor.claimConsent({ callerItemId: "unclear-2", proposalVersion: 2 });
   assert.equal(floor.recordUnclearConsent(), 2);
 });

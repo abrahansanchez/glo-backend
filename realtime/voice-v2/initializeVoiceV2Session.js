@@ -36,7 +36,7 @@ export function initializeVoiceV2Session({
   callSid, callerNumber, businessContext, buildSha, twilioSocket, openaiSocketFactory,
   availabilityAdapter = new V1AvailabilityAdapter(), bookingAdapter = new SharedBookingAdapter(),
   smsAdapter = new SharedSmsAdapter(), transcriptAdapter = new SharedTranscriptAdapter(),
-  callControlAdapter = null, speechAdapter = null,
+  callControlAdapter = null, speechAdapter = null, applicationOwnedCollectSpeech = false, applicationOwnedAvailabilitySpeech = false,
   coordinator = new VoiceCoordinator(), scheduler = {}, now = () => new Date(),
   proposal = createBookingProposal({ proposalId: `proposal:${callSid}` }),
   openaiSession = {}, turnContext = {}, emit = () => {}, timingOptions = {},
@@ -240,7 +240,11 @@ export function initializeVoiceV2Session({
       observeConsent("speechStarted", event.itemId, listeningTraceDetails(event));
       session.turnRegistry.speechStarted(event.itemId); callTrace.speechStarted(listeningTraceDetails(event)); session.watchdog.cancel("caller-silence");
       if (session.floorOwner.snapshot.state === FloorState.AWAIT_CONSENT) return;
-      return interruptCurrent();
+      if (session.floorOwner.snapshot.category === FloorPurpose.EXIT && session.floorOwner.snapshot.audioSubmitted === true) {
+        session.record("EXIT_CALLER_SPEECH_OBSERVED", { itemId: event.itemId || null, proposalVersion: session.proposal.proposalVersion });
+        return;
+      }
+      return interruptCurrent(event.itemId || null);
     }
     if (event.type === TransportEvent.CALLER_SPEECH_STOPPED) { observeConsent("speechStopped", event.itemId, listeningTraceDetails(event)); session.turnRegistry.speechStopped(event.itemId); callTrace.speechStopped(listeningTraceDetails(event)); return; }
     if (event.type === TransportEvent.RESPONSE_CREATED) return responseCreated(event);
@@ -263,6 +267,10 @@ export function initializeVoiceV2Session({
 
   async function acceptTurn(event) {
     const providerId = event.itemId || event.eventId;
+    if (session.floorOwner.snapshot.category === FloorPurpose.EXIT) {
+      session.record("EXIT_CALLER_SPEECH_OBSERVED", { itemId: providerId || null, proposalVersion: session.proposal.proposalVersion });
+      return;
+    }
     if (lifecycle.terminated || session.proposal.terminal || session.ambiguityRecovery.limitReached) {
       observeConsent("admission", providerId, { status: "REJECTED", reason: lifecycle.terminated ? "CALL_TERMINATED" : session.proposal.terminal ? "PROPOSAL_TERMINAL" : "AMBIGUITY_LIMIT_REACHED" });
       return;
@@ -357,9 +365,11 @@ export function initializeVoiceV2Session({
     }
     const languageTransition = session.conversationLanguage.observe({ languageEvidence: outcome?.interpreted?.languageEvidence, turnId, action: outcome?.interpreted?.interpretation?.action });
     if (languageTransition.changed) session.record("CONVERSATION_LANGUAGE_CHANGED", { turnId, previousLanguage: languageTransition.previousLanguage, currentLanguage: languageTransition.currentLanguage, reason: languageTransition.reason, confidence: languageTransition.languageEvidence?.confidence || null });
-    const ambiguousAction = ["UNKNOWN", "CLARIFY"].includes(outcome?.interpreted?.interpretation?.action);
+    const ambiguousAction = ["UNKNOWN", "CLARIFY"].includes(interpretedAction);
     if (!consentClaim.claimed) {
-      const recovery = session.ambiguityRecovery.observe({ action: outcome?.interpreted?.interpretation?.action, turnId, proposal: session.proposal, accepted: outcome?.reduced?.rejected !== true });
+      const recovery = interpretedAction === "NO_INFORMATION"
+        ? session.ambiguityRecovery.observeNoInformation({ turnId, proposal: session.proposal })
+        : session.ambiguityRecovery.observe({ action: interpretedAction, turnId, proposal: session.proposal, accepted: outcome?.reduced?.rejected !== true });
       recordAmbiguity(recovery, turnId);
       if (recovery.responsePurpose) ambiguityPurposes.push(recovery.responsePurpose);
     } else if (ambiguousAction) {
@@ -511,7 +521,7 @@ export function initializeVoiceV2Session({
     // Production composition always supplies SpeechAdapter. Keeping the
     // binder conditional preserves transport-only test harnesses that do not
     // construct a TTS boundary; they cannot be used as production evidence.
-    const ownedPlan = speechAdapter ? bindApplicationOwnedLifecycleSpeech(terminalizedPlan) : terminalizedPlan;
+    const ownedPlan = speechAdapter ? bindApplicationOwnedLifecycleSpeech(terminalizedPlan, { collect: applicationOwnedCollectSpeech, availability: applicationOwnedAvailabilitySpeech }) : terminalizedPlan;
     observeConsent("responsePlanned", ownedPlan);
     const requestId = requestIdentity || `${callSid}:response:${++responseSequence}`;
     if (requests.has(requestId)) return { accepted: false, reason: "DUPLICATE_REQUEST_ID" };
@@ -543,6 +553,7 @@ export function initializeVoiceV2Session({
     tracked.abortController = abortController;
     const state = registerResponseState(tracked, responseId, "application_tts");
     state.abortController = abortController;
+    timing.point("TTS_DISPATCH", timingDetails({ requestId: tracked.requestId, responseId }));
     timing.point("RESPONSE_CREATE_DISPATCH", timingDetails({ requestId: tracked.requestId, responseId }));
     callTrace.entry("SPEECH_SYNTHESIS_DISPATCHED", { ...timingDetails({ requestId: tracked.requestId, responseId }), attempt: tracked.attempt });
     session.watchdog.schedule(`response:${tracked.requestId}`, 15000, () => enqueue(() => responseTimedOut(tracked.requestId)));
@@ -571,6 +582,8 @@ export function initializeVoiceV2Session({
     state.audioBytes = audio.length;
     state.audioCompletedEventReceived = true;
     timing.once("FIRST_RESPONSE_AUDIO_RECEIVED", responseId, timingDetails({ responseId }));
+    timing.point("TTS_FIRST_AUDIO_READY", timingDetails({ responseId }));
+    timing.point("TTS_COMPLETE_BUFFER_READY", timingDetails({ responseId }));
     callTrace.entry("SPEECH_SYNTHESIS_COMPLETED", {
       ...timingDetails({ responseId }),
       sourceFormat: result.sourceFormat || null,
@@ -634,6 +647,11 @@ export function initializeVoiceV2Session({
 
   function responseCreated(event) {
     const tracked = requests.get(event.requestId); if (!tracked || lifecycle.terminated) return;
+    if (usesApplicationSpeech(tracked.plan)) {
+      session.record("APPLICATION_SPEECH_LEAK_QUARANTINED", { requestId: tracked.requestId, responseId: event.responseId, purpose: tracked.plan.purpose, proposalVersion: tracked.plan.proposalVersion });
+      superseded.add(event.responseId);
+      return;
+    }
     tracked.responseId = event.responseId;
     registerResponseState(tracked, event.responseId, "openai_realtime");
   }
@@ -641,7 +659,7 @@ export function initializeVoiceV2Session({
   function registerResponseState(tracked, responseId, transport) {
     const state = { ...tracked, responseId, transport, audio: [], audioBytes: 0, submittedAudioBytes: 0, audioCompletedEventReceived: false, transcript: null, assistantItemId: null, markId: null, providerCompletion: null, validation: null };
     responses.set(responseId, state);
-    session.responseRegistry.register({ responseId, proposalVersion: tracked.plan.proposalVersion, purpose: tracked.plan.purpose });
+    session.responseRegistry.register({ responseId, proposalVersion: tracked.plan.proposalVersion, purpose: tracked.plan.purpose === ResponsePurpose.CONSENT_REASK ? ResponsePurpose.PRE_BOOKING_CONFIRMATION : tracked.plan.purpose });
     session.responseRegistry.request(responseId);
     if (!session.floorOwner.bindResponse({ requestId: tracked.requestId, responseId })) {
       session.responseRegistry.invalidate(responseId, "FLOOR_OWNER_MISMATCH");
@@ -739,14 +757,17 @@ export function initializeVoiceV2Session({
     }
     session.playbackRegistry.acknowledge(markId);
     session.watchdog.cancel(`playback:${markId}`);
+    timing.point("PLAYBACK_MARK_ACKNOWLEDGED", timingDetails({ responseId: state.responseId, markId }));
     callTrace.playbackEnded();
     session.record("PLAYBACK_ACKNOWLEDGED", { responseId: state.responseId, markId, proposalVersion: state.plan.proposalVersion });
     lastAcknowledgedState = state;
-    if (state.plan.purpose === ResponsePurpose.PRE_BOOKING_CONFIRMATION) {
+    if ([ResponsePurpose.PRE_BOOKING_CONFIRMATION, ResponsePurpose.CONSENT_REASK].includes(state.plan.purpose)) {
       const floorGrant = session.floorOwner.mayGrantConfirmation({ requestId: state.requestId, proposalVersion: state.plan.proposalVersion, responseId: state.responseId, markId });
-      const grant = floorGrant.authorized
+      const grant = state.plan.purpose === ResponsePurpose.CONSENT_REASK
         ? session.confirmationAuthority.grant({ proposalVersion: state.plan.proposalVersion, responseId: state.responseId, markId, responseRegistry: session.responseRegistry, playbackRegistry: session.playbackRegistry })
-        : floorGrant;
+        : floorGrant.authorized
+          ? session.confirmationAuthority.grant({ proposalVersion: state.plan.proposalVersion, responseId: state.responseId, markId, responseRegistry: session.responseRegistry, playbackRegistry: session.playbackRegistry })
+          : floorGrant;
       session.record(grant.authorized ? "CONFIRMATION_AUTHORITY_GRANTED" : "CONFIRMATION_AUTHORITY_WITHHELD", { responseId: state.responseId, markId, reason: grant.reason || null });
       if (!grant.authorized) {
         session.floorOwner.release({ reason: grant.reason || "CONFIRMATION_AUTHORITY_WITHHELD", requestId: state.requestId, responseId: state.responseId, markId });
@@ -813,12 +834,18 @@ export function initializeVoiceV2Session({
     };
   }
 
-  async function interruptCurrent() {
+  async function interruptCurrent(callerItemId = null) {
     if (session.floorOwner.snapshot.state === FloorState.AWAIT_CONSENT) return;
-    if (session.floorOwner.snapshot.category === FloorPurpose.EXIT && !lifecycle.terminated) {
-      return lifecycle.terminate("RESPONSE_RECOVERY_INTERRUPTED");
+    const currentOwner = session.floorOwner.snapshot;
+    const state = currentLifecycle();
+    const controlledExit = [FloorPurpose.EXIT, FloorPurpose.POST_BOOK].includes(currentOwner.category);
+    const synthesisDispatched = Boolean(state?.requestId || state?.responseId);
+    if (controlledExit && synthesisDispatched && !lifecycle.terminated) {
+      session.record("EXIT_CALLER_SPEECH_OBSERVED", { itemId: callerItemId || null, proposalVersion: session.proposal.proposalVersion });
+      return;
     }
-    const state = currentLifecycle(); if (!state || lifecycle.terminated) return;
+    if (controlledExit && !lifecycle.terminated) return lifecycle.terminate("RESPONSE_RECOVERY_INTERRUPTED");
+    if (!state || lifecycle.terminated) return;
     if (state.markId) session.watchdog.cancel(`playback:${state.markId}`);
     const result = await coordinator.handleCallerSpeechStarted(session, { responseId: state.responseId, markId: state.markId, submittedAudioBytes: state.submittedAudioBytes, cancelResponse: () => supersedeResponse(state, "CALLER_INTERRUPTION"), clearPlayback: () => clearPlayback("CALLER_INTERRUPTION", state) });
     const owner = session.floorOwner.snapshot;
@@ -829,6 +856,10 @@ export function initializeVoiceV2Session({
 
   function recordAmbiguity(recovery, turnId) {
     if (recovery.kind === "unchanged" || recovery.kind === "blocked") return;
+    if (recovery.noInformationCount > 0) {
+      session.record(recovery.kind === "limit_reached" ? "NO_INFORMATION_LIMIT_REACHED" : "NO_INFORMATION_RECORDED", { turnId, count: recovery.noInformationCount, proposalVersion: session.proposal.proposalVersion, responsePurpose: recovery.responsePurpose });
+      return;
+    }
     const event = recovery.kind === "reset" ? "AMBIGUITY_RESET" : recovery.kind === "recorded" ? "AMBIGUITY_RECORDED" : recovery.kind === "escalated" ? "AMBIGUITY_ESCALATED" : "AMBIGUITY_LIMIT_REACHED";
     session.record(event, { turnId, count: recovery.consecutiveAmbiguousTurns, escalationLevel: recovery.escalationLevel, proposalVersion: session.proposal.proposalVersion, responsePurpose: recovery.responsePurpose });
   }
@@ -913,6 +944,14 @@ export function initializeVoiceV2Session({
 
   async function callerSilenceTimedOut() {
     if (lifecycle.terminated) return;
+    if (session.floorOwner.snapshot.state === FloorState.AWAIT_CONSENT) {
+      const callerItemId = `${callSid}:consent-silence:${session.floorOwner.consentUnclearCount + 1}`;
+      const claim = session.floorOwner.claimConsent({ callerItemId, proposalVersion: session.proposal.proposalVersion });
+      if (!claim.claimed) return;
+      const count = session.floorOwner.recordUnclearConsent();
+      if (count === 1) return requestResponse(planConsentReask({ proposal: session.proposal, language: session.conversationLanguage.currentLanguage }));
+      return requestResponse(coordinator.responsePlanner({ proposal: session.proposal, purpose: ResponsePurpose.AMBIGUITY_LIMIT_REACHED, language: session.conversationLanguage.currentLanguage }));
+    }
     const recovery = coordinator.handleTimeout(session, "CALLER_SILENCE");
     await requestResponse(coordinator.responsePlanner({ proposal: session.proposal, purpose: recovery.responsePlan.purpose, language: session.conversationLanguage.currentLanguage }));
   }

@@ -82,11 +82,12 @@ test('B: turn-5 failed clarification gets one recovery; duplicate and exhausted 
  f.openai.receive({type:'response.done',response:{id:'r7',status:'failed'}});await settle(f.app);
  assert.equal(f.creates().length,count);
 });
-test('B: recovery interruption before provider response.created terminates and cannot revive recovery',async()=>{
+test('B: recovery interruption after dispatch before provider response.created is observed and cannot revive recovery',async()=>{
  const f=await fixture();await f.turn('Could you repeat that?',1);await f.complete('', 'failed');
  const count=f.creates().length;
  f.openai.receive({type:'input_audio_buffer.speech_started'});await settle(f.app);
- assert.equal(f.app.lifecycle.terminated,true);assert.equal(f.app.session.watchdog.pendingCount,0);
+ assert.equal(f.app.lifecycle.terminated,false);assert.equal(f.app.session.watchdog.pendingCount,1);
+ assert.ok(f.app.session.journal().some((entry)=>entry.event==='EXIT_CALLER_SPEECH_OBSERVED'));
  f.openai.receive({type:'response.done',response:{id:'r2',status:'failed'}});await settle(f.app);
  assert.equal(f.creates().length,count);assert.equal(f.writes(),0);
 });

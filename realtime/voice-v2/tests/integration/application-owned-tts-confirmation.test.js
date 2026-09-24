@@ -60,6 +60,24 @@ test("application-owned confirmation uses the real TTS adapter, buffered Twilio 
   await f.app.terminate("TEST_COMPLETE");
 });
 
+test("production availability outcomes use application TTS without Realtime response.create", async () => {
+  const speech = { calls: [], synthesize: async ({ input, language }) => { speech.calls.push({ input, language }); return { audio: Buffer.alloc(160, 0xff), format: "audio/pcmu" }; } };
+  const facts = { service: "Haircut", date: "2026-09-19", time: "10:30" };
+  const proposal = createBookingProposal({
+    proposalId: "availability-tts", proposalVersion: 5, ...facts,
+    availability: { proposalVersion: 5, slotKey: deriveSlotKey(facts), status: "unavailable", alternatives: [{ date: "2026-09-19", time: "11:00" }] },
+  });
+  const f = await fixture({ speechAdapter: speech, proposal, applicationOwnedAvailabilitySpeech: true });
+  for (const purpose of [ResponsePurpose.OFFER_ALTERNATIVES, ResponsePurpose.SLOT_UNAVAILABLE, ResponsePurpose.NO_AVAILABLE_TIMES]) {
+    await f.app.requestResponse(planResponse({ proposal: f.app.session.proposal, purpose, language: "en", availabilitySearch: { requestedDate: facts.date, searchType: "DATE", afterTime: null } })); await settle(f.app);
+    assert.equal(f.openai.sent.filter((event) => event.type === "response.create" && event.response?.metadata?.purpose === purpose).length, 0, purpose);
+    assert.equal(speech.calls.at(-1).language, "en");
+    const mark = f.twilio.sent.filter((event) => event.event === "mark").at(-1)?.mark?.name; assert.ok(mark, purpose);
+    f.twilio.receive({ event: "mark", streamSid: f.streamSid, mark: { name: mark } }); await settle(f.app);
+  }
+  await f.app.terminate("TEST_COMPLETE");
+});
+
 test("Spanish application-owned confirmation uses the same TTS, playback and fresh-affirmative gates", async () => {
   const fetches = []; const speechAdapter = new OpenAISpeechAdapter({
     apiKey: "test", monotonicNow: values([20, 51]),
@@ -128,9 +146,9 @@ test("SessionWatchdog bounds a never-settling TTS request, aborts it and plans o
   await f.app.terminate("TEST_COMPLETE");
 });
 
-async function fixture({ speechAdapter, scheduler = {}, language = "en" }) {
+async function fixture({ speechAdapter, scheduler = {}, language = "en", proposal: suppliedProposal = null, applicationOwnedAvailabilitySpeech = false }) {
   const facts = { service: "Haircut", name: "Abe", date: "2026-09-19", time: "10:30" };
-  const proposal = createBookingProposal({
+  const defaultProposal = createBookingProposal({
     proposalId: "tts-path-a", proposalVersion: 5, ...facts,
     availability: { proposalVersion: 5, slotKey: deriveSlotKey(facts), status: "available", alternatives: [] },
   });
@@ -138,9 +156,9 @@ async function fixture({ speechAdapter, scheduler = {}, language = "en" }) {
   const callSid = `CA-tts-${Math.random().toString(16).slice(2)}`; const streamSid = `MZ-${callSid}`;
   const bookings = []; const sms = [];
   const app = initializeVoiceV2Session({
-    callSid, callerNumber: "+18135550100", buildSha: "tts-offline", proposal,
+    callSid, callerNumber: "+18135550100", buildSha: "tts-offline",
     businessContext: { businessId: "probando", barberId: "probando", businessName: "Probando", timeZone: "America/New_York" },
-    twilioSocket: twilio, openaiSocketFactory: () => openai, speechAdapter, scheduler,
+    twilioSocket: twilio, openaiSocketFactory: () => openai, speechAdapter, scheduler, proposal: suppliedProposal || defaultProposal, applicationOwnedAvailabilitySpeech,
     bookingAdapter: { createAppointment: async (command) => { bookings.push(command); return { success: true, appointmentId: "appt-tts" }; } },
     smsAdapter: { sendAppointmentConfirmation: async (command) => { sms.push(command); return { success: true }; } },
     transcriptAdapter: { appendTurn: async () => ({ success: true }), finalizeCall: async () => ({ success: true }) },

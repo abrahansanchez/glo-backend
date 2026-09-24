@@ -12,7 +12,7 @@ const BUSINESS_ID = "69d6b84155368d54a594b55a";
 const BUILD_SHA = "882a89a4ba16d7d12c23e53a5c372fa640a7bd97";
 
 test("CA6f9 unsafe ASK_TIME then one malformed caller time recovers through grounded speech and completes naturally", async (t) => {
-  const f = await fixture(t);
+  const f = await fixture(t, "", { applicationOwnedCollectSpeech: false });
   await caller(f, "request", "I need a haircut tomorrow");
   assert.deepEqual(facts(f), { proposalVersion: 2, service: "Haircut", date: "2026-09-23", time: null, name: null });
   const ask = lastCreate(f.openai);
@@ -62,7 +62,7 @@ test("CA6f9 unsafe ASK_TIME then one malformed caller time recovers through grou
 });
 
 test("a second unparseable caller time uses the existing controlled exit without facts or effects", async (t) => {
-  const f = await fixture(t, "-bounded");
+  const f = await fixture(t, "-bounded", { applicationOwnedCollectSpeech: false });
   await caller(f, "request", "I need a haircut tomorrow");
   await finishRealtime(f, lastCreate(f.openai), "ask-time", "What time would you like?", true);
   await caller(f, "bad-1", "Fóir a chlog.");
@@ -77,7 +77,7 @@ test("a second unparseable caller time uses the existing controlled exit without
 });
 
 test("4 PM becomes authoritative only from the later valid caller transcript", async (t) => {
-  const f = await fixture(t, "-caller-four-pm");
+  const f = await fixture(t, "-caller-four-pm", { applicationOwnedCollectSpeech: false });
   await caller(f, "request", "I need a haircut tomorrow");
   const ask = lastCreate(f.openai);
   await finishRealtime(f, ask, "unsafe-time", "You want 4 PM. I'll check that now.", false);
@@ -89,6 +89,15 @@ test("4 PM becomes authoritative only from the later valid caller transcript", a
   assert.equal(f.app.session.proposal.time, "16:00");
   assert.equal(f.availability.length, 1);
   assert.equal(f.availability[0].time, "16:00");
+});
+
+test("production collect lock uses fixed TTS and does not dispatch Realtime collect speech", async (t) => {
+  const f = await fixture(t, "-collect-lock");
+  await caller(f, "request", "I need a haircut tomorrow");
+  assert.equal(f.speech.calls.at(-1).input, "What time would you like?");
+  assert.equal(f.openai.sent.filter((item) => item.type === "response.create" && item.response.metadata.purpose === ResponsePurpose.ASK_TIME).length, 0);
+  assert.equal(f.app.session.proposal.time, null);
+  assert.equal(f.availability.length, 0);
 });
 
 test("production sessions bind isolated English and Spanish transcription and TTS languages", async (t) => {
@@ -112,7 +121,7 @@ test("production sessions bind isolated English and Spanish transcription and TT
   assert.equal(es.speech.calls.at(-1).language, "es"); assert.match(es.speech.calls.at(-1).input, /¿Quieres que reserve/i);
 });
 
-async function fixture(t, suffix = "", { preferredLanguage = "en" } = {}) {
+async function fixture(t, suffix = "", { preferredLanguage = "en", applicationOwnedCollectSpeech = true } = {}) {
   const twilio = new FakeSocket(); let openai; let app;
   const speech = { calls: [], async synthesize(args) { this.calls.push(args); return { audio: Buffer.alloc(160, 0xff), format: "audio/pcmu" }; } };
   const availability = []; const bookings = []; const sms = []; const finalized = [];
@@ -123,7 +132,7 @@ async function fixture(t, suffix = "", { preferredLanguage = "en" } = {}) {
     twilioFactory: () => ({ messages: {} }), speechAdapter: speech,
     resolveBusinessByCalledNumber: async () => business,
     initializeSession: (args) => {
-      app = initializeVoiceV2Session({ ...args, now: () => new Date("2026-09-22T16:00:00.000Z"),
+      app = initializeVoiceV2Session({ ...args, applicationOwnedCollectSpeech, now: () => new Date("2026-09-22T16:00:00.000Z"),
         availabilityAdapter: { checkAvailability: async (request) => { availability.push(request); return { slotKey: request.slotKey, available: true }; }, getAlternatives: async () => ({ alternatives: [] }) },
         bookingAdapter: { createAppointment: async (request) => { bookings.push(request); return { success: true, appointmentId: "appointment-ca6f9" }; } },
         smsAdapter: { sendAppointmentConfirmation: async (request) => { sms.push(request); return { success: true, submitted: true }; } },

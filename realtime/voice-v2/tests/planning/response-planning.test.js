@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createBookingProposal } from "../../domain/BookingProposal.js";
-import { planResponse, planSafeCollectionReprompt, planTerminalResponseRecovery, ResponsePurpose } from "../../planning/ResponsePlanner.js";
+import { applyAvailabilityResult } from "../../domain/BookingLifecycleTransitions.js";
+import { planResponse, planSafeCollectionReprompt, planTerminalResponseRecovery, bindApplicationOwnedLifecycleSpeech, ResponsePurpose } from "../../planning/ResponsePlanner.js";
 import { validateSpeech } from "../../planning/SpeechValidator.js";
 
 const proposal = createBookingProposal({ proposalId: "p1", proposalVersion: 7, service: "Haircut", name: "Roberto", date: "2026-08-27", time: "14:30" });
@@ -99,6 +100,30 @@ test("ASK_TIME and CLARIFICATION buffer and reject invented time or availability
     assert.equal(validateSpeech(ordinary, "That time is unavailable.").failedInvariant, "unsupported_availability_result_claim");
     assert.equal(validateSpeech(ordinary, "I found another opening.").failedInvariant, "unsupported_availability_result_claim");
   }
+});
+
+test("verified availability purposes render localized application speech only from current facts", () => {
+  const unavailable = createBookingProposal({
+    proposalId: "availability-rendering", proposalVersion: 3,
+    service: "Haircut", date: "2026-08-27", time: "14:00",
+    availability: {
+      proposalVersion: 3,
+      slotKey: JSON.stringify(["Haircut", "2026-08-27", "14:00"]),
+      status: "unavailable",
+      alternatives: [
+        { date: "2026-08-27", time: "15:00" },
+        { date: "2026-08-28", time: "10:30" },
+      ],
+    },
+  });
+  const offerEn = bindApplicationOwnedLifecycleSpeech(planResponse({ proposal: unavailable, purpose: ResponsePurpose.OFFER_ALTERNATIVES, language: "en" }), { availability: true });
+  const offerEs = bindApplicationOwnedLifecycleSpeech(planResponse({ proposal: unavailable, purpose: ResponsePurpose.OFFER_ALTERNATIVES, language: "es" }), { availability: true });
+  assert.match(offerEn.speechContract.requiredMessage, /Haircut is unavailable.*Thursday, August 27, 2026 at 2:00 PM.*Thursday, August 27, 2026 at 3:00 PM.*Friday, August 28, 2026 at 10:30 AM/s);
+  assert.match(offerEs.speechContract.requiredMessage, /Haircut no est\u00e1 disponible.*jueves 27 de agosto de 2026.*Puedo ofrecerte.*viernes 28 de agosto de 2026/s);
+  assert.equal(offerEn.speechContract.applicationSpeechKind, "availability");
+  const empty = createBookingProposal({ ...unavailable, proposalId: "availability-empty", availability: { ...unavailable.availability, alternatives: [] } });
+  assert.equal(bindApplicationOwnedLifecycleSpeech(planResponse({ proposal: empty, purpose: ResponsePurpose.OFFER_ALTERNATIVES }), { availability: true }).speechContract.applicationOwnedSpeech, undefined);
+  assert.equal(applyAvailabilityResult(unavailable, { proposalVersion: 2, slotKey: unavailable.availability.slotKey, available: false, alternatives: [] }).reason, "STALE_PROPOSAL_VERSION");
 });
 
 test("every eligible application-owned collection reprompt has fixed validated English and Spanish text", () => {

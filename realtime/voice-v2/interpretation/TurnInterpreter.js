@@ -65,7 +65,7 @@ export async function interpretTurn({
 
 export function classifyOneAction(normalizedTurn, context) {
   const text = normalizedTurn.text;
-  if (!text) return CallerActionType.UNKNOWN;
+  if (!text || isBackchannel(text)) return CallerActionType.NO_INFORMATION;
   const modification = matchesRuleGroup("modification_cues", text);
   const timeSignal = matchesRuleGroup("time_expressions", text)
     || matchesRuleGroup("half_hour_forms", text)
@@ -104,6 +104,10 @@ export function classifyOneAction(normalizedTurn, context) {
   if (context.nameCollectionContext && extractName(normalizedTurn, { allowBare: true })) return CallerActionType.SET_NAME;
   if (matchesRuleGroup("clarification_cues", text) || /\?$/.test(normalizedTurn.raw.trim())) return CallerActionType.CLARIFY;
   return CallerActionType.UNKNOWN;
+}
+
+function isBackchannel(text) {
+  return /^(?:m+h+m+|uh ?huh|mm+|aja)$/i.test(text);
 }
 
 function buildInterpretation(action, normalizedTurn, sourceTurnId, context) {

@@ -15,8 +15,9 @@ export class AmbiguityRecoveryState {
   #lastTurnId = null;
   #level = 0;
   #terminated = false;
+  #noInformationCount = 0;
 
-  get snapshot() { return Object.freeze({ consecutiveAmbiguousTurns: this.#count, lastAmbiguousTurnId: this.#lastTurnId, escalationLevel: this.#level }); }
+  get snapshot() { return Object.freeze({ consecutiveAmbiguousTurns: this.#count, lastAmbiguousTurnId: this.#lastTurnId, escalationLevel: this.#level, noInformationCount: this.#noInformationCount }); }
   get limitReached() { return this.#level === 3; }
   get terminated() { return this.#terminated; }
 
@@ -24,7 +25,7 @@ export class AmbiguityRecoveryState {
     if (this.#terminated || this.limitReached) return Object.freeze({ kind: "blocked", ...this.snapshot, responsePurpose: null });
     if (!AMBIGUOUS_ACTIONS.has(action)) {
       if (!accepted) return Object.freeze({ kind: "unchanged", ...this.snapshot, responsePurpose: null });
-      const previousCount = this.#count; this.#count = 0; this.#lastTurnId = null; this.#level = 0;
+      const previousCount = this.#count; this.#count = 0; this.#lastTurnId = null; this.#level = 0; this.#noInformationCount = 0;
       return Object.freeze({ kind: previousCount ? "reset" : "unchanged", previousCount, ...this.snapshot, responsePurpose: null });
     }
     this.#count += 1; this.#lastTurnId = turnId;
@@ -42,5 +43,14 @@ export class AmbiguityRecoveryState {
     return Object.freeze({ kind: this.#level === 3 ? "limit_reached" : this.#count === 1 ? "recorded" : "escalated", ...this.snapshot, responsePurpose });
   }
 
-  terminate() { this.#terminated = true; this.#count = 0; this.#lastTurnId = null; this.#level = 0; }
+  observeNoInformation({ turnId, proposal }) {
+    if (this.#terminated || this.limitReached) return Object.freeze({ kind: "blocked", ...this.snapshot, responsePurpose: null });
+    this.#noInformationCount += 1;
+    const directedPurpose = DIRECTED_PURPOSE[deriveBookingRequirement(proposal)] || ResponsePurpose.CLARIFICATION;
+    const exhausted = this.#noInformationCount >= 2;
+    if (exhausted) this.#level = 3;
+    return Object.freeze({ kind: exhausted ? "limit_reached" : "recorded", turnId, ...this.snapshot, responsePurpose: exhausted ? ResponsePurpose.AMBIGUITY_LIMIT_REACHED : directedPurpose });
+  }
+
+  terminate() { this.#terminated = true; this.#count = 0; this.#lastTurnId = null; this.#level = 0; this.#noInformationCount = 0; }
 }

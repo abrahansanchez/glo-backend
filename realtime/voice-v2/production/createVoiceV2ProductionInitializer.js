@@ -70,6 +70,8 @@ export function createVoiceV2ProductionInitializer({
                 twilioSocket: socket, openaiSocketFactory: dependencies.openaiSocketFactory,
                 smsAdapter: dependencies.smsAdapter,
                 speechAdapter: dependencies.speechAdapter,
+                applicationOwnedCollectSpeech: true,
+                applicationOwnedAvailabilitySpeech: true,
                 callControlAdapter: dependencies.callControlAdapter,
                 openaiSession: {
                   ...dependencies.openaiSession,

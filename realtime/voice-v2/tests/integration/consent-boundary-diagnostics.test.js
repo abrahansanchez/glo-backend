@@ -92,11 +92,11 @@ test("production path continues nonempty semantic processing after a reported pe
   assert.equal(boundary.interpretationRan, true);
 });
 
-test("production path records completed empty transcript and still interprets UNKNOWN", async () => {
+test("production path records completed empty transcript as no information", async () => {
   const f = fixture("CA-consent-empty", "en", { transcriptSuccess: false });
   await start(f); await finishGreeting(f);
   await callerPipeline(f, "empty-item", "   ");
-  assert.ok(f.app.session.journal().some((entry) => entry.event === "TURN_INTERPRETED" && entry.action === "UNKNOWN"));
+  assert.ok(f.app.session.journal().some((entry) => entry.event === "TURN_INTERPRETED" && entry.action === "NO_INFORMATION"));
   await f.app.terminate("TEST_COMPLETE"); await settle(f.app);
   const boundary = traces(f).find((entry) => entry.traceEvent === "CONSENT_BOUNDARY" && entry.itemId === "empty-item");
   assert.equal(boundary.classification, "EMPTY_TRANSCRIPT");
@@ -126,6 +126,7 @@ function fixture(callSid, language, { transcriptSuccess = true } = {}) {
     businessContext: { businessId: "business", barberId: "barber", businessName: "Shop", timeZone: "America/New_York", preferredLanguage: language },
     twilioSocket: twilio, openaiSocketFactory: () => openai, proposal,
     openaiSession: { model: "offline", voice: "alloy", input_audio_transcription: { model: "offline", language } },
+    timingOptions: { monotonicNow: () => 10, wallNow: () => "2026-09-22T12:00:00.000Z" },
     turnContext: { language, availableServices: ["Haircut"], referenceDate: "2026-09-22" },
     speechAdapter: { synthesize: async () => ({ audio: Buffer.alloc(160, 0xff), format: "audio/pcmu" }) },
     bookingAdapter: { createAppointment: async () => { bookings += 1; return { success: true, appointmentId: "appointment" }; } },
@@ -183,4 +184,33 @@ function applyStep(d, id, step) {
   if (step === "owner-mismatch") d.consent(id, { ownerMatched: false, authorityExisted: false, authorityDecision: "WITHHELD", reason: "NO_CURRENT_CONFIRMATION" });
   if (step === "booking") d.booking(id, { queued: true, reason: "AUTHORIZE_BOOKING_QUEUED" });
 }
+
+const PRIVACY_FORBIDDEN_KEYS = new Set([
+  "transcript", "transcripttext", "callername", "clientname", "phone", "phonenumber", "service",
+  "requesteddate", "appointmentdate", "requestedtime", "appointmenttime", "audio", "audiopayload",
+  "mediapayload", "prompt", "instructions", "rawprovidercontent", "providerpayload", "providerresponse",
+]);
+const PRIVACY_TIME_KEYS = new Set(["walltime", "elapsedms", "durationms", "queuewaitms", "processingms"]);
+
+test("compact trace privacy guard rejects forbidden nested fields and allows approved timing", () => {
+  const f = diagnosticFixture(); f.d.playbackAcknowledged(owner()); f.d.complete();
+  const valid = f.logs.filter((entry) => entry.event === "V2_CALL_TRACE");
+  assert.doesNotThrow(() => assertCompactTracePrivacy(valid));
+  assert.throws(() => assertCompactTracePrivacy([{ wallTime: "2026-09-22T12:00:00.000Z", nested: { transcriptText: "synthetic" } }]), /transcriptText/);
+  assert.throws(() => assertCompactTracePrivacy([{ providerPayload: { value: "synthetic" } }]), /providerPayload/);
+});
+
+function assertCompactTracePrivacy(records) {
+  function visit(value, path = []) {
+    if (!value || typeof value !== "object") return;
+    for (const [key, child] of Object.entries(value)) {
+      const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, "");
+      if (PRIVACY_FORBIDDEN_KEYS.has(normalized)) throw new Error(path.concat(key).join("."));
+      if (normalized.endsWith("time") && !PRIVACY_TIME_KEYS.has(normalized) && normalized !== "transcriptionlanguage") throw new Error(path.concat(key).join("."));
+      visit(child, path.concat(key));
+    }
+  }
+  visit(records);
+}
+
 async function settle(app) { for (let index = 0; index < 20; index += 1) { await Promise.resolve(); await app.ready(); } }

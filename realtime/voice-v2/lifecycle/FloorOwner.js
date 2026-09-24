@@ -76,6 +76,7 @@ export class FloorOwner {
       this.#snapshot = frozen({ state: FloorState.AWAIT_CONSENT, ...this.#consentAuthority, purpose: previous.purpose, category: previous.category, source: previous.source, audioSubmitted: true, playbackCleared: false, authorityExists: true, generation: previous.generation });
     } else if (previous.category === FloorPurpose.REASK && this.#consentAuthority) {
       this.#claimedCallerItemId = null;
+      this.#consentAuthority = frozen({ requestId: previous.requestId, responseId: previous.responseId, markId: previous.markId, proposalVersion: previous.proposalVersion });
       this.#snapshot = frozen({ state: FloorState.AWAIT_CONSENT, ...this.#consentAuthority, purpose: previous.purpose, category: FloorPurpose.CONFIRM, source: previous.source, audioSubmitted: true, playbackCleared: false, authorityExists: true, generation: previous.generation });
     } else {
       this.#snapshot = frozen({ state: FloorState.LISTEN });
@@ -152,6 +153,7 @@ export class FloorOwner {
   releaseReaskForConsent({ reason, requestId = null, responseId = null, markId = null, playbackCleared = false } = {}) {
     if (this.#snapshot.state !== FloorState.SPEAKING || this.#snapshot.category !== FloorPurpose.REASK || !this.#matches({ requestId, responseId, markId }) || !this.#consentAuthority) return false;
     const previous = this.#snapshot;
+    this.#consentAuthority = frozen({ requestId: previous.requestId, responseId: previous.responseId, markId: previous.markId, proposalVersion: previous.proposalVersion });
     this.#snapshot = frozen({ state: FloorState.AWAIT_CONSENT, ...this.#consentAuthority, purpose: previous.purpose, category: FloorPurpose.CONFIRM, source: previous.source, audioSubmitted: true, playbackCleared: false, authorityExists: true, generation: previous.generation });
     this.#record("FLOOR_OWNER_REPLACED", details(previous, { reason, playbackCleared, authorityExisted: true }));
     this.#transition(previous, this.#snapshot, reason || "REASK_INTERRUPTED");

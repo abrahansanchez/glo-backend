@@ -5,6 +5,9 @@ import { createBookingProposal, deriveSlotKey } from "../../domain/BookingPropos
 import { ResponsePurpose, planResponse } from "../../planning/ResponsePlanner.js";
 import { initializeVoiceV2Session } from "../../initializeVoiceV2Session.js";
 import { FakeSocket } from "../helpers/FakeSocket.js";
+import { normalizeTurn } from "../../interpretation/TurnNormalizer.js";
+import { classifyOneAction } from "../../interpretation/TurnInterpreter.js";
+import { CallerActionType } from "../../domain/CallerAction.js";
 
 test("first UNKNOWN and CLARIFY ask for the single authoritative missing requirement", () => {
   for (const action of ["UNKNOWN", "CLARIFY"]) {
@@ -12,6 +15,20 @@ test("first UNKNOWN and CLARIFY ask for the single authoritative missing require
     assert.equal(state.observe({ action, turnId: "t1", proposal }).responsePurpose, ResponsePurpose.ASK_SERVICE);
     assert.deepEqual(proposal, before); assert.equal(state.snapshot.consecutiveAmbiguousTurns, 1);
   }
+});
+
+test("Spanish ajá backchannels are no-information and remain bounded", () => {
+  const proposal = missing();
+  for (const text of ["ajá", "aja", "ajá.", "Aja"]) {
+    assert.equal(classifyOneAction(normalizeTurn(text), { currentProposal: proposal, availableServices: [] }), CallerActionType.NO_INFORMATION, text);
+  }
+  const state = new AmbiguityRecoveryState();
+  const first = state.observeNoInformation({ turnId: "aja-1", proposal });
+  const second = state.observeNoInformation({ turnId: "aja-2", proposal });
+  assert.equal(first.responsePurpose, ResponsePurpose.ASK_SERVICE);
+  assert.equal(second.responsePurpose, ResponsePurpose.AMBIGUITY_LIMIT_REACHED);
+  assert.equal(state.snapshot.consecutiveAmbiguousTurns, 0);
+  assert.equal(state.snapshot.noInformationCount, 2);
 });
 
 test("first ambiguity remains generic when no field-level continuation exists", () => {
@@ -145,12 +162,32 @@ test("ambiguity-limit playback timeout terminates through SessionWatchdog and fi
   assert.equal(f.app.lifecycle.terminated, true); assert.equal(f.finalized.length, 1);
 });
 
-test("caller interruption during ambiguity-limit response terminates and cannot resume booking", async () => {
+test("caller speech after submitted ambiguity-limit response is observed and cannot resume booking", async () => {
   const f = fixture({ callSid: "CA-INTERRUPT" }); await start(f); const create = await reachLimit(f); const requestId = create.response.metadata.v2RequestId;
   f.openai.receive({ type: "response.created", response: { id: "limit-interrupt", metadata: { v2RequestId: requestId } } }); f.openai.receive({ type: "response.output_audio.delta", response_id: "limit-interrupt", delta: "AQID" }); await settle(f.app);
+  f.openai.receive({ type: "response.output_audio_transcript.done", response_id: "limit-interrupt", transcript: "I'm sorry, I can't continue this call. Please call again later. Goodbye." });
+  f.openai.receive({ type: "response.done", response: { id: "limit-interrupt", status: "completed" } }); await settle(f.app);
   f.openai.receive({ type: "input_audio_buffer.speech_started", event_id: "speech" }); await settle(f.app);
   f.openai.receive(transcript("after-limit", "haircut")); await settle(f.app);
+  const mark = f.twilio.sent.filter((item) => item.event === "mark").at(-1);
+  f.twilio.receive({ event: "mark", streamSid: "MZ1", mark: { name: mark.mark.name } }); await settle(f.app);
   assert.equal(f.app.lifecycle.terminated, true); assert.equal(f.finalized.length, 1); assert.equal(f.bookings.length, 0); assert.equal(f.app.session.proposal.service, null);
+  assert.ok(f.app.session.journal().some((entry) => entry.event === "EXIT_CALLER_SPEECH_OBSERVED"));
+});
+
+test("caller speech after exit response creation but before mark submission is observed", async () => {
+  const f = fixture({ callSid: "CA-EXIT-INFLIGHT" }); await start(f); const create = await reachLimit(f); const requestId = create.response.metadata.v2RequestId;
+  f.openai.receive({ type: "response.created", response: { id: "exit-inflight", metadata: { v2RequestId: requestId } } });
+  f.openai.receive({ type: "input_audio_buffer.speech_started", item_id: "exit-caller" }); await settle(f.app);
+  assert.equal(f.app.lifecycle.terminated, false);
+  assert.equal(f.app.session.journal().some((entry) => entry.event === "RESPONSE_RECOVERY_INTERRUPTED"), false);
+  assert.ok(f.app.session.journal().some((entry) => entry.event === "EXIT_CALLER_SPEECH_OBSERVED" && entry.itemId === "exit-caller"));
+  f.openai.receive({ type: "response.output_audio.delta", response_id: "exit-inflight", delta: "AQID" });
+  f.openai.receive({ type: "response.output_audio_transcript.done", response_id: "exit-inflight", transcript: "I'm sorry, I can't continue this call. Please call again later. Goodbye." });
+  f.openai.receive({ type: "response.done", response: { id: "exit-inflight", status: "completed" } }); await settle(f.app);
+  const mark = f.twilio.sent.filter((item) => item.event === "mark").at(-1);
+  f.twilio.receive({ event: "mark", streamSid: "MZ1", mark: { name: mark.mark.name } }); await settle(f.app);
+  assert.equal(f.app.lifecycle.terminated, true);
 });
 
 function primed(proposal) { const state = new AmbiguityRecoveryState(); state.observe({ action: "UNKNOWN", turnId: "t1", proposal }); return state; }
