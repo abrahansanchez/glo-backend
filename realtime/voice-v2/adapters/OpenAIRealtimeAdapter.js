@@ -15,6 +15,9 @@ export class OpenAIRealtimeAdapter {
   #responses = new Map();
   #cancellations = new Map();
   #pending = [];
+  #audioInput = null;
+  #transcription = null;
+  #pendingLanguageUpdate = null;
   #now;
   #callSid = null;
   #model = null;
@@ -45,18 +48,31 @@ export class OpenAIRealtimeAdapter {
   configureSession({ model, instructions, voice, turnDetection = {}, input_audio_transcription: transcription } = {}) {
     this.#requireWritable();
     if (this.#configurationRequested) return null;
+    this.#audioInput = freezePlain({
+      format: { type: "audio/pcmu" },
+      ...(transcription ? { transcription: { ...transcription } } : {}),
+      turn_detection: { type: "server_vad", ...turnDetection, create_response: false, interrupt_response: false },
+    });
+    this.#transcription = this.#audioInput.transcription || null;
     const message = { type: "session.update", session: {
       type: "realtime", model, instructions, output_modalities: ["audio"],
       audio: {
-        input: {
-          format: { type: "audio/pcmu" },
-          ...(transcription ? { transcription } : {}),
-          turn_detection: { type: "server_vad", ...turnDetection, create_response: false, interrupt_response: false },
-        },
+        input: this.#audioInput,
         output: { format: { type: "audio/pcmu" }, voice },
       },
     } };
     sendJson(this.#socket, message); this.#configurationRequested = true; return message;
+  }
+
+  updateTranscriptionLanguage(language, { updateId = this.#id("language") } = {}) {
+    this.#requireWritable();
+    if (this.#pendingLanguageUpdate) return Object.freeze({ accepted: false, reason: "LANGUAGE_UPDATE_PENDING", updateId: this.#pendingLanguageUpdate.updateId });
+    if (!this.#audioInput?.transcription || this.#transcription?.language !== "en" || language !== "es") return Object.freeze({ accepted: false, reason: "LANGUAGE_UPDATE_NOT_ALLOWED", updateId });
+    const transcription = freezePlain({ ...this.#audioInput.transcription, language });
+    const audioInput = freezePlain({ ...this.#audioInput, transcription });
+    this.#pendingLanguageUpdate = Object.freeze({ updateId, requestedLanguage: language, audioInput, transcription });
+    sendJson(this.#socket, { event_id: updateId, type: "session.update", session: { audio: { input: audioInput } } });
+    return Object.freeze({ accepted: true, updateId, transcription });
   }
 
   appendCallerAudio({ payload, eventId = this.#id("audio") }) { this.#requireConfigured(); return sendJson(this.#socket, { event_id: eventId, type: "input_audio_buffer.append", audio: payload }); }
@@ -97,7 +113,11 @@ export class OpenAIRealtimeAdapter {
     let message; try { message = parseJsonMessage(raw); } catch (error) { return this.#onError(error); }
     const type = message.type; const identity = providerIdentity(message);
     if (type === "session.created") return this.#publish(TransportEvent.OPENAI_SESSION_CREATED, identity);
-    if (type === "session.updated" && this.#configurationRequested) { this.#configured = true; return this.#publish(TransportEvent.OPENAI_SESSION_CONFIGURED, identity); }
+    if (type === "session.updated" && this.#configurationRequested) {
+      if (this.#pendingLanguageUpdate) return this.#languageUpdateAcknowledgement(message, identity);
+      if (this.#configured) return this.#publish(TransportEvent.OPENAI_LANGUAGE_UPDATE_STALE_IGNORED, { ...identity, reason: "NO_PENDING_LANGUAGE_UPDATE" });
+      this.#configured = true; return this.#publish(TransportEvent.OPENAI_SESSION_CONFIGURED, identity);
+    }
     if (type === "input_audio_buffer.speech_started") return this.#publish(TransportEvent.CALLER_SPEECH_STARTED, identity);
     if (type === "input_audio_buffer.speech_stopped") return this.#publish(TransportEvent.CALLER_SPEECH_STOPPED, identity);
     if (type === "input_audio_buffer.committed") return this.#publish(TransportEvent.CALLER_INPUT_COMMITTED, identity);
@@ -147,18 +167,33 @@ export class OpenAIRealtimeAdapter {
       if (this.#activeRequestId === request.requestId) this.#activeRequestId = null; request.status = "provider_rejected";
       return this.#publish(TransportEvent.ACTIVE_RESPONSE_REJECTED, { ...providerDetails, requestId: request.requestId, reason: "PROVIDER_ACTIVE_RESPONSE" });
     }
+    if (this.#pendingLanguageUpdate?.updateId === failedEventId) {
+      const pending = this.#pendingLanguageUpdate; this.#pendingLanguageUpdate = null;
+      return this.#publish(TransportEvent.OPENAI_LANGUAGE_UPDATE_REJECTED, { ...identity, updateId: pending.updateId, requestedLanguage: pending.requestedLanguage, reason: "PROVIDER_REJECTED" });
+    }
     const cancelledResponseId = this.#cancellations.get(failedEventId);
     if (cancelledResponseId) { this.#cancellations.delete(failedEventId); return this.#publish(TransportEvent.RESPONSE_CANCEL_FAILED, { ...providerDetails, responseId: cancelledResponseId }); }
     return this.#publish(TransportEvent.OPENAI_TRANSPORT_ERROR, providerDetails);
   }
 
-  #onClose(details) { if (!this.#connected && !this.#socket) return; const type = this.#opened ? TransportEvent.OPENAI_SOCKET_CLOSED : TransportEvent.OPENAI_SOCKET_CLOSED_BEFORE_READY; this.#connected = false; this.#publish(type, { ...this.#startupMetadata(), readyState: this.#socket?.readyState ?? null, closeCode: details?.code ?? null, closeReason: details?.reason?.toString?.() || null }); this.#publish(TransportEvent.OPENAI_CONNECTION_CLOSED, { code: details?.code ?? null, reason: details?.reason?.toString?.() || null }); }
+  #onClose(details) { if (!this.#connected && !this.#socket) return; const type = this.#opened ? TransportEvent.OPENAI_SOCKET_CLOSED : TransportEvent.OPENAI_SOCKET_CLOSED_BEFORE_READY; this.#connected = false; if (this.#pendingLanguageUpdate) { const pending = this.#pendingLanguageUpdate; this.#pendingLanguageUpdate = null; this.#publish(TransportEvent.OPENAI_LANGUAGE_UPDATE_REJECTED, { ...this.#startupMetadata(), updateId: pending.updateId, requestedLanguage: pending.requestedLanguage, reason: "SOCKET_CLOSED" }); } this.#publish(type, { ...this.#startupMetadata(), readyState: this.#socket?.readyState ?? null, closeCode: details?.code ?? null, closeReason: details?.reason?.toString?.() || null }); this.#publish(TransportEvent.OPENAI_CONNECTION_CLOSED, { code: details?.code ?? null, reason: details?.reason?.toString?.() || null }); }
   #onError(error) { this.#publish(TransportEvent.OPENAI_SOCKET_ERROR, { ...this.#startupMetadata(), phase: this.#opened ? "CONNECTED" : "STARTUP", readyState: this.#socket?.readyState ?? null, errorCode: safeString(error?.code), errorName: safeString(error?.name) || "Error" }); this.#publish(TransportEvent.OPENAI_TRANSPORT_ERROR, { error: normalizeError(error) }); }
   #requireWritable() { if (!this.#socket || this.#socket.readyState === 2 || this.#socket.readyState === 3) throw new TypeError("openai_transport_not_writable"); }
   #requireConfigured() { this.#requireWritable(); if (!this.#configured) throw new TypeError("openai_session_not_configured"); }
   #id(prefix) { this.#sequence += 1; return `v2-${prefix}-${this.#sequence}`; }
   #publish(type, details = {}) { const event = transportEvent(type, details); this.#emit(event); return event; }
   #startupMetadata() { return { callSid: this.#callSid, model: this.#model, elapsedStartupMs: this.#startupStartedAt === null ? null : Math.max(0, this.#now() - this.#startupStartedAt) }; }
+  #languageUpdateAcknowledgement(message, identity) {
+    const pending = this.#pendingLanguageUpdate;
+    const effectiveInput = message.session?.audio?.input || null;
+    const effective = effectiveInput?.transcription || null;
+    if (!effectiveInput || !effective || effective.language !== pending.requestedLanguage || effective.model !== pending.transcription.model || !matchesExpected(effectiveInput, pending.audioInput)) {
+      this.#pendingLanguageUpdate = null;
+      return this.#publish(TransportEvent.OPENAI_LANGUAGE_UPDATE_REJECTED, { ...identity, updateId: pending.updateId, requestedLanguage: pending.requestedLanguage, effectiveLanguage: effective?.language || null, reason: "EFFECTIVE_CONFIGURATION_MISMATCH" });
+    }
+    this.#audioInput = freezePlain(effectiveInput); this.#transcription = this.#audioInput.transcription; this.#pendingLanguageUpdate = null;
+    return this.#publish(TransportEvent.OPENAI_LANGUAGE_UPDATE_ACKNOWLEDGED, { ...identity, updateId: pending.updateId, requestedLanguage: pending.requestedLanguage, acknowledgedLanguage: effective.language });
+  }
 }
 
 function providerIdentity(message) { return { eventId: message.event_id ?? null, itemId: message.item_id || message.item?.id || null, providerType: message.type }; }
@@ -167,6 +202,18 @@ function isTranscriptFailed(type) { return ["conversation.item.input_audio_trans
 function normalizeError(error) { return Object.freeze({ code: error?.code || null, name: error?.name || "Error", message: error?.message || String(error || "unknown_error") }); }
 function normalizeProviderError(error) { return Object.freeze({ code: safeString(error?.code), name: safeString(error?.type || error?.name) || "ProviderError" }); }
 function safeString(value) { return typeof value === "string" && value.trim() ? value.trim() : null; }
+function freezePlain(value) {
+  if (!value || typeof value !== "object") return value;
+  const copy = Array.isArray(value) ? value.map((item) => freezePlain(item)) : Object.fromEntries(Object.entries(value).map(([key, item]) => [key, freezePlain(item)]));
+  return Object.freeze(copy);
+}
+function matchesExpected(actual, expected) {
+  if (expected && typeof expected === "object") {
+    if (!actual || typeof actual !== "object") return false;
+    return Object.entries(expected).every(([key, value]) => matchesExpected(actual[key], value));
+  }
+  return actual === expected;
+}
 
 function summarizeProviderResponse(response, status) {
   const output = Array.isArray(response?.output) ? response.output : [];

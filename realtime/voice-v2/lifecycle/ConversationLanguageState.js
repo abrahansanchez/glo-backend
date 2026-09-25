@@ -10,7 +10,7 @@ export class ConversationLanguageState {
     if (this.#terminated) return result(false, this.#currentLanguage, this.#currentLanguage, turnId, "SESSION_TERMINATED", languageEvidence);
     if (this.#observedTurns.has(turnId)) return this.#observedTurns.get(turnId);
     const previous = this.#currentLanguage; let reason = "EVIDENCE_NOT_STRONG";
-    if (["UNKNOWN", "CLARIFY"].includes(action)) reason = "AMBIGUOUS_SEMANTIC_ACTION";
+    if (["UNKNOWN", "CLARIFY", "NO_INFORMATION"].includes(action)) reason = "AMBIGUOUS_SEMANTIC_ACTION";
     else if (languageEvidence?.confidence === "strong" && SUPPORTED.has(languageEvidence.language)) {
       this.#lastEvidence = languageEvidence;
       if (languageEvidence.language !== previous) { this.#currentLanguage = languageEvidence.language; this.#lastTransitionTurnId = turnId; reason = "STRONG_INTERPRETATION_EVIDENCE"; } else reason = "LANGUAGE_CONFIRMED";

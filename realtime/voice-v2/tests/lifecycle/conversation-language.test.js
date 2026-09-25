@@ -23,8 +23,8 @@ test("strong evidence transitions both directions and duplicate turn observation
   assert.equal(state.observe({ languageEvidence: strong("en"), turnId: "t2", action: "SET_DATE" }).currentLanguage, "en");
 });
 
-test("weak, mixed, short-confirmation, UNKNOWN, and CLARIFY evidence never flips language", () => {
-  for (const [evidence, action] of [[weak, "SET_TIME"], [{ language: null, confidence: "mixed" }, "SET_SERVICE"], [strong("es"), "UNKNOWN"], [strong("es"), "CLARIFY"], [weak, "AFFIRM_CONFIRMATION"]]) {
+test("weak, mixed, short-confirmation, UNKNOWN, CLARIFY, and NO_INFORMATION evidence never flips language", () => {
+  for (const [evidence, action] of [[weak, "SET_TIME"], [{ language: null, confidence: "mixed" }, "SET_SERVICE"], [strong("es"), "UNKNOWN"], [strong("es"), "CLARIFY"], [strong("es"), "NO_INFORMATION"], [weak, "AFFIRM_CONFIRMATION"]]) {
     const state = new ConversationLanguageState(); state.observe({ languageEvidence: evidence, turnId: `${action}:${evidence.confidence}`, action }); assert.equal(state.currentLanguage, "en");
   }
 });
@@ -58,6 +58,89 @@ test("ResponsePlan snapshots language and future confirmation uses the new langu
 
 test("two calls have isolated language owners and termination prevents later mutation", () => {
   const a = new ConversationLanguageState(); const b = new ConversationLanguageState(); a.observe({ languageEvidence: strong("es"), turnId: "a1", action: "SET_DATE" }); assert.deepEqual([a.currentLanguage, b.currentLanguage], ["es", "en"]); a.observe({ languageEvidence: strong("en"), turnId: "a2", action: "SET_DATE" }); b.observe({ languageEvidence: strong("es"), turnId: "b1", action: "SET_DATE" }); assert.deepEqual([a.currentLanguage, b.currentLanguage], ["en", "es"]); b.terminate(); b.observe({ languageEvidence: strong("en"), turnId: "late", action: "SET_DATE" }); assert.equal(b.currentLanguage, "es");
+});
+
+test("trusted Spanish caller evidence requests one full transcription update before confirmation", async () => {
+  const twilio = new FakeSocket(); const openai = new FakeSocket(); openai.readyState = 0; const logs = [];
+  const app = initializeVoiceV2Session({
+    callSid: "CA-language-sync", callerNumber: "+18135550100",
+    businessContext: { businessId: "business", barberId: "barber", timeZone: "America/New_York" },
+    buildSha: "language-sync", twilioSocket: twilio, openaiSocketFactory: () => openai,
+    openaiSession: { model: "gpt-realtime", voice: "alloy", input_audio_transcription: { model: "gpt-4o-mini-transcribe", language: "en" } },
+    turnContext: { language: "en", availableServices: ["Haircut"], referenceDate: "2026-08-20" },
+    transcriptAdapter: { appendTurn: async () => ({ success: true }), finalizeCall: async () => ({ success: true }) },
+    emit: (event) => logs.push(event),
+  });
+  twilio.receive({ event: "start", start: { callSid: "CA-language-sync", streamSid: "MZ-language-sync" } }); openai.open();
+  openai.receive({ type: "session.created", event_id: "created" }); await settle(app);
+  openai.receive({ type: "session.updated", event_id: "initial-configured" }); await settle(app);
+  const greeting = openai.sent.find((entry) => entry.type === "response.create");
+  openai.receive({ type: "response.created", response: { id: "greeting", metadata: greeting.response.metadata } });
+  openai.receive({ type: "response.output_audio.delta", response_id: "greeting", delta: "AQID" });
+  openai.receive({ type: "response.done", response: { id: "greeting", status: "completed" } }); await settle(app);
+  const greetingMark = twilio.sent.find((entry) => entry.event === "mark"); twilio.receive({ event: "mark", streamSid: "MZ-language-sync", mark: greetingMark.mark }); await settle(app);
+  openai.sent.length = 0;
+  openai.receive({ type: "conversation.item.input_audio_transcription.completed", event_id: "caller-es", item_id: "caller-es", transcript: "Necesito un corte" }); await settle(app);
+  const updates = openai.sent.filter((entry) => entry.type === "session.update");
+  assert.equal(updates.length, 1);
+  assert.deepEqual(updates[0].session.audio.input, {
+    format: { type: "audio/pcmu" },
+    transcription: { model: "gpt-4o-mini-transcribe", language: "es" },
+    turn_detection: { type: "server_vad", create_response: false, interrupt_response: false },
+  });
+  assert.equal(app.session.conversationLanguage.currentLanguage, "es");
+  assert.equal(logs.some((entry) => entry.traceEvent === "LANGUAGE_UPDATE_REQUESTED"), true);
+  assert.equal(logs.some((entry) => entry.traceEvent === "LANGUAGE_UPDATE_ACKNOWLEDGED"), false);
+  assert.equal(logs.some((entry) => entry.traceEvent === "LANGUAGE_UPDATE_ACKNOWLEDGED" && entry.acknowledgedLanguage === "es"), false);
+  openai.receive({ type: "session.updated", event_id: "language-ack", session: { audio: { input: updates[0].session.audio.input } } }); await settle(app);
+  assert.equal(logs.some((entry) => entry.traceEvent === "LANGUAGE_UPDATE_ACKNOWLEDGED"), true);
+  assert.equal(logs.some((entry) => entry.traceEvent === "LANGUAGE_BOUNDARY"), false);
+  await app.terminate("TEST_COMPLETE"); await settle(app);
+  const boundary = logs.find((entry) => entry.traceEvent === "LANGUAGE_BOUNDARY");
+  assert.equal(boundary.consistent, true);
+});
+
+test("English, empty, weak, and stale duplicate turns do not request transcription updates", async () => {
+  for (const [name, turns] of [
+    ["English", [transcript("english", "I need a haircut")]],
+    ["empty", [transcript("empty", "")]],
+    ["weak English acknowledgement", [transcript("mhm", "Mhm.")]],
+    ["weak Spanish acknowledgement", [transcript("aja", "ajá")]],
+    ["stale duplicate Spanish evidence", [transcript("dup", ""), transcript("dup", "Necesito un corte")]],
+  ]) {
+    const f = fixture({ callSid: `CA-NO-LANGUAGE-${name.replaceAll(" ", "-")}`, language: "en" }); await start(f);
+    for (const item of turns) {
+      f.openai.sent.length = 0;
+      f.openai.receive(item);
+      await settle(f.app);
+      assert.equal(f.openai.sent.filter((entry) => entry.type === "session.update").length, 0, name);
+      assert.equal(f.app.session.conversationLanguage.currentLanguage, "en", name);
+    }
+  }
+});
+
+test("missing language-update acknowledgement leaves active transcription language as English", async () => {
+  const twilio = new FakeSocket(); const openai = new FakeSocket(); openai.readyState = 0; const logs = [];
+  const app = initializeVoiceV2Session({
+    callSid: "CA-language-no-ack", callerNumber: "+18135550100",
+    businessContext: { businessId: "business", barberId: "barber", timeZone: "America/New_York" },
+    buildSha: "language-sync", twilioSocket: twilio, openaiSocketFactory: () => openai,
+    openaiSession: { model: "gpt-realtime", voice: "alloy", input_audio_transcription: { model: "gpt-4o-mini-transcribe", language: "en" } },
+    turnContext: { language: "en", availableServices: ["Haircut"], referenceDate: "2026-08-20" },
+    transcriptAdapter: { appendTurn: async () => ({ success: true }), finalizeCall: async () => ({ success: true }) },
+    emit: (event) => logs.push(event),
+  });
+  twilio.receive({ event: "start", start: { callSid: "CA-language-no-ack", streamSid: "MZ-language-no-ack" } }); openai.open();
+  openai.receive({ type: "session.created", event_id: "created" }); await settle(app);
+  openai.receive({ type: "session.updated", event_id: "initial-configured" }); await settle(app);
+  openai.sent.length = 0;
+  openai.receive({ type: "conversation.item.input_audio_transcription.completed", event_id: "caller-es", item_id: "caller-es", transcript: "Necesito un corte" }); await settle(app);
+  assert.equal(openai.sent.filter((entry) => entry.type === "session.update").length, 1);
+  assert.equal(logs.some((entry) => entry.traceEvent === "LANGUAGE_UPDATE_ACKNOWLEDGED"), false);
+  await app.terminate("TEST_COMPLETE"); await settle(app);
+  const boundary = logs.find((entry) => entry.traceEvent === "LANGUAGE_BOUNDARY");
+  assert.equal(boundary.transcriptionLanguage, "en");
+  assert.equal(boundary.conversationLanguage, "es");
 });
 
 for (const scenario of [

@@ -23,6 +23,8 @@ export class ConsentBoundaryDiagnostics {
     if (purpose === "BOOKING_SUCCESS") this.bookingSuccessLanguage = language || null;
   }
 
+  setTranscriptionLanguage(language) { this.transcriptionLanguage = language || null; }
+
   playbackAcknowledged(details) {
     if (!details.expectsCallerInput) return;
     if (this.windows.length >= this.maxBoundaries) {
@@ -88,7 +90,7 @@ export class ConsentBoundaryDiagnostics {
     this.completed = true;
     for (const window of this.windows) this.#emitWindow(window);
     const conversationLanguage = this.context().conversationLanguage;
-    const languages = [this.preferredLanguage, this.transcriptionLanguage, conversationLanguage, this.confirmationLanguage, this.bookingSuccessLanguage].filter(Boolean);
+    const languages = [this.transcriptionLanguage, conversationLanguage, this.confirmationLanguage, this.bookingSuccessLanguage].filter(Boolean);
     this.trace.entry("LANGUAGE_BOUNDARY", {
       preferredLanguage: this.preferredLanguage,
       transcriptionLanguage: this.transcriptionLanguage,

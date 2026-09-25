@@ -3,10 +3,10 @@ import assert from "node:assert/strict";
 import { OpenAIRealtimeAdapter } from "../../adapters/OpenAIRealtimeAdapter.js";
 import { FakeSocket } from "../helpers/FakeSocket.js";
 
-function setup() {
+function setup({ transcription = {}, turnDetection = {} } = {}) {
   const socket = new FakeSocket(); const events = [];
   const adapter = new OpenAIRealtimeAdapter({ socketFactory: () => socket, onEvent: (event) => events.push(event) });
-  adapter.connect(); socket.open(); adapter.configureSession({ model: "gpt-realtime", instructions: "injected", voice: "alloy", input_audio_transcription: { model: "gpt-4o-mini-transcribe" } }); socket.receive({ type: "session.updated", event_id: "configured" });
+  adapter.connect(); socket.open(); adapter.configureSession({ model: "gpt-realtime", instructions: "injected", voice: "alloy", turnDetection, input_audio_transcription: { model: "gpt-4o-mini-transcribe", language: "en", ...transcription } }); socket.receive({ type: "session.updated", event_id: "configured" });
   return { socket, events, adapter };
 }
 function create(state, requestId = "local-1", eventId = "create-1") { return state.adapter.createResponse({ requestId, eventId, response: { instructions: "say hello" } }); }
@@ -15,8 +15,8 @@ function created(state, requestId = "local-1", responseId = "resp-1") { state.so
 test("connects and configures PCMU server VAD without provider lifecycle ownership", () => {
   const state = setup(); const update = state.socket.sent[0];
   assert.deepEqual(state.events.slice(0, 4).map((event) => event.type), ["OPENAI_SOCKET_CREATE_REQUESTED", "OPENAI_SOCKET_CREATED", "OPENAI_SOCKET_OPENED", "OPENAI_CONNECTED"]); assert.deepEqual(update.session.audio.input.format, { type: "audio/pcmu" }); assert.deepEqual(update.session.audio.output.format, { type: "audio/pcmu" });
-  assert.deepEqual(update.session.audio.input.turn_detection, { type: "server_vad", create_response: false, interrupt_response: false }); assert.equal(update.session.instructions, "injected"); assert.deepEqual(update.session.output_modalities, ["audio"]); assert.equal(update.session.model, "gpt-realtime"); assert.deepEqual(update.session.audio.input.transcription, { model: "gpt-4o-mini-transcribe" });
-  state.socket.receive({ type: "session.updated", event_id: "e" }); assert.equal(state.events.at(-1).type, "OPENAI_SESSION_CONFIGURED");
+  assert.deepEqual(update.session.audio.input.turn_detection, { type: "server_vad", create_response: false, interrupt_response: false }); assert.equal(update.session.instructions, "injected"); assert.deepEqual(update.session.output_modalities, ["audio"]); assert.equal(update.session.model, "gpt-realtime"); assert.deepEqual(update.session.audio.input.transcription, { model: "gpt-4o-mini-transcribe", language: "en" });
+  state.socket.receive({ type: "session.updated", event_id: "e" }); assert.equal(state.events.at(-1).type, "OPENAI_LANGUAGE_UPDATE_STALE_IGNORED");
 });
 
 test("configuration is requested once and caller operations remain blocked until session.updated", () => {
@@ -27,6 +27,39 @@ test("configuration is requested once and caller operations remain blocked until
   assert.throws(() => adapter.appendCallerAudio({ payload: "AQID" }), /openai_session_not_configured/);
   socket.receive({ type: "session.updated", event_id: "configured" }); assert.equal(adapter.configured, true);
   assert.doesNotThrow(() => adapter.appendCallerAudio({ payload: "AQID" }));
+});
+
+test("Spanish language update preserves the complete audio input object and waits for effective acknowledgement", () => {
+  const state = setup({ transcription: { prompt: "Expect haircut appointment words." }, turnDetection: { threshold: 0.71, silence_duration_ms: 650 } });
+  const initialInput = state.socket.sent[0].session.audio.input;
+  const update = state.adapter.updateTranscriptionLanguage("es", { updateId: "language-update-1" });
+  assert.equal(update.accepted, true);
+  assert.deepEqual(state.socket.sent.at(-1), { event_id: "language-update-1", type: "session.update", session: { audio: { input: {
+    format: { type: "audio/pcmu" },
+    transcription: { model: "gpt-4o-mini-transcribe", language: "es", prompt: "Expect haircut appointment words." },
+    turn_detection: { type: "server_vad", threshold: 0.71, silence_duration_ms: 650, create_response: false, interrupt_response: false },
+  } } } });
+  assert.deepEqual(initialInput, {
+    format: { type: "audio/pcmu" },
+    transcription: { model: "gpt-4o-mini-transcribe", language: "en", prompt: "Expect haircut appointment words." },
+    turn_detection: { type: "server_vad", threshold: 0.71, silence_duration_ms: 650, create_response: false, interrupt_response: false },
+  });
+  assert.equal(state.events.some((event) => event.type === "OPENAI_LANGUAGE_UPDATE_ACKNOWLEDGED"), false);
+  state.socket.receive({ type: "session.updated", event_id: "ack-1", session: { audio: { input: state.socket.sent.at(-1).session.audio.input } } });
+  assert.equal(state.events.at(-1).type, "OPENAI_LANGUAGE_UPDATE_ACKNOWLEDGED");
+  assert.equal(state.events.at(-1).acknowledgedLanguage, "es");
+  assert.equal(state.adapter.updateTranscriptionLanguage("es").accepted, false);
+});
+
+test("language update rejects incomplete effective configuration and ignores stale acknowledgements", () => {
+  const state = setup();
+  state.adapter.updateTranscriptionLanguage("es", { updateId: "language-update-2" });
+  state.socket.receive({ type: "session.updated", event_id: "wrong-ack", session: { audio: { input: { transcription: { language: "es" } } } } });
+  assert.equal(state.events.at(-1).type, "OPENAI_LANGUAGE_UPDATE_REJECTED");
+  const sentAfterReject = state.socket.sent.length;
+  state.socket.receive({ type: "session.updated", event_id: "stale-ack" });
+  assert.equal(state.events.at(-1).type, "OPENAI_LANGUAGE_UPDATE_STALE_IGNORED");
+  assert.equal(state.socket.sent.length, sentAfterReject);
 });
 
 test("provider validation errors expose safe identity and omit message content", () => {
