@@ -9,6 +9,12 @@ import {
   suggestClosestSlots,
 } from "../utils/ai/availabilityHelpers.js";
 import { sendAppointmentConfirmationSms } from "../utils/appointments/appointmentSms.js";
+import {
+  createAppointmentAtomically,
+  isReconciliationRequired,
+  isScheduleConflict,
+  updateAppointmentAtomically,
+} from "../services/booking/atomicScheduleMutation.js";
 
 /**
  * BOOK an appointment with full availability validation
@@ -19,6 +25,10 @@ export async function bookAppointment(
 ) {
   const BarberModel = dependencies.BarberModel || Barber;
   const AppointmentModel = dependencies.AppointmentModel || Appointment;
+  const createAtomic = dependencies.createAppointmentAtomically
+    || (dependencies.AppointmentModel
+      ? async (values) => ({ appointment: await AppointmentModel.create(values) })
+      : createAppointmentAtomically);
   const checkSlotAvailable = dependencies.isSlotAvailable || isSlotAvailable;
   const suggestSlots = dependencies.suggestClosestSlots || suggestClosestSlots;
   const sendConfirmationSms = dependencies.sendAppointmentConfirmationSms || sendAppointmentConfirmationSms;
@@ -44,18 +54,28 @@ export async function bookAppointment(
   const startAt = moment.tz(`${date} ${time}`, "YYYY-MM-DD h:mm A", tz).toDate();
   const endAt = moment(startAt).add(durationMinutes, "minutes").toDate();
 
-  const appt = await AppointmentModel.create({
-    barberId,
-    clientPhone: phone,
-    clientName: name,
-    service,
-    date: startAt,
-    time,
-    startAt,
-    endAt,
-    status: "confirmed",
-    source: "ai",
-  });
+  let appt;
+  try {
+    ({ appointment: appt } = await createAtomic({
+      barberId,
+      clientPhone: phone,
+      clientName: name,
+      service,
+      date: startAt,
+      time,
+      startAt,
+      endAt,
+      status: "confirmed",
+      source: "ai",
+    }, { AppointmentModel }));
+  } catch (error) {
+    if (isScheduleConflict(error)) {
+      const alternatives = await suggestSlots({ barber, date, durationMinutes });
+      return { unavailable: true, alternatives };
+    }
+    if (isReconciliationRequired(error)) return { error: "Booking status uncertain. Please check before retrying." };
+    throw error;
+  }
 
   await sendConfirmationSms(appt);
 
@@ -101,11 +121,28 @@ export async function rescheduleAppointment({ barberId, phone, oldDate, newDate,
     return { unavailable: true, alternatives };
   }
 
-  current.startAt = moment.tz(`${newDate} ${newTime}`, "YYYY-MM-DD h:mm A", tz).toDate();
-  current.endAt = moment(current.startAt).add(durationMinutes, "minutes").toDate();
-  current.date = current.startAt;
-  current.time = newTime;
-  await current.save();
+  const newStart = moment.tz(`${newDate} ${newTime}`, "YYYY-MM-DD h:mm A", tz).toDate();
+  const newEnd = moment(newStart).add(durationMinutes, "minutes").toDate();
+  try {
+    await updateAppointmentAtomically({
+      appointmentId: current._id,
+      barberId,
+      update: {
+        startAt: newStart,
+        endAt: newEnd,
+        date: newStart,
+        time: newTime,
+        service: service || current.service,
+      },
+    });
+  } catch (error) {
+    if (isScheduleConflict(error)) {
+      const alternatives = await suggestClosestSlots({ barber, date: newDate, durationMinutes });
+      return { unavailable: true, alternatives };
+    }
+    if (isReconciliationRequired(error)) return { error: "Reschedule status uncertain. Please check before retrying." };
+    throw error;
+  }
 
   return {
     success: true,

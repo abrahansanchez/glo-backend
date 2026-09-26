@@ -21,7 +21,7 @@ export function getServiceDurationMinutes(barber, serviceName) {
  * Check if a specific date/time slot is available.
  * Enforces: business hours, closed days, blackout dates, overlap, buffer.
  */
-export async function isSlotAvailable({ barber, date, time, durationMinutes, excludeAppointmentId }) {
+export async function isSlotAvailable({ barber, date, time, durationMinutes, excludeAppointmentId, session }) {
   const tz = barber.availability?.timezone || "America/New_York";
   const duration = durationMinutes || barber.availability?.defaultServiceDurationMinutes || 30;
   const buffer = barber.availability?.bufferMinutes || 0;
@@ -87,7 +87,9 @@ export async function isSlotAvailable({ barber, date, time, durationMinutes, exc
     query._id = { $ne: excludeAppointmentId };
   }
 
-  const conflict = await Appointment.findOne(query);
+  let finder = Appointment.findOne(query);
+  if (session && typeof finder.session === "function") finder = finder.session(session);
+  const conflict = await finder;
   console.log("[AVAILABILITY_RESULT]", {
     date,
     time,

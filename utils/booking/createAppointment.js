@@ -1,9 +1,15 @@
 // utils/booking/createAppointment.js
-import Appointment from "../../models/Appointment.js";
 import { sendAppointmentConfirmationSms } from "../appointments/appointmentSms.js";
+import {
+  createAppointmentAtomically,
+  isReconciliationRequired,
+  isScheduleConflict,
+} from "../../services/booking/atomicScheduleMutation.js";
 
 /**
- * Creates an appointment and returns success/failure
+ * Creates an appointment and returns success/failure.
+ * Persistence is protected by the shared atomic schedule boundary; SMS remains
+ * post-commit only.
  */
 export const createAppointment = async (
   barberId,
@@ -13,7 +19,7 @@ export const createAppointment = async (
   serviceName
 ) => {
   try {
-    const appt = await Appointment.create({
+    const { appointment: appt } = await createAppointmentAtomically({
       barberId,
       clientName,
       clientPhone,
@@ -29,7 +35,9 @@ export const createAppointment = async (
 
     return { ok: true, appointment: appt };
   } catch (err) {
-    console.error("❌ Appointment creation error:", err);
+    if (isScheduleConflict(err)) return { ok: false, unavailable: true, error: "SCHEDULE_CONFLICT" };
+    if (isReconciliationRequired(err)) return { ok: false, unknown: true, error: "RECONCILIATION_REQUIRED" };
+    console.error("Appointment creation error:", err);
     return { ok: false, error: err.message };
   }
 };

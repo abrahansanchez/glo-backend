@@ -6,6 +6,11 @@ import {
   getServiceDurationMinutes,
   isSlotAvailable,
 } from "../../utils/ai/availabilityHelpers.js";
+import {
+  createAppointmentAtomically,
+  isReconciliationRequired,
+  isScheduleConflict,
+} from "./atomicScheduleMutation.js";
 
 export function canonicalizeBookingRequest(request, durationMinutes) {
   const timeZone = String(request.timeZone || "").trim();
@@ -51,8 +56,7 @@ export async function createIdempotentAppointment(request, dependencies = {}) {
       barberId,
       "bookingCommand.idempotencyKey": idempotencyKey,
     }));
-  const createAppointment = dependencies.createAppointment
-    || ((values) => Appointment.create(values));
+  const createAppointment = dependencies.createAppointment;
   const checkAvailability = dependencies.checkAvailability || isSlotAvailable;
   const getDuration = dependencies.getServiceDuration || getServiceDurationMinutes;
 
@@ -101,9 +105,18 @@ export async function createIdempotentAppointment(request, dependencies = {}) {
     },
   };
   try {
-    const appointment = await createAppointment(values);
+    const atomicResult = createAppointment
+      ? { appointment: await createAppointment(values), replayed: false, requestHashMatches: true }
+      : await createAppointmentAtomically(values, {
+        idempotencyKey: request.idempotencyKey,
+        requestHash,
+      });
+    if (atomicResult.replayed && !atomicResult.requestHashMatches) return failure("IDEMPOTENCY_CONFLICT");
+    const appointment = atomicResult.appointment;
     return success(appointment, false, requestHash);
   } catch (error) {
+    if (isScheduleConflict(error)) return failure("UNAVAILABLE");
+    if (isReconciliationRequired(error)) return failure("SETTLEMENT_UNKNOWN");
     if (error?.code !== 11000) return failure("PERSISTENCE_ERROR");
     const winner = await findByIdempotencyKey(request.barberId, request.idempotencyKey);
     return winner ? replayOrConflict(winner, requestHash) : failure("PERSISTENCE_ERROR");

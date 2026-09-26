@@ -195,16 +195,29 @@ test("reconciliation returning after the original operation settles cannot overw
   assert.equal(f.twilio.closeCalls.length, 1);
 });
 
-test("characterization: different commands can currently create the same slot because no atomic slot boundary exists", async () => {
+test("different commands for the same slot serialize through the atomic boundary", async () => {
   const memory = bookingMemory();
-  const adapter = new SharedBookingAdapter({ dependencies: memory.dependencies });
+  let created = false;
+  const adapter = new SharedBookingAdapter({ dependencies: {
+    ...memory.dependencies,
+    createAppointment: async (values) => {
+      if (created) {
+        const error = new Error("SCHEDULE_CONFLICT");
+        error.code = "SCHEDULE_CONFLICT";
+        throw error;
+      }
+      created = true;
+      return memory.dependencies.createAppointment(values);
+    },
+  } });
   const first = bookingCommand({ commandId: "book-a", idempotencyKey: "key-a", callSid: "CA-A", callerNumber: "+18135550101" });
   const second = bookingCommand({ commandId: "book-b", idempotencyKey: "key-b", callSid: "CA-B", callerNumber: "+18135550102" });
   const results = await Promise.all([adapter.createAppointment(first), adapter.createAppointment(second)]);
 
-  assert.deepEqual(results.map((result) => result.success), [true, true]);
-  assert.equal(memory.appointments.length, 2);
-  assert.equal(memory.availabilityChecks, 4, "preserve current checks until an authoritative conflict boundary is approved");
+  assert.deepEqual(results.map((result) => result.success), [true, false]);
+  assert.equal(results[1].reason, "UNAVAILABLE");
+  assert.equal(memory.appointments.length, 1);
+  assert.equal(memory.availabilityChecks, 4, "conversational/UI availability prechecks remain separate from the authoritative boundary");
 });
 
 test("ordinary ERROR_RECOVERY playback on an incomplete booking terminates with one lifecycle owner", async () => {

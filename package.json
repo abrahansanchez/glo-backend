@@ -11,6 +11,12 @@
   "author": "",
   "license": "ISC",
   "description": "",
+  "config": {
+    "mongodbMemoryServer": {
+      "disablePostinstall": true,
+      "version": "8.0.32"
+    }
+  },
   "dependencies": {
     "axios": "^1.13.2",
     "bcryptjs": "^3.0.2",
@@ -31,5 +37,8 @@
     "stripe": "^19.1.0",
     "twilio": "^5.10.4",
     "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "mongodb-memory-server": "10.4.3"
   }
 }

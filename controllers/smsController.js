@@ -7,6 +7,7 @@ import axios from "axios";
 import { sendSMS } from "../utils/sendSMS.js";
 import { isBarberOpenForSMS } from "../utils/booking/businessRules.js";
 import { sendExpoPush } from "../utils/push/expoPush.js";
+import { updateAppointmentAtomically } from "../services/booking/atomicScheduleMutation.js";
 
 /**
  * Handle inbound SMS messages from Twilio
@@ -34,10 +35,15 @@ export const handleInboundSMS = async (req, res) => {
         }).sort({ startAt: 1 });
 
         if (appointment) {
-          appointment.status = "canceled";
-          appointment.cancelledAt = new Date();
-          appointment.cancelledBy = "client_sms";
-          await appointment.save();
+          await updateAppointmentAtomically({
+            appointmentId: appointment._id,
+            barberId: appointment.barberId,
+            update: {
+              status: "canceled",
+              cancelledAt: new Date(),
+              cancelledBy: "client_sms",
+            },
+          });
 
           const barber = await Barber.findById(appointment.barberId).select("expoPushToken barberName name");
           if (barber?.expoPushToken) {

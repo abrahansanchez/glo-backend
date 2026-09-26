@@ -2,6 +2,13 @@ import Appointment from "../models/Appointment.js";
 import Barber from "../models/Barber.js";
 import { getServiceDurationMinutes, isSlotAvailable } from "../utils/ai/availabilityHelpers.js";
 import { sendAppointmentConfirmationSms } from "../utils/appointments/appointmentSms.js";
+import {
+  createAppointmentAtomically,
+  deleteAppointmentAtomically,
+  isReconciliationRequired,
+  isScheduleConflict,
+  updateAppointmentAtomically,
+} from "../services/booking/atomicScheduleMutation.js";
 import moment from "moment-timezone";
 
 const oneHourMs = 60 * 60 * 1000;
@@ -148,7 +155,7 @@ export const createAppointment = async (req, res) => {
       });
     }
 
-    const appt = await Appointment.create({
+    const { appointment: appt } = await createAppointmentAtomically({
       barberId,
       clientName,
       clientPhone,
@@ -165,6 +172,14 @@ export const createAppointment = async (req, res) => {
 
     return res.status(201).json({ message: "Appointment created", appointment: appt });
   } catch (err) {
+    if (isScheduleConflict(err)) {
+      return res.status(409).json({
+        message: "This time slot is not available. Please choose a different time.",
+      });
+    }
+    if (isReconciliationRequired(err)) {
+      return res.status(503).json({ message: "Appointment status is uncertain. Please refresh before retrying." });
+    }
     console.error("createAppointment error:", err);
     res.status(500).json({ message: "Failed to create appointment" });
   }
@@ -236,14 +251,20 @@ export const updateAppointment = async (req, res) => {
       update.endAt = parsedEnd;
     }
 
-    const appt = await Appointment.findOneAndUpdate(
-      { _id: apptId, barberId },
-      update,
-      { new: true }
-    );
+    const result = await updateAppointmentAtomically({ appointmentId: apptId, barberId, update });
+    if (result?.notFound || !result?.appointment) return res.status(404).json({ message: "Appointment not found" });
+    const appt = result.appointment;
 
     return res.json({ message: "Appointment updated", appointment: appt });
   } catch (err) {
+    if (isScheduleConflict(err)) {
+      return res.status(409).json({
+        message: "This time slot is not available. Please choose a different time.",
+      });
+    }
+    if (isReconciliationRequired(err)) {
+      return res.status(503).json({ message: "Appointment status is uncertain. Please refresh before retrying." });
+    }
     console.error("updateAppointment error:", err);
     res.status(500).json({ message: "Failed to update appointment" });
   }
@@ -259,10 +280,8 @@ export const deleteAppointment = async (req, res) => {
       return res.status(401).json({ message: "Unauthorized: No barber on token" });
     }
 
-    const appt = await Appointment.findOneAndDelete({
-      _id: apptId,
-      barberId,
-    });
+    const result = await deleteAppointmentAtomically({ appointmentId: apptId, barberId });
+    const appt = result?.appointment;
 
     if (!appt) {
       return res.status(404).json({ message: "Appointment not found" });
@@ -270,6 +289,9 @@ export const deleteAppointment = async (req, res) => {
 
     return res.json({ message: "Appointment deleted" });
   } catch (err) {
+    if (isReconciliationRequired(err)) {
+      return res.status(503).json({ message: "Appointment status is uncertain. Please refresh before retrying." });
+    }
     console.error("deleteAppointment error:", err);
     res.status(500).json({ message: "Failed to delete appointment" });
   }
