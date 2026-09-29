@@ -4,30 +4,102 @@ import { CallSession } from "../../CallSession.js";
 import { createBookingProposal } from "../../domain/BookingProposal.js";
 import { reduceBooking } from "../../domain/BookingReducer.js";
 import { prepareVoiceV2SessionStart } from "../../application/prepareVoiceV2SessionStart.js";
-import { INBOUND_NUMBER_FIELDS, findBarberByInboundNumber, resolveBusinessByCalledNumber } from "../../../../services/business/resolveBusinessByCalledNumber.js";
+import {
+  CANONICAL_INBOUND_NUMBER_FIELD,
+  INBOUND_NUMBER_FIELDS,
+  findBarberByInboundNumber,
+  resolveBusinessByCalledNumber,
+} from "../../../../services/business/resolveBusinessByCalledNumber.js";
 import Barber from "../../../../models/Barber.js";
 
 const context = (id = "barber-1", businessName = "Test Shop") => ({ businessId: id, barberId: id, businessName, timeZone: "America/New_York", services: [{ name: "Haircut" }], calledNumber: "+18135550100" });
 const proposal = (id = "p") => createBookingProposal({ proposalId: id });
 
 test("shared lookup preserves the exact V1 model query, sort, no-input, and no-match behavior", async () => {
-  let filter; let sort; const document = { _id: "barber-1" };
-  const found = await findBarberByInboundNumber("+18135550100", { findOneFn: (value) => { filter = value; return { sort: (value2) => { sort = value2; return document; } }; } });
-  assert.equal(found, document); assert.deepEqual(filter, { $or: [{ twilioNumber: "+18135550100" }, { assignedTwilioNumber: "+18135550100" }, { twilioPhoneNumber: "+18135550100" }] }); assert.deepEqual(sort, { updatedAt: -1, createdAt: -1 });
+  const filters = []; let sort; const document = { _id: "barber-1" };
+  const found = await findBarberByInboundNumber("+18135550100", { findOneFn: (value) => { filters.push(value); if (value.inboundRoutingNumber) return null; return { sort: (value2) => { sort = value2; return document; } }; } });
+  assert.equal(found, document); assert.deepEqual(filters, [{ inboundRoutingNumber: "+18135550100" }, { $or: [{ twilioNumber: "+18135550100" }, { assignedTwilioNumber: "+18135550100" }, { twilioPhoneNumber: "+18135550100" }] }]); assert.deepEqual(sort, { updatedAt: -1, createdAt: -1 });
   assert.equal(await findBarberByInboundNumber("", { findOneFn: () => { throw new Error("must not query"); } }), null);
-  assert.equal(await findBarberByInboundNumber("+1", { findOneFn: () => ({ sort: () => null }) }), null);
+  assert.equal(await findBarberByInboundNumber("+1", { findOneFn: (filter) => filter.inboundRoutingNumber ? null : ({ sort: () => null }) }), null);
   await assert.rejects(findBarberByInboundNumber("+1", { findOneFn: () => { throw new Error("database failed"); } }), /database failed/);
-  await assert.rejects(findBarberByInboundNumber("+1", { findOneFn: () => ({ sort: () => { throw new Error("sort failed"); } }) }), /sort failed/);
+  await assert.rejects(findBarberByInboundNumber("+1", { findOneFn: (filter) => filter.inboundRoutingNumber ? null : ({ sort: () => { throw new Error("sort failed"); } }) }), /sort failed/);
 });
 
 test("all currently accepted Twilio number fields resolve through the one shared query", async () => {
+  assert.equal(CANONICAL_INBOUND_NUMBER_FIELD, "inboundRoutingNumber");
   assert.deepEqual(INBOUND_NUMBER_FIELDS, ["twilioNumber", "assignedTwilioNumber", "twilioPhoneNumber"]);
   for (const field of INBOUND_NUMBER_FIELDS) {
     const barber = { _id: `${field}-id`, [field]: "+18135550100", availability: { timezone: "America/Chicago" }, services: [{ name: "Haircut" }] };
-    const resolved = await resolveBusinessByCalledNumber("  +18135550100  ", { findOneFn: (filter) => ({ sort: () => filter.$or.some((term) => term[field] === barber[field]) ? barber : null }) });
+    const resolved = await resolveBusinessByCalledNumber("  +18135550100  ", { findOneFn: (filter) => filter.inboundRoutingNumber ? null : ({ sort: () => filter.$or.some((term) => term[field] === barber[field]) ? barber : null }) });
     assert.equal(resolved.businessId, `${field}-id`); assert.equal(resolved.calledNumber, "+18135550100"); assert.equal(Object.isFrozen(resolved.services[0]), true);
     assert.equal(resolved.businessName, null);
   }
+});
+
+test("canonical inboundRoutingNumber resolves first and cannot be overridden by legacy duplicates", async () => {
+  const canonical = { _id: "canonical", inboundRoutingNumber: "+18135550100", services: [] };
+  const newerLegacy = { _id: "newer-legacy", twilioNumber: "+18135550100", updatedAt: new Date("2026-09-01T00:00:00Z"), services: [] };
+  const filters = [];
+  const resolved = await resolveBusinessByCalledNumber("+18135550100", {
+    findOneFn: (filter) => {
+      filters.push(filter);
+      if (filter.inboundRoutingNumber === canonical.inboundRoutingNumber) return { lean: () => canonical };
+      return { sort: () => ({ lean: () => newerLegacy }) };
+    },
+  });
+  assert.equal(resolved.businessId, "canonical");
+  assert.deepEqual(filters, [{ inboundRoutingNumber: "+18135550100" }]);
+});
+
+test("pending and forwarding-only numbers do not enter ordinary called-number routing", async () => {
+  const pendingOnly = { _id: "pending", pendingInboundRoutingNumber: "+18135550100", services: [] };
+  const forwardingOnly = { _id: "forwarding", forwardToNumber: "+18135550100", services: [] };
+  for (const forbidden of [pendingOnly, forwardingOnly]) {
+    const resolved = await resolveBusinessByCalledNumber("+18135550100", {
+      findOneFn: (filter) => {
+        if (filter.inboundRoutingNumber === forbidden.pendingInboundRoutingNumber || filter.inboundRoutingNumber === forbidden.forwardToNumber) return null;
+        return { sort: () => null };
+      },
+    });
+    assert.equal(resolved, null);
+  }
+});
+
+test("Barber schema exposes canonical routing fields with nonempty partial unique indexes only", () => {
+  for (const field of ["inboundRoutingNumber", "inboundRoutingSid", "pendingInboundRoutingNumber", "pendingInboundRoutingSid"]) {
+    const path = Barber.schema.path(field);
+    assert.ok(path, `${field} path missing`);
+    assert.equal(path.instance, "String");
+  }
+
+  const indexes = Barber.schema.indexes();
+  for (const field of ["inboundRoutingNumber", "inboundRoutingSid", "pendingInboundRoutingNumber", "pendingInboundRoutingSid"]) {
+    const match = indexes.find(([keys]) => keys[field] === 1);
+    assert.ok(match, `${field} index missing`);
+    assert.equal(match[1].unique, true);
+    assert.deepEqual(match[1].partialFilterExpression, { [field]: { $type: "string", $gt: "" } });
+  }
+
+  for (const field of ["twilioNumber", "assignedTwilioNumber", "interimTwilioNumber", "forwardToNumber", "twilioSid"]) {
+    const uniqueLegacyIndex = indexes.find(([keys, options]) => keys[field] === 1 && options.unique === true);
+    assert.equal(uniqueLegacyIndex, undefined, `${field} must not receive a unique index in this slice`);
+  }
+
+  const blank = new Barber({
+    name: "Blank",
+    email: "blank@example.test",
+    phone: "+18135550123",
+    password: "pw",
+    inboundRoutingNumber: "",
+    inboundRoutingSid: "   ",
+    pendingInboundRoutingNumber: "",
+    pendingInboundRoutingSid: "   ",
+  });
+  const plain = blank.toObject();
+  assert.equal("inboundRoutingNumber" in plain, false);
+  assert.equal("inboundRoutingSid" in plain, false);
+  assert.equal("pendingInboundRoutingNumber" in plain, false);
+  assert.equal("pendingInboundRoutingSid" in plain, false);
 });
 
 test("production resolver converts a hydrated Mongoose result to plain data before deep freezing", async () => {
@@ -47,7 +119,7 @@ test("production resolver converts a hydrated Mongoose result to plain data befo
   let leanCalls = 0;
   let leanOptions;
   const resolved = await resolveBusinessByCalledNumber("+12602523232", {
-    findOneFn: () => ({
+    findOneFn: (filter) => filter.inboundRoutingNumber ? null : ({
       sort: () => ({
         lean: (options) => {
           leanCalls += 1;
@@ -79,7 +151,7 @@ test("resolver preserves descending update/create ordering for ambiguous numbers
   ];
   let receivedSort;
   const resolved = await resolveBusinessByCalledNumber("+18132952433", {
-    findOneFn: () => ({
+    findOneFn: (filter) => filter.inboundRoutingNumber ? null : ({
       sort: (sort) => {
         receivedSort = sort;
         return {
@@ -95,7 +167,7 @@ test("resolver preserves descending update/create ordering for ambiguous numbers
 
 test("resolved business context remains deeply immutable", async () => {
   const resolved = await resolveBusinessByCalledNumber("+12602523232", {
-    findOneFn: () => ({
+    findOneFn: (filter) => filter.inboundRoutingNumber ? null : ({
       sort: () => ({
         lean: () => ({
           _id: "69d6b84155368d54a594b55a",

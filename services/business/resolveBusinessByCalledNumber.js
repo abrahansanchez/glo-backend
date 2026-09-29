@@ -1,5 +1,7 @@
 import Barber from "../../models/Barber.js";
 
+export const CANONICAL_INBOUND_NUMBER_FIELD = "inboundRoutingNumber";
+
 export const INBOUND_NUMBER_FIELDS = Object.freeze([
   "twilioNumber",
   "assignedTwilioNumber",
@@ -15,19 +17,21 @@ export async function findBarberByInboundNumber(
   { findOneFn = (filter) => Barber.findOne(filter), lean = false } = {}
 ) {
   if (!phoneNumber) return null;
-  const query = findOneFn({
+  const canonicalQuery = findOneFn({ [CANONICAL_INBOUND_NUMBER_FIELD]: phoneNumber });
+  const canonicalResult = await leanResult(canonicalQuery, { lean });
+  if (canonicalResult) return canonicalResult;
+
+  const legacyQuery = findOneFn({
     $or: [
       { twilioNumber: phoneNumber },
       { assignedTwilioNumber: phoneNumber },
       { twilioPhoneNumber: phoneNumber },
     ],
   });
-  const sortedQuery = typeof query?.sort === "function"
-    ? query.sort({ updatedAt: -1, createdAt: -1 })
-    : query;
-  return lean && typeof sortedQuery?.lean === "function"
-    ? sortedQuery.lean({ flattenObjectIds: true })
-    : sortedQuery;
+  const sortedLegacyQuery = typeof legacyQuery?.sort === "function"
+    ? legacyQuery.sort({ updatedAt: -1, createdAt: -1 })
+    : legacyQuery;
+  return await leanResult(sortedLegacyQuery, { lean });
 }
 
 export async function resolveBusinessByCalledNumber(calledNumber, dependencies = {}) {
@@ -61,6 +65,12 @@ function canonicalBusinessName(value) {
 function toPlainService(service) {
   if (typeof service?.toObject === "function") return service.toObject();
   return structuredClone(service);
+}
+
+function leanResult(queryOrDocument, { lean }) {
+  return lean && typeof queryOrDocument?.lean === "function"
+    ? queryOrDocument.lean({ flattenObjectIds: true })
+    : queryOrDocument;
 }
 
 function deepFreeze(value) {

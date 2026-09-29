@@ -43,6 +43,26 @@ const BarberSchema = new mongoose.Schema(
       default: null,
     },
 
+    inboundRoutingNumber: {
+      type: String,
+      set: normalizeOptionalRoutingIdentity,
+    },
+
+    inboundRoutingSid: {
+      type: String,
+      set: normalizeOptionalRoutingIdentity,
+    },
+
+    pendingInboundRoutingNumber: {
+      type: String,
+      set: normalizeOptionalRoutingIdentity,
+    },
+
+    pendingInboundRoutingSid: {
+      type: String,
+      set: normalizeOptionalRoutingIdentity,
+    },
+
     expoPushToken: {
       type: String,
       default: null,
@@ -299,6 +319,40 @@ const BarberSchema = new mongoose.Schema(
 );
 
 BarberSchema.index({ forwardToNumber: 1 });
+BarberSchema.index(
+  { inboundRoutingNumber: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { inboundRoutingNumber: { $type: "string", $gt: "" } },
+  }
+);
+BarberSchema.index(
+  { inboundRoutingSid: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { inboundRoutingSid: { $type: "string", $gt: "" } },
+  }
+);
+BarberSchema.index(
+  { pendingInboundRoutingNumber: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { pendingInboundRoutingNumber: { $type: "string", $gt: "" } },
+  }
+);
+BarberSchema.index(
+  { pendingInboundRoutingSid: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { pendingInboundRoutingSid: { $type: "string", $gt: "" } },
+  }
+);
 
 const Barber = mongoose.model("Barber", BarberSchema);
 export default Barber;
+
+function normalizeOptionalRoutingIdentity(value) {
+  if (typeof value !== "string") return value;
+  const trimmed = value.trim();
+  return trimmed || undefined;
+}
