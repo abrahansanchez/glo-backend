@@ -6,15 +6,27 @@ import Barber from "../models/Barber.js";
 
 const router = express.Router();
 
-router.post("/setup-call-complete", async (req, res) => {
+export const setupCallComplete = async (req, res) => {
   try {
-    const { barberId, setupData } = req.body;
+    const authenticatedBarberId = req.user?._id || req.user?.id;
+    const { barberId: requestedBarberId, setupData } = req.body || {};
 
-    if (!barberId || !setupData) {
-      return res.status(400).json({ code: "MISSING_DATA", message: "barberId and setupData required" });
+    if (!authenticatedBarberId) {
+      return res.status(401).json({ code: "UNAUTHORIZED", message: "Authentication required" });
     }
 
-    const barber = await Barber.findById(barberId);
+    if (requestedBarberId && String(requestedBarberId) !== String(authenticatedBarberId)) {
+      return res.status(403).json({
+        code: "BARBER_OWNERSHIP_MISMATCH",
+        message: "Authenticated barber does not match setup target",
+      });
+    }
+
+    if (!setupData) {
+      return res.status(400).json({ code: "MISSING_DATA", message: "setupData required" });
+    }
+
+    const barber = await Barber.findById(authenticatedBarberId);
     if (!barber) {
       return res.status(404).json({ code: "BARBER_NOT_FOUND", message: "Barber not found" });
     }
@@ -63,7 +75,7 @@ router.post("/setup-call-complete", async (req, res) => {
     await barber.save();
 
     console.log(
-      `[SETUP_CALL_COMPLETE] barberId=${String(barberId)} services=${barber.services.length} days=${openDays.join(",")}`
+      `[SETUP_CALL_COMPLETE] barberId=${String(authenticatedBarberId)} services=${barber.services.length} days=${openDays.join(",")}`
     );
     return res.json({ ok: true });
   } catch (err) {
@@ -73,12 +85,13 @@ router.post("/setup-call-complete", async (req, res) => {
       message: "Failed to save setup data",
     });
   }
-});
+};
 
 router.use(protect);
 
 router.get("/status", getOnboardingStatus);
 router.post("/step", postOnboardingStep);
+router.post("/setup-call-complete", setupCallComplete);
 router.post("/demo-call", async (req, res) => {
   try {
     const barberId = req.user?._id;

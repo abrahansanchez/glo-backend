@@ -1,5 +1,4 @@
 import { assignPhoneNumber } from "../utils/assignPhoneNumber.js";
-import { releasePhoneNumber } from "../utils/releasePhoneNumber.js";
 import Barber from "../models/Barber.js";
 
 export const assignNumberController = async (req, res) => {
@@ -35,15 +34,14 @@ export const assignNumberController = async (req, res) => {
 
 export const releaseNumberController = async (req, res) => {
   try {
-    console.log("releaseNumberController started");
+    console.warn("[DIRECT_NUMBER_RELEASE_DISABLED]");
 
     const barberId = req.user?.id || req.user?._id;
     if (!barberId) {
       return res.status(401).json({ message: "Authentication required" });
     }
 
-    const result = await releasePhoneNumber(barberId);
-    res.status(200).json({ message: "Number released", result });
+    return res.status(404).json({ error: "PHONE_NUMBER_RELEASE_UNAVAILABLE" });
   } catch (error) {
     console.error("❌ Release Controller Error:", error.message);
     res.status(500).json({ message: "Failed to release number", error: error.message });

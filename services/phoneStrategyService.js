@@ -247,35 +247,36 @@ export const startForwardingTest = async ({ barberId, forwardFromNumber }) => {
     barber.forwardToNumber || process.env.GLO_ROUTING_NUMBER,
     { required: true }
   );
+  getForwardingVerificationSourceNumber();
 
-  barber.forwardingStatus = "verified";
-  console.log("[AUTO_VERIFY_TRIGGERED]", barber._id);
-  barber.forwardingVerifiedAt = new Date();
+  const verificationSessionId = randomUUID();
+  const verificationWindowExpiresAt = new Date(Date.now() + FORWARDING_TEST_WINDOW_MS);
+
+  barber.forwardingStatus = "verification_pending";
   const stepMap =
     barber.onboarding?.stepMap instanceof Map
       ? Object.fromEntries(barber.onboarding.stepMap.entries())
       : { ...(barber.onboarding?.stepMap || {}) };
   stepMap.forwarding_flow = true;
   stepMap.forwarding_setup = true;
-  stepMap.forwarding_verification = true;
   barber.onboarding = barber.onboarding || {};
   barber.onboarding.stepMap = stepMap;
   barber.onboarding.updatedAt = new Date();
   barber.forwardFromNumber = normalizedForwardFromNumber;
   barber.forwardToNumber = forwardToNumber;
-  barber.verificationSessionId = null;
-  barber.verificationWindowExpiresAt = null;
+  barber.forwardingVerifiedAt = null;
+  barber.verificationSessionId = verificationSessionId;
+  barber.verificationWindowExpiresAt = verificationWindowExpiresAt;
   await barber.save();
-  console.log("[AUTO_VERIFY_SAVED]", barber._id, barber.forwardingStatus);
 
   console.log(
-    `[FORWARDING_AUTO_VERIFIED] barberId=${String(barber._id)} forwardFrom=${normalizedForwardFromNumber} forwardTo=${forwardToNumber}`
+    `[FORWARDING_VERIFICATION_PENDING] barberId=${String(barber._id)} forwardFrom=${normalizedForwardFromNumber} forwardTo=${forwardToNumber}`
   );
 
   return {
-    status: "verified",
-    forwardingStatus: "verified",
-    forwardingVerifiedAt: barber.forwardingVerifiedAt,
+    status: "verification_pending",
+    forwardingStatus: "verification_pending",
+    verificationWindowExpiresAt,
   };
 };
 
@@ -320,11 +321,11 @@ export const maybeVerifyForwardingCall = async ({ to, from, callSid }) => {
     ? new Date(barber.verificationWindowExpiresAt)
     : null;
   const normalizedFrom = sanitize(from);
-  let expectedFrom = "";
+  let expectedFrom;
   try {
     expectedFrom = sanitize(getForwardingVerificationSourceNumber());
   } catch {
-    expectedFrom = "";
+    return false;
   }
 
   if (!activeSessionId || !expiresAt || expiresAt.getTime() <= Date.now()) {
@@ -336,7 +337,7 @@ export const maybeVerifyForwardingCall = async ({ to, from, callSid }) => {
   if (!normalizedTo || normalizedTo !== sanitize(barber.forwardToNumber)) {
     return false;
   }
-  if (expectedFrom && normalizedFrom !== expectedFrom) {
+  if (!expectedFrom || normalizedFrom !== expectedFrom) {
     return false;
   }
 
