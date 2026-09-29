@@ -412,34 +412,44 @@ export const getForwardingStatus = async (req, res) => {
 
 export const forwardingStatusCallback = async (req, res) => {
   try {
-    const { barberId } = req.query;
-    const { CallStatus, To } = req.body;
+    // Compatibility endpoint only: real forwarding verification is performed by
+    // the server-correlated inbound-call path in maybeVerifyForwardingCall().
+    const signature = req.get?.("x-twilio-signature") || req.headers?.["x-twilio-signature"];
+    const authToken = process.env.TWILIO_AUTH_TOKEN;
 
-    console.log("[FORWARDING_STATUS_CALLBACK]", {
-      barberId,
-      CallStatus,
-      To,
-    });
-
-    if (["answered", "completed"].includes(CallStatus)) {
-      const barber = await Barber.findById(barberId);
-
-      if (!barber) {
-        console.log("[FORWARDING_STATUS_CALLBACK] barber not found");
-        return res.sendStatus(200);
-      }
-
-      barber.forwardingStatus = "verified";
-      barber.forwardingVerifiedAt = new Date();
-
-      await barber.save();
-
-      console.log(
-        `[FORWARDING_VERIFIED] barberId=${barber._id} number=${To}`
-      );
+    if (!authToken || !signature) {
+      console.warn("[FORWARDING_STATUS_CALLBACK_REJECTED]", {
+        reason: !authToken ? "TWILIO_AUTH_TOKEN_MISSING" : "TWILIO_SIGNATURE_MISSING",
+      });
+      return res.status(401).json({ code: "TWILIO_SIGNATURE_INVALID" });
     }
 
-    return res.sendStatus(200);
+    const publicUrl = `${getAppBaseUrl()}${req.originalUrl || req.url || ""}`;
+    const validSignature = twilio.validateRequest(
+      authToken,
+      signature,
+      publicUrl,
+      req.body || {}
+    );
+
+    if (!validSignature) {
+      console.warn("[FORWARDING_STATUS_CALLBACK_REJECTED]", {
+        reason: "TWILIO_SIGNATURE_INVALID",
+      });
+      return res.status(401).json({ code: "TWILIO_SIGNATURE_INVALID" });
+    }
+
+    console.warn("[FORWARDING_STATUS_CALLBACK_REJECTED]", {
+      reason: "FORWARDING_CALLBACK_CORRELATION_REQUIRED",
+      callSid: String(req.body?.CallSid || ""),
+      callStatus: String(req.body?.CallStatus || ""),
+    });
+
+    return res.status(200).json({
+      ok: true,
+      verified: false,
+      code: "FORWARDING_CALLBACK_CORRELATION_REQUIRED",
+    });
   } catch (err) {
     console.error("[FORWARDING_STATUS_CALLBACK_ERROR]", err.message);
     return res.sendStatus(500);
