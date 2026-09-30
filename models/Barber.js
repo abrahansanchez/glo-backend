@@ -266,6 +266,26 @@ const BarberSchema = new mongoose.Schema(
       default: null,
     },
 
+    verificationCodeDigest: {
+      type: String,
+      default: null,
+    },
+
+    verificationCodeAttempts: {
+      type: Number,
+      default: 0,
+    },
+
+    verificationMaxAttempts: {
+      type: Number,
+      default: 5,
+    },
+
+    verificationCallSid: {
+      type: String,
+      default: null,
+    },
+
     porting: {
       status: {
         type: String,

@@ -10,8 +10,9 @@ import {
 } from "../utils/voice/activeCallStore.js";
 import { sendExpoPush } from "../utils/push/expoPush.js";
 import {
+  beginForwardingVerificationCall,
   isForwardingVerificationSessionActive,
-  maybeVerifyForwardingCall,
+  verifyForwardingDigits,
 } from "../services/phoneStrategyService.js";
 
 const VoiceResponse = twilio.twiml.VoiceResponse;
@@ -188,14 +189,23 @@ export const handleIncomingCall = async (req, res) => {
   try {
     console.log("[INCOMING] Incoming Twilio Call (RAW):", req.body);
 
-    const verificationResult = await maybeVerifyForwardingCall({
+    const verificationResult = await beginForwardingVerificationCall({
       to: req.body.To || req.body.Called || "",
       from: req.body.From || "",
       callSid: req.body.CallSid || "",
     });
 
-    if (verificationResult === true) {
+    if (verificationResult?.active === true) {
       const twiml = new VoiceResponse();
+      const gather = twiml.gather({
+        input: "dtmf",
+        numDigits: 6,
+        timeout: 12,
+        method: "POST",
+        action: `${getBaseHttpsUrl(req)}/api/voice/forwarding-verification/digits?session=${encodeURIComponent(verificationResult.verificationSessionId)}`,
+      });
+      gather.say("Please enter your six digit Glo forwarding verification code.");
+      twiml.say("We did not receive a valid code. Please try again from the app.");
       twiml.hangup();
       return res.type("text/xml").send(twiml.toString());
     }
@@ -266,6 +276,34 @@ export const handleIncomingCall = async (req, res) => {
     const fallback = new VoiceResponse();
     fallback.say("We are experiencing issues. Please try again later.");
     return res.type("text/xml").send(fallback.toString());
+  }
+};
+
+export const handleForwardingVerificationDigits = async (req, res) => {
+  try {
+    const result = await verifyForwardingDigits({
+      to: req.body.To || req.body.Called || "",
+      callSid: req.body.CallSid || "",
+      sessionId: req.query?.session || req.body?.session || "",
+      digits: req.body.Digits || "",
+    });
+
+    const twiml = new VoiceResponse();
+    if (result.verified === true) {
+      twiml.say("Forwarding is verified. You can return to the Glo app.");
+      twiml.hangup();
+      return res.type("text/xml").send(twiml.toString());
+    }
+
+    twiml.say("That verification code was not accepted. Please return to the Glo app and try again.");
+    twiml.hangup();
+    return res.type("text/xml").send(twiml.toString());
+  } catch (error) {
+    console.error("Error in handleForwardingVerificationDigits:", error);
+    const twiml = new VoiceResponse();
+    twiml.say("We could not verify forwarding right now. Please try again from the Glo app.");
+    twiml.hangup();
+    return res.type("text/xml").send(twiml.toString());
   }
 };
 

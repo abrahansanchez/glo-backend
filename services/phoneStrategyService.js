@@ -1,7 +1,12 @@
-import { randomUUID } from "node:crypto";
+import { createHmac, randomInt, randomUUID, timingSafeEqual } from "node:crypto";
 import twilio from "twilio";
 import Barber from "../models/Barber.js";
+import PhoneNumberAssignment from "../models/PhoneNumberAssignment.js";
 import { assignPhoneNumber } from "../utils/assignPhoneNumber.js";
+import {
+  INBOUND_ROUTING_ROLE,
+  provisionDedicatedInboundRoutingNumber,
+} from "./phoneNumberProvisioningService.js";
 
 export const FORWARDING_STATUSES = [
   "not_started",
@@ -13,21 +18,37 @@ export const FORWARDING_STATUSES = [
 ];
 
 const FORWARDING_TEST_WINDOW_MS = 3 * 60 * 1000;
+const FORWARDING_VERIFICATION_DIGITS = 6;
+const FORWARDING_VERIFICATION_MAX_ATTEMPTS = 5;
 const E164_REGEX = /^\+[1-9]\d{7,14}$/;
 
 const sanitize = (value) => String(value || "").trim();
 const hasConfirmedTrial = (barber) =>
   barber?.subscriptionStatus === "trialing" || barber?.subscriptionStatus === "active";
 
-const serializeForwardingState = (barber) => ({
-  strategy: barber.numberStrategy || barber.phoneNumberStrategy || null,
-  forwardFromNumber: barber.forwardFromNumber || null,
-  forwardToNumber: barber.forwardToNumber || null,
-  forwardingCarrier: barber.forwardingCarrier || "",
-  forwardingStatus: barber.forwardingStatus || "not_started",
-  forwardingVerifiedAt: barber.forwardingVerifiedAt || null,
-  verificationWindowExpiresAt: barber.verificationWindowExpiresAt || null,
-});
+const FORWARDING_STRATEGY = "forward_existing";
+const ROUTING_READY_RESETTABLE_STATUSES = new Set([
+  "not_started",
+  "routing_ready",
+  "activation_failed",
+]);
+
+const serializeForwardingState = (barber, assignment = null) => {
+  const provisioning = serializeProvisioningState(assignment);
+  return {
+    strategy: barber.numberStrategy || barber.phoneNumberStrategy || null,
+    forwardFromNumber: barber.forwardFromNumber || null,
+    forwardToNumber: barber.forwardToNumber || null,
+    forwardingCarrier: barber.forwardingCarrier || "",
+    forwardingStatus: barber.forwardingStatus || "not_started",
+    forwardingVerifiedAt: barber.forwardingVerifiedAt || null,
+    verificationWindowExpiresAt: barber.verificationWindowExpiresAt || null,
+    provisioningStatus: provisioning.status,
+    provisioningFailureClass: provisioning.failureClass,
+    provisioningRetryAfter: provisioning.retryAfter,
+    phoneSetupState: derivePhoneSetupState(barber, provisioning),
+  };
+};
 
 const ensureBarber = async (barberId) => {
   const barber = await Barber.findById(barberId);
@@ -93,6 +114,97 @@ const getForwardingVerificationSourceNumber = () => {
   });
 };
 
+const getForwardingVerificationSecret = () => {
+  const secret = sanitize(process.env.FORWARDING_VERIFICATION_HMAC_SECRET);
+  if (!secret) {
+    const error = new Error("Forwarding verification secret is not configured");
+    error.code = "FORWARDING_VERIFICATION_SECRET_MISSING";
+    error.status = 500;
+    throw error;
+  }
+  if (Buffer.byteLength(secret, "utf8") < 32 || /^change-?me$/i.test(secret)) {
+    const error = new Error("Forwarding verification secret is not strong enough");
+    error.code = "FORWARDING_VERIFICATION_SECRET_WEAK";
+    error.status = 500;
+    throw error;
+  }
+  return secret;
+};
+
+const generateVerificationCode = () =>
+  String(randomInt(0, 10 ** FORWARDING_VERIFICATION_DIGITS)).padStart(
+    FORWARDING_VERIFICATION_DIGITS,
+    "0"
+  );
+
+const updateDigestPart = (hmac, value) => {
+  const normalized = String(value || "");
+  hmac.update(String(Buffer.byteLength(normalized, "utf8")));
+  hmac.update(":");
+  hmac.update(normalized);
+  hmac.update("|");
+  return hmac;
+};
+
+const digestVerificationCode = ({ barberId, assignmentId, sessionId, code }) => {
+  const hmac = createHmac("sha256", getForwardingVerificationSecret());
+  updateDigestPart(hmac, barberId);
+  updateDigestPart(hmac, assignmentId);
+  updateDigestPart(hmac, sessionId);
+  updateDigestPart(hmac, code);
+  return hmac.digest("hex");
+};
+
+const safeDigestEquals = (actual, expected) => {
+  const actualBuffer = Buffer.from(String(actual || ""), "hex");
+  const expectedBuffer = Buffer.from(String(expected || ""), "hex");
+  if (actualBuffer.length !== expectedBuffer.length || actualBuffer.length === 0) return false;
+  return timingSafeEqual(actualBuffer, expectedBuffer);
+};
+
+const failForwarding = (code, status = 409) => {
+  const error = new Error("Forwarding verification is not available.");
+  error.code = code;
+  error.status = status;
+  return error;
+};
+
+const assertCanonicalForwardingMirror = ({ barber, assignment, forwardToNumber = null }) => {
+  if (!assignment || assignment.role !== INBOUND_ROUTING_ROLE || assignment.status !== "assigned") {
+    throw failForwarding("FORWARDING_ROUTING_NOT_ASSIGNED");
+  }
+
+  const expectedNumber = validatePhoneOrThrow(
+    "forwardToNumber",
+    forwardToNumber || barber?.forwardToNumber,
+    { required: true }
+  );
+  const numberKey = validatePhoneOrThrow("routingNumber", assignment.numberKey, { required: true });
+  const phoneNumber = validatePhoneOrThrow("routingPhoneNumber", assignment.phoneNumber, {
+    required: true,
+  });
+  const inboundRoutingNumber = validatePhoneOrThrow(
+    "inboundRoutingNumber",
+    barber?.inboundRoutingNumber,
+    { required: true }
+  );
+  const providerSid = sanitize(assignment.providerSid);
+  const inboundRoutingSid = sanitize(barber?.inboundRoutingSid);
+
+  if (
+    !providerSid ||
+    !inboundRoutingSid ||
+    numberKey !== expectedNumber ||
+    phoneNumber !== expectedNumber ||
+    inboundRoutingNumber !== expectedNumber ||
+    inboundRoutingSid !== providerSid
+  ) {
+    throw failForwarding("FORWARDING_ROUTING_MIRROR_MISMATCH");
+  }
+
+  return { expectedNumber, assignmentId: assignment._id };
+};
+
 export const expireForwardingVerificationIfNeeded = async (barber) => {
   if (!barber) return barber;
   if (barber.forwardingStatus !== "verification_pending") return barber;
@@ -105,6 +217,10 @@ export const expireForwardingVerificationIfNeeded = async (barber) => {
   barber.forwardingStatus = "activation_failed";
   barber.verificationSessionId = null;
   barber.verificationWindowExpiresAt = null;
+  barber.verificationCodeDigest = null;
+  barber.verificationCodeAttempts = 0;
+  barber.verificationMaxAttempts = FORWARDING_VERIFICATION_MAX_ATTEMPTS;
+  barber.verificationCallSid = null;
   await barber.save();
 
   console.log(
@@ -135,53 +251,61 @@ export const handleForwardExisting = async (barber, options = {}) => {
 };
 
 export const assignForwardingRoutingNumber = async (barberId) => {
+  return assignForwardingRoutingNumberWithOptions(barberId);
+};
+
+export const assignForwardingRoutingNumberWithOptions = async (barberId, options = {}) => {
   const barber = await ensureBarber(barberId);
 
-  // If already has a routing number assigned, return as-is
-  if (barber.twilioNumber && barber.twilioSid) {
-    return barber;
+  if ((barber.numberStrategy || barber.phoneNumberStrategy) !== FORWARDING_STRATEGY) {
+    const error = new Error("Forwarding strategy is required before assigning a routing number");
+    error.code = "FORWARDING_NOT_READY";
+    error.status = 400;
+    throw error;
   }
 
-  console.log(`[TWILIO_FORWARDING_ASSIGN_ATTEMPT] barberId=${String(barberId)}`);
-
-  // Use the dedicated GLO routing number from env - do NOT purchase a new number
-  const routingNumber = process.env.GLO_ROUTING_NUMBER || process.env.TWILIO_PHONE_NUMBER;
-  if (!routingNumber) {
-    throw new Error("GLO_ROUTING_NUMBER not configured in environment");
+  if (
+    barber.inboundRoutingNumber &&
+    barber.inboundRoutingSid &&
+    barber.forwardToNumber === barber.inboundRoutingNumber
+  ) {
+    const assignment = await findRoutingAssignment(barberId, options.AssignmentModel);
+    return attachRoutingProvisioningState(barber, assignment);
   }
 
-  // Look up the SID for this number from Twilio
-  const accountSid = process.env.TWILIO_ACCOUNT_SID;
-  const authToken = process.env.TWILIO_AUTH_TOKEN;
-  const twilioClient = twilio(accountSid, authToken);
+  console.log(`[DEDICATED_ROUTING_ASSIGN_ATTEMPT] barberId=${String(barberId)}`);
+  const provisioning = await provisionDedicatedInboundRoutingNumber(
+    barberId,
+    options.provisioningOptions || {}
+  );
+  const assignment = provisioning.assignment;
 
-  let twilioSid = null;
-  try {
-    const numbers = await twilioClient.incomingPhoneNumbers.list({
-      phoneNumber: routingNumber,
-    });
-    if (numbers.length > 0) {
-      twilioSid = numbers[0].sid;
-    }
-  } catch (err) {
-    console.error(`[TWILIO_FORWARDING_SID_LOOKUP] failed:`, err?.message);
+  if (provisioning.status !== "assigned") {
+    return attachRoutingProvisioningState(barber, assignment);
   }
 
-  barber.twilioNumber = routingNumber;
-  barber.assignedTwilioNumber = routingNumber;
-  barber.forwardToNumber = routingNumber;
-  if (twilioSid) barber.twilioSid = twilioSid;
+  const assignedNumber = validatePhoneOrThrow("forwardToNumber", assignment.phoneNumber, {
+    required: true,
+  });
+  if (assignment.numberKey && assignment.numberKey !== assignedNumber) {
+    const error = new Error("Routing assignment identity mismatch");
+    error.code = "ROUTING_ASSIGNMENT_IDENTITY_MISMATCH";
+    error.status = 500;
+    throw error;
+  }
 
-  if (barber.forwardingStatus === "not_started") {
+  barber.forwardToNumber = assignedNumber;
+
+  if (ROUTING_READY_RESETTABLE_STATUSES.has(barber.forwardingStatus || "not_started")) {
     barber.forwardingStatus = "routing_ready";
   }
 
   await barber.save();
 
   console.log(
-    `[TWILIO_FORWARDING_ASSIGN_SUCCESS] barberId=${String(barberId)} forwardToNumber=${routingNumber}`
+    `[DEDICATED_ROUTING_ASSIGN_SUCCESS] barberId=${String(barberId)} assignmentStatus=assigned`
   );
-  return barber;
+  return attachRoutingProvisioningState(barber, assignment);
 };
 
 export const assignPortingInterimNumber = async (barberId) => {
@@ -215,7 +339,7 @@ export const assignStrategy = async (barberId, strategy, options = {}) => {
   if (normalizedStrategy === "port_existing") {
     return handlePortExisting(barber);
   }
-  if (normalizedStrategy === "forward_existing") {
+  if (normalizedStrategy === FORWARDING_STRATEGY) {
     return handleForwardExisting(barber, options);
   }
 
@@ -225,11 +349,17 @@ export const assignStrategy = async (barberId, strategy, options = {}) => {
   throw error;
 };
 
-export const startForwardingTest = async ({ barberId, forwardFromNumber }) => {
+export const startForwardingTest = async ({
+  barberId,
+  forwardFromNumber,
+  restartVerification = false,
+  expectedVerificationSessionId = "",
+  createVerificationCode = generateVerificationCode,
+}) => {
   const barber = await ensureBarber(barberId);
   console.log("[FORWARDING_TEST_HIT]", barber._id);
 
-  if ((barber.numberStrategy || barber.phoneNumberStrategy) !== "forward_existing") {
+  if ((barber.numberStrategy || barber.phoneNumberStrategy) !== FORWARDING_STRATEGY) {
     const error = new Error("Forwarding is not ready for verification yet.");
     error.code = "FORWARDING_NOT_READY";
     error.status = 400;
@@ -241,16 +371,65 @@ export const startForwardingTest = async ({ barberId, forwardFromNumber }) => {
     forwardFromNumber || barber.forwardFromNumber,
     { required: true }
   );
+  getForwardingVerificationSecret();
 
   const forwardToNumber = validatePhoneOrThrow(
     "forwardToNumber",
-    barber.forwardToNumber || process.env.GLO_ROUTING_NUMBER,
+    barber.forwardToNumber,
     { required: true }
   );
-  getForwardingVerificationSourceNumber();
+  const assignment = await findRoutingAssignment(barberId);
+  const { assignmentId } = assertCanonicalForwardingMirror({ barber, assignment, forwardToNumber });
+  if (barber.pendingInboundRoutingNumber) {
+    throw failForwarding("FORWARDING_ROUTING_MIRROR_MISMATCH");
+  }
+
+  await expireForwardingVerificationIfNeeded(barber);
+
+  const existingExpiresAt = barber.verificationWindowExpiresAt
+    ? new Date(barber.verificationWindowExpiresAt)
+    : null;
+  if (
+    barber.forwardingStatus === "verification_pending" &&
+    sanitize(barber.verificationSessionId) &&
+    sanitize(barber.verificationCodeDigest) &&
+    existingExpiresAt &&
+    existingExpiresAt.getTime() > Date.now()
+  ) {
+    if (restartVerification === true) {
+      if (sanitize(expectedVerificationSessionId) !== sanitize(barber.verificationSessionId)) {
+        const error = new Error("Forwarding verification is already in progress.");
+        error.code = "VERIFICATION_ALREADY_RUNNING";
+        error.status = 409;
+        error.verificationWindowExpiresAt = existingExpiresAt;
+        throw error;
+      }
+      return restartForwardingVerificationSession({
+        barber,
+        assignmentId,
+        normalizedForwardFromNumber,
+        forwardToNumber,
+        currentSessionId: sanitize(barber.verificationSessionId),
+        currentDigest: sanitize(barber.verificationCodeDigest),
+        createVerificationCode,
+      });
+    }
+    const error = new Error("Forwarding verification is already in progress.");
+    error.code = "VERIFICATION_ALREADY_RUNNING";
+    error.status = 409;
+    error.verificationWindowExpiresAt = existingExpiresAt;
+    throw error;
+  }
 
   const verificationSessionId = randomUUID();
   const verificationWindowExpiresAt = new Date(Date.now() + FORWARDING_TEST_WINDOW_MS);
+  const verificationCode = createVerificationCode();
+  const verificationCodeDigest = digestVerificationCode({
+    barberId: barber._id,
+    assignmentId,
+    sessionId: verificationSessionId,
+    code: verificationCode,
+  });
 
   barber.forwardingStatus = "verification_pending";
   const stepMap =
@@ -267,32 +446,102 @@ export const startForwardingTest = async ({ barberId, forwardFromNumber }) => {
   barber.forwardingVerifiedAt = null;
   barber.verificationSessionId = verificationSessionId;
   barber.verificationWindowExpiresAt = verificationWindowExpiresAt;
+  barber.verificationCodeDigest = verificationCodeDigest;
+  barber.verificationCodeAttempts = 0;
+  barber.verificationMaxAttempts = FORWARDING_VERIFICATION_MAX_ATTEMPTS;
+  barber.verificationCallSid = null;
   await barber.save();
 
   console.log(
-    `[FORWARDING_VERIFICATION_PENDING] barberId=${String(barber._id)} forwardFrom=${normalizedForwardFromNumber} forwardTo=${forwardToNumber}`
+    `[FORWARDING_VERIFICATION_PENDING] barberId=${String(barber._id)} status=verification_pending`
   );
 
   return {
     status: "verification_pending",
     forwardingStatus: "verification_pending",
     verificationWindowExpiresAt,
+    verificationCode,
+    instructions:
+      "Call your existing business number. When Glo answers, enter the six-digit verification code shown here.",
   };
 };
+
+async function restartForwardingVerificationSession({
+  barber,
+  assignmentId,
+  normalizedForwardFromNumber,
+  forwardToNumber,
+  currentSessionId,
+  currentDigest,
+  createVerificationCode,
+}) {
+  const verificationSessionId = randomUUID();
+  const verificationWindowExpiresAt = new Date(Date.now() + FORWARDING_TEST_WINDOW_MS);
+  const verificationCode = createVerificationCode();
+  const verificationCodeDigest = digestVerificationCode({
+    barberId: barber._id,
+    assignmentId,
+    sessionId: verificationSessionId,
+    code: verificationCode,
+  });
+
+  const updated = await Barber.findOneAndUpdate(
+    {
+      _id: barber._id,
+      forwardingStatus: "verification_pending",
+      verificationSessionId: currentSessionId,
+      verificationCodeDigest: currentDigest,
+      verificationWindowExpiresAt: { $gt: new Date() },
+    },
+    {
+      $set: {
+        forwardFromNumber: normalizedForwardFromNumber,
+        forwardToNumber,
+        verificationSessionId,
+        verificationWindowExpiresAt,
+        verificationCodeDigest,
+        verificationCodeAttempts: 0,
+        verificationMaxAttempts: FORWARDING_VERIFICATION_MAX_ATTEMPTS,
+        verificationCallSid: null,
+        forwardingVerifiedAt: null,
+        "onboarding.updatedAt": new Date(),
+      },
+    },
+    { new: true }
+  );
+
+  if (!updated) {
+    const error = new Error("Forwarding verification is already in progress.");
+    error.code = "VERIFICATION_ALREADY_RUNNING";
+    error.status = 409;
+    error.verificationWindowExpiresAt = barber.verificationWindowExpiresAt || undefined;
+    throw error;
+  }
+
+  return {
+    status: "verification_pending",
+    forwardingStatus: "verification_pending",
+    verificationWindowExpiresAt,
+    verificationCode,
+    instructions:
+      "Call your existing business number. When Glo answers, enter the six-digit verification code shown here.",
+  };
+}
 
 export const getStrategyStatus = async (barberId) => {
   const barber = await ensureBarber(barberId);
   await expireForwardingVerificationIfNeeded(barber);
-  return serializeForwardingState(barber);
+  const assignment = await findRoutingAssignment(barberId);
+  return serializeForwardingState(barber, assignment);
 };
 
 export const isForwardingVerificationSessionActive = async ({ to }) => {
   const normalizedTo = sanitize(to);
   if (!normalizedTo) return false;
 
-  const barber = await Barber.findOne({ forwardToNumber: normalizedTo });
+  const barber = await Barber.findOne({ inboundRoutingNumber: normalizedTo });
   if (!barber) return false;
-  if ((barber.numberStrategy || barber.phoneNumberStrategy) !== "forward_existing") return false;
+  if ((barber.numberStrategy || barber.phoneNumberStrategy) !== FORWARDING_STRATEGY) return false;
 
   await expireForwardingVerificationIfNeeded(barber);
 
@@ -301,18 +550,27 @@ export const isForwardingVerificationSessionActive = async ({ to }) => {
     : null;
 
   if (barber.forwardingStatus !== "verification_pending") return false;
+  if (!sanitize(barber.verificationSessionId)) return false;
+  if (!sanitize(barber.verificationCodeDigest)) return false;
   if (!expiresAt || expiresAt.getTime() <= Date.now()) return false;
 
   return true;
 };
 
 export const maybeVerifyForwardingCall = async ({ to, from, callSid }) => {
-  const normalizedTo = sanitize(to);
-  if (!normalizedTo) return false;
+  const result = await beginForwardingVerificationCall({ to, from, callSid });
+  return result.verified === true;
+};
 
-  const barber = await Barber.findOne({ forwardToNumber: normalizedTo });
-  if (!barber) return false;
-  if ((barber.numberStrategy || barber.phoneNumberStrategy) !== "forward_existing") return false;
+export const beginForwardingVerificationCall = async ({ to, from, callSid }) => {
+  const normalizedTo = sanitize(to);
+  if (!normalizedTo) return { active: false, verified: false };
+
+  const barber = await Barber.findOne({ inboundRoutingNumber: normalizedTo });
+  if (!barber) return { active: false, verified: false };
+  if ((barber.numberStrategy || barber.phoneNumberStrategy) !== FORWARDING_STRATEGY) {
+    return { active: false, verified: false };
+  }
 
   await expireForwardingVerificationIfNeeded(barber);
 
@@ -320,36 +578,230 @@ export const maybeVerifyForwardingCall = async ({ to, from, callSid }) => {
   const expiresAt = barber.verificationWindowExpiresAt
     ? new Date(barber.verificationWindowExpiresAt)
     : null;
-  const normalizedFrom = sanitize(from);
-  let expectedFrom;
-  try {
-    expectedFrom = sanitize(getForwardingVerificationSourceNumber());
-  } catch {
-    return false;
-  }
-
   if (!activeSessionId || !expiresAt || expiresAt.getTime() <= Date.now()) {
-    return false;
+    return { active: false, verified: false };
   }
   if (barber.forwardingStatus !== "verification_pending") {
-    return false;
+    return { active: false, verified: false };
   }
   if (!normalizedTo || normalizedTo !== sanitize(barber.forwardToNumber)) {
-    return false;
+    return { active: false, verified: false };
   }
-  if (!expectedFrom || normalizedFrom !== expectedFrom) {
-    return false;
+  const assignment = await findRoutingAssignment(barber._id);
+  try {
+    assertCanonicalForwardingMirror({ barber, assignment, forwardToNumber: normalizedTo });
+  } catch {
+    return { active: false, verified: false };
   }
 
-  barber.forwardingStatus = "verified";
-  barber.forwardingVerifiedAt = new Date();
-  barber.verificationSessionId = null;
-  barber.verificationWindowExpiresAt = null;
-  await barber.save();
+  const normalizedCallSid = sanitize(callSid);
+  if (!normalizedCallSid) return { active: false, verified: false };
+  if (!sanitize(barber.verificationCodeDigest)) return { active: false, verified: false };
+  if (sanitize(barber.verificationCallSid) && sanitize(barber.verificationCallSid) !== normalizedCallSid) {
+    return { active: false, verified: false };
+  }
+  if (!sanitize(barber.verificationCallSid)) {
+    const bound = await Barber.findOneAndUpdate(
+      {
+        _id: barber._id,
+        inboundRoutingNumber: normalizedTo,
+        numberStrategy: FORWARDING_STRATEGY,
+        forwardingStatus: "verification_pending",
+        verificationSessionId: activeSessionId,
+        verificationWindowExpiresAt: { $gt: new Date() },
+        verificationCallSid: { $in: [null, ""] },
+        verificationCodeDigest: sanitize(barber.verificationCodeDigest),
+        verificationCodeAttempts: {
+          $lt: Number(barber.verificationMaxAttempts || FORWARDING_VERIFICATION_MAX_ATTEMPTS),
+        },
+      },
+      { $set: { verificationCallSid: normalizedCallSid } },
+      { new: true }
+    );
+    if (!bound) {
+      const current = await Barber.findOne({ inboundRoutingNumber: normalizedTo });
+      if (
+        current &&
+        current.forwardingStatus === "verification_pending" &&
+        sanitize(current.verificationSessionId) === activeSessionId &&
+        sanitize(current.verificationCallSid) === normalizedCallSid
+      ) {
+        return {
+          active: true,
+          verified: false,
+          verificationSessionId: activeSessionId,
+          callSid: normalizedCallSid,
+          to: normalizedTo,
+        };
+      }
+      return { active: false, verified: false, reason: "CALL_BIND_FAILED" };
+    }
+  }
 
-  console.log(
-    `[FORWARDING_VERIFIED] barberId=${String(barber._id)} callSid=${sanitize(callSid)} to=${normalizedTo} from=${normalizedFrom || "unknown"}`
+  return {
+    active: true,
+    verified: false,
+    verificationSessionId: activeSessionId,
+    callSid: normalizedCallSid,
+    to: normalizedTo,
+  };
+};
+
+export const verifyForwardingDigits = async ({ to, callSid, sessionId, digits }) => {
+  const normalizedTo = sanitize(to);
+  const normalizedCallSid = sanitize(callSid);
+  const normalizedSessionId = sanitize(sessionId);
+  const normalizedDigits = sanitize(digits);
+  if (!normalizedTo || !normalizedCallSid || !normalizedSessionId) {
+    return { verified: false, reason: "MISSING_CORRELATION" };
+  }
+  if (!/^\d{6}$/.test(normalizedDigits)) return { verified: false, reason: "INVALID_DIGITS" };
+
+  const barber = await Barber.findOne({ inboundRoutingNumber: normalizedTo });
+  if (!barber) return { verified: false, reason: "SESSION_NOT_FOUND" };
+  if ((barber.numberStrategy || barber.phoneNumberStrategy) !== FORWARDING_STRATEGY) {
+    return { verified: false, reason: "FORWARDING_NOT_READY" };
+  }
+
+  await expireForwardingVerificationIfNeeded(barber);
+
+  const expiresAt = barber.verificationWindowExpiresAt
+    ? new Date(barber.verificationWindowExpiresAt)
+    : null;
+  if (barber.forwardingStatus === "verified" && !sanitize(barber.verificationSessionId)) {
+    return { verified: true, reason: "ALREADY_VERIFIED" };
+  }
+  if (barber.forwardingStatus !== "verification_pending") return { verified: false, reason: "NOT_PENDING" };
+  if (!expiresAt || expiresAt.getTime() <= Date.now()) return { verified: false, reason: "EXPIRED" };
+  if (sanitize(barber.verificationSessionId) !== normalizedSessionId) return { verified: false, reason: "STALE_SESSION" };
+  if (sanitize(barber.verificationCallSid) !== normalizedCallSid) return { verified: false, reason: "CALL_MISMATCH" };
+  if (
+    Number(barber.verificationCodeAttempts || 0) >=
+    Number(barber.verificationMaxAttempts || FORWARDING_VERIFICATION_MAX_ATTEMPTS)
+  ) {
+    return { verified: false, reason: "TOO_MANY_ATTEMPTS" };
+  }
+
+  const assignment = await findRoutingAssignment(barber._id);
+  let assignmentId;
+  try {
+    ({ assignmentId } = assertCanonicalForwardingMirror({ barber, assignment, forwardToNumber: normalizedTo }));
+  } catch {
+    return { verified: false, reason: "ROUTING_MISMATCH" };
+  }
+
+  const expectedDigest = digestVerificationCode({
+    barberId: barber._id,
+    assignmentId,
+    sessionId: normalizedSessionId,
+    code: normalizedDigits,
+  });
+  if (!safeDigestEquals(barber.verificationCodeDigest, expectedDigest)) {
+    const incremented = await Barber.findOneAndUpdate(
+      {
+        _id: barber._id,
+        inboundRoutingNumber: normalizedTo,
+        forwardingStatus: "verification_pending",
+        verificationSessionId: normalizedSessionId,
+        verificationCallSid: normalizedCallSid,
+        verificationWindowExpiresAt: { $gt: new Date() },
+        verificationCodeDigest: barber.verificationCodeDigest,
+        verificationCodeAttempts: {
+          $lt: Number(barber.verificationMaxAttempts || FORWARDING_VERIFICATION_MAX_ATTEMPTS),
+        },
+      },
+      { $inc: { verificationCodeAttempts: 1 } },
+      { new: true }
+    );
+    if (!incremented) return { verified: false, reason: "ATTEMPT_REJECTED" };
+    return { verified: false, reason: "CODE_MISMATCH" };
+  }
+
+  const verifiedAt = new Date();
+  const consumed = await Barber.findOneAndUpdate(
+    {
+      _id: barber._id,
+      inboundRoutingNumber: normalizedTo,
+      forwardToNumber: normalizedTo,
+      inboundRoutingSid: sanitize(barber.inboundRoutingSid),
+      numberStrategy: FORWARDING_STRATEGY,
+      forwardingStatus: "verification_pending",
+      verificationSessionId: normalizedSessionId,
+      verificationCallSid: normalizedCallSid,
+      verificationWindowExpiresAt: { $gt: new Date() },
+      verificationCodeDigest: barber.verificationCodeDigest,
+      verificationCodeAttempts: {
+        $lt: Number(barber.verificationMaxAttempts || FORWARDING_VERIFICATION_MAX_ATTEMPTS),
+      },
+    },
+    {
+      $set: {
+        forwardingStatus: "verified",
+        forwardingVerifiedAt: verifiedAt,
+        verificationSessionId: null,
+        verificationWindowExpiresAt: null,
+        verificationCodeDigest: null,
+        verificationCodeAttempts: 0,
+        verificationMaxAttempts: FORWARDING_VERIFICATION_MAX_ATTEMPTS,
+        verificationCallSid: null,
+      },
+    },
+    { new: true }
   );
 
-  return true;
+  if (!consumed) {
+    const current = await Barber.findOne({ inboundRoutingNumber: normalizedTo });
+    if (current?.forwardingStatus === "verified" && !sanitize(current.verificationSessionId)) {
+      return { verified: true, reason: "ALREADY_VERIFIED" };
+    }
+    return { verified: false, reason: "CONSUME_REJECTED" };
+  }
+
+  console.log(
+    `[FORWARDING_VERIFIED] barberId=${String(barber._id)} callSid=${normalizedCallSid}`
+  );
+
+  return { verified: true, reason: "VERIFIED" };
 };
+
+async function findRoutingAssignment(barberId, AssignmentModel = PhoneNumberAssignment) {
+  return await AssignmentModel.findOne({
+    barberId,
+    role: INBOUND_ROUTING_ROLE,
+  });
+}
+
+function attachRoutingProvisioningState(barber, assignment) {
+  barber.routingProvisioning = serializeProvisioningState(assignment);
+  return barber;
+}
+
+function serializeProvisioningState(assignment) {
+  if (!assignment) {
+    return {
+      status: "not_started",
+      failureClass: null,
+      retryAfter: null,
+    };
+  }
+  return {
+    status: assignment.status || "not_started",
+    failureClass: assignment.failureClass || null,
+    retryAfter: assignment.retryAfter || null,
+  };
+}
+
+function derivePhoneSetupState(barber, provisioning) {
+  if (barber.forwardingStatus === "verified") return "verified";
+  if (barber.forwardingStatus === "verification_pending") return "verification_in_progress";
+  if (provisioning.status === "provisioning") return "provisioning";
+  if (provisioning.status === "failed" && provisioning.failureClass === "retryable") {
+    return "provisioning_failed_retryable";
+  }
+  if (provisioning.status === "failed" && provisioning.failureClass === "terminal") {
+    return "provisioning_failed_terminal";
+  }
+  if (barber.forwardingStatus === "activation_failed") return "verification_failed_retryable";
+  if (provisioning.status === "assigned" && barber.forwardToNumber) return "awaiting_forwarding_setup";
+  return "provisioning";
+}

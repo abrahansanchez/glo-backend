@@ -5,6 +5,7 @@ import { createTwilioHttpAuthMiddleware } from "../services/security/twilioTrans
 import {
   handleAiTakeover,
   handleDialFallback,
+  handleForwardingVerificationDigits,
   handleIncomingCall,
 } from "../controllers/callController.js";
 
@@ -13,6 +14,7 @@ const twilioHttpAuth = createTwilioHttpAuthMiddleware();
 
 router.post("/incoming", twilioHttpAuth, handleIncomingCall);
 router.post("/dial-fallback", twilioHttpAuth, handleDialFallback);
+router.post("/forwarding-verification/digits", twilioHttpAuth, handleForwardingVerificationDigits);
 router.post("/ai-takeover", protect, handleAiTakeover);
 
 // Legacy path support for existing Twilio webhook configs.

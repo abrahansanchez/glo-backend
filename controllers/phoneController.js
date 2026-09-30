@@ -311,7 +311,7 @@ export const selectNumberStrategy = async (req, res) => {
       });
     }
 
-    const barber = await assignStrategy(barberId, strategy, {
+    let barber = await assignStrategy(barberId, strategy, {
       forwardFromNumber: req.body?.forwardFromNumber,
       forwardingCarrier: req.body?.forwardingCarrier,
     });
@@ -332,7 +332,7 @@ export const selectNumberStrategy = async (req, res) => {
     // For forward_existing - assign routing number immediately so ForwardingSetup has a number ready
     if (strategy === "forward_existing") {
       try {
-        await assignForwardingRoutingNumber(String(barberId));
+        barber = await assignForwardingRoutingNumber(String(barberId));
         console.log(`[NUMBER_STRATEGY] forwarding routing number assigned barberId=${String(barberId)}`);
       } catch (routingErr) {
         console.error(`[NUMBER_STRATEGY] forwarding routing assignment failed:`, routingErr?.message);
@@ -345,6 +345,9 @@ export const selectNumberStrategy = async (req, res) => {
     return res.json({
       ok: true,
       numberStrategy: barber.numberStrategy,
+      phoneSetupState: barber.routingProvisioning?.status === "assigned"
+        ? "awaiting_forwarding_setup"
+        : barber.routingProvisioning?.status || undefined,
     });
   } catch (err) {
     console.error("selectNumberStrategy error:", err);
@@ -379,7 +382,7 @@ export const getForwardingStatus = async (req, res) => {
 
     if (
       (barber.numberStrategy || barber.phoneNumberStrategy) === "forward_existing" &&
-      !barber.twilioNumber &&
+      !barber.inboundRoutingNumber &&
       (barber.subscriptionStatus === "trialing" || barber.subscriptionStatus === "active")
     ) {
       barber = await assignForwardingRoutingNumber(barberId);
@@ -393,6 +396,10 @@ export const getForwardingStatus = async (req, res) => {
       forwardingStatus: status.forwardingStatus,
       forwardingVerifiedAt: status.forwardingVerifiedAt,
       verificationWindowExpiresAt: status.verificationWindowExpiresAt,
+      provisioningStatus: status.provisioningStatus,
+      provisioningFailureClass: status.provisioningFailureClass,
+      provisioningRetryAfter: status.provisioningRetryAfter,
+      phoneSetupState: status.phoneSetupState,
       verified: status.forwardingStatus === "verified",
     });
   } catch (err) {
@@ -485,6 +492,8 @@ export const triggerForwardingTest = async (req, res, next) => {
     const result = await startForwardingTest({
       barberId,
       forwardFromNumber,
+      restartVerification: req.body?.restartVerification === true,
+      expectedVerificationSessionId: req.body?.expectedVerificationSessionId || "",
     });
 
     return res.json({
@@ -496,7 +505,11 @@ export const triggerForwardingTest = async (req, res, next) => {
     if (err?.code === "BARBER_NOT_FOUND") {
       return res.status(404).json({ code: err.code, message: err.message });
     }
-    if (err?.code === "FORWARDING_NOT_READY") {
+    if (
+      err?.code === "FORWARDING_NOT_READY" ||
+      err?.code === "FORWARDING_ROUTING_NOT_ASSIGNED" ||
+      err?.code === "FORWARDING_ROUTING_MIRROR_MISMATCH"
+    ) {
       return res.status(err.status || 400).json({ code: err.code, message: err.message });
     }
     if (err?.code === "VERIFICATION_ALREADY_RUNNING") {
@@ -506,7 +519,12 @@ export const triggerForwardingTest = async (req, res, next) => {
         verificationWindowExpiresAt: err.verificationWindowExpiresAt || undefined,
       });
     }
-    if (err?.code === "TWILIO_TEST_NUMBER_MISSING" || err?.code === "FORWARDING_VERIFICATION_SOURCE_MISSING") {
+    if (
+      err?.code === "TWILIO_TEST_NUMBER_MISSING" ||
+      err?.code === "FORWARDING_VERIFICATION_SOURCE_MISSING" ||
+      err?.code === "FORWARDING_VERIFICATION_SECRET_MISSING" ||
+      err?.code === "FORWARDING_VERIFICATION_SECRET_WEAK"
+    ) {
       return res.status(err.status || 500).json({ code: err.code, message: err.message });
     }
     if (err?.code === "INVALID_FORWARDING_PHONE" && err?.field === "TWILIO_TEST_NUMBER") {
