@@ -42,6 +42,10 @@ const serializeForwardingState = (barber, assignment = null) => {
     forwardingCarrier: barber.forwardingCarrier || "",
     forwardingStatus: barber.forwardingStatus || "not_started",
     forwardingVerifiedAt: barber.forwardingVerifiedAt || null,
+    verificationSessionId:
+      barber.forwardingStatus === "verification_pending"
+        ? sanitize(barber.verificationSessionId) || null
+        : null,
     verificationWindowExpiresAt: barber.verificationWindowExpiresAt || null,
     provisioningStatus: provisioning.status,
     provisioningFailureClass: provisioning.failureClass,
@@ -401,6 +405,7 @@ export const startForwardingTest = async ({
         const error = new Error("Forwarding verification is already in progress.");
         error.code = "VERIFICATION_ALREADY_RUNNING";
         error.status = 409;
+        error.verificationSessionId = sanitize(barber.verificationSessionId);
         error.verificationWindowExpiresAt = existingExpiresAt;
         throw error;
       }
@@ -417,6 +422,7 @@ export const startForwardingTest = async ({
     const error = new Error("Forwarding verification is already in progress.");
     error.code = "VERIFICATION_ALREADY_RUNNING";
     error.status = 409;
+    error.verificationSessionId = sanitize(barber.verificationSessionId);
     error.verificationWindowExpiresAt = existingExpiresAt;
     throw error;
   }
@@ -459,6 +465,7 @@ export const startForwardingTest = async ({
   return {
     status: "verification_pending",
     forwardingStatus: "verification_pending",
+    verificationSessionId,
     verificationWindowExpiresAt,
     verificationCode,
     instructions:
@@ -521,6 +528,7 @@ async function restartForwardingVerificationSession({
   return {
     status: "verification_pending",
     forwardingStatus: "verification_pending",
+    verificationSessionId,
     verificationWindowExpiresAt,
     verificationCode,
     instructions:

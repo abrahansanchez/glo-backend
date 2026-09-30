@@ -395,6 +395,7 @@ export const getForwardingStatus = async (req, res) => {
       forwardingCarrier: status.forwardingCarrier,
       forwardingStatus: status.forwardingStatus,
       forwardingVerifiedAt: status.forwardingVerifiedAt,
+      verificationSessionId: status.verificationSessionId,
       verificationWindowExpiresAt: status.verificationWindowExpiresAt,
       provisioningStatus: status.provisioningStatus,
       provisioningFailureClass: status.provisioningFailureClass,
@@ -516,6 +517,7 @@ export const triggerForwardingTest = async (req, res, next) => {
       return res.status(err.status || 409).json({
         code: err.code,
         message: err.message,
+        verificationSessionId: err.verificationSessionId || undefined,
         verificationWindowExpiresAt: err.verificationWindowExpiresAt || undefined,
       });
     }
