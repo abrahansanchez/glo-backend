@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import http from "node:http";
+import express from "express";
 import twilio from "twilio";
 
 process.env.JWT_SECRET ||= "test_onboarding_security_containment";
@@ -8,12 +10,19 @@ process.env.STRIPE_SECRET_KEY ||= "sk_test_onboardingSecurityContainment";
 process.env.STRIPE_WEBHOOK_SECRET ||= "whsec_onboardingSecurityContainment";
 
 const Barber = (await import("../../models/Barber.js")).default;
+const PhoneNumberAssignment = (await import("../../models/PhoneNumberAssignment.js")).default;
+const voiceWebhook = (await import("../../routes/voiceWebhook.js")).default;
 const { setupCallComplete } = await import("../../routes/onboardingRoutes.js");
 const {
   forwardingStatusCallback,
 } = await import("../../controllers/phoneController.js");
+const {
+  handleForwardingVerificationDigits,
+  handleIncomingCall,
+} = await import("../../controllers/callController.js");
 const { releaseNumberController } = await import("../../controllers/numberController.js");
 const {
+  beginForwardingVerificationCall,
   maybeVerifyForwardingCall,
   startForwardingTest,
 } = await import("../../services/phoneStrategyService.js");
@@ -33,6 +42,14 @@ const makeResponse = () => ({
     this.body = payload;
     return this;
   },
+  type(value) {
+    this.contentType = value;
+    return this;
+  },
+  send(payload) {
+    this.sent = payload;
+    return this;
+  },
   sendStatus(code) {
     this.statusCode = code;
     this.sentStatus = code;
@@ -44,6 +61,8 @@ const forwardingEnvKeys = [
   "TWILIO_VERIFICATION_FROM_NUMBER",
   "GLO_ROUTING_NUMBER",
   "TWILIO_PHONE_NUMBER",
+  "FORWARDING_VERIFICATION_HMAC_SECRET",
+  "APP_BASE_URL",
 ];
 
 const snapshotEnv = () =>
@@ -63,16 +82,24 @@ const clearForwardingSourceEnv = () => {
   for (const key of forwardingEnvKeys) delete process.env[key];
 };
 
+const VALID_TEST_SECRET = "test-forwarding-secret-32-bytes-minimum";
+
 const makeForwardingBarber = (overrides = {}) => ({
   _id: "barber-forwarding",
   numberStrategy: "forward_existing",
   phoneNumberStrategy: "forward_existing",
   forwardFromNumber: "+15555550123",
   forwardToNumber: "+15555550199",
+  inboundRoutingNumber: "+15555550199",
+  inboundRoutingSid: "PNforwarding",
   forwardingStatus: "verification_pending",
   forwardingVerifiedAt: null,
   verificationSessionId: "session-1",
   verificationWindowExpiresAt: new Date(Date.now() + 60_000),
+  verificationCodeDigest: "abcd",
+  verificationCodeAttempts: 0,
+  verificationMaxAttempts: 5,
+  verificationCallSid: "CAverify",
   onboarding: { stepMap: {} },
   saveCount: 0,
   async save() {
@@ -80,6 +107,36 @@ const makeForwardingBarber = (overrides = {}) => ({
   },
   ...overrides,
 });
+
+const forwardingAssignment = () => ({
+  _id: "assignment-forwarding",
+  barberId: "barber-forwarding",
+  role: "inbound_routing",
+  status: "assigned",
+  numberKey: "+15555550199",
+  phoneNumber: "+15555550199",
+  providerSid: "PNforwarding",
+});
+
+const matchesValue = (actual, expected) => {
+  if (expected && typeof expected === "object") {
+    if ("$gt" in expected) return new Date(actual).getTime() > new Date(expected.$gt).getTime();
+    if ("$lt" in expected) return Number(actual || 0) < Number(expected.$lt);
+    if ("$in" in expected) return expected.$in.includes(actual ?? null);
+  }
+  return actual === expected;
+};
+
+const matchesQuery = (record, query) =>
+  Object.entries(query || {}).every(([key, value]) => matchesValue(record[key], value));
+
+const applyAtomicUpdate = (record, update) => {
+  for (const [key, value] of Object.entries(update.$set || {})) record[key] = value;
+  for (const [key, value] of Object.entries(update.$inc || {})) {
+    record[key] = Number(record[key] || 0) + Number(value);
+  }
+  return record;
+};
 
 test("setup-call-complete rejects unauthenticated requests before any Barber mutation", async (t) => {
   const originalFindById = Barber.findById;
@@ -312,6 +369,9 @@ test("startForwardingTest creates pending verification instead of auto-verifying
     numberStrategy: "forward_existing",
     forwardingStatus: "activation_pending",
     forwardingVerifiedAt: new Date("2026-01-01T00:00:00Z"),
+    forwardToNumber: "+15555550199",
+    inboundRoutingNumber: "+15555550199",
+    inboundRoutingSid: "PNforwarding",
     onboarding: { stepMap: {} },
     async save() {
       calls.save += 1;
@@ -324,7 +384,16 @@ test("startForwardingTest creates pending verification instead of auto-verifying
   clearForwardingSourceEnv();
   process.env.GLO_ROUTING_NUMBER = "+15555550199";
   process.env.TWILIO_VERIFICATION_FROM_NUMBER = "+15555550198";
+  process.env.FORWARDING_VERIFICATION_HMAC_SECRET = VALID_TEST_SECRET;
   Barber.findById = async (id) => (String(id) === "barber-forwarding" ? barber : null);
+  t.mock.method(PhoneNumberAssignment, "findOne", async () => ({
+    barberId: "barber-forwarding",
+    role: "inbound_routing",
+    status: "assigned",
+    numberKey: "+15555550199",
+    phoneNumber: "+15555550199",
+    providerSid: "PNforwarding",
+  }));
 
   const result = await startForwardingTest({
     barberId: "barber-forwarding",
@@ -338,6 +407,9 @@ test("startForwardingTest creates pending verification instead of auto-verifying
   assert.equal(barber.forwardingVerifiedAt, null);
   assert.equal(typeof barber.verificationSessionId, "string");
   assert.ok(barber.verificationWindowExpiresAt instanceof Date);
+  assert.match(result.verificationCode, /^\d{6}$/);
+  assert.equal(typeof barber.verificationCodeDigest, "string");
+  assert.notEqual(barber.verificationCodeDigest, result.verificationCode);
   assert.equal(barber.forwardFromNumber, "+15555550123");
   assert.equal(barber.forwardToNumber, "+15555550199");
   assert.equal(barber.onboarding.stepMap.forwarding_flow, true);
@@ -346,7 +418,7 @@ test("startForwardingTest creates pending verification instead of auto-verifying
   assert.equal(calls.save, 1);
 });
 
-test("startForwardingTest fails closed without configured verification source and leaves state unchanged", async (t) => {
+test("startForwardingTest fails closed without configured verification secret and leaves state unchanged", async (t) => {
   const originalFindById = Barber.findById;
   const originalEnv = snapshotEnv();
   const barber = makeForwardingBarber({
@@ -377,7 +449,7 @@ test("startForwardingTest fails closed without configured verification source an
         barberId: "barber-forwarding",
         forwardFromNumber: "+15555550123",
       }),
-    { code: "FORWARDING_VERIFICATION_SOURCE_MISSING" }
+    { code: "FORWARDING_VERIFICATION_SECRET_MISSING" }
   );
 
   assert.equal(barber.saveCount, 0);
@@ -394,7 +466,7 @@ test("startForwardingTest fails closed without configured verification source an
   );
 });
 
-test("startForwardingTest fails closed on invalid verification source and leaves state unchanged", async (t) => {
+test("startForwardingTest fails closed on weak verification secret and leaves state unchanged", async (t) => {
   const originalFindById = Barber.findById;
   const originalEnv = snapshotEnv();
   const barber = makeForwardingBarber({
@@ -416,7 +488,7 @@ test("startForwardingTest fails closed on invalid verification source and leaves
     restoreEnv(originalEnv);
   });
   clearForwardingSourceEnv();
-  process.env.TWILIO_VERIFICATION_FROM_NUMBER = "not-a-phone-number";
+  process.env.FORWARDING_VERIFICATION_HMAC_SECRET = "short";
   Barber.findById = async () => barber;
 
   await assert.rejects(
@@ -425,7 +497,7 @@ test("startForwardingTest fails closed on invalid verification source and leaves
         barberId: "barber-forwarding",
         forwardFromNumber: "+15555550123",
       }),
-    { code: "INVALID_FORWARDING_PHONE", field: "FORWARDING_VERIFICATION_SOURCE" }
+    { code: "FORWARDING_VERIFICATION_SECRET_WEAK" }
   );
 
   assert.equal(barber.saveCount, 0);
@@ -442,16 +514,23 @@ test("startForwardingTest fails closed on invalid verification source and leaves
   );
 });
 
-test("pending forwarding session cannot verify when verification source is missing", async (t) => {
+test("pending forwarding session with arbitrary source still cannot verify before DTMF", async (t) => {
   const originalFindOne = Barber.findOne;
+  const originalFindOneAndUpdate = Barber.findOneAndUpdate;
+  const originalAssignmentFindOne = PhoneNumberAssignment.findOne;
   const originalEnv = snapshotEnv();
-  const barber = makeForwardingBarber();
+  const barber = makeForwardingBarber({ verificationCallSid: null });
   t.after(() => {
     Barber.findOne = originalFindOne;
+    Barber.findOneAndUpdate = originalFindOneAndUpdate;
+    PhoneNumberAssignment.findOne = originalAssignmentFindOne;
     restoreEnv(originalEnv);
   });
   clearForwardingSourceEnv();
-  Barber.findOne = async () => barber;
+  Barber.findOne = async (query) => query?.inboundRoutingNumber === barber.inboundRoutingNumber ? barber : null;
+  Barber.findOneAndUpdate = async (query, update) =>
+    matchesQuery(barber, query) ? applyAtomicUpdate(barber, update) : null;
+  PhoneNumberAssignment.findOne = async () => forwardingAssignment();
 
   const verified = await maybeVerifyForwardingCall({
     to: "+15555550199",
@@ -463,20 +542,27 @@ test("pending forwarding session cannot verify when verification source is missi
   assert.equal(barber.forwardingStatus, "verification_pending");
   assert.equal(barber.forwardingVerifiedAt, null);
   assert.equal(barber.verificationSessionId, "session-1");
+  assert.equal(barber.verificationCallSid, "CAmissingSource");
   assert.equal(barber.saveCount, 0);
 });
 
-test("pending forwarding session cannot verify unrelated inbound source", async (t) => {
+test("pending forwarding session does not treat From as authentication proof", async (t) => {
   const originalFindOne = Barber.findOne;
+  const originalFindOneAndUpdate = Barber.findOneAndUpdate;
+  const originalAssignmentFindOne = PhoneNumberAssignment.findOne;
   const originalEnv = snapshotEnv();
-  const barber = makeForwardingBarber();
+  const barber = makeForwardingBarber({ verificationCallSid: null });
   t.after(() => {
     Barber.findOne = originalFindOne;
+    Barber.findOneAndUpdate = originalFindOneAndUpdate;
+    PhoneNumberAssignment.findOne = originalAssignmentFindOne;
     restoreEnv(originalEnv);
   });
   clearForwardingSourceEnv();
-  process.env.TWILIO_VERIFICATION_FROM_NUMBER = "+15555550198";
-  Barber.findOne = async () => barber;
+  Barber.findOne = async (query) => query?.inboundRoutingNumber === barber.inboundRoutingNumber ? barber : null;
+  Barber.findOneAndUpdate = async (query, update) =>
+    matchesQuery(barber, query) ? applyAtomicUpdate(barber, update) : null;
+  PhoneNumberAssignment.findOne = async () => forwardingAssignment();
 
   const verified = await maybeVerifyForwardingCall({
     to: "+15555550199",
@@ -488,6 +574,7 @@ test("pending forwarding session cannot verify unrelated inbound source", async 
   assert.equal(barber.forwardingStatus, "verification_pending");
   assert.equal(barber.forwardingVerifiedAt, null);
   assert.equal(barber.verificationSessionId, "session-1");
+  assert.equal(barber.verificationCallSid, "CAunrelatedSource");
   assert.equal(barber.saveCount, 0);
 });
 
@@ -501,10 +588,9 @@ test("pending forwarding session cannot verify correct source with incorrect des
     restoreEnv(originalEnv);
   });
   clearForwardingSourceEnv();
-  process.env.TWILIO_VERIFICATION_FROM_NUMBER = "+15555550198";
   Barber.findOne = async (query) => {
     querySeen = query;
-    return query?.forwardToNumber === barber.forwardToNumber ? barber : null;
+    return query?.inboundRoutingNumber === barber.inboundRoutingNumber ? barber : null;
   };
 
   const verified = await maybeVerifyForwardingCall({
@@ -514,7 +600,7 @@ test("pending forwarding session cannot verify correct source with incorrect des
   });
 
   assert.equal(verified, false);
-  assert.deepEqual(querySeen, { forwardToNumber: "+15555550001" });
+  assert.deepEqual(querySeen, { inboundRoutingNumber: "+15555550001" });
   assert.equal(barber.forwardingStatus, "verification_pending");
   assert.equal(barber.forwardingVerifiedAt, null);
   assert.equal(barber.verificationSessionId, "session-1");
@@ -549,20 +635,26 @@ test("expired forwarding session cannot verify", async (t) => {
   assert.equal(barber.saveCount, 1);
 });
 
-test("correct forwarding source and destination verify once and consume session", async (t) => {
+test("correct forwarding source and destination bind current call without verifying before DTMF", async (t) => {
   const originalFindOne = Barber.findOne;
+  const originalFindOneAndUpdate = Barber.findOneAndUpdate;
+  const originalAssignmentFindOne = PhoneNumberAssignment.findOne;
   const originalEnv = snapshotEnv();
-  const barber = makeForwardingBarber();
+  const barber = makeForwardingBarber({ verificationCallSid: null });
   t.after(() => {
     Barber.findOne = originalFindOne;
+    Barber.findOneAndUpdate = originalFindOneAndUpdate;
+    PhoneNumberAssignment.findOne = originalAssignmentFindOne;
     restoreEnv(originalEnv);
   });
   clearForwardingSourceEnv();
-  process.env.TWILIO_VERIFICATION_FROM_NUMBER = "+15555550198";
   Barber.findOne = async (query) =>
-    query?.forwardToNumber === barber.forwardToNumber ? barber : null;
+    query?.inboundRoutingNumber === barber.inboundRoutingNumber ? barber : null;
+  Barber.findOneAndUpdate = async (query, update) =>
+    matchesQuery(barber, query) ? applyAtomicUpdate(barber, update) : null;
+  PhoneNumberAssignment.findOne = async () => forwardingAssignment();
 
-  const first = await maybeVerifyForwardingCall({
+  const first = await beginForwardingVerificationCall({
     to: "+15555550199",
     from: "+15555550198",
     callSid: "CAverify",
@@ -574,14 +666,172 @@ test("correct forwarding source and destination verify once and consume session"
     callSid: "CAreplay",
   });
 
-  assert.equal(first, true);
+  assert.equal(first.active, true);
+  assert.equal(first.verified, false);
+  assert.equal(barber.forwardingStatus, "verification_pending");
+  assert.equal(barber.forwardingVerifiedAt, null);
+  assert.equal(barber.verificationSessionId, "session-1");
+  assert.equal(barber.verificationCallSid, "CAverify");
+  assert.equal(saveCountAfterFirst, 0);
+  assert.equal(second, false);
+  assert.equal(barber.saveCount, saveCountAfterFirst);
+});
+
+test("pending forwarding verification call receives DTMF Gather and correct code verifies through action", async (t) => {
+  const originalFindById = Barber.findById;
+  const originalFindOne = Barber.findOne;
+  const originalFindOneAndUpdate = Barber.findOneAndUpdate;
+  const originalAssignmentFindOne = PhoneNumberAssignment.findOne;
+  const originalEnv = snapshotEnv();
+  const barber = makeForwardingBarber({
+    forwardingStatus: "routing_ready",
+    verificationSessionId: null,
+    verificationWindowExpiresAt: null,
+    verificationCodeDigest: null,
+    verificationCallSid: null,
+  });
+  t.after(() => {
+    Barber.findById = originalFindById;
+    Barber.findOne = originalFindOne;
+    Barber.findOneAndUpdate = originalFindOneAndUpdate;
+    PhoneNumberAssignment.findOne = originalAssignmentFindOne;
+    restoreEnv(originalEnv);
+  });
+  clearForwardingSourceEnv();
+  process.env.APP_BASE_URL = "https://glo.example.test";
+  process.env.FORWARDING_VERIFICATION_HMAC_SECRET = VALID_TEST_SECRET;
+  Barber.findById = async () => barber;
+  Barber.findOne = async (query) =>
+    query?.inboundRoutingNumber === barber.inboundRoutingNumber ? barber : null;
+  Barber.findOneAndUpdate = async (query, update) =>
+    matchesQuery(barber, query) ? applyAtomicUpdate(barber, update) : null;
+  PhoneNumberAssignment.findOne = async () => forwardingAssignment();
+
+  const started = await startForwardingTest({
+    barberId: "barber-forwarding",
+    forwardFromNumber: "+15555550123",
+  });
+
+  const gatherResponse = makeResponse();
+  await handleIncomingCall(
+    {
+      headers: { host: "glo.example.test" },
+      body: {
+        To: "+15555550199",
+        Called: "+15555550199",
+        From: "+15555550198",
+        CallSid: "CAdtmf",
+      },
+    },
+    gatherResponse
+  );
+
+  assert.equal(gatherResponse.contentType, "text/xml");
+  assert.match(gatherResponse.sent, /<Gather[^>]+input="dtmf"/);
+  assert.match(gatherResponse.sent, /numDigits="6"/);
+  assert.match(gatherResponse.sent, /\/api\/voice\/forwarding-verification\/digits\?session=/);
+  assert.equal(barber.forwardingStatus, "verification_pending");
+  assert.equal(barber.verificationCallSid, "CAdtmf");
+
+  const verifyResponse = makeResponse();
+  await handleForwardingVerificationDigits(
+    {
+      query: { session: barber.verificationSessionId },
+      body: {
+        To: "+15555550199",
+        Called: "+15555550199",
+        CallSid: "CAdtmf",
+        Digits: started.verificationCode,
+      },
+    },
+    verifyResponse
+  );
+
+  assert.equal(verifyResponse.contentType, "text/xml");
+  assert.match(verifyResponse.sent, /Forwarding is verified/);
+  assert.match(verifyResponse.sent, /<Hangup\/>/);
   assert.equal(barber.forwardingStatus, "verified");
   assert.ok(barber.forwardingVerifiedAt instanceof Date);
   assert.equal(barber.verificationSessionId, null);
   assert.equal(barber.verificationWindowExpiresAt, null);
-  assert.equal(saveCountAfterFirst, 1);
-  assert.equal(second, false);
-  assert.equal(barber.saveCount, saveCountAfterFirst);
+  assert.equal(barber.verificationCodeDigest, null);
+  assert.equal(barber.verificationCallSid, null);
+});
+
+test("DTMF forwarding verification route rejects missing and invalid Twilio signatures before controller work", async (t) => {
+  const originalFindOne = Barber.findOne;
+  const originalFindOneAndUpdate = Barber.findOneAndUpdate;
+  const originalAssignmentFindOne = PhoneNumberAssignment.findOne;
+  const originalEnv = snapshotEnv();
+  const originalTwilioAuthMode = process.env.TWILIO_HTTP_AUTH_MODE;
+  const originalTwilioAuthToken = process.env.TWILIO_AUTH_TOKEN;
+  let barberLookups = 0;
+  let assignmentLookups = 0;
+  let mutations = 0;
+
+  t.after(() => {
+    Barber.findOne = originalFindOne;
+    Barber.findOneAndUpdate = originalFindOneAndUpdate;
+    PhoneNumberAssignment.findOne = originalAssignmentFindOne;
+    restoreEnv(originalEnv);
+    if (originalTwilioAuthMode === undefined) delete process.env.TWILIO_HTTP_AUTH_MODE;
+    else process.env.TWILIO_HTTP_AUTH_MODE = originalTwilioAuthMode;
+    if (originalTwilioAuthToken === undefined) delete process.env.TWILIO_AUTH_TOKEN;
+    else process.env.TWILIO_AUTH_TOKEN = originalTwilioAuthToken;
+  });
+
+  clearForwardingSourceEnv();
+  process.env.TWILIO_HTTP_AUTH_MODE = "enforce";
+  process.env.TWILIO_AUTH_TOKEN = "twilio-auth-token";
+  process.env.APP_BASE_URL = "https://glo.example.test";
+  Barber.findOne = async () => {
+    barberLookups += 1;
+    throw new Error("Barber lookup must not run after Twilio auth rejection");
+  };
+  Barber.findOneAndUpdate = async () => {
+    mutations += 1;
+    throw new Error("Barber mutation must not run after Twilio auth rejection");
+  };
+  PhoneNumberAssignment.findOne = async () => {
+    assignmentLookups += 1;
+    throw new Error("Assignment lookup must not run after Twilio auth rejection");
+  };
+
+  const app = express();
+  app.use(express.urlencoded({ extended: false }));
+  app.use("/api/voice", voiceWebhook);
+  const server = http.createServer(app);
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const { port } = server.address();
+  const url = `http://127.0.0.1:${port}/api/voice/forwarding-verification/digits?session=session-1`;
+  const body = new URLSearchParams({
+    To: "+15555550199",
+    CallSid: "CAsignature",
+    Digits: "123456",
+  });
+
+  const missing = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body,
+  });
+  assert.equal(missing.status, 403);
+  assert.equal(await missing.text(), "Twilio request authentication failed");
+
+  const invalid = await fetch(url, {
+    method: "POST",
+    headers: {
+      "content-type": "application/x-www-form-urlencoded",
+      "x-twilio-signature": "invalid",
+    },
+    body,
+  });
+  assert.equal(invalid.status, 403);
+  assert.equal(await invalid.text(), "Twilio request authentication failed");
+  assert.equal(barberLookups, 0);
+  assert.equal(assignmentLookups, 0);
+  assert.equal(mutations, 0);
 });
 
 test("direct number release returns containment response without provider or Barber mutation", async (t) => {
