@@ -78,8 +78,29 @@ test("concurrent forward_existing submissions create one assignment and one acti
     [first, second].find((entry) => entry.status === "rejected").reason.code,
     "VERIFICATION_ALREADY_RUNNING"
   );
+  const fulfilled = [first, second].find((entry) => entry.status === "fulfilled").value;
+  const rejected = [first, second].find((entry) => entry.status === "rejected").reason;
   assert.equal(state.barbers.records.get("barber-1").forwardingStatus, "verification_pending");
   assert.equal(typeof state.barbers.records.get("barber-1").verificationSessionId, "string");
+  assert.equal(fulfilled.verificationSessionId, state.barbers.records.get("barber-1").verificationSessionId);
+  assert.equal(rejected.verificationSessionId, state.barbers.records.get("barber-1").verificationSessionId);
+});
+
+test("forwarding status exposes current pending verification session id to the owner", async (t) => {
+  const state = setup();
+  mockBarber(t, state);
+  mockAssignmentFindOne(t, state);
+  process.env.TWILIO_VERIFICATION_FROM_NUMBER = "+15555550198";
+  process.env.FORWARDING_VERIFICATION_HMAC_SECRET = VALID_TEST_SECRET;
+
+  await assignForwardingRoutingNumberWithOptions("barber-1", provisionOptions(state));
+  const started = await startForwardingTest({ barberId: "barber-1", forwardFromNumber: "+15555550001" });
+  const status = await getStrategyStatus("barber-1");
+
+  assert.equal(typeof started.verificationSessionId, "string");
+  assert.equal(status.forwardingStatus, "verification_pending");
+  assert.equal(status.verificationSessionId, started.verificationSessionId);
+  assert.equal(status.verificationSessionId, state.barbers.records.get("barber-1").verificationSessionId);
 });
 
 test("active provisioning returns pending state and does not call provider again", async (t) => {
