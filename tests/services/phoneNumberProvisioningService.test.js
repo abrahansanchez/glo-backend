@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import PhoneNumberAssignment from "../../models/PhoneNumberAssignment.js";
 import {
+  createTwilioProvisioningProvider,
   INBOUND_ROUTING_ROLE,
   mirrorAssignedBarber,
   provisionDedicatedInboundRoutingNumber,
@@ -31,9 +32,129 @@ test("first successful request creates one provisioning assignment, purchases on
   assert.equal(state.assignments.records[0].phoneNumber, "+15555550100");
   assert.equal(state.assignments.records[0].providerSid, "PN100");
   assert.equal(state.provider.searches, 1);
+  assert.deepEqual(state.provider.searchRequests, [{ limit: 3, fallback: false }]);
   assert.equal(state.provider.purchases.length, 1);
   assert.equal(state.barbers.records.get("barber-1").inboundRoutingNumber, "+15555550100");
   assert.equal(state.barbers.records.get("barber-1").inboundRoutingSid, "PN100");
+});
+
+test("Twilio inventory provider searches preferred area first and fallback without areaCode", async () => {
+  const requests = [];
+  const client = {
+    availablePhoneNumbers(country) {
+      return {
+        local: {
+          async list(params) {
+            requests.push({ country, params });
+            return [{ phoneNumber: "+15555550100" }];
+          },
+        },
+      };
+    },
+    incomingPhoneNumbers: {
+      async list() { return []; },
+      async create() { throw new Error("not used"); },
+    },
+  };
+  const provider = createTwilioProvisioningProvider({
+    env: { TWILIO_DEFAULT_COUNTRY: "US", TWILIO_DEFAULT_AREA_CODE: "813" },
+    client,
+  });
+
+  await provider.searchAvailableNumbers({ limit: 3 });
+  await provider.searchAvailableNumbers({ limit: 3, fallback: true });
+
+  assert.deepEqual(requests, [
+    { country: "US", params: { areaCode: "813", limit: 3, voiceEnabled: true } },
+    { country: "US", params: { limit: 3, voiceEnabled: true } },
+  ]);
+});
+
+test("empty preferred inventory invokes country-wide fallback and purchases the fallback candidate", async () => {
+  const state = setup({
+    preferredAvailable: [],
+    fallbackAvailable: ["+15555550200"],
+    sidByNumber: { "+15555550200": "PN200" },
+  });
+  const result = await provision(state, "barber-1");
+
+  assert.equal(result.status, "assigned");
+  assert.equal(state.assignments.records[0].numberKey, "+15555550200");
+  assert.deepEqual(state.provider.searchRequests, [
+    { limit: 3, fallback: false },
+    { limit: 3, fallback: true },
+  ]);
+  assert.deepEqual(state.provider.purchases.map((entry) => entry.phoneNumber), ["+15555550200"]);
+});
+
+test("preferred candidates all colliding invokes fallback and reserves exactly one fallback winner", async () => {
+  const state = setup({
+    assignments: [{ _id: "other", barberId: "barber-2", role: INBOUND_ROUTING_ROLE, status: "assigned", numberKey: "+15555550100", phoneNumber: "+15555550100", providerSid: "PN100" }],
+    preferredAvailable: ["+15555550100"],
+    fallbackAvailable: ["+15555550200"],
+    sidByNumber: { "+15555550200": "PN200" },
+  });
+  const result = await provision(state, "barber-1");
+
+  assert.equal(result.status, "assigned");
+  assert.equal(state.assignments.records.find((entry) => entry.barberId === "barber-1").numberKey, "+15555550200");
+  assert.deepEqual(state.provider.purchases.map((entry) => entry.phoneNumber), ["+15555550200"]);
+});
+
+test("empty preferred and fallback inventory returns retryable NO_AVAILABLE_NUMBER", async () => {
+  const state = setup({ preferredAvailable: [], fallbackAvailable: [] });
+
+  await assert.rejects(provision(state, "barber-1"), (error) => {
+    assert.equal(error.code, "NO_AVAILABLE_NUMBER");
+    assert.equal(error.preferredInventoryFailureReason, "PREFERRED_INVENTORY_EMPTY");
+    assert.equal(error.inventoryFailureReason, "FALLBACK_INVENTORY_EMPTY");
+    return true;
+  });
+  assert.equal(state.assignments.records[0].status, "failed");
+  assert.equal(state.assignments.records[0].failureClass, "retryable");
+  assert.equal(state.assignments.records[0].lastErrorCode, "NO_AVAILABLE_NUMBER");
+  assert.equal(state.provider.purchases.length, 0);
+});
+
+test("unusable preferred and fallback candidates return retryable failure without purchase", async () => {
+  const state = setup({
+    assignments: [
+      { _id: "other-1", barberId: "barber-2", role: INBOUND_ROUTING_ROLE, status: "assigned", numberKey: "+15555550100", phoneNumber: "+15555550100", providerSid: "PN100" },
+      { _id: "other-2", barberId: "barber-3", role: INBOUND_ROUTING_ROLE, status: "assigned", numberKey: "+15555550200", phoneNumber: "+15555550200", providerSid: "PN200" },
+    ],
+    preferredAvailable: ["+15555550100", "not-a-number"],
+    fallbackAvailable: ["+15555550200"],
+  });
+
+  await assert.rejects(provision(state, "barber-1"), (error) => {
+    assert.equal(error.code, "NO_AVAILABLE_NUMBER");
+    assert.equal(error.preferredInventoryFailureReason, "PREFERRED_CANDIDATES_UNUSABLE");
+    assert.equal(error.inventoryFailureReason, "FALLBACK_CANDIDATES_UNUSABLE");
+    return true;
+  });
+  assert.equal(state.assignments.records.find((entry) => entry.barberId === "barber-1").failureClass, "retryable");
+  assert.equal(state.provider.purchases.length, 0);
+});
+
+test("search remains bounded across preferred and fallback stages", async () => {
+  const state = setup({
+    preferredAvailable: ["bad", "+15555550100", "+15555550101"],
+    fallbackAvailable: ["+15555550200", "+15555550201"],
+    candidateRetryLimit: 2,
+    assignments: [
+      { _id: "other-1", barberId: "barber-2", role: INBOUND_ROUTING_ROLE, status: "assigned", numberKey: "+15555550100", phoneNumber: "+15555550100", providerSid: "PN100" },
+      { _id: "other-2", barberId: "barber-3", role: INBOUND_ROUTING_ROLE, status: "assigned", numberKey: "+15555550200", phoneNumber: "+15555550200", providerSid: "PN200" },
+    ],
+    sidByNumber: { "+15555550201": "PN201" },
+  });
+  const result = await provision(state, "barber-1");
+
+  assert.equal(result.status, "assigned");
+  assert.equal(state.assignments.records.find((entry) => entry.barberId === "barber-1").numberKey, "+15555550201");
+  assert.deepEqual(state.provider.searchRequests, [
+    { limit: 2, fallback: false },
+    { limit: 2, fallback: true },
+  ]);
 });
 
 test("assigned retry returns same number and repairs Barber without provider calls", async () => {
@@ -274,19 +395,30 @@ function setup({
   barber = {},
   barbers = ["barber-1"],
   available = ["+15555550100"],
+  preferredAvailable = null,
+  fallbackAvailable = [],
   sidByNumber = { "+15555550100": "PN100" },
   purchaseError = null,
   ownedAfterPurchaseFailure = false,
   providerDelayMs = 0,
   failNextSave = false,
   ownedNumbers = new Map(),
+  candidateRetryLimit = 3,
 } = {}) {
   const logs = [];
   const assignModel = createAssignmentModel(assignments);
   const barberSeed = Object.fromEntries(barbers.map((id) => [id, { _id: id, ...barber }]));
   const barberModel = createBarberModel(barberSeed, { failNextSave });
-  const provider = createProvider({ available, sidByNumber, purchaseError, ownedAfterPurchaseFailure, providerDelayMs, ownedNumbers });
-  return { assignments: assignModel, barbers: barberModel, provider, logs };
+  const provider = createProvider({
+    preferredAvailable: preferredAvailable || available,
+    fallbackAvailable,
+    sidByNumber,
+    purchaseError,
+    ownedAfterPurchaseFailure,
+    providerDelayMs,
+    ownedNumbers,
+  });
+  return { assignments: assignModel, barbers: barberModel, provider, logs, candidateRetryLimit };
 }
 
 function provision(state, barberId) {
@@ -296,17 +428,21 @@ function provision(state, barberId) {
     provider: state.provider,
     baseUrl: BASE_URL,
     now: () => NOW,
+    candidateRetryLimit: state.candidateRetryLimit,
     createAttemptId: () => `attempt-${state.assignments.attempts++}`,
   });
 }
 
-function createProvider({ available, sidByNumber, purchaseError, ownedAfterPurchaseFailure, providerDelayMs, ownedNumbers }) {
+function createProvider({ preferredAvailable, fallbackAvailable, sidByNumber, purchaseError, ownedAfterPurchaseFailure, providerDelayMs, ownedNumbers }) {
   return {
     searches: 0,
+    searchRequests: [],
     purchases: [],
     purchaseError,
-    async searchAvailableNumbers() {
+    async searchAvailableNumbers({ limit, fallback = false }) {
       this.searches += 1;
+      this.searchRequests.push({ limit, fallback });
+      const available = fallback ? fallbackAvailable : preferredAvailable;
       return available.map((phoneNumber) => ({ phoneNumber }));
     },
     async findOwnedNumber({ phoneNumber }) {

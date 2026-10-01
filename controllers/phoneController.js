@@ -375,17 +375,9 @@ export const getForwardingStatus = async (req, res) => {
       return res.status(401).json({ code: "UNAUTHORIZED", message: "Authentication required" });
     }
 
-    let barber = await Barber.findById(barberId);
+    const barber = await Barber.findById(barberId);
     if (!barber) {
       return res.status(404).json({ code: "BARBER_NOT_FOUND", message: "Barber not found" });
-    }
-
-    if (
-      (barber.numberStrategy || barber.phoneNumberStrategy) === "forward_existing" &&
-      !barber.inboundRoutingNumber &&
-      (barber.subscriptionStatus === "trialing" || barber.subscriptionStatus === "active")
-    ) {
-      barber = await assignForwardingRoutingNumber(barberId);
     }
 
     const status = await getStrategyStatus(barberId);

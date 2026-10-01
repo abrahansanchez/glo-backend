@@ -214,9 +214,7 @@ export const postOnboardingStep = async (req, res) => {
       barber.onboarding.completedAt = null;
     }
 
-    console.log("[BACKEND_SAVE_FORWARDING]", req.body.data?.forwardFromNumber);
     await barber.save();
-    console.log("[BACKEND_SAVED_FORWARDING]", barber.forwardFromNumber);
 
     const languageChanged =
       step === "language" && previousPreferredLanguage !== (barber.preferredLanguage || "en");

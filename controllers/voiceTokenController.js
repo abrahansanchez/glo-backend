@@ -51,11 +51,6 @@ export const getVoiceToken = async (req, res) => {
 
     token.addGrant(voiceGrant);
 
-    console.log("[VOICE_TOKEN_DEBUG]", {
-      identity: String(barberId),
-      pushCredentialSid: "CR6e19ee5d76f5eee446eae0766fcd9f1f",
-    });
-
     return res.status(200).json({
       token: token.toJwt(),
       identity: String(barberId),

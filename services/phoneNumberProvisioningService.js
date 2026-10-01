@@ -41,7 +41,11 @@ export async function provisionDedicatedInboundRoutingNumber(barberId, options =
   } catch (error) {
     const sanitized = sanitizeErrorCode(error);
     await markFailed(assignment, sanitized, deps);
-    throw Object.assign(new Error(sanitized), { code: sanitized });
+    throw Object.assign(new Error(sanitized), {
+      code: sanitized,
+      inventoryFailureReason: error?.inventoryFailureReason,
+      preferredInventoryFailureReason: error?.preferredInventoryFailureReason,
+    });
   }
   const mirror = await mirrorAssignedBarber(assignment, deps);
   return result("assigned", assignment, {
@@ -65,17 +69,20 @@ function resolveDependencies(options) {
   };
 }
 
-export function createTwilioProvisioningProvider({ env = process.env } = {}) {
-  const client = twilio(env.TWILIO_ACCOUNT_SID, env.TWILIO_AUTH_TOKEN);
+export function createTwilioProvisioningProvider({ env = process.env, client = null } = {}) {
+  const resolvedClient = client || twilio(env.TWILIO_ACCOUNT_SID, env.TWILIO_AUTH_TOKEN);
   return {
-    async searchAvailableNumbers({ limit }) {
+    async searchAvailableNumbers({ limit, fallback = false }) {
       const country = env.TWILIO_DEFAULT_COUNTRY || "US";
       const areaCode = env.TWILIO_DEFAULT_AREA_CODE || "813";
-      const numbers = await client.availablePhoneNumbers(country).local.list({ areaCode, limit });
+      const search = fallback
+        ? { limit, voiceEnabled: true }
+        : { areaCode, limit, voiceEnabled: true };
+      const numbers = await resolvedClient.availablePhoneNumbers(country).local.list(search);
       return numbers.map((entry) => ({ phoneNumber: entry.phoneNumber }));
     },
     async findOwnedNumber({ phoneNumber }) {
-      const matches = await client.incomingPhoneNumbers.list({ phoneNumber, limit: 1 });
+      const matches = await resolvedClient.incomingPhoneNumbers.list({ phoneNumber, limit: 1 });
       const [match] = matches || [];
       if (!match) return null;
       return {
@@ -87,7 +94,7 @@ export function createTwilioProvisioningProvider({ env = process.env } = {}) {
       };
     },
     async purchaseNumber({ phoneNumber, voiceUrl, smsUrl, friendlyName }) {
-      const purchased = await client.incomingPhoneNumbers.create({
+      const purchased = await resolvedClient.incomingPhoneNumbers.create({
         phoneNumber,
         voiceUrl,
         smsUrl,
@@ -171,9 +178,35 @@ async function ensureCandidateReserved(assignment, deps) {
     }
     return assignment;
   }
+  const preferred = await reserveCandidateFromInventory(assignment, deps, {
+    fallback: false,
+    emptyReason: "PREFERRED_INVENTORY_EMPTY",
+    unusableReason: "PREFERRED_CANDIDATES_UNUSABLE",
+  });
+  if (preferred.assignment) return preferred.assignment;
+
+  const fallback = await reserveCandidateFromInventory(assignment, deps, {
+    fallback: true,
+    emptyReason: "FALLBACK_INVENTORY_EMPTY",
+    unusableReason: "FALLBACK_CANDIDATES_UNUSABLE",
+  });
+  if (fallback.assignment) return fallback.assignment;
+
+  const error = new Error("NO_AVAILABLE_NUMBER");
+  error.code = "NO_AVAILABLE_NUMBER";
+  error.inventoryFailureReason = fallback.reason;
+  error.preferredInventoryFailureReason = preferred.reason;
+  throw error;
+}
+
+async function reserveCandidateFromInventory(assignment, deps, { fallback, emptyReason, unusableReason }) {
   const available = await deps.provider.searchAvailableNumbers({
     limit: deps.candidateRetryLimit,
+    fallback,
   });
+  if (!Array.isArray(available) || available.length === 0) {
+    return { assignment: null, reason: emptyReason };
+  }
   for (const entry of available.slice(0, deps.candidateRetryLimit)) {
     const candidateNumber = normalizePhone(entry.phoneNumber);
     if (!candidateNumber) continue;
@@ -192,13 +225,13 @@ async function ensureCandidateReserved(assignment, deps) {
         },
         { new: true }
       );
-      if (updated) return updated;
+      if (updated) return { assignment: updated, reason: null };
     } catch (error) {
       if (isRelevantNumberKeyDuplicate(error)) continue;
       throw error;
     }
   }
-  throw Object.assign(new Error("NO_AVAILABLE_NUMBER"), { code: "NO_AVAILABLE_NUMBER" });
+  return { assignment: null, reason: unusableReason };
 }
 
 function reconcileOwnedNumber(owned, assignment, deps) {

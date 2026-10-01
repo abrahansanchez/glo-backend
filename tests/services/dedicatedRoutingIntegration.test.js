@@ -1,7 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import Barber from "../../models/Barber.js";
 import PhoneNumberAssignment from "../../models/PhoneNumberAssignment.js";
+import { getForwardingStatus } from "../../controllers/phoneController.js";
 import { findBarberByInboundNumber } from "../../services/business/resolveBusinessByCalledNumber.js";
 import {
   assignForwardingRoutingNumberWithOptions,
@@ -157,6 +159,71 @@ test("retryable and terminal provisioning failures are represented without autom
   await assignForwardingRoutingNumberWithOptions("barber-1", provisionOptions(terminal));
   assert.equal(terminal.provider.purchases.length, 0);
   assert.equal(terminal.assignments.records[0].status, "failed");
+});
+
+test("GET forwarding status is observational and returns persisted retryable failure state", async (t) => {
+  const state = setup({
+    assignments: [{
+      _id: "assignment-1",
+      barberId: "barber-1",
+      role: "inbound_routing",
+      status: "failed",
+      failureClass: "retryable",
+      lastErrorCode: "NO_AVAILABLE_NUMBER",
+      retryAfter: new Date("2026-09-29T12:00:00Z"),
+    }],
+    available: ["+15555550100"],
+  });
+  mockBarber(t, state);
+  mockAssignmentFindOne(t, state);
+
+  const response = await invokeForwardingStatus("barber-1");
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.body.forwardToNumber, null);
+  assert.equal(response.body.provisioningStatus, "failed");
+  assert.equal(response.body.provisioningFailureClass, "retryable");
+  assert.equal(response.body.phoneSetupState, "provisioning_failed_retryable");
+  assert.equal(state.provider.searches, 0);
+  assert.equal(state.provider.purchases.length, 0);
+  assert.equal(state.assignments.records[0].status, "failed");
+});
+
+test("GET forwarding status returns canonical forwardToNumber only for valid assigned mirror", async (t) => {
+  const state = setup({
+    assignments: [{
+      _id: "assignment-1",
+      barberId: "barber-1",
+      role: "inbound_routing",
+      status: "assigned",
+      numberKey: "+15555550100",
+      phoneNumber: "+15555550100",
+      providerSid: "PN100",
+    }],
+  });
+  state.barbers.records.get("barber-1").forwardToNumber = "+15555550100";
+  state.barbers.records.get("barber-1").inboundRoutingNumber = "+15555550100";
+  state.barbers.records.get("barber-1").inboundRoutingSid = "PN100";
+  mockBarber(t, state);
+  mockAssignmentFindOne(t, state);
+
+  const response = await invokeForwardingStatus("barber-1");
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.body.forwardToNumber, "+15555550100");
+  assert.equal(response.body.provisioningStatus, "assigned");
+  assert.equal(response.body.phoneSetupState, "awaiting_forwarding_setup");
+  assert.equal(state.provider.searches, 0);
+  assert.equal(state.provider.purchases.length, 0);
+});
+
+test("sensitive forwarding and voice token debug logs are absent from production controllers", () => {
+  const onboarding = readFileSync(new URL("../../controllers/onboardingController.js", import.meta.url), "utf8");
+  const voiceToken = readFileSync(new URL("../../controllers/voiceTokenController.js", import.meta.url), "utf8");
+
+  assert.equal(onboarding.includes("[BACKEND_SAVE_FORWARDING]"), false);
+  assert.equal(onboarding.includes("[BACKEND_SAVED_FORWARDING]"), false);
+  assert.equal(voiceToken.includes("[VOICE_TOKEN_DEBUG]"), false);
 });
 
 test("provisioning survives verification failure and retry does not repurchase", async (t) => {
@@ -881,6 +948,23 @@ function provisionOptions(state) {
   };
 }
 
+async function invokeForwardingStatus(barberId) {
+  const response = {
+    statusCode: 200,
+    body: null,
+    status(code) {
+      this.statusCode = code;
+      return this;
+    },
+    json(payload) {
+      this.body = payload;
+      return this;
+    },
+  };
+  await getForwardingStatus({ user: { _id: barberId } }, response);
+  return response;
+}
+
 function setup({
   assignments = [],
   available = ["+15555550100"],
@@ -916,9 +1000,11 @@ function createProvider({ available, sidByNumber, providerDelayMs }) {
   const ownedNumbers = new Map();
   return {
     searches: 0,
+    searchRequests: [],
     purchases: [],
-    async searchAvailableNumbers() {
+    async searchAvailableNumbers({ limit, fallback = false }) {
       this.searches += 1;
+      this.searchRequests.push({ limit, fallback });
       return available.map((phoneNumber) => ({ phoneNumber }));
     },
     async findOwnedNumber({ phoneNumber }) {
