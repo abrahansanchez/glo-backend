@@ -4,7 +4,9 @@ import upload from "../middleware/uploadMiddleware.js";
 import {
   selectNumberStrategy,
   getForwardingStatus,
+  getPhoneSetupReadiness,
   forwardingStatusCallback,
+  startPhoneSetup,
   triggerForwardingTest,
   startPorting,
   submitPorting,
@@ -21,6 +23,8 @@ router.post("/porting/webhook", portingWebhook);
 router.post("/forwarding/status-callback", forwardingStatusCallback);
 
 router.use(protect);
+router.get("/setup/readiness", getPhoneSetupReadiness);
+router.post("/setup/start", startPhoneSetup);
 router.post("/number-strategy", selectNumberStrategy);
 router.get("/forwarding/status", getForwardingStatus);
 router.post("/forwarding/test", triggerForwardingTest);

@@ -201,6 +201,27 @@ const BarberSchema = new mongoose.Schema(
       },
     },
 
+    onboardingContractVersion: {
+      type: String,
+      default: null,
+    },
+
+    productType: {
+      type: String,
+      enum: ["individual", "shop", null],
+      default: null,
+    },
+
+    phoneSetupIntentId: {
+      type: String,
+      default: null,
+    },
+
+    phoneSetupStartedAt: {
+      type: Date,
+      default: null,
+    },
+
     phoneNumberStrategy: {
       type: String,
       enum: ["new_number", "port_existing", "forward_existing"],

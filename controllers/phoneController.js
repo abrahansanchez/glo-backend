@@ -1,7 +1,9 @@
+import { randomUUID } from "node:crypto";
 import twilio from "twilio";
 import Barber from "../models/Barber.js";
 import PortingOrder from "../models/PortingOrder.js";
 import IdempotencyKey from "../models/IdempotencyKey.js";
+import PhoneNumberAssignment from "../models/PhoneNumberAssignment.js";
 import {
   createPortOrder,
   fetchPortOrder,
@@ -17,6 +19,12 @@ import {
   getStrategyStatus,
   startForwardingTest,
 } from "../services/phoneStrategyService.js";
+import {
+  deriveSetupReadiness,
+  validatePhoneSetupStart,
+  SETUP_CONTRACT_VERSION,
+} from "../services/onboardingReadinessService.js";
+import { INBOUND_ROUTING_ROLE } from "../services/phoneNumberProvisioningService.js";
 
 const PORTING_STATES = ["draft", "submitted", "carrier_review", "approved", "completed", "rejected"];
 const E164_REGEX = /^\+[1-9]\d{7,14}$/;
@@ -406,6 +414,169 @@ export const getForwardingStatus = async (req, res) => {
     return res.status(500).json({
       code: "FORWARDING_STATUS_FAILED",
       message: "Failed to load forwarding status",
+    });
+  }
+};
+
+const readRoutingAssignment = async (barberId) =>
+  PhoneNumberAssignment.findOne({ barberId, role: INBOUND_ROUTING_ROLE }).lean();
+
+const intentMissingFilter = [
+  { phoneSetupIntentId: { $exists: false } },
+  { phoneSetupIntentId: null },
+  { phoneSetupIntentId: "" },
+];
+
+const compatibleProductFilter = [
+  { productType: { $exists: false } },
+  { productType: null },
+  { productType: "" },
+  { productType: "individual" },
+];
+
+const notAlreadyLiveFilter = [
+  { $or: [{ forwardingStatus: { $ne: "verified" } }, { forwardingStatus: { $exists: false } }] },
+  { $or: [{ twilioNumber: { $exists: false } }, { twilioNumber: null }, { twilioNumber: "" }] },
+  { $or: [{ assignedTwilioNumber: { $exists: false } }, { assignedTwilioNumber: null }, { assignedTwilioNumber: "" }] },
+];
+
+const claimPhoneSetupIntent = async (barberId, { now = new Date(), intentIdFactory = randomUUID } = {}) => {
+  const intentId = intentIdFactory();
+  const updated = await Barber.findOneAndUpdate(
+    {
+      _id: barberId,
+      $and: [
+        { $or: intentMissingFilter },
+        { subscriptionStatus: { $in: ["trialing", "active"] } },
+        { $or: compatibleProductFilter },
+        ...notAlreadyLiveFilter,
+      ],
+    },
+    {
+      $set: {
+        phoneSetupIntentId: intentId,
+        phoneSetupStartedAt: now,
+        onboardingContractVersion: SETUP_CONTRACT_VERSION,
+        productType: "individual",
+      },
+    },
+    { new: true }
+  );
+
+  if (updated?.phoneSetupIntentId) {
+    return {
+      ok: true,
+      created: updated.phoneSetupIntentId === intentId,
+      barber: updated,
+      intentId: updated.phoneSetupIntentId,
+      startedAt: updated.phoneSetupStartedAt,
+    };
+  }
+
+  const current = await Barber.findById(barberId);
+  if (current?.phoneSetupIntentId && current?.phoneSetupStartedAt) {
+    return {
+      ok: true,
+      created: false,
+      barber: current,
+      intentId: current.phoneSetupIntentId,
+      startedAt: current.phoneSetupStartedAt,
+    };
+  }
+
+  return { ok: false, barber: current };
+};
+
+export const getPhoneSetupReadiness = async (req, res) => {
+  try {
+    const barberId = req.user?._id;
+    if (!barberId) {
+      return res.status(401).json({ code: "UNAUTHORIZED", message: "Authentication required" });
+    }
+
+    const barber = await Barber.findById(barberId);
+    if (!barber) {
+      return res.status(404).json({ code: "BARBER_NOT_FOUND", message: "Barber not found" });
+    }
+
+    const assignment = await readRoutingAssignment(barberId);
+    return res.json(deriveSetupReadiness(barber, { assignment }));
+  } catch (err) {
+    console.error("getPhoneSetupReadiness error:", err);
+    if (err?.code === "BARBER_NOT_FOUND") {
+      return res.status(404).json({ code: err.code, message: err.message });
+    }
+    return res.status(500).json({
+      code: "PHONE_SETUP_READINESS_FAILED",
+      message: "Failed to load phone setup readiness",
+    });
+  }
+};
+
+export const startPhoneSetup = async (req, res) => {
+  try {
+    const barberId = req.user?._id;
+    if (!barberId) {
+      return res.status(401).json({ code: "UNAUTHORIZED", message: "Authentication required" });
+    }
+
+    const productType = String(req.body?.productType || "individual").trim().toLowerCase();
+    if (productType !== "individual") {
+      return res.status(409).json({
+        ok: false,
+        code: "SHOP_SETUP_NOT_AVAILABLE",
+        message: "Shop setup is not available in this phase.",
+      });
+    }
+
+    const barber = await Barber.findById(barberId);
+    if (!barber) {
+      return res.status(404).json({ code: "BARBER_NOT_FOUND", message: "Barber not found" });
+    }
+
+    const assignment = await readRoutingAssignment(barberId);
+    const validation = validatePhoneSetupStart(barber, { assignment, productTypeOverride: productType });
+    if (!validation.ok) {
+      return res.status(validation.status).json({
+        ok: false,
+        code: validation.code,
+        message: validation.message,
+        incomplete: validation.incomplete || undefined,
+      });
+    }
+
+    const claim = await claimPhoneSetupIntent(barberId);
+    if (!claim.ok) {
+      if (!claim.barber) {
+        return res.status(404).json({ code: "BARBER_NOT_FOUND", message: "Barber not found" });
+      }
+      const currentAssignment = await readRoutingAssignment(barberId);
+      const currentValidation = validatePhoneSetupStart(claim.barber, { assignment: currentAssignment, productTypeOverride: productType });
+      return res.status(currentValidation.status || 409).json({
+        ok: false,
+        code: currentValidation.code || "PHONE_SETUP_START_NOT_AVAILABLE",
+        message: currentValidation.message || "Phone setup is not available.",
+        incomplete: currentValidation.incomplete || undefined,
+      });
+    }
+
+    return res.status(claim.created ? 201 : 200).json({
+      ok: true,
+      idempotent: !claim.created,
+      phoneSetupIntentId: claim.intentId,
+      phoneSetupStartedAt: claim.startedAt,
+      readiness: deriveSetupReadiness(claim.barber, { assignment }),
+      nextStep: "choose_number_strategy",
+      supportedStrategies: ["new_number", "forward_existing"],
+    });
+  } catch (err) {
+    console.error("startPhoneSetup error:", err);
+    if (err?.code === "BARBER_NOT_FOUND") {
+      return res.status(404).json({ code: err.code, message: err.message });
+    }
+    return res.status(500).json({
+      code: "PHONE_SETUP_START_FAILED",
+      message: "Failed to start phone setup",
     });
   }
 };
