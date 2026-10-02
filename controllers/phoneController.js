@@ -25,6 +25,7 @@ import {
   SETUP_CONTRACT_VERSION,
 } from "../services/onboardingReadinessService.js";
 import { INBOUND_ROUTING_ROLE } from "../services/phoneNumberProvisioningService.js";
+import { validatePaymentFirstProvisioningGate } from "../services/paymentFirstProvisioningGate.js";
 
 const PORTING_STATES = ["draft", "submitted", "carrier_review", "approved", "completed", "rejected"];
 const E164_REGEX = /^\+[1-9]\d{7,14}$/;
@@ -315,7 +316,32 @@ export const selectNumberStrategy = async (req, res) => {
     if (!["new_number", "port_existing", "forward_existing"].includes(strategy)) {
       return res.status(400).json({
         code: "INVALID_STRATEGY",
-        message: "strategy must be 'new_number', 'port_existing', or 'forward_existing'",
+        message: "strategy must be 'new_number' or 'forward_existing'",
+      });
+    }
+
+    if (strategy === "port_existing") {
+      return res.status(409).json({
+        code: "STRATEGY_UNAVAILABLE",
+        message: "This number strategy is not available in this launch flow.",
+      });
+    }
+
+    const currentBarber = await Barber.findById(barberId);
+    if (!currentBarber) {
+      return res.status(404).json({ code: "BARBER_NOT_FOUND", message: "Barber not found" });
+    }
+    const currentAssignment = await readRoutingAssignment(barberId);
+    const gate = validatePaymentFirstProvisioningGate(currentBarber, {
+      strategy,
+      assignment: currentAssignment,
+    });
+    if (!gate.ok) {
+      return res.status(gate.status).json({
+        ok: false,
+        code: gate.code,
+        message: gate.message,
+        incomplete: gate.incomplete || undefined,
       });
     }
 

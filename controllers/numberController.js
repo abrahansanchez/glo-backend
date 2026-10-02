@@ -1,5 +1,6 @@
 import { assignPhoneNumber } from "../utils/assignPhoneNumber.js";
 import Barber from "../models/Barber.js";
+import { validatePaymentFirstProvisioningGate } from "../services/paymentFirstProvisioningGate.js";
 
 export const assignNumberController = async (req, res) => {
   try {
@@ -8,16 +9,22 @@ export const assignNumberController = async (req, res) => {
     if (!barberId) {
       return res.status(401).json({ message: "Authentication required" });
     }
-    const barber = await Barber.findById(barberId).select("subscriptionStatus");
+    const barber = await Barber.findById(barberId);
     if (!barber) {
       return res.status(404).json({ message: "Barber not found" });
     }
-    if (!["trialing", "active"].includes(String(barber.subscriptionStatus || "").toLowerCase())) {
-      return res.status(400).json({
-        code: "TRIAL_REQUIRED",
-        message: "Cannot assign a Twilio number before trial has started",
+
+    const gate = validatePaymentFirstProvisioningGate(barber, {
+      strategy: barber.numberStrategy || barber.phoneNumberStrategy,
+    });
+    if (!gate.ok) {
+      return res.status(gate.status).json({
+        code: gate.code,
+        message: gate.message,
+        incomplete: gate.incomplete || undefined,
       });
     }
+
     const number = await assignPhoneNumber(barberId);
     res.status(200).json({ message: "Number assigned", number });
   } catch (error) {
