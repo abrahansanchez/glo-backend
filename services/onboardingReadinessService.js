@@ -148,9 +148,17 @@ function deriveClientSetupState({ barber, billingStatus, business, phone, produc
 
 function businessReadiness(barber, stepMap) {
   const profileComplete = Boolean(nonEmpty(barber?.barberName) || nonEmpty(barber?.shopName) || nonEmpty(barber?.name) || stepMap.business_snapshot);
-  const servicesComplete = Array.isArray(barber?.services) && barber.services.some((service) => nonEmpty(service?.name));
+  const servicesComplete = Array.isArray(barber?.services) && barber.services.some((service) =>
+    nonEmpty(service?.name) && service?.enabled !== false && service?.bookable !== false
+  );
   const hoursComplete = hasUsableHours(barber?.availability?.businessHours);
-  const greetingComplete = Boolean(stepMap.ai_intro || barber?.setupCompletedViaCall || nonEmpty(barber?.voiceId) || nonEmpty(barber?.voiceSampleUrl));
+  const greetingComplete = Boolean(
+    nonEmpty(barber?.receptionist?.greeting) ||
+    stepMap.ai_intro ||
+    barber?.setupCompletedViaCall ||
+    nonEmpty(barber?.voiceId) ||
+    nonEmpty(barber?.voiceSampleUrl)
+  );
   const languageComplete = barber?.preferredLanguage === "en" || barber?.preferredLanguage === "es";
   const parts = { profile: profileComplete, services: servicesComplete, hours: hoursComplete, greeting: greetingComplete, language: languageComplete };
   const incomplete = Object.entries(parts).filter(([, complete]) => !complete).map(([key]) => key);
@@ -254,7 +262,9 @@ function normalizeProductType(value) {
 
 function hasUsableHours(hours) {
   if (!hours || typeof hours !== "object") return false;
-  return Object.values(hours).some((day) => day && day.isClosed !== true && nonEmpty(day.open) && nonEmpty(day.close));
+  return Object.values(hours).some((day) => day && day.isClosed !== true && (
+    nonEmpty(day.open) && nonEmpty(day.close)
+  ));
 }
 
 function nonEmpty(value) {
