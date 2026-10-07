@@ -55,6 +55,8 @@ export function reduceBooking(currentProposal, action) {
       return affirmConfirmation(currentProposal);
     case CallerActionType.REJECT_CONFIRMATION:
       return rejectConfirmation(currentProposal);
+    case CallerActionType.ABANDON_PROPOSAL:
+      return abandonBooking(currentProposal);
     case CallerActionType.CANCEL:
     case CallerActionType.RESCHEDULE:
       return rejected(currentProposal, "post_booking_action_out_of_phase_1_scope");
@@ -237,6 +239,11 @@ function rejectConfirmation(current) {
     confirmation: { proposalVersion: current.proposalVersion, status: ConfirmationStatus.NONE },
   });
   return changed(next, [{ type: BookingEffectType.CONFIRMATION_REJECTED, proposalVersion: current.proposalVersion }]);
+}
+
+function abandonBooking(current) {
+  const terminal = Object.freeze({ outcome: "ABANDONED", appointmentId: null, reason: "CALLER_ABANDONED" });
+  return changed(createBookingProposal({ ...current, terminal }));
 }
 
 function isValidFieldValue(field, value) {

@@ -92,6 +92,8 @@ export function classifyOneAction(normalizedTurn, context) {
   if (matchesRuleGroup("day_date_requests", text) && /\b(?:what|available|que|disponible|hay|tienes)\b/.test(text)) {
     return CallerActionType.REQUEST_AVAILABLE_TIMES_FOR_DATE;
   }
+  if (text === "cancel") return hasMeaningfulActiveProposal(context.currentProposal) ? CallerActionType.ABANDON_PROPOSAL : CallerActionType.CANCEL;
+  if (matchesRuleGroup("cancellation_cues", text)) return CallerActionType.ABANDON_PROPOSAL;
   if ([serviceSignal, dateSignal, timeSignal, nameSignal].filter(Boolean).length > 1) return CallerActionType.BOOK_REQUEST;
   const confirmation = extractConfirmation(normalizedTurn);
   if (confirmation === "affirm") return CallerActionType.AFFIRM_CONFIRMATION;
@@ -173,6 +175,9 @@ function matchCurrentAlternativeTime(normalizedTurn, context) {
 
 function nameSignalFor(normalizedTurn) { return matchesRuleGroup("name_setting_cues", normalizedTurn.text); }
 function hasTimeSignal(text) { return matchesRuleGroup("time_expressions", text) || matchesRuleGroup("half_hour_forms", text) || matchesRuleGroup("quarter_hour_forms", text); }
+function hasMeaningfulActiveProposal(proposal) {
+  return Boolean(proposal && !proposal.terminal && (proposal.service || proposal.date || proposal.time || proposal.name || proposal.availability?.alternatives?.length));
+}
 
 function validateOrClarify(candidate, context, source, sourceTurnId, languageEvidence) {
   const validation = validateCandidate(candidate, context, sourceTurnId);

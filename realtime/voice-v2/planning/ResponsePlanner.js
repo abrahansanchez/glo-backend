@@ -1,7 +1,7 @@
 import { deriveBookingRequirement, deriveSlotKey, AvailabilityStatus } from "../domain/BookingProposal.js";
 import { renderPreBookingConfirmation } from "./renderPreBookingConfirmation.js";
 
-export const ResponsePurpose = Object.freeze({
+const responsePurpose = {
   INITIAL_GREETING: "INITIAL_GREETING",
   ASK_SERVICE: "ASK_SERVICE", ASK_DATE: "ASK_DATE", ASK_TIME: "ASK_TIME", ASK_NAME: "ASK_NAME",
   OFFER_ALTERNATIVES: "OFFER_ALTERNATIVES", SCHEDULING_ALTERNATIVES: "SCHEDULING_ALTERNATIVES", NO_AVAILABLE_TIMES: "NO_AVAILABLE_TIMES",
@@ -9,7 +9,9 @@ export const ResponsePurpose = Object.freeze({
   BOOKING_SUCCESS: "BOOKING_SUCCESS", CLARIFICATION: "CLARIFICATION", CLARIFY_LATER_REFERENCE: "CLARIFY_LATER_REFERENCE",
   CONSENT_REASK: "CONSENT_REASK",
   ERROR_RECOVERY: "ERROR_RECOVERY", AMBIGUITY_LIMIT_REACHED: "AMBIGUITY_LIMIT_REACHED",
-});
+};
+Object.defineProperty(responsePurpose, "BOOKING_ABANDONED", { value: "BOOKING_ABANDONED", enumerable: false });
+export const ResponsePurpose = Object.freeze(responsePurpose);
 
 const CALLER_INPUT_PURPOSES = Object.freeze([
   ResponsePurpose.INITIAL_GREETING,
@@ -54,7 +56,7 @@ const APPLICATION_COLLECT_MESSAGES = Object.freeze({
 
 export function planResponse({ proposal, purpose, language = "en", businessName = null, availabilitySearch = null }) {
   if (!proposal || !Number.isInteger(proposal.proposalVersion)) throw new TypeError("invalid_proposal");
-  const resolvedPurpose = purpose || purposeForRequirement(deriveBookingRequirement(proposal));
+  const resolvedPurpose = purpose || terminalPurpose(proposal) || purposeForRequirement(deriveBookingRequirement(proposal));
   const expectedFacts = resolvedPurpose === ResponsePurpose.PRE_BOOKING_CONFIRMATION
     ? Object.freeze({ service: proposal.service, name: proposal.name, date: proposal.date, time: proposal.time })
     : resolvedPurpose === ResponsePurpose.INITIAL_GREETING
@@ -174,6 +176,12 @@ export function bindApplicationOwnedLifecycleSpeech(plan, { collect = false, ava
       ? "Tu cita fue reservada correctamente. Recibirás un mensaje de confirmación. Adiós."
       : "Your appointment was booked successfully. You will receive a confirmation message. Goodbye.";
     return withApplicationOwnedSpeech(plan, message, "post_booking");
+  }
+  if (plan?.purpose === ResponsePurpose.BOOKING_ABANDONED) {
+    const message = plan.language === "es"
+      ? "De acuerdo, detendr\u00e9 esta solicitud. Adi\u00f3s."
+      : "Okay, I'll stop this request. Goodbye.";
+    return withApplicationOwnedSpeech(plan, message, "exit");
   }
   if (plan?.purpose === ResponsePurpose.AMBIGUITY_LIMIT_REACHED) {
     const message = plan.language === "es"
@@ -346,7 +354,13 @@ function ordinaryFacts(proposal, purpose, availabilitySearch) {
       : Object.freeze([]);
   }
   if (purpose === ResponsePurpose.BOOKING_SUCCESS && proposal.terminal?.outcome === 'BOOKED') facts.outcome = 'BOOKED';
+  if (purpose === ResponsePurpose.BOOKING_ABANDONED && proposal.terminal?.outcome === 'ABANDONED') facts.outcome = 'ABANDONED';
   return Object.freeze(facts);
+}
+
+function terminalPurpose(proposal) {
+  if (proposal.terminal?.outcome === "ABANDONED") return ResponsePurpose.BOOKING_ABANDONED;
+  return null;
 }
 
 function purposeForRequirement(requirement) {
