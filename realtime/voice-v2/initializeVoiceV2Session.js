@@ -816,7 +816,7 @@ export function initializeVoiceV2Session({
     });
     if (state.plan.expectsCallerInput) session.watchdog.schedule("caller-silence", 30000, () => enqueue(callerSilenceTimedOut));
     if (isTerminalRecovery(state)) return lifecycle.terminate("RESPONSE_RECOVERY_DELIVERED");
-    if (state.plan.purpose === ResponsePurpose.BOOKING_SUCCESS || state.plan.purpose === ResponsePurpose.AMBIGUITY_LIMIT_REACHED || (state.plan.purpose === ResponsePurpose.ERROR_RECOVERY && session.proposal.terminal)) await lifecycle.terminate("RESPONSE_DELIVERED");
+    if (state.plan.purpose === ResponsePurpose.BOOKING_SUCCESS || state.plan.purpose === ResponsePurpose.BOOKING_ABANDONED || state.plan.purpose === ResponsePurpose.AMBIGUITY_LIMIT_REACHED || (state.plan.purpose === ResponsePurpose.ERROR_RECOVERY && session.proposal.terminal)) await lifecycle.terminate("RESPONSE_DELIVERED");
   }
 
   async function responseFailed(responseId, reason) {

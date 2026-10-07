@@ -36,13 +36,14 @@ const interpret = (transcript, values = {}) => interpretTurn({
   fallbackClassifier: values.fallbackClassifier,
 });
 
-test("rule inventory contains 41 normalization and interpretation rules in all required review groups", () => {
-  assert.equal(countInterpretationRules(), 41);
+test("rule inventory contains 43 normalization and interpretation rules in all required review groups", () => {
+  assert.equal(countInterpretationRules(), 43);
   assert.deepEqual(
     InterpretationRuleInventory.map(({ id, rules }) => [id, rules.length]),
     [
       ["surface_normalization", 5],
       ["modification_cues", 4], ["confirmation_cues", 4], ["rejection_cues", 2],
+      ["cancellation_cues", 2],
       ["half_hour_forms", 2], ["quarter_hour_forms", 2], ["meridiem_forms", 3],
       ["ordinal_alternative_references", 2],
       ["later_requests", 2], ["day_date_requests", 4], ["service_setting_cues", 3],
@@ -128,6 +129,48 @@ test("clear bilingual confirmation and rejection cues map to the shared action v
   }
   for (const transcript of ["no", "nope", "incorrecto"]) {
     assert.equal((await interpret(transcript, { confirmationContext: true })).interpretation.action, CallerActionType.REJECT_CONFIRMATION);
+  }
+});
+
+test("approved exact abandonment cues map to ABANDON_PROPOSAL only with active proposal context", async () => {
+  const currentProposal = createBookingProposal({ proposalId: "active-abandon", service: "Haircut" });
+  for (const transcript of ["never mind", "nevermind", "cancel", "forget it", "stop this", "olvídalo", "olvidalo", "cancela", "detén esto", "deten esto"]) {
+    assert.equal((await interpret(transcript, { currentProposal, confirmationContext: true })).interpretation.action, CallerActionType.ABANDON_PROPOSAL, transcript);
+  }
+  assert.equal((await interpret("cancel", { confirmationContext: true })).interpretation.action, CallerActionType.CANCEL);
+  assert.equal((await interpret("no", { confirmationContext: true })).interpretation.action, CallerActionType.REJECT_CONFIRMATION);
+});
+
+test("abandonment cue policy is exact and does not swallow inquiries, appointment cancellation, or corrections", async () => {
+  const currentProposal = createBookingProposal({
+    proposalId: "abandonment-policy",
+    service: "Haircut",
+    date: "2026-08-27",
+    time: "10:00",
+    availability: { proposalVersion: 1, slotKey: deriveSlotKey({ service: "Haircut", date: "2026-08-27", time: "10:00" }), status: "available", alternatives: [] },
+  });
+  const cases = [
+    ["What is your cancellation policy?", CallerActionType.CLARIFY],
+    ["I need to cancel my appointment tomorrow.", CallerActionType.BOOK_REQUEST],
+    ["Do not cancel it.", CallerActionType.UNKNOWN],
+    ["Never mind, 10:30 works.", CallerActionType.SET_TIME],
+    ["stop", CallerActionType.UNKNOWN],
+    ["stop, 3 PM", CallerActionType.SET_TIME],
+    ["stop listing days", CallerActionType.UNKNOWN],
+    ["no importa", CallerActionType.UNKNOWN],
+    ["No importa cu\u00e1l barbero.", CallerActionType.UNKNOWN],
+    ["No importa la hora.", CallerActionType.UNKNOWN],
+    ["Cancela eso y mejor ponme a las tres.", CallerActionType.MODIFY_TIME],
+    ["Olv\u00eddalo, mejor quiero otro servicio.", CallerActionType.BOOK_REQUEST],
+    ["D\u00e9jalo a las 3.", CallerActionType.SET_TIME],
+    ["D\u00e9jalo como est\u00e1.", CallerActionType.UNKNOWN],
+    ["cancellation", CallerActionType.UNKNOWN],
+    ["scancellation", CallerActionType.UNKNOWN],
+    ["cancelled", CallerActionType.UNKNOWN],
+    ["cancelar", CallerActionType.UNKNOWN],
+  ];
+  for (const [transcript, expected] of cases) {
+    assert.equal((await interpret(transcript, { currentProposal, confirmationContext: true })).interpretation.action, expected, transcript);
   }
 });
 

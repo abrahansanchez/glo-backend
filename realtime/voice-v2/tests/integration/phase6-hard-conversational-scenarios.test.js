@@ -152,6 +152,146 @@ scenario(28, "No during confirmation", async () => {
   const f = fixture({ proposal: completeProposal() }); start(f); await grantLatestConfirmation(f); await caller(f, "no"); assert.equal(f.bookingCalls.length, 0); assert.equal(authorizations(f), 0);
 });
 
+for (const [number, phrase, language] of [
+  [61, "never mind", "en"],
+  [62, "cancel", "en"],
+  [63, "forget it", "en"],
+  [64, "olvidalo", "es"],
+  [65, "cancela", "es"],
+  [66, "stop this", "en"],
+  [71, "deten esto", "es"],
+]) scenario(number, `Caller abandonment ${phrase}`, async () => {
+  const f = fixture({ proposal: completeProposal(), language }); start(f); await grantLatestConfirmation(f);
+  const before = f.app.session.proposal;
+  await caller(f, phrase, `cancel-${number}`);
+  assert.equal(f.bookingCalls.length, 0);
+  assert.equal(f.smsCalls.length, 0);
+  assert.equal(authorizations(f), 0);
+  assert.equal(f.app.session.proposal.service, before.service);
+  assert.equal(f.app.session.proposal.date, before.date);
+  assert.equal(f.app.session.proposal.time, before.time);
+  assert.equal(f.app.session.proposal.name, before.name);
+  assert.equal(f.app.session.proposal.terminal?.outcome, "ABANDONED");
+  await deliverTerminal(f, ResponsePurpose.BOOKING_ABANDONED, language === "es" ? "De acuerdo, detendr\u00e9 esta solicitud. Adi\u00f3s." : "Okay, I'll stop this request. Goodbye.");
+  assert.equal(f.finalized.length, 1);
+  assert.equal(f.finalized[0].outcome, "ABANDONED");
+});
+
+scenario(72, "Bare cancel without an active meaningful proposal does not produce booking abandonment", async () => {
+  const f = fixture(); start(f);
+  await caller(f, "cancel", "empty-cancel-72");
+  assert.equal(f.bookingCalls.length, 0);
+  assert.equal(f.smsCalls.length, 0);
+  assert.equal(authorizations(f), 0);
+  assert.notEqual(f.app.session.proposal.terminal?.outcome, "ABANDONED");
+  assert.equal(creates(f, ResponsePurpose.BOOKING_ABANDONED).length, 0);
+  assert.equal(f.finalized.length, 0);
+});
+
+scenario(73, "No importa after a collection question does not abandon the active proposal", async () => {
+  const f = fixture({ proposal: createBookingProposal({ proposalId: "no-importa-active", service: "Haircut", date: "2026-08-27" }), language: "es" });
+  start(f);
+  await prepareScenario(f);
+  await f.app.requestResponse(planResponse({ proposal: f.app.session.proposal, purpose: ResponsePurpose.ASK_TIME, language: "es" }));
+  await deliverLatest(f, ResponsePurpose.ASK_TIME, "\u00bfA qu\u00e9 hora te gustar\u00eda?");
+  await caller(f, "no importa", "no-importa-73");
+  assert.equal(f.bookingCalls.length, 0);
+  assert.equal(f.smsCalls.length, 0);
+  assert.equal(authorizations(f), 0);
+  assert.notEqual(f.app.session.proposal.terminal?.outcome, "ABANDONED");
+  assert.equal(creates(f, ResponsePurpose.BOOKING_ABANDONED).length, 0);
+  assert.equal(f.app.session.proposal.service, "Haircut");
+  assert.equal(f.app.session.proposal.date, "2026-08-27");
+});
+
+scenario(67, "Caller abandonment during active audio treats cancel-not-active as harmless", async () => {
+  const f = fixture(); start(f); await caller(f, "haircut", "cancel-race-service-67");
+  const create = lastCreate(f, ResponsePurpose.ASK_DATE); const activeResponseId = "resp:cancel-race-67";
+  f.openai.receive({ type: "response.created", response: { id: activeResponseId, metadata: { v2RequestId: create.response.metadata.v2RequestId } } });
+  f.openai.receive({ type: "response.output_audio.delta", response_id: activeResponseId, delta: "AQID" }); await settle(f.app);
+  f.openai.receive({ type: "input_audio_buffer.speech_started", event_id: "speech-cancel-67" }); await settle(f.app);
+  const cancel = f.openai.sent.find((message) => message.type === "response.cancel" && message.response_id === activeResponseId);
+  assert.ok(cancel, "active assistant response should be cancelled");
+  assert.ok(f.twilio.sent.some((message) => message.event === "clear"), "submitted active audio should be cleared");
+  f.openai.receive({ type: "error", event_id: "cancel-race-67", error: { event_id: cancel.event_id, code: "response_cancel_not_active", name: "invalid_request_error", message: "not active" } }); await settle(f.app);
+  await caller(f, "never mind", "cancel-race-turn-67");
+  assert.equal(f.bookingCalls.length, 0);
+  assert.equal(f.smsCalls.length, 0);
+  assert.equal(authorizations(f), 0);
+  assert.equal(events(f, "PERSISTENCE_ERROR").length, 0);
+  assert.equal(f.app.session.proposal.terminal?.outcome, "ABANDONED");
+  await deliverTerminal(f, ResponsePurpose.BOOKING_ABANDONED, "Okay, I'll stop this request. Goodbye.");
+  assert.equal(f.finalized.length, 1);
+  assert.equal(f.finalized[0].outcome, "ABANDONED");
+});
+
+scenario(68, "Caller abandonment goodbye waits for owned playback and finalizes exactly once", async () => {
+  const clock = manualScheduler();
+  const f = fixture({ proposal: completeProposal(), scheduler: clock.options });
+  start(f); await grantLatestConfirmation(f);
+  await caller(f, "never mind", "abandon-playback-68");
+  assert.equal(f.bookingCalls.length, 0);
+  assert.equal(f.smsCalls.length, 0);
+  assert.equal(authorizations(f), 0);
+  assert.equal(f.app.session.proposal.terminal?.outcome, "ABANDONED");
+  const beforeMedia = f.twilio.sent.filter((message) => message.event === "media").length;
+  const beforeMarks = f.twilio.sent.filter((message) => message.event === "mark").length;
+  const { markId } = await deliverTerminalPending(f, ResponsePurpose.BOOKING_ABANDONED, "Okay, I'll stop this request. Goodbye.");
+  assert.equal(f.twilio.sent.filter((message) => message.event === "media").length, beforeMedia + 1, "abandonment goodbye audio submitted once");
+  assert.equal(f.twilio.sent.filter((message) => message.event === "mark").length, beforeMarks + 1, "abandonment goodbye mark submitted once");
+  assert.equal(f.finalized.length, 0, "terminal transcript waits for playback acknowledgement");
+  acknowledge(f, markId); await settle(f.app);
+  assert.equal(f.finalized.length, 1);
+  assert.equal(f.finalized[0].outcome, "ABANDONED");
+  assert.equal(f.twilio.closeCalls.length, 1);
+  acknowledge(f, markId); await settle(f.app);
+  assert.equal(f.finalized.length, 1, "duplicate mark cannot finalize twice");
+  assert.equal(f.twilio.closeCalls.length, 1, "duplicate mark cannot clean up twice");
+});
+
+scenario(69, "Caller abandonment missing playback mark terminates safely without duplicate effects", async () => {
+  const clock = manualScheduler();
+  const f = fixture({ proposal: completeProposal(), scheduler: clock.options });
+  start(f); await grantLatestConfirmation(f);
+  await caller(f, "cancel", "abandon-timeout-69");
+  const { markId } = await deliverTerminalPending(f, ResponsePurpose.BOOKING_ABANDONED, "Okay, I'll stop this request. Goodbye.");
+  assert.equal(clock.active(30000).length, 1, "abandonment playback watchdog is bounded");
+  clock.fire(30000); await settle(f.app);
+  assert.equal(f.bookingCalls.length, 0);
+  assert.equal(f.smsCalls.length, 0);
+  assert.equal(authorizations(f), 0);
+  assert.equal(f.finalized.length, 1);
+  assert.equal(f.finalized[0].outcome, "ABANDONED");
+  assert.equal(f.twilio.closeCalls.length, 1);
+  acknowledge(f, markId); await settle(f.app);
+  assert.equal(f.finalized.length, 1, "late abandonment mark cannot finalize twice");
+  assert.equal(f.twilio.closeCalls.length, 1, "late abandonment mark cannot clean up twice");
+});
+
+scenario(70, "Abandonment cleanup is scoped to one session while another call completes", async () => {
+  const abandoned = fixture({ callSid: "CA-70-A", proposal: completeProposal(), scheduler: manualScheduler().options });
+  const completing = fixture({ callSid: "CA-70-B", proposal: completeProposal(), scheduler: manualScheduler().options });
+  start(abandoned, "MZ-70-A"); start(completing, "MZ-70-B");
+  await grantLatestConfirmation(abandoned);
+  await grantLatestConfirmation(completing);
+  await caller(abandoned, "forget it", "abandon-70-a");
+  await deliverTerminal(abandoned, ResponsePurpose.BOOKING_ABANDONED, "Okay, I'll stop this request. Goodbye.");
+  assert.equal(abandoned.finalized.length, 1);
+  assert.equal(abandoned.finalized[0].outcome, "ABANDONED");
+  assert.equal(abandoned.bookingCalls.length, 0);
+  assert.equal(abandoned.smsCalls.length, 0);
+  assert.equal(completing.finalized.length, 0, "abandonment cleanup must not close the other call");
+  assert.equal(completing.bookingCalls.length, 0);
+  await caller(completing, "yes", "complete-70-b");
+  assertBookedOnce(completing);
+  await deliverTerminal(completing, ResponsePurpose.BOOKING_SUCCESS, "Your appointment is booked.");
+  assert.equal(completing.finalized.length, 1);
+  assert.equal(completing.finalized[0].outcome, "BOOKED");
+  assert.notEqual(abandoned.bookingCalls.length, completing.bookingCalls.length);
+  assert.equal(abandoned.twilio.closeCalls.length, 1);
+  assert.equal(completing.twilio.closeCalls.length, 1);
+});
+
 scenario(29, "Correction immediately after confirmation begins", async () => {
   const f = fixture({ proposal: completeProposal(), availabilityAdapter: availability({ available: true }) }); start(f);
   await beginConfirmation(f); f.openai.receive({ type: "input_audio_buffer.speech_started", event_id: "speech-29" }); await settle(f.app); await caller(f, "actually change the time to 11 AM");
@@ -398,7 +538,7 @@ function availability({ available = true, reason = available ? null : "UNAVAILAB
     getAlternatives: async (request) => { alternativeCalls?.push(request); return { slotKey: request.slotKey, alternatives: alternatives.map((item) => ({ ...item, slotKey: deriveSlotKey({ service: request.service, ...item }) })), reason: alternativeReason }; },
   }; adapter.__recordsCalls = Boolean(calls); return adapter;
 }
-function start(f, streamSid = "MZ1") { f.twilio.receive({ event: "start", start: { callSid: f.app.session.callSid, streamSid } }); }
+function start(f, streamSid = "MZ1") { f.streamSid = streamSid; f.twilio.receive({ event: "start", start: { callSid: f.app.session.callSid, streamSid } }); }
 function stop(f, streamSid = "MZ1") { f.twilio.receive({ event: "stop", streamSid }); }
 function transcript(id, text) { return { type: "conversation.item.input_audio_transcription.completed", event_id: `evt:${id}`, item_id: id, transcript: text }; }
 async function caller(f, text, id = `turn-${events(f, "TURN_ACCEPTED").length + 1}`) { await prepareScenario(f); f.openai.receive(transcript(id, text)); await settle(f.app); }
@@ -435,12 +575,18 @@ async function completeConfirmation(f, { acknowledge: shouldAcknowledge = true, 
   return { responseId, markId };
 }
 async function grantLatestConfirmation(f, _legacyText = safeConfirmation()) { return completeConfirmation(f, { acknowledge: true }); }
-function acknowledge(f, markId) { f.twilio.receive({ event: "mark", streamSid: "MZ1", mark: { name: markId } }); }
+function acknowledge(f, markId) { f.twilio.receive({ event: "mark", streamSid: f.streamSid || "MZ1", mark: { name: markId } }); }
 async function deliverTerminal(f, purpose, text) {
   const create = lastCreate(f, purpose); assert.ok(create, `${purpose} response required`); const responseId = `resp:terminal:${purpose}`;
   f.openai.receive({ type: "response.created", response: { id: responseId, metadata: { v2RequestId: create.response.metadata.v2RequestId } } });
   f.openai.receive({ type: "response.output_audio.delta", response_id: responseId, delta: "AQID" }); finishResponse(f, responseId, text); await settle(f.app);
   const markId = f.twilio.sent.filter((x) => x.event === "mark").at(-1)?.mark?.name; assert.ok(markId); acknowledge(f, markId); await settle(f.app);
+}
+async function deliverTerminalPending(f, purpose, text) {
+  const create = lastCreate(f, purpose); assert.ok(create, `${purpose} response required`); const responseId = `resp:terminal:${purpose}:${creates(f, purpose).length}`;
+  f.openai.receive({ type: "response.created", response: { id: responseId, metadata: { v2RequestId: create.response.metadata.v2RequestId } } });
+  f.openai.receive({ type: "response.output_audio.delta", response_id: responseId, delta: "AQID" }); finishResponse(f, responseId, text); await settle(f.app);
+  const markId = f.twilio.sent.filter((x) => x.event === "mark").at(-1)?.mark?.name; assert.ok(markId); return { responseId, markId };
 }
 async function deliverLatest(f, purpose, text) {
   const create = lastCreate(f, purpose); assert.ok(create, `${purpose} response required`); const responseId = `resp:${purpose}:${creates(f, purpose).length}`;
