@@ -212,6 +212,11 @@ const BarberSchema = new mongoose.Schema(
       default: null,
     },
 
+    selectedIndividualPlanId: {
+      type: String,
+      default: null,
+    },
+
     phoneSetupIntentId: {
       type: String,
       default: null,
@@ -341,8 +346,28 @@ const BarberSchema = new mongoose.Schema(
         name: { type: String, required: true },
         price: { type: Number, default: null },
         durationMinutes: { type: Number, default: null },
+        description: { type: String, default: "" },
+        enabled: { type: Boolean, default: true },
+        bookable: { type: Boolean, default: true },
+        displayOrder: { type: Number, default: 0 },
       },
     ],
+
+    receptionist: {
+      greeting: {
+        type: String,
+        default: "",
+      },
+      instructions: {
+        type: String,
+        default: "",
+      },
+      liveTransferPreference: {
+        type: String,
+        enum: ["disabled", "pending", null],
+        default: "disabled",
+      },
+    },
 
     setupCompletedViaCall: {
       type: Boolean,
