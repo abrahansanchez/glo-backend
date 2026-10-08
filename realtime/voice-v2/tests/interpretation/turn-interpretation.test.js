@@ -69,6 +69,21 @@ test("time extractor canonicalizes shared numeric, punctuated meridiem, and bili
   assert.equal(extractTime(normalizeTurn("las dos y media"), { currentTime: "14:00" }), "14:30");
 });
 
+test("Spanish PM marker after spoken hour resolves to afternoon time without affecting AM handling", async () => {
+  assert.equal(extractTime(normalizeTurn("mañana a las tres p.m.")), "15:00");
+  assert.equal(extractTime(normalizeTurn("tres p.m.")), "15:00");
+  assert.equal(extractTime(normalizeTurn("3:00 p.m.")), "15:00");
+  assert.equal(extractTime(normalizeTurn("3 pm")), "15:00");
+  assert.equal(extractTime(normalizeTurn("mañana a las tres a.m.")), "03:00");
+  assert.equal(extractTime(normalizeTurn("three p.m.")), "15:00");
+  assert.equal(extractTime(normalizeTurn("3 AM")), "03:00");
+
+  const interpreted = await interpret("mañana a las tres p.m.");
+  assert.equal(interpreted.interpretation.action, CallerActionType.BOOK_REQUEST);
+  assert.equal(interpreted.interpretation.date, "2026-08-27");
+  assert.equal(interpreted.interpretation.time, "15:00");
+});
+
 test("date extractor resolves bilingual weekdays from explicit reference date rather than wall clock", () => {
   assert.equal(extractDate(normalizeTurn("Thursday"), { referenceDate: "2026-08-26" }), "2026-08-27");
   assert.equal(extractDate(normalizeTurn("el jueves"), { referenceDate: "2026-08-26" }), "2026-08-27");
@@ -171,6 +186,16 @@ test("abandonment cue policy is exact and does not swallow inquiries, appointmen
   ];
   for (const [transcript, expected] of cases) {
     assert.equal((await interpret(transcript, { currentProposal, confirmationContext: true })).interpretation.action, expected, transcript);
+  }
+});
+
+test("Spanish cancelalo and accented cancelalo abandon only an active meaningful proposal", async () => {
+  const currentProposal = createBookingProposal({ proposalId: "active-cancelalo", service: "Haircut" });
+  for (const transcript of ["cancela", "cancelalo", "cáncelalo"]) {
+    assert.equal((await interpret(transcript, { currentProposal, confirmationContext: true })).interpretation.action, CallerActionType.ABANDON_PROPOSAL, transcript);
+  }
+  for (const transcript of ["Kancelár", "kancela", "完事了", "kan", "cancelar", "stop", "no importa", "déjalo"]) {
+    assert.notEqual((await interpret(transcript, { currentProposal, confirmationContext: true })).interpretation.action, CallerActionType.ABANDON_PROPOSAL, transcript);
   }
 });
 

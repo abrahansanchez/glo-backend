@@ -22,6 +22,7 @@ export function extractTime(normalizedTurn, { currentTime = null } = {}) {
   }
   if (!Number.isInteger(hour)) return null;
 
+  if (!meridiem) meridiem = text.match(/\b(am|pm)\b/)?.[1] ?? null;
   if (!meridiem) {
     if (/\b(?:morning|de la manana|por la manana)\b/.test(text)) meridiem = "am";
     if (/\b(?:afternoon|evening|night|de la tarde|de la noche|por la tarde|por la noche)\b/.test(text)) meridiem = "pm";

@@ -24,7 +24,7 @@ export const InterpretationRuleInventory = Object.freeze([
   ]),
   group("cancellation_cues", "language-specific", [
     ["English abandonment", /^(?:never mind|nevermind|forget it|stop this)$/],
-    ["Spanish abandonment", /^(?:olvidalo|cancela|deten esto)$/],
+    ["Spanish abandonment", /^(?:olvidalo|cancela|cancelalo|deten esto)$/],
   ]),
   group("half_hour_forms", "language-specific", [
     ["English spoken half-hour", /\b(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve) thirty\b/],

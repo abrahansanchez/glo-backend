@@ -177,6 +177,21 @@ for (const [number, phrase, language] of [
   assert.equal(f.finalized[0].outcome, "ABANDONED");
 });
 
+for (const [number, phrase] of [
+  [74, "cancelalo"],
+  [75, "cáncelalo"],
+]) scenario(number, `Spanish caller abandonment ${phrase}`, async () => {
+  const f = fixture({ proposal: completeProposal(), language: "es" }); start(f); await grantLatestConfirmation(f);
+  await caller(f, phrase, `cancelalo-${number}`);
+  assert.equal(f.bookingCalls.length, 0);
+  assert.equal(f.smsCalls.length, 0);
+  assert.equal(authorizations(f), 0);
+  assert.equal(f.app.session.proposal.terminal?.outcome, "ABANDONED");
+  await deliverTerminal(f, ResponsePurpose.BOOKING_ABANDONED, "De acuerdo, detendré esta solicitud. Adiós.");
+  assert.equal(f.finalized.length, 1);
+  assert.equal(f.finalized[0].outcome, "ABANDONED");
+});
+
 scenario(72, "Bare cancel without an active meaningful proposal does not produce booking abandonment", async () => {
   const f = fixture(); start(f);
   await caller(f, "cancel", "empty-cancel-72");
