@@ -1,5 +1,7 @@
 import { interpretTurn } from "./interpretation/TurnInterpreter.js";
+import { normalizeTurn } from "./interpretation/TurnNormalizer.js";
 import { reduceBooking } from "./domain/BookingReducer.js";
+import { CallerActionConfidence, CallerActionType, createCallerAction } from "./domain/CallerAction.js";
 import { planResponse } from "./planning/ResponsePlanner.js";
 import { validateSpeech } from "./planning/SpeechValidator.js";
 import { applyConfirmationAuthority } from "./domain/BookingLifecycleTransitions.js";
@@ -8,7 +10,7 @@ import { ResponseStatus } from "./lifecycle/ResponseRegistry.js";
 import { PlaybackStatus } from "./lifecycle/PlaybackRegistry.js";
 
 export class VoiceCoordinator {
-  constructor({ interpreter = interpretTurn, reducer = reduceBooking, postBookingReducer = reduceBookingResult, responsePlanner = planResponse, speechValidator = validateSpeech } = {}) { this.interpreter = interpreter; this.reducer = reducer; this.postBookingReducer = postBookingReducer; this.responsePlanner = responsePlanner; this.speechValidator = speechValidator; }
+  constructor({ interpreter = interpretTurn, reducer = reduceBooking, postBookingReducer = reduceBookingResult, responsePlanner = planResponse, speechValidator = validateSpeech, consentIntentClassifier = null } = {}) { this.interpreter = interpreter; this.reducer = reducer; this.postBookingReducer = postBookingReducer; this.responsePlanner = responsePlanner; this.speechValidator = speechValidator; this.consentIntentClassifier = consentIntentClassifier; }
   receiveFinalizedTurn(session, turn, context = {}) {
     session.record("TURN_RECEIVED", { turnId: turn.turnId });
     const existing = session.turnRegistry.get(turn.turnId);
@@ -16,7 +18,8 @@ export class VoiceCoordinator {
     return session.turnRegistry.acquire(turn, async () => {
       session.record("TURN_PROCESSING_STARTED", { turnId: turn.turnId, proposalVersion: session.proposal.proposalVersion });
       const interpretationTiming = context.timing?.start("INTERPRETATION", { turnId: turn.turnId });
-      const interpreted = await this.interpreter({ transcript: turn.transcript, sourceTurnId: turn.turnId, currentProposal: session.proposal, confirmationContext: context.confirmationContext, referenceDate: context.referenceDate, businessTimeZone: context.businessTimeZone, availableServices: context.availableServices || [], laterReferenceClarification: context.laterReferenceClarification === true, nameCollectionContext: context.nameCollectionContext === true });
+      let interpreted = await this.interpreter({ transcript: turn.transcript, sourceTurnId: turn.turnId, currentProposal: session.proposal, confirmationContext: context.confirmationContext, referenceDate: context.referenceDate, businessTimeZone: context.businessTimeZone, availableServices: context.availableServices || [], laterReferenceClarification: context.laterReferenceClarification === true, nameCollectionContext: context.nameCollectionContext === true });
+      interpreted = await this.#applyConsentIntentClassifier({ session, turn, context, interpreted });
       context.timing?.end("INTERPRETATION", interpretationTiming, { turnId: turn.turnId });
       session.record("TURN_INTERPRETED", { turnId: turn.turnId, action: interpreted.interpretation.action, proposalVersion: session.proposal.proposalVersion });
       if (interpreted.interpretation.action === "AFFIRM_CONFIRMATION") {
@@ -53,6 +56,37 @@ export class VoiceCoordinator {
       }
       if (interpreted.interpretation.action === "AFFIRM_CONFIRMATION") recordAffirmativeDecision(session, { turnId: turn.turnId, proposalVersion: session.proposal.proposalVersion, context: context.confirmationContext, authority: { authorized: true, reason: null }, reducerRan: true, reduced });
       return Object.freeze({ interpreted, reduced });
+    });
+  }
+  async #applyConsentIntentClassifier({ session, turn, context, interpreted }) {
+    const originalAction = interpreted?.interpretation;
+    if (!isConsentClassifierEligibleInterpretation(originalAction)) return interpreted;
+    if (!this.consentIntentClassifier?.classify) return interpreted;
+    if (!hasMeaningfulActiveProposal(session.proposal)) return interpreted;
+    const normalized = normalizeTurn(turn.transcript);
+    let classified;
+    try {
+      classified = await this.consentIntentClassifier.classify({
+        transcript: turn.transcript,
+        normalizedTranscript: normalized.text,
+        sourceTurnId: turn.turnId,
+        proposalVersion: session.proposal.proposalVersion,
+      });
+    } catch (error) {
+      session.record("CONSENT_INTENT_CLASSIFIER_IGNORED", { turnId: turn.turnId, reason: "CLASSIFIER_ERROR", errorName: error?.name || "Error" });
+      return interpreted;
+    }
+    const action = consentIntentToAction({ classified, normalizedTranscript: normalized.text, sourceTurnId: turn.turnId, session, context, originalAction });
+    if (!action) {
+      session.record("CONSENT_INTENT_CLASSIFIER_IGNORED", { turnId: turn.turnId, reason: consentIntentIgnoreReason(classified), label: safeConsentLabel(classified?.label) });
+      return interpreted;
+    }
+    session.record("CONSENT_INTENT_CLASSIFIED", { turnId: turn.turnId, label: safeConsentLabel(classified.label), action: action.action, proposalVersion: session.proposal.proposalVersion });
+    return Object.freeze({
+      ...interpreted,
+      interpretation: action,
+      interpretationSource: "consent_intent_classifier",
+      fallbackStatus: interpreted.fallbackStatus,
     });
   }
   async handleCallerSpeechStarted(session, { responseId = null, markId = null, submittedAudioBytes = 0, cancelResponse = async () => {}, clearPlayback = async () => {} } = {}) {
@@ -107,6 +141,8 @@ export class VoiceCoordinator {
 }
 
 const EFFECT_RESULT_EVENT = Object.freeze({ CHECK_AVAILABILITY: "AVAILABILITY_RESULT", AUTHORIZE_BOOKING: "BOOKING_AUTHORIZED", CREATE_APPOINTMENT: "BOOKING_SUCCEEDED", SEND_CONFIRMATION_SMS: "SMS_RESULT", FINALIZE_TRANSCRIPT: "TRANSCRIPT_FINALIZED" });
+const CONSENT_LABELS = new Set(["YES", "NO", "ABANDON_PROPOSAL", "ABSTAIN", "UNCLEAR"]);
+const MIN_CONSENT_CONFIDENCE = 0.75;
 
 function authorizationRefused(nextProposal, reason) { return Object.freeze({ nextProposal, proposalChanged: false, effects: Object.freeze([]), rejected: true, reason }); }
 
@@ -126,4 +162,59 @@ function recordAffirmativeDecision(session, { turnId, proposalVersion, context =
     bookingCommandQueued: Boolean(bookingCommand),
     bookingCommandId: bookingCommand?.commandId || null,
   });
+}
+
+function consentIntentToAction({ classified, normalizedTranscript, sourceTurnId, session, context, originalAction }) {
+  if (!isGroundedConsentIntent(classified, normalizedTranscript)) return null;
+  const confidence = CallerActionConfidence.CONTEXTUAL;
+  if (originalAction?.action === CallerActionType.BOOK_REQUEST && classified.label !== "ABANDON_PROPOSAL") return null;
+  if (classified.label === "ABANDON_PROPOSAL" && hasMeaningfulActiveProposal(session.proposal)) {
+    return createCallerAction({ action: CallerActionType.ABANDON_PROPOSAL, confidence, sourceTurnId });
+  }
+  if (classified.label === "NO" && context.consentTurnClaimed === true) {
+    return createCallerAction({ action: CallerActionType.REJECT_CONFIRMATION, confidence, sourceTurnId });
+  }
+  if (classified.label === "YES") {
+    const responseId = context.confirmationContext?.responseId || null;
+    const markId = context.confirmationContext?.markId || null;
+    const authority = session.confirmationAuthority.evaluateAffirmative({ proposal: session.proposal, action: { action: CallerActionType.AFFIRM_CONFIRMATION, sourceTurnId }, responseId, markId, responseRegistry: session.responseRegistry, playbackRegistry: session.playbackRegistry });
+    if (authority.authorized) return createCallerAction({ action: CallerActionType.AFFIRM_CONFIRMATION, confidence, sourceTurnId });
+  }
+  return null;
+}
+
+function isConsentClassifierEligibleInterpretation(interpretation) {
+  if (interpretation?.action === CallerActionType.UNKNOWN) return true;
+  return isFactEmptyBookRequest(interpretation);
+}
+
+function isFactEmptyBookRequest(interpretation) {
+  return interpretation?.action === CallerActionType.BOOK_REQUEST
+    && interpretation.service === undefined
+    && interpretation.name === undefined
+    && interpretation.date === undefined
+    && interpretation.time === undefined;
+}
+
+function isGroundedConsentIntent(classified, normalizedTranscript) {
+  if (!classified || typeof classified !== "object" || Array.isArray(classified)) return false;
+  const label = safeConsentLabel(classified.label);
+  if (!CONSENT_LABELS.has(label) || label === "ABSTAIN" || label === "UNCLEAR") return false;
+  if (typeof classified.confidence !== "number" || classified.confidence < MIN_CONSENT_CONFIDENCE) return false;
+  const evidence = typeof classified.evidence === "string" ? normalizeTurn(classified.evidence).text : "";
+  return Boolean(evidence && normalizedTranscript.includes(evidence));
+}
+
+function consentIntentIgnoreReason(classified) {
+  if (!classified || typeof classified !== "object" || Array.isArray(classified)) return "INVALID_RESULT";
+  const label = safeConsentLabel(classified.label);
+  if (!CONSENT_LABELS.has(label)) return "INVALID_LABEL";
+  if (label === "ABSTAIN" || label === "UNCLEAR") return label;
+  if (typeof classified.confidence !== "number" || classified.confidence < MIN_CONSENT_CONFIDENCE) return "LOW_CONFIDENCE";
+  return "UNGROUNDED_EVIDENCE_OR_CONTEXT";
+}
+
+function safeConsentLabel(label) { return typeof label === "string" ? label.trim().toUpperCase() : null; }
+function hasMeaningfulActiveProposal(proposal) {
+  return Boolean(proposal && !proposal.terminal && (proposal.service || proposal.date || proposal.time || proposal.name || proposal.availability?.alternatives?.length));
 }

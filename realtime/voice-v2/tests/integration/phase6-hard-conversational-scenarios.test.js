@@ -504,9 +504,121 @@ scenario(60, "CAa58ccbdaa986a54b9767f95e851f6d02 successful control", async () =
   await grantLatestConfirmation(f, "Roberto, should I confirm your Haircut for Thursday at 4:30 PM?"); await caller(f, "yes", "s60-yes"); assertBookedOnce(f);
 });
 
+scenario(76, "Consent classifier abandons active proposals only after interpreter abstains", async () => {
+  const classifier = fakeConsentClassifier({
+    "no cancelalo": { label: "ABANDON_PROPOSAL", confidence: 0.96, evidence: "cancelalo" },
+    "ya no quiero": { label: "ABANDON_PROPOSAL", confidence: 0.96, evidence: "ya no quiero" },
+  });
+  for (const phrase of ["No, cancelalo", "No cancelalo", "Ya no quiero"]) {
+    const f = fixture({ proposal: completeProposal(), language: "es", consentIntentClassifier: classifier }); start(f); await grantLatestConfirmation(f);
+    await caller(f, phrase, `classifier-abandon-${phrase.replaceAll(" ", "-")}`);
+    assert.equal(f.bookingCalls.length, 0, phrase);
+    assert.equal(f.smsCalls.length, 0, phrase);
+    assert.equal(authorizations(f), 0, phrase);
+    assert.equal(f.app.session.proposal.terminal?.outcome, "ABANDONED", phrase);
+  }
+});
+
+scenario(77, "Consent classifier cannot steal corrections that the interpreter already owns", async () => {
+  const classifier = fakeConsentClassifier({
+    "no a las tres": { label: "ABANDON_PROPOSAL", confidence: 0.99, evidence: "no" },
+    "never mind 3 pm works": { label: "ABANDON_PROPOSAL", confidence: 0.99, evidence: "never mind" },
+    "cancela eso y ponme a las tres": { label: "ABANDON_PROPOSAL", confidence: 0.99, evidence: "cancela" },
+  });
+  for (const [phrase, expected] of [["No, a las tres", "03:00"], ["Never mind, 3 PM works", "15:00"], ["Cancela eso y ponme a las tres", "03:00"]]) {
+    const f = fixture({ proposal: completeProposal(), language: "es", consentIntentClassifier: classifier, availabilityAdapter: availability({ available: true }) }); start(f); await grantLatestConfirmation(f);
+    await caller(f, phrase, `classifier-correction-${phrase.replaceAll(" ", "-")}`);
+    assert.equal(f.app.session.proposal.time, expected, phrase);
+    assert.equal(f.app.session.proposal.terminal, false, phrase);
+    assert.equal(f.bookingCalls.length, 0, phrase);
+    assert.equal(f.smsCalls.length, 0, phrase);
+    assert.equal(classifier.calls.length, 0, "known interpreter actions must not call classifier");
+  }
+});
+
+scenario(78, "Consent classifier abstain unclear timeout invalid and ungrounded results preserve UNKNOWN fallback", async () => {
+  const cases = [
+    ["No importa", { label: "ABSTAIN", confidence: 0.99, evidence: "no importa" }],
+    ["Stop", { label: "UNCLEAR", confidence: 0.99, evidence: "stop" }],
+    ["Do not cancel it", { label: "ABANDON_PROPOSAL", confidence: 0.99, evidence: "not in transcript" }],
+    ["What is your cancellation policy?", { label: "ABANDON_PROPOSAL", confidence: 0.4, evidence: "cancellation" }],
+    ["Cancela mi cita del martes", null],
+  ];
+  for (const [phrase, result] of cases) {
+    const classifier = fakeConsentClassifier({ [phrase.toLowerCase().replace(/[^\p{L}\p{N}:]+/gu, " ").trim()]: result });
+    const f = fixture({ proposal: completeProposal(), language: "es", consentIntentClassifier: classifier }); start(f); await grantLatestConfirmation(f);
+    await caller(f, phrase, `classifier-fallback-${phrase.replaceAll(" ", "-")}`);
+    assert.equal(f.bookingCalls.length, 0, phrase);
+    assert.equal(f.smsCalls.length, 0, phrase);
+    assert.notEqual(f.app.session.proposal.terminal?.outcome, "ABANDONED", phrase);
+  }
+});
+
+scenario(79, "Consent classifier YES requires existing confirmation authority", async () => {
+  const classifier = fakeConsentClassifier({ absolutely: { label: "YES", confidence: 0.96, evidence: "absolutely" } });
+  const unauthorized = fixture({ proposal: completeProposal(), consentIntentClassifier: classifier }); start(unauthorized);
+  await caller(unauthorized, "absolutely", "classifier-yes-without-authority");
+  assert.equal(unauthorized.bookingCalls.length, 0);
+  assert.equal(unauthorized.smsCalls.length, 0);
+  assert.equal(authorizations(unauthorized), 0);
+
+  const authorized = fixture({ proposal: completeProposal(), consentIntentClassifier: classifier }); start(authorized); await grantLatestConfirmation(authorized);
+  await caller(authorized, "absolutely", "classifier-yes-with-authority");
+  assertBookedOnce(authorized);
+});
+
+scenario(80, "Consent classifier two-call decisions remain session scoped", async () => {
+  const classifierA = fakeConsentClassifier({ "ya no quiero": { label: "ABANDON_PROPOSAL", confidence: 0.96, evidence: "ya no quiero" } });
+  const classifierB = fakeConsentClassifier({ absolutely: { label: "YES", confidence: 0.96, evidence: "absolutely" } });
+  const abandoned = fixture({ callSid: "CA-consent-a", proposal: completeProposal({ name: "Abe" }), consentIntentClassifier: classifierA, language: "es" });
+  const booked = fixture({ callSid: "CA-consent-b", proposal: completeProposal({ name: "Bea" }), consentIntentClassifier: classifierB });
+  start(abandoned, "MZ-consent-a"); start(booked, "MZ-consent-b"); await grantLatestConfirmation(abandoned); await grantLatestConfirmation(booked);
+  await caller(abandoned, "Ya no quiero", "consent-a-abandon");
+  await caller(booked, "absolutely", "consent-b-yes");
+  assert.equal(abandoned.app.session.proposal.terminal?.outcome, "ABANDONED");
+  assert.equal(abandoned.bookingCalls.length, 0);
+  assertBookedOnce(booked);
+  assert.equal(booked.bookingCalls[0].clientName, "Bea");
+});
+
+scenario(81, "Consent classifier cannot widen fact-empty book requests or recognized interpreter actions", async () => {
+  const classifier = fakeConsentClassifier({
+    "quiero una cita": { label: "ABANDON_PROPOSAL", confidence: 0.99, evidence: "quiero" },
+    "ya no quiero": { label: "NO", confidence: 0.99, evidence: "no" },
+    haircut: { label: "ABANDON_PROPOSAL", confidence: 0.99, evidence: "haircut" },
+    "3 pm": { label: "ABANDON_PROPOSAL", confidence: 0.99, evidence: "3 pm" },
+    "my name is roberto": { label: "ABANDON_PROPOSAL", confidence: 0.99, evidence: "roberto" },
+    "never mind": { label: "YES", confidence: 0.99, evidence: "never mind" },
+    cancelalo: { label: "YES", confidence: 0.99, evidence: "cancelalo" },
+  });
+  const firstTurn = fixture({ consentIntentClassifier: classifier }); start(firstTurn);
+  await caller(firstTurn, "quiero una cita", "first-turn-book-request");
+  assert.equal(classifier.calls.length, 0, "first-turn fact-empty book request has no meaningful active proposal and must not call classifier");
+  assert.notEqual(firstTurn.app.session.proposal.terminal?.outcome, "ABANDONED");
+
+  const active = fixture({ proposal: completeProposal(), consentIntentClassifier: classifier }); start(active); await grantLatestConfirmation(active);
+  await caller(active, "Ya no quiero", "fact-empty-non-abandon");
+  assert.equal(active.app.session.proposal.terminal, false, "non-abandon classifier result must keep fact-empty BOOK_REQUEST");
+  assert.equal(active.bookingCalls.length, 0);
+  assert.equal(active.smsCalls.length, 0);
+
+  const recognized = fixture({ proposal: completeProposal(), consentIntentClassifier: classifier }); start(recognized); await grantLatestConfirmation(recognized);
+  for (const [phrase, expectedAction] of [["haircut", "MODIFY_SERVICE"], ["3 pm", "SET_TIME"], ["my name is Roberto", "SET_NAME"], ["never mind", "ABANDON_PROPOSAL"]]) {
+    const before = classifier.calls.length;
+    await caller(recognized, phrase, `recognized-${phrase.replaceAll(" ", "-")}`);
+    assert.equal(classifier.calls.length, before, `${phrase} must not call classifier`);
+    assert.equal(events(recognized, "TURN_INTERPRETED").at(-1).action, expectedAction, phrase);
+    if (recognized.app.session.proposal.terminal) break;
+  }
+  const cancelalo = fixture({ proposal: completeProposal(), consentIntentClassifier: classifier, language: "es" }); start(cancelalo); await grantLatestConfirmation(cancelalo);
+  await caller(cancelalo, "cancelalo", "recognized-cancelalo");
+  assert.equal(classifier.calls.filter((call) => call.normalizedTranscript === "cancelalo").length, 0);
+  assert.equal(events(cancelalo, "TURN_INTERPRETED").at(-1).action, "ABANDON_PROPOSAL");
+});
+
 for (const entry of scenarios) test(`Scenario ${entry.number} - ${entry.name}`, entry.run);
 
-function fixture({ callSid, proposal, availabilityAdapter, bookingAdapter, smsAdapter, transcriptAdapter, scheduler, language = "en", businessContext = BUSINESS } = {}) {
+function fixture({ callSid, proposal, availabilityAdapter, bookingAdapter, smsAdapter, transcriptAdapter, scheduler, language = "en", businessContext = BUSINESS, consentIntentClassifier = null } = {}) {
   const number = scenarios.length + 1; callSid ||= `CA-${number}`; proposal ||= createBookingProposal({ proposalId: `proposal:${callSid}` });
   const twilio = new AutoStartupTwilioSocket(); const openai = new AutoConfiguredOpenAISocket(); openai.readyState = 0;
   const availabilityCalls = []; const alternativeCalls = []; const bookingCalls = []; const smsCalls = []; const turnsPersisted = []; const finalized = [];
@@ -522,7 +634,7 @@ function fixture({ callSid, proposal, availabilityAdapter, bookingAdapter, smsAd
       : { settled: false, success: false, reason: "SETTLEMENT_UNKNOWN" },
   };
   const wrappedSms = { sendAppointmentConfirmation: async (command) => { smsCalls.push(command); return smsAdapter.sendAppointmentConfirmation(command); } };
-  const app = initializeVoiceV2Session({ callSid, callerNumber: "+18135550100", businessContext, buildSha: "phase6-test", twilioSocket: twilio, openaiSocketFactory: () => openai, proposal, availabilityAdapter: wrappedAvailability, bookingAdapter: wrappedBooking, smsAdapter: wrappedSms, transcriptAdapter, scheduler, turnContext: { language, referenceDate: REFERENCE_DATE, availableServices: [{ canonical: "Haircut", aliases: ["haircut", "corte de pelo"] }, { canonical: "Beard Trim", aliases: ["beard trim", "recorte de barba"] }] } });
+  const app = initializeVoiceV2Session({ callSid, callerNumber: "+18135550100", businessContext, buildSha: "phase6-test", twilioSocket: twilio, openaiSocketFactory: () => openai, proposal, availabilityAdapter: wrappedAvailability, bookingAdapter: wrappedBooking, smsAdapter: wrappedSms, transcriptAdapter, scheduler, consentIntentClassifier, turnContext: { language, referenceDate: REFERENCE_DATE, availableServices: [{ canonical: "Haircut", aliases: ["haircut", "corte de pelo"] }, { canonical: "Beard Trim", aliases: ["beard trim", "recorte de barba"] }] } });
   openai.open(); openai.receive({ type: "session.created", event_id: "session-created" }); return { app, twilio, openai, availabilityCalls, alternativeCalls, bookingCalls, smsCalls, turnsPersisted, finalized };
 }
 
@@ -552,6 +664,16 @@ function availability({ available = true, reason = available ? null : "UNAVAILAB
     checkAvailability: async (request) => { calls?.push(request); checks += 1; if (checks === 1 && firstWait) await firstWait; return { slotKey: request.slotKey, available, reason }; },
     getAlternatives: async (request) => { alternativeCalls?.push(request); return { slotKey: request.slotKey, alternatives: alternatives.map((item) => ({ ...item, slotKey: deriveSlotKey({ service: request.service, ...item }) })), reason: alternativeReason }; },
   }; adapter.__recordsCalls = Boolean(calls); return adapter;
+}
+function fakeConsentClassifier(results) {
+  const calls = [];
+  return {
+    calls,
+    classify: async (request) => {
+      calls.push(request);
+      return results[request.normalizedTranscript] ?? null;
+    },
+  };
 }
 function start(f, streamSid = "MZ1") { f.streamSid = streamSid; f.twilio.receive({ event: "start", start: { callSid: f.app.session.callSid, streamSid } }); }
 function stop(f, streamSid = "MZ1") { f.twilio.receive({ event: "stop", streamSid }); }

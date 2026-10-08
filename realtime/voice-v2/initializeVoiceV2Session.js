@@ -37,7 +37,7 @@ export function initializeVoiceV2Session({
   availabilityAdapter = new V1AvailabilityAdapter(), bookingAdapter = new SharedBookingAdapter(),
   smsAdapter = new SharedSmsAdapter(), transcriptAdapter = new SharedTranscriptAdapter(),
   callControlAdapter = null, speechAdapter = null, applicationOwnedCollectSpeech = false, applicationOwnedAvailabilitySpeech = false,
-  coordinator = new VoiceCoordinator(), scheduler = {}, now = () => new Date(),
+  consentIntentClassifier = null, coordinator = new VoiceCoordinator({ consentIntentClassifier }), scheduler = {}, now = () => new Date(),
   proposal = createBookingProposal({ proposalId: `proposal:${callSid}` }),
   openaiSession = {}, turnContext = {}, emit = () => {}, timingOptions = {},
 } = {}) {
