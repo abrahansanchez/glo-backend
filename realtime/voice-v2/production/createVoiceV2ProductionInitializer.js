@@ -4,6 +4,7 @@ import Barber from "../../../models/Barber.js";
 import { resolveBusinessByCalledNumber as resolveBusiness } from "../../../services/business/resolveBusinessByCalledNumber.js";
 import { SharedSmsAdapter } from "../adapters/SharedSmsAdapter.js";
 import { OpenAISpeechAdapter } from "../adapters/OpenAISpeechAdapter.js";
+import { OpenAIConsentIntentAdapter } from "../adapters/OpenAIConsentIntentAdapter.js";
 import { TwilioCallControlAdapter } from "../adapters/TwilioCallControlAdapter.js";
 import { prepareVoiceV2SessionStart } from "../application/prepareVoiceV2SessionStart.js";
 import { initializeVoiceV2Session } from "../initializeVoiceV2Session.js";
@@ -65,6 +66,8 @@ export function createVoiceV2ProductionInitializer({
               if (String(businessContext.businessId) !== approvedBusinessId) throw Object.assign(new Error("UNAPPROVED_BUSINESS"), { code: "UNAPPROVED_BUSINESS" });
               cleanup();
               const preferredLanguage = businessContext.preferredLanguage === "es" ? "es" : "en";
+              const consentClassifier = buildConsentIntentClassifier({ env, businessId: businessContext.businessId });
+              emit({ event: "V2_CONSENT_CLASSIFIER_CONFIGURED", callSid: identity.callSid, barberId: businessContext.businessId, consentClassifierEnabled: Boolean(consentClassifier.adapter), reason: consentClassifier.reason });
               return initializeSession({
                 callSid: identity.callSid, callerNumber: identity.callerNumber, businessContext, buildSha,
                 twilioSocket: socket, openaiSocketFactory: dependencies.openaiSocketFactory,
@@ -73,6 +76,7 @@ export function createVoiceV2ProductionInitializer({
                 applicationOwnedCollectSpeech: true,
                 applicationOwnedAvailabilitySpeech: true,
                 callControlAdapter: dependencies.callControlAdapter,
+                consentIntentClassifier: consentClassifier.adapter,
                 openaiSession: {
                   ...dependencies.openaiSession,
                   instructions: buildBusinessSessionInstructions(businessContext),
@@ -105,6 +109,21 @@ export function createVoiceV2ProductionInitializer({
       socket.on("message", onMessage); socket.on("close", onClose); socket.on("error", onError);
     });
   };
+}
+
+function buildConsentIntentClassifier({ env, businessId }) {
+  const allowlist = parseConsentClassifierAllowlist(env.VOICE_V2_CONSENT_CLASSIFIER_BUSINESS_IDS);
+  if (allowlist.size === 0) return { adapter: null, reason: "ALLOWLIST_EMPTY" };
+  if (!allowlist.has(String(businessId))) return { adapter: null, reason: "BUSINESS_NOT_LISTED" };
+  const model = String(env.VOICE_V2_CONSENT_CLASSIFIER_MODEL || "").trim();
+  if (!model) return { adapter: null, reason: "MODEL_MISSING" };
+  const apiKey = String(env.OPENAI_API_KEY || "").trim();
+  if (!apiKey) return { adapter: null, reason: "API_KEY_MISSING" };
+  return { adapter: new OpenAIConsentIntentAdapter({ apiKey, model }), reason: "ENABLED" };
+}
+
+function parseConsentClassifierAllowlist(value) {
+  return new Set(String(value || "").split(",").map((entry) => entry.trim()).filter(Boolean));
 }
 
 function startIdentity(message) {

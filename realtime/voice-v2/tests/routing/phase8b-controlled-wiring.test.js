@@ -154,6 +154,39 @@ test("production-created SharedSmsAdapter uses sender fallback and DELIVERY_UNKN
   assert.equal(providerSubmissions[0].to, "+18135550101"); assert.equal(providerSubmissions[0].from, fallbackEnv.GLO_ROUTING_NUMBER);
 });
 
+test("production consent classifier is opt-in per business and constructs without provider calls", async () => {
+  for (const [name, environment, expectedReason] of [
+    ["absent allowlist", env, "ALLOWLIST_EMPTY"],
+    ["empty allowlist", { ...env, VOICE_V2_CONSENT_CLASSIFIER_BUSINESS_IDS: " , " }, "ALLOWLIST_EMPTY"],
+    ["business not listed", { ...env, VOICE_V2_CONSENT_CLASSIFIER_BUSINESS_IDS: OTHER, VOICE_V2_CONSENT_CLASSIFIER_MODEL: "gpt-consent" }, "BUSINESS_NOT_LISTED"],
+    ["listed business missing model", { ...env, VOICE_V2_CONSENT_CLASSIFIER_BUSINESS_IDS: APPROVED }, "MODEL_MISSING"],
+    ["listed business missing key", { ...env, OPENAI_API_KEY: " ", VOICE_V2_CONSENT_CLASSIFIER_BUSINESS_IDS: APPROVED, VOICE_V2_CONSENT_CLASSIFIER_MODEL: "gpt-consent" }, "API_KEY_MISSING"],
+  ]) {
+    const { wired, events } = await productionConsentFixture({ environment });
+    assert.equal(wired.consentIntentClassifier, null, name);
+    assert.deepEqual(events.filter((event) => event.event === "V2_CONSENT_CLASSIFIER_CONFIGURED").map((event) => ({ enabled: event.consentClassifierEnabled, reason: event.reason })), [{ enabled: false, reason: expectedReason }], name);
+  }
+
+  let fetchCalls = 0;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => { fetchCalls += 1; throw new Error("network must not be touched"); };
+  try {
+    const enabled = await productionConsentFixture({ environment: { ...env, VOICE_V2_CONSENT_CLASSIFIER_BUSINESS_IDS: ` ${APPROVED} `, VOICE_V2_CONSENT_CLASSIFIER_MODEL: "gpt-consent" } });
+    assert.equal(enabled.wired.consentIntentClassifier?.constructor?.name, "OpenAIConsentIntentAdapter");
+    assert.equal(enabled.wired.consentIntentClassifier.configured, true);
+    assert.equal(fetchCalls, 0);
+    assert.deepEqual(enabled.events.filter((event) => event.event === "V2_CONSENT_CLASSIFIER_CONFIGURED").map((event) => ({ enabled: event.consentClassifierEnabled, reason: event.reason })), [{ enabled: true, reason: "ENABLED" }]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  const first = await productionConsentFixture({ environment: { ...env, VOICE_V2_CONSENT_CLASSIFIER_BUSINESS_IDS: APPROVED, VOICE_V2_CONSENT_CLASSIFIER_MODEL: "gpt-consent" }, businessId: APPROVED });
+  const second = await productionConsentFixture({ environment: { ...env, VOICE_V2_TEST_BUSINESS_ID: OTHER, VOICE_V2_CONSENT_CLASSIFIER_BUSINESS_IDS: APPROVED, VOICE_V2_CONSENT_CLASSIFIER_MODEL: "gpt-consent" }, businessId: OTHER });
+  assert.equal(first.wired.consentIntentClassifier?.constructor?.name, "OpenAIConsentIntentAdapter");
+  assert.equal(second.wired.consentIntentClassifier, null);
+  assert.deepEqual(second.events.filter((event) => event.event === "V2_CONSENT_CLASSIFIER_CONFIGURED").map((event) => ({ enabled: event.consentClassifierEnabled, reason: event.reason })), [{ enabled: false, reason: "BUSINESS_NOT_LISTED" }]);
+});
+
 function fixture({ resolver = async () => context(APPROVED), environment = env } = {}) {
   const socket = new FakeSocket(); const events = []; const calls = [];
   const initialize = createVoiceV2ProductionInitializer({
@@ -162,6 +195,20 @@ function fixture({ resolver = async () => context(APPROVED), environment = env }
     initializeSession: ({ callSid, callerNumber, businessContext }) => { calls.push({ callSid, callerNumber, businessId: businessContext.businessId }); return { id: "session" }; },
   });
   return { socket, events, calls, initialize };
+}
+async function productionConsentFixture({ environment, businessId = APPROVED } = {}) {
+  const socket = new FakeSocket(); const events = []; let wired = null;
+  const initialize = createVoiceV2ProductionInitializer({
+    env: environment,
+    resolveBusinessByCalledNumber: async () => context(businessId),
+    emit: (event) => events.push(event),
+    twilioFactory: () => ({ messages: { create: async () => ({ sid: "SM1" }) } }),
+    WebSocketClass: class {},
+    initializeSession: (args) => { wired = args; return { id: "session" }; },
+  });
+  const started = initialize({ socket, buildSha: "sha" }); socket.emit("message", start());
+  await started;
+  return { wired, events };
 }
 function context(id) { return Object.freeze({ businessId: id, barberId: id, timeZone: "America/New_York", services: [], calledNumber: "+18135550100" }); }
 function start({ callSid = "CA1", streamSid = "MZ1", calledNumber = "+18135550100", callerNumber = "+18135550101" } = {}) { return JSON.stringify({ event: "start", start: { callSid, streamSid, customParameters: { to: calledNumber, from: callerNumber } } }); }
