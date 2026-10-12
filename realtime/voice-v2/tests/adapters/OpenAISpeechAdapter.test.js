@@ -188,11 +188,17 @@ for (const [label, error, signal, failureClass, transient, timeout, publicCode] 
   assert.equal(requests, 1);
 });
 
-test("aborted timeout signal identifies timeout while preserving TTS_ABORTED", async () => {
-  const controller = new AbortController(); controller.abort(new DOMException("secret", "TimeoutError"));
+for (const [reason, failureClass, transient, timeout] of [
+  ["RESPONSE_GENERATION_TIMEOUT", "TIMEOUT", true, true],
+  [undefined, "ABORTED", false, false],
+  ["CALLER_INTERRUPTION", "ABORTED", false, false],
+  [new DOMException("secret", "TimeoutError"), "ABORTED", false, false],
+]) test(`abort reason ${typeof reason === "string" ? reason : String(reason)} classifies ${failureClass} while preserving TTS_ABORTED`, async () => {
+  const controller = new AbortController(); controller.abort(reason);
   const adapter = new OpenAISpeechAdapter({ apiKey: "test", fetchFn: async () => { throw new DOMException("secret", "AbortError"); } });
   await assert.rejects(adapter.synthesize({ input: "text", signal: controller.signal }), (error) => {
-    assert.equal(error.code, "TTS_ABORTED"); assert.equal(error.diagnostic.failureClass, "TIMEOUT"); assert.equal(error.diagnostic.timeout, true); return true;
+    assert.equal(error.code, "TTS_ABORTED"); assert.equal(error.diagnostic.failureClass, failureClass);
+    assert.equal(error.diagnostic.transient, transient); assert.equal(error.diagnostic.timeout, timeout); return true;
   });
 });
 

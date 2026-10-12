@@ -929,16 +929,27 @@ export function initializeVoiceV2Session({
   async function responseTimedOut(requestId) {
     const tracked = requests.get(requestId); if (!tracked || lifecycle.terminated) return;
     if (superseded.has(`request:${requestId}`) || (tracked.responseId && session.responseRegistry.get(tracked.responseId)?.invalidated)) return;
+    const state = responses.get(tracked.responseId);
+    const owner = session.floorOwner.snapshot;
+    const retryUnheardSpeech = state?.transport === "application_tts" && tracked.attempt === 1
+      && owner.requestId === requestId && owner.audioSubmitted === false
+      && state.audioBytes === 0 && state.submittedAudioBytes === 0 && !state.markId
+      && tracked.plan.proposalVersion === session.proposal.proposalVersion;
     if (tracked.responseId) session.responseRegistry.invalidate(tracked.responseId, "RESPONSE_GENERATION_TIMEOUT");
     const supersessionKey = tracked.responseId || `request:${tracked.requestId}`;
     if (!superseded.has(supersessionKey)) {
       superseded.add(supersessionKey);
-      if (tracked.responseId && responses.get(tracked.responseId)?.transport === "application_tts") tracked.abortController?.abort();
+      if (state?.transport === "application_tts") tracked.abortController?.abort("RESPONSE_GENERATION_TIMEOUT");
       else openai.supersedeResponse({ requestId: tracked.requestId, responseId: tracked.responseId || undefined, reason: "RESPONSE_GENERATION_TIMEOUT" });
     }
     session.floorOwner.release({ reason: "RESPONSE_GENERATION_TIMEOUT", requestId: tracked.requestId, responseId: tracked.responseId || null });
     session.record("TIMEOUT_RECOVERY_PLANNED", { timeoutType: "RESPONSE_GENERATION_TIMEOUT", responseId: tracked.responseId || null, proposalVersion: tracked.plan.proposalVersion });
     if (session.proposal.terminal || tracked.plan.purpose === ResponsePurpose.AMBIGUITY_LIMIT_REACHED || tracked.plan.purpose === ResponsePurpose.ERROR_RECOVERY) return lifecycle.terminate("RESPONSE_GENERATION_TIMEOUT");
+    if (retryUnheardSpeech) {
+      // Reuse the rendered plan; no interpretation, availability effect or new wording.
+      const retry = await requestResponse(tracked.plan, 2, null, tracked.timingContext);
+      if (retry.accepted) return;
+    }
     if (tracked.plan.purpose !== ResponsePurpose.ERROR_RECOVERY) await requestResponse(coordinator.responsePlanner({ proposal: session.proposal, purpose: ResponsePurpose.ERROR_RECOVERY, language: tracked.plan.language }));
   }
 

@@ -122,8 +122,11 @@ function httpClassification(status) {
 
 function fetchDiagnostic(error, signal) {
   const code = error?.cause?.code || error?.code;
-  if (error?.name === "TimeoutError" || signal?.reason?.name === "TimeoutError" || ["ETIMEDOUT", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT"].includes(code)) return { failureClass: "TIMEOUT", transient: true, timeout: true };
-  if (signal?.aborted || error?.name === "AbortError") return { failureClass: "ABORTED", transient: false };
+  if (signal?.aborted || error?.name === "AbortError") {
+    if (signal?.aborted && signal.reason === "RESPONSE_GENERATION_TIMEOUT") return { failureClass: "TIMEOUT", transient: true, timeout: true };
+    return { failureClass: "ABORTED", transient: false };
+  }
+  if (error?.name === "TimeoutError" || ["ETIMEDOUT", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT"].includes(code)) return { failureClass: "TIMEOUT", transient: true, timeout: true };
   if (["ECONNRESET", "ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "ENETUNREACH", "EHOSTUNREACH", "EPIPE", "UND_ERR_SOCKET"].includes(code)) return { failureClass: "NETWORK", transient: true };
   return { failureClass: "UNKNOWN", transient: null };
 }
