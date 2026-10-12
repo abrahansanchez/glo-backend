@@ -146,7 +146,7 @@ test("SessionWatchdog bounds a never-settling TTS request, aborts it and plans o
   await f.app.terminate("TEST_COMPLETE");
 });
 
-async function fixture({ speechAdapter, scheduler = {}, language = "en", proposal: suppliedProposal = null, applicationOwnedAvailabilitySpeech = false }) {
+async function fixture({ speechAdapter, scheduler = {}, language = "en", proposal: suppliedProposal = null, applicationOwnedAvailabilitySpeech = false, emit = () => {} }) {
   const facts = { service: "Haircut", name: "Abe", date: "2026-09-19", time: "10:30" };
   const defaultProposal = createBookingProposal({
     proposalId: "tts-path-a", proposalVersion: 5, ...facts,
@@ -156,7 +156,7 @@ async function fixture({ speechAdapter, scheduler = {}, language = "en", proposa
   const callSid = `CA-tts-${Math.random().toString(16).slice(2)}`; const streamSid = `MZ-${callSid}`;
   const bookings = []; const sms = [];
   const app = initializeVoiceV2Session({
-    callSid, callerNumber: "+18135550100", buildSha: "tts-offline",
+    callSid, callerNumber: "+18135550100", buildSha: "tts-offline", emit,
     businessContext: { businessId: "probando", barberId: "probando", businessName: "Probando", timeZone: "America/New_York" },
     twilioSocket: twilio, openaiSocketFactory: () => openai, speechAdapter, scheduler, proposal: suppliedProposal || defaultProposal, applicationOwnedAvailabilitySpeech,
     bookingAdapter: { createAppointment: async (command) => { bookings.push(command); return { success: true, appointmentId: "appt-tts" }; } },
@@ -200,3 +200,64 @@ function manualScheduler() {
     active: (delay) => [...tasks.values()].filter((task) => !task.cancelled && task.delay === delay).map((task) => ({ ...task, run: () => { task.cancelled = true; task.callback(); } })),
   };
 }
+
+for (const language of ["en", "es"]) test(`${language} availability TTS failure emits one private diagnostic per synthesis and preserves recovery`, async () => {
+  const logs = []; const requestTexts = []; let requests = 0;
+  const secrets = ["secret-key", "secret-provider-body", "secret-transcript", "secret-audio", "Authorization", "Bearer"];
+  const adapter = new OpenAISpeechAdapter({ apiKey: secrets[0], fetchFn: async (_url, options) => {
+    requests++;
+    requestTexts.push(JSON.parse(options.body).input);
+    return new Response(new ReadableStream({ type: "bytes", start(controller) { controller.enqueue(new TextEncoder().encode(JSON.stringify({ error: { code: "rate_limit_exceeded", message: secrets.join(" ") } }))); controller.close(); } }), { status: 429 });
+  } });
+  const facts = { service: "Haircut", date: "2026-09-19", time: "10:30" };
+  const proposal = createBookingProposal({ proposalId: "diagnostic", proposalVersion: 5, ...facts,
+    availability: { proposalVersion: 5, slotKey: deriveSlotKey(facts), status: "unavailable", alternatives: [{ date: facts.date, time: "11:00" }] } });
+  const f = await fixture({ speechAdapter: adapter, proposal, language, applicationOwnedAvailabilitySpeech: true, emit: (entry) => logs.push(entry) });
+  const plan = planResponse({ proposal, purpose: ResponsePurpose.OFFER_ALTERNATIVES, language });
+  await f.app.requestResponse(plan); await settle(f.app);
+  const diagnostics = logs.filter((entry) => entry.event === "V2_TTS_PROVIDER_FAILURE");
+  const failures = logs.filter((entry) => entry.traceEvent === "SPEECH_SYNTHESIS_FAILED");
+  assert.equal(requests, 2, "one offer request and the existing one-shot EXIT request; no added retry");
+  assert.equal(diagnostics.length, 2); assert.equal(failures.length, diagnostics.length);
+  assert.equal(new Set(diagnostics.map((entry) => entry.responseId)).size, 2);
+  for (const entry of diagnostics) {
+    assert.deepEqual(Object.keys(entry).sort(), ["event", "callSid", "buildSha", "requestId", "responseId", "purpose", "proposalVersion", "adapter", "providerStatus", "providerCode", "failureClass", "transient", "timeout"].sort());
+    assert.equal(entry.callSid, f.callSid); assert.equal(entry.buildSha, "tts-offline"); assert.equal(entry.proposalVersion, 5);
+    assert.ok(entry.requestId); assert.equal(entry.responseId, `${entry.requestId}:tts`);
+    assert.equal(entry.adapter, "OPENAI_SPEECH"); assert.equal(entry.providerStatus, 429);
+    assert.equal(entry.providerCode, "rate_limit_exceeded"); assert.equal(entry.failureClass, "RATE_LIMIT"); assert.equal(entry.transient, true); assert.equal(entry.timeout, false);
+  }
+  assert.equal(diagnostics[0].purpose, ResponsePurpose.OFFER_ALTERNATIVES);
+  assert.equal(requestTexts.length, 2);
+  for (const secret of [...secrets, ...requestTexts]) assert.equal(JSON.stringify(diagnostics).includes(secret), false);
+  assert.ok(failures.every((entry) => entry.reason === "TTS_ADAPTER_ERROR"));
+  assert.equal(f.app.lifecycle.terminated, true);
+  assert.equal(f.bookings.length, 0); assert.equal(f.sms.length, 0);
+  assert.equal(f.twilio.sent.some((entry) => entry.event === "media" || entry.event === "mark"), false);
+  assert.deepEqual(f.app.session.proposal.availability.alternatives, proposal.availability.alternatives);
+  await f.app.terminate("TEST_COMPLETE");
+});
+
+test("unrelated adapter errors emit zero TTS provider-failure events", async () => {
+  const logs = [];
+  const speechAdapter = { synthesize: async () => { throw Object.assign(new Error("secret-transcript"), { code: "TTS_ADAPTER_ERROR", diagnostic: { adapter: "secret-key", providerStatus: "401 secret", providerCode: "secret-key", failureClass: "secret-body", transient: "yes", timeout: "yes", audio: "secret-audio" } }); } };
+  const f = await fixture({ speechAdapter, emit: (entry) => logs.push(entry) });
+  await f.app.requestResponse(planResponse({ proposal: f.app.session.proposal, purpose: ResponsePurpose.PRE_BOOKING_CONFIRMATION })); await settle(f.app);
+  const diagnostics = logs.filter((entry) => entry.event === "V2_TTS_PROVIDER_FAILURE");
+  assert.equal(diagnostics.length, 0);
+  await f.app.terminate("TEST_COMPLETE");
+});
+
+test("Realtime and caller transcription provider errors emit zero TTS provider-failure events", async () => {
+  const logs = []; let requests = 0;
+  const adapter = new OpenAISpeechAdapter({ apiKey: "test", fetchFn: async () => {
+    requests++; return new Response(pcmWav(Buffer.alloc(960)), { status: 200 });
+  } });
+  const f = await fixture({ speechAdapter: adapter, emit: (entry) => logs.push(entry) });
+  f.openai.receive({ type: "conversation.item.input_audio_transcription.failed", item_id: "failed-caller", error: { code: "rate_limit_exceeded" } });
+  f.openai.receive({ type: "error", error: { code: "invalid_api_key", type: "authentication_error" } });
+  await settle(f.app);
+  assert.equal(logs.filter((entry) => entry.event === "V2_TTS_PROVIDER_FAILURE").length, 0);
+  assert.equal(requests, 0);
+  await f.app.terminate("TEST_COMPLETE");
+});
