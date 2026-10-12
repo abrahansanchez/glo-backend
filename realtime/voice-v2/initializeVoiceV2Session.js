@@ -591,8 +591,9 @@ export function initializeVoiceV2Session({
       input: tracked.plan.speechContract.requiredMessage,
       language: tracked.plan.language,
       signal: abortController.signal,
-      diagnosticContext: { callSid, buildSha, requestId: tracked.requestId, responseId, purpose: tracked.plan.purpose, proposalVersion: tracked.plan.proposalVersion },
+      diagnosticContext: { callSid, buildSha, requestId: tracked.requestId, responseId, purpose: tracked.plan.purpose, proposalVersion: tracked.plan.proposalVersion, attempt: tracked.attempt },
       onFailureDiagnostic: safeEmit,
+      onPhaseDiagnostic: safeEmit,
     })).then(
       (result) => enqueue(() => synthesizedConfirmationCompleted(responseId, result)),
       (error) => enqueue(() => synthesizedConfirmationFailed(responseId, error)),

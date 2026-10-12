@@ -97,10 +97,92 @@ function pcmWav(pcm, { sampleRate = 24000 } = {}) {
 
 function values(entries) { let index = 0; return () => entries[Math.min(index++, entries.length - 1)]; }
 
+for (const language of ["en", "es"]) test(`${language} successful Speech HTTP reports each private phase once with one request`, async () => {
+  const logs = []; let requests = 0; let time = 0;
+  const adapter = new OpenAISpeechAdapter({ apiKey: "secret-key", monotonicNow: () => ++time,
+    fetchFn: async () => { requests++; return new Response(pcmWav(Buffer.alloc(960))); } });
+  await adapter.synthesize({ input: "secret-rendered-transcript", language,
+    diagnosticContext: { callSid: "CA-test", requestId: "request-1", responseId: "response-1", purpose: "ASK_SERVICE", attempt: 1, extra: "secret-business" },
+    onPhaseDiagnostic: (event) => logs.push(event) });
+  assert.deepEqual(logs.map(({ phase }) => phase), ["REQUEST_DISPATCH_STARTED", "RESPONSE_HEADERS_RECEIVED", "AUDIO_BODY_READ_STARTED", "AUDIO_BODY_READ_COMPLETED", "WAV_CONVERSION_COMPLETED"]);
+  assert.equal(requests, 1); assert.equal(logs.at(-1).settled, true);
+  for (const entry of logs) {
+    assert.deepEqual(Object.keys(entry).sort(), ["event", "callSid", "requestId", "responseId", "purpose", "attempt", "phase", "operationPhase", "elapsedMs", "providerStatus", "abortReason", "settled"].sort());
+    assert.equal(entry.attempt, 1); assert.ok(Number.isFinite(entry.elapsedMs));
+  }
+  for (const secret of ["secret", "Authorization", "Bearer", "audio", "body", "input", "transcript"]) assert.equal(JSON.stringify(logs).includes(secret), false);
+});
+
+for (const duringBody of [false, true]) test(`application timeout ${duringBody ? "during body" : "before headers"} exposes phase and delayed abort settlement`, async () => {
+  const logs = []; const controller = new AbortController(); let rejectOperation; let requests = 0;
+  const pending = new Promise((resolve, reject) => { rejectOperation = reject; });
+  const adapter = new OpenAISpeechAdapter({ apiKey: "test", fetchFn: async () => {
+    requests++;
+    return duringBody ? { ok: true, status: 200, arrayBuffer: () => pending } : pending;
+  } });
+  const synthesis = adapter.synthesize({ input: "secret-input", signal: controller.signal, onPhaseDiagnostic: (entry) => logs.push(entry) });
+  const rejected = assert.rejects(synthesis);
+  for (let i = 0; i < 5; i++) await Promise.resolve();
+  controller.abort("RESPONSE_GENERATION_TIMEOUT");
+  const abort = logs.at(-1);
+  assert.equal(abort.phase, "ABORT_REQUESTED");
+  assert.equal(abort.operationPhase, duringBody ? "AUDIO_BODY_READ_STARTED" : "REQUEST_DISPATCH_STARTED");
+  assert.equal(abort.providerStatus, duringBody ? 200 : null);
+  assert.equal(abort.abortReason, "RESPONSE_GENERATION_TIMEOUT"); assert.equal(abort.settled, false);
+  assert.equal(logs.some(({ phase }) => phase === "OPERATION_SETTLED_AFTER_ABORT"), false);
+  rejectOperation(new DOMException("secret-error", "AbortError")); await rejected;
+  const settlement = logs.at(-1);
+  assert.equal(settlement.phase, "OPERATION_SETTLED_AFTER_ABORT"); assert.equal(settlement.settled, true);
+  assert.equal(settlement.operationPhase, abort.operationPhase); assert.equal(requests, 1);
+  assert.equal(logs.filter(({ phase }) => phase === "ABORT_REQUESTED").length, 1);
+  assert.equal(logs.filter(({ phase }) => phase === "OPERATION_SETTLED_AFTER_ABORT").length, 1);
+  assert.equal(JSON.stringify(logs).includes("secret"), false);
+});
+
+test("ordinary abort phase reason is normalized and phase observer errors cannot change synthesis", async () => {
+  const logs = []; const controller = new AbortController();
+  const adapter = new OpenAISpeechAdapter({ apiKey: "test", fetchFn: async () => new Response(pcmWav(Buffer.alloc(960))) });
+  controller.abort("secret-transcript");
+  const result = await adapter.synthesize({ input: "text", signal: controller.signal, onPhaseDiagnostic: (event) => { logs.push(event); throw new Error("observer"); } });
+  assert.equal(result.format, "audio/pcmu");
+  assert.ok(logs.filter(({ abortReason }) => abortReason).every(({ abortReason }) => abortReason === "ABORTED"));
+  assert.equal(JSON.stringify(logs).includes("secret"), false);
+});
+
 function byteResponse(body, status = 400) {
   const bytes = typeof body === "string" ? new TextEncoder().encode(body) : body;
   return new Response(new ReadableStream({ type: "bytes", start(controller) { controller.enqueue(bytes); controller.close(); } }), { status });
 }
+
+test("rejected async phase observers create no unhandled rejection or synthesis change", async () => {
+  const unhandled = []; const phases = []; let requests = 0;
+  const onUnhandled = (reason) => unhandled.push(reason);
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    const wav = pcmWav(Buffer.alloc(960));
+    const adapter = new OpenAISpeechAdapter({ apiKey: "offline", fetchFn: async () => {
+      requests++; return new Response(wav, { status: 200 });
+    } });
+    const result = await adapter.synthesize({ input: "offline text", onPhaseDiagnostic: (event) => {
+      phases.push(event.phase); return Promise.reject(new Error("observer failure"));
+    } });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(unhandled.length, 0);
+    assert.equal(result.format, "audio/pcmu");
+    assert.deepEqual(result.audio, pcm24kToPcmu8k(extractPcm24kMonoFromWav(wav)));
+    assert.deepEqual(phases, ["REQUEST_DISPATCH_STARTED", "RESPONSE_HEADERS_RECEIVED", "AUDIO_BODY_READ_STARTED", "AUDIO_BODY_READ_COMPLETED", "WAV_CONVERSION_COMPLETED"]);
+    assert.equal(new Set(phases).size, phases.length); assert.equal(requests, 1);
+  } finally { process.removeListener("unhandledRejection", onUnhandled); }
+});
+
+test("pending async phase observers cannot delay synthesis", async () => {
+  let requests = 0;
+  const adapter = new OpenAISpeechAdapter({ apiKey: "offline", fetchFn: async () => {
+    requests++; return new Response(pcmWav(Buffer.alloc(960)), { status: 200 });
+  } });
+  const result = await adapter.synthesize({ input: "offline text", onPhaseDiagnostic: () => new Promise(() => {}) });
+  assert.equal(result.format, "audio/pcmu"); assert.equal(requests, 1);
+});
 
 test("bounded BYOB reader consumes at most 4096 bytes and cancels before the full provider payload", async () => {
   let consumed = 0; let cancelled = 0; const logs = []; const total = 20000;

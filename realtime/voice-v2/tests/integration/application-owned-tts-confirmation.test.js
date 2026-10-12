@@ -249,6 +249,73 @@ for (const secondTimeout of [false, true]) test(`CAffac196 ASK_SERVICE retries i
   await f.app.terminate("TEST_COMPLETE");
 });
 
+test("phase diagnostics expose retry dispatch before prior abort settlement without changing retry", async () => {
+  const clock = manualScheduler(); const logs = []; let requests = 0; let rejectPrior;
+  const adapter = new OpenAISpeechAdapter({ apiKey: "offline-test", fetchFn: async () => {
+    requests++;
+    if (requests === 1) return new Promise((resolve, reject) => { rejectPrior = reject; });
+    return new Response(pcmWav(Buffer.alloc(960)), { status: 200 });
+  } });
+  const f = await fixture({ speechAdapter: adapter, scheduler: clock.options, applicationOwnedCollectSpeech: true, emit: (entry) => logs.push(entry) });
+  await f.app.requestResponse(planResponse({ proposal: f.app.session.proposal, purpose: ResponsePurpose.ASK_SERVICE })); await settle(f.app);
+  const priorId = f.app.session.floorOwner.snapshot.responseId;
+  clock.active(15000)[0].run(); await settle(f.app);
+  assert.equal(requests, 2);
+  const phases = () => logs.filter(({ event }) => event === "V2_TTS_HTTP_PHASE");
+  assert.equal(phases().filter(({ phase }) => phase === "OPERATION_SETTLED_AFTER_ABORT").length, 0);
+  const dispatches = phases().filter(({ phase }) => phase === "REQUEST_DISPATCH_STARTED");
+  assert.deepEqual(dispatches.map(({ attempt }) => attempt), [1, 2]);
+  assert.equal(dispatches[0].responseId, priorId); assert.notEqual(dispatches[1].responseId, priorId);
+  const ownerAfterRetry = f.app.session.floorOwner.snapshot;
+  rejectPrior(new DOMException("aborted", "AbortError")); await settle(f.app);
+  const settlement = phases().find(({ phase }) => phase === "OPERATION_SETTLED_AFTER_ABORT");
+  assert.equal(settlement.responseId, priorId); assert.equal(settlement.attempt, 1); assert.equal(settlement.settled, true);
+  assert.ok(logs.indexOf(settlement) > logs.indexOf(dispatches[1]));
+  assert.deepEqual(f.app.session.floorOwner.snapshot, ownerAfterRetry, "late settlement does not replace retry ownership");
+  assert.equal(requests, 2, "phase diagnostics add no provider request");
+  await f.app.terminate("TEST_COMPLETE");
+});
+
+test("late successful audio after timeout is discarded while attempt two exclusively owns playback", async () => {
+  const clock = manualScheduler(); const logs = []; const requests = []; let resolvePrior; let resolveRetry;
+  const adapter = new OpenAISpeechAdapter({ apiKey: "offline-test", fetchFn: async (_url, options) => {
+    requests.push(options);
+    return new Promise((resolve) => {
+      if (requests.length === 1) resolvePrior = resolve;
+      else resolveRetry = resolve;
+    });
+  } });
+  const f = await fixture({ speechAdapter: adapter, scheduler: clock.options, applicationOwnedCollectSpeech: true, emit: (entry) => logs.push(entry) });
+  await f.app.requestResponse(planResponse({ proposal: f.app.session.proposal, purpose: ResponsePurpose.ASK_SERVICE })); await settle(f.app);
+  const priorId = f.app.session.floorOwner.snapshot.responseId;
+  clock.active(15000)[0].run(); await settle(f.app);
+  assert.equal(requests.length, 2);
+  assert.equal(requests[0].signal.aborted, true); assert.equal(requests[0].signal.reason, "RESPONSE_GENERATION_TIMEOUT");
+  assert.equal(requests[1].signal.aborted, false);
+  assert.equal(logs.some((entry) => entry.phase === "OPERATION_SETTLED_AFTER_ABORT"), false);
+  const retryOwner = f.app.session.floorOwner.snapshot;
+  assert.notEqual(retryOwner.responseId, priorId); assert.equal(retryOwner.markId, null);
+  assert.equal(f.twilio.sent.some((entry) => entry.event === "media" || entry.event === "mark"), false);
+  resolvePrior(new Response(pcmWav(Buffer.alloc(960)), { status: 200 })); await settle(f.app);
+  assert.deepEqual(f.app.session.floorOwner.snapshot, retryOwner);
+  assert.equal(f.app.session.responseRegistry.get(priorId).invalidated, true);
+  assert.equal(f.app.session.responseRegistry.get(retryOwner.responseId).status, "requested");
+  assert.equal(f.twilio.sent.some((entry) => entry.event === "media" || entry.event === "mark"), false, "attempt one cannot submit media or a playback mark");
+  const settlement = logs.filter((entry) => entry.event === "V2_TTS_HTTP_PHASE" && entry.phase === "OPERATION_SETTLED_AFTER_ABORT");
+  assert.equal(settlement.length, 1); assert.equal(settlement[0].responseId, priorId); assert.equal(settlement[0].settled, true);
+  assert.ok(logs.some((entry) => entry.responseId === priorId && entry.phase === "WAV_CONVERSION_COMPLETED"), "late operation produced valid audio");
+  const retryDispatch = logs.find((entry) => entry.phase === "REQUEST_DISPATCH_STARTED" && entry.attempt === 2);
+  assert.ok(logs.indexOf(retryDispatch) < logs.indexOf(settlement[0]));
+  resolveRetry(new Response(pcmWav(Buffer.alloc(960)), { status: 200 })); await settle(f.app);
+  assert.equal(f.twilio.sent.filter((entry) => entry.event === "media").length, 1);
+  const marks = f.twilio.sent.filter((entry) => entry.event === "mark"); assert.equal(marks.length, 1);
+  assert.equal(f.app.session.playbackRegistry.get(marks[0].mark.name).responseId, retryOwner.responseId);
+  assert.equal(f.app.session.floorOwner.snapshot.responseId, retryOwner.responseId);
+  assert.equal(logs.filter((entry) => entry.phase === "OPERATION_SETTLED_AFTER_ABORT").length, 1);
+  assert.equal(requests.length, 2);
+  await f.app.terminate("TEST_COMPLETE");
+});
+
 test("caller barge-in aborts ASK_SERVICE without a timeout reason or retry", async () => {
   const clock = manualScheduler(); const requests = []; const logs = [];
   const adapter = new OpenAISpeechAdapter({ apiKey: "offline-test", fetchFn: async (_url, options) => {

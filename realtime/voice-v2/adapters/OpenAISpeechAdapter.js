@@ -22,7 +22,8 @@ export class OpenAISpeechAdapter {
   }
 
   async synthesize(request = {}) {
-    try { return await this.#synthesize(request); }
+    const trace = speechPhaseTrace(request, this.monotonicNow);
+    try { return await this.#synthesize(request, trace); }
     catch (error) {
       const diagnostic = sanitizeSpeechDiagnostic(error?.diagnostic);
       const context = request.diagnosticContext;
@@ -36,12 +37,14 @@ export class OpenAISpeechAdapter {
       try { request.onFailureDiagnostic?.(event); } catch { /* Diagnostics cannot change synthesis behavior. */ }
       throw error;
     }
+    finally { trace.settle(); }
   }
 
-  async #synthesize({ input, language = "en", signal } = {}) {
+  async #synthesize({ input, language = "en", signal } = {}, trace) {
     if (typeof input !== "string" || !input.trim()) throw new TypeError("speech_input_required");
     const startedAt = this.monotonicNow();
     let response;
+    trace.phase("REQUEST_DISPATCH_STARTED");
     try {
       response = await this.fetchFn(this.endpoint, {
         method: "POST",
@@ -63,16 +66,20 @@ export class OpenAISpeechAdapter {
       throw typedError("speech_provider_request_failed", "TTS_ADAPTER_ERROR", diagnostic);
     }
 
+    trace.headers(response?.status);
     if (!response?.ok) throw typedError(`speech_provider_http_${response?.status || "unknown"}`, "TTS_ADAPTER_ERROR", {
       providerStatus: response?.status, providerCode: await readProviderCode(response), ...httpClassification(response?.status),
     });
     let sourceAudio;
+    trace.phase("AUDIO_BODY_READ_STARTED");
     try { sourceAudio = Buffer.from(await response.arrayBuffer()); }
     catch (error) { throw typedError("speech_provider_audio_read_failed", error?.code, fetchDiagnostic(error, signal)); }
+    trace.phase("AUDIO_BODY_READ_COMPLETED");
     if (!sourceAudio.length) throw typedError("speech_provider_empty_audio", "TTS_EMPTY_AUDIO", { failureClass: "EMPTY_AUDIO", transient: false });
     let audio;
     try { audio = pcm24kToPcmu8k(extractPcm24kMonoFromWav(sourceAudio)); }
     catch (error) { throw typedError("speech_provider_invalid_audio", error?.code, { failureClass: error?.code === "TTS_INVALID_AUDIO" ? "INVALID_AUDIO" : "UNKNOWN", transient: error?.code === "TTS_INVALID_AUDIO" ? false : null }); }
+    trace.phase("WAV_CONVERSION_COMPLETED");
     const completedAt = this.monotonicNow();
     const latencyMs = Math.max(0, completedAt - startedAt);
 
@@ -89,6 +96,38 @@ export class OpenAISpeechAdapter {
       durationMs: (audio.length / speechAudioFormat.targetSampleRate) * 1000,
     });
   }
+}
+
+function speechPhaseTrace(request, clock) {
+  let phase = null; let status = null; let aborted = false; let settled = false;
+  const origin = typeof request.onPhaseDiagnostic === "function" ? clock() : 0;
+  const context = request.diagnosticContext;
+  const identifier = (value) => typeof value === "string" && value.length <= 128 && /^[A-Za-z0-9_:.\/-]+$/.test(value) ? value : null;
+  const emit = (eventPhase) => {
+    try {
+      const observed = request.onPhaseDiagnostic?.(Object.freeze({ event: "V2_TTS_HTTP_PHASE",
+        callSid: identifier(context?.callSid), requestId: identifier(context?.requestId), responseId: identifier(context?.responseId),
+        purpose: identifier(context?.purpose), attempt: Number.isSafeInteger(context?.attempt) && context.attempt > 0 ? context.attempt : null,
+        phase: eventPhase, operationPhase: phase, elapsedMs: Math.max(0, clock() - origin), providerStatus: status,
+        abortReason: aborted ? (request.signal?.reason === "RESPONSE_GENERATION_TIMEOUT" ? "RESPONSE_GENERATION_TIMEOUT" : "ABORTED") : null,
+        settled,
+      }));
+      // Observe rejection without awaiting or extending the synthesis lifetime.
+      Promise.resolve(observed).catch(() => {});
+    } catch { /* Observations cannot affect synthesis. */ }
+  };
+  const onAbort = () => { if (!aborted) { aborted = true; emit("ABORT_REQUESTED"); } };
+  request.signal?.addEventListener("abort", onAbort, { once: true });
+  if (request.signal?.aborted) onAbort();
+  return {
+    phase(value) { phase = value; if (value === "WAV_CONVERSION_COMPLETED") settled = true; emit(value); },
+    headers(value) { status = Number.isInteger(value) && value >= 100 && value <= 599 ? value : null; this.phase("RESPONSE_HEADERS_RECEIVED"); },
+    settle() {
+      settled = true;
+      request.signal?.removeEventListener("abort", onAbort);
+      if (aborted) emit("OPERATION_SETTLED_AFTER_ABORT");
+    },
+  };
 }
 
 function typedError(message, code, diagnostic) {
