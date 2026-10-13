@@ -5,6 +5,7 @@ import { initializeVoiceV2Session } from "../../initializeVoiceV2Session.js";
 import { createBookingProposal, deriveSlotKey } from "../../domain/BookingProposal.js";
 import { planResponse, ResponsePurpose } from "../../planning/ResponsePlanner.js";
 import { FakeSocket } from "../helpers/FakeSocket.js";
+import { localRecoveryFixture } from "../helpers/localRecoveryFixture.js";
 
 const BUILD_SHA = "f8f00ffc1e101beed45b7d341e968b611b465f29";
 const BUSINESS = Object.freeze({
@@ -122,7 +123,7 @@ async function fixture(t, callSid) {
   const bookingCalls = []; const smsCalls = []; const finalized = [];
   const app = initializeVoiceV2Session({
     callSid, callerNumber: "+18135550100", businessContext: BUSINESS, buildSha: BUILD_SHA,
-    twilioSocket: twilio, openaiSocketFactory: () => openai, proposal, speechAdapter: speech, scheduler: clock.options,
+    twilioSocket: twilio, openaiSocketFactory: () => openai, proposal, speechAdapter: speech, scheduler: clock.options, localRecoveryAudioAdapter: localRecoveryFixture(),
     openaiSession: { model: "offline", voice: "alloy", input_audio_transcription: { model: "offline" } },
     availabilityAdapter: { checkAvailability: async (request) => ({ slotKey: request.slotKey, available: true }), getAlternatives: async () => ({ alternatives: [] }) },
     bookingAdapter: { createAppointment: async (request) => { bookingCalls.push(request); return { success: true, appointmentId: "6ab164b299ee5499dd0dbf00" }; } },

@@ -18,6 +18,8 @@ import { SharedSmsAdapter } from "./adapters/SharedSmsAdapter.js";
 import { SharedTranscriptAdapter } from "./adapters/SharedTranscriptAdapter.js";
 import { FloorPurpose, FloorState } from "./lifecycle/FloorOwner.js";
 import { PlaybackStatus } from "./lifecycle/PlaybackRegistry.js";
+import { SpeechPreparation, preparationDeadlineMs } from "./lifecycle/SpeechPreparation.js";
+import { LocalRecoveryAudioAdapter } from "./adapters/LocalRecoveryAudioAdapter.js";
 
 const STARTUP_AUDIO_MAX_FRAMES = 500;
 const STARTUP_AUDIO_MAX_BYTES = 80000;
@@ -40,11 +42,17 @@ export function initializeVoiceV2Session({
   coordinator = new VoiceCoordinator(), scheduler = {}, now = () => new Date(),
   proposal = createBookingProposal({ proposalId: `proposal:${callSid}` }),
   openaiSession = {}, turnContext = {}, emit = () => {}, timingOptions = {},
+  localRecoveryAudioAdapter = new LocalRecoveryAudioAdapter(),
+  speechPreparationTimeoutMs = process.env.VOICE_V2_SPEECH_PREPARATION_TIMEOUT_MS,
 } = {}) {
   requireSessionInputs({ callSid, callerNumber, businessContext, buildSha, twilioSocket, openaiSocketFactory });
   let lifecycle; let consentDiagnostics; let processing = Promise.resolve(); let effectsProcessing = Promise.resolve(); let turnSequence = 0; let responseSequence = 0; let markSequence = 0; let twilioStarted = false; let openaiSessionCreated = false; let openaiConfigured = false; let initialGreetingRequested = false; let callerTurnSeen = false; let lastAcknowledgedState = null; let transcriptionLanguage = openaiSession.input_audio_transcription?.language || null; let languageUpdateAttempted = false;
   const providerTurns = new Set(); const requests = new Map(); const responses = new Map(); const marks = new Map(); const superseded = new Set(); const ambiguityPurposes = []; const startupAudio = []; let startupAudioBytes = 0; let callTerminationRequested = false;
+  const preparationBudget = preparationDeadlineMs(speechPreparationTimeoutMs);
+  let localRecoveryStarted = false;
   const safeEmit = (event) => { try { emit(event); } catch { /* Logging cannot terminate a call. */ } };
+  try { localRecoveryAudioAdapter.prepare?.(); }
+  catch { safeEmit({ event: "V2_LOCAL_RECOVERY_ASSETS_REQUIRED", callSid, buildSha, reason: "PRODUCTION_ASSETS_REQUIRED" }); }
   const timing = new LatencyDiagnostics({ ...timingOptions, callSid, buildSha, emit: safeEmit });
   const callTrace = new CallTrace({ ...timingOptions, callSid, buildSha, emit: safeEmit });
   const timingDetails = (value = {}) => {
@@ -290,6 +298,10 @@ export function initializeVoiceV2Session({
     // A finalized transcript closes its own speech episode even if the
     // provider omitted or reordered the matching speech_stopped event.
     session.turnRegistry.speechStopped(providerId);
+    // A finalized eligible turn can arrive without a speech_started event.
+    // Cancel only preparation before waiting for the unchanged caller audit write.
+    if (!callerSpeechOverlap && session.floorOwner.snapshot.state === FloorState.PREPARING
+      && ![FloorPurpose.EXIT, FloorPurpose.POST_BOOK].includes(session.floorOwner.snapshot.category)) await interruptCurrent(providerId);
     const persistenceTiming = timing.start("TRANSCRIPT_PERSISTENCE", { turnId, role: "caller", itemId: providerId });
     try {
       const persisted = await lifecycle.appendTurn({ turnId, role: "caller", text: event.transcript, timestamp: now() });
@@ -307,8 +319,8 @@ export function initializeVoiceV2Session({
       session.record("AMBIGUITY_OVERLAP_IGNORED", { turnId, proposalVersion: session.proposal.proposalVersion, reason: "NEWER_CALLER_SPEECH_ACTIVE" });
       return;
     }
-    if (session.floorOwner.snapshot.state === FloorState.SPEAKING) await interruptCurrent();
-    if (lifecycle.terminated) return;
+    if ([FloorState.PREPARING, FloorState.SPEAKING].includes(session.floorOwner.snapshot.state)) await interruptCurrent();
+    if (lifecycle.terminated || localRecoveryStarted) return;
     const consentClaim = session.floorOwner.claimConsent({ callerItemId: providerId, proposalVersion: session.proposal.proposalVersion });
     observeConsent("consent", providerId, { ownerMatched: consentClaim.claimed === true, authorityExisted: consentClaim.claimed === true, authorityDecision: consentClaim.claimed ? "CLAIMED" : "NOT_CLAIMED", reason: consentClaim.reason || null });
     const current = consentClaim.claimed
@@ -540,6 +552,8 @@ export function initializeVoiceV2Session({
 
   async function requestResponse(plan, attempt = 1, requestIdentity = null, timingContext = {}) {
     if (lifecycle.terminated) return { accepted: false, reason: "CALL_TERMINATED" };
+    if (localRecoveryStarted) return { accepted: false, reason: "CONTROLLED_RECOVERY" };
+    if (speechAdapter && plan.purpose === ResponsePurpose.ERROR_RECOVERY) return startLocalRecovery();
     const contextualPlan = bindServiceValidationContext(plan, turnContext.availableServices, {
       referenceDate: businessLocalReferenceDate(turnContext.referenceDate, businessContext.timeZone, now),
       timeZone: businessContext.timeZone,
@@ -556,7 +570,7 @@ export function initializeVoiceV2Session({
     if (requests.has(requestId)) return { accepted: false, reason: "DUPLICATE_REQUEST_ID" };
     const category = floorPurposeFor(ownedPlan);
     const source = usesApplicationSpeech(ownedPlan) ? "application_tts" : "openai_realtime";
-    const admission = session.floorOwner.plan({ purpose: ownedPlan.purpose, category, requestId, proposalVersion: ownedPlan.proposalVersion, source });
+    const admission = session.floorOwner.plan({ purpose: ownedPlan.purpose, category, requestId, proposalVersion: ownedPlan.proposalVersion, source, preparing: source === "application_tts" });
     if (!admission.accepted) return { accepted: false, reason: admission.reason };
     if (category === FloorPurpose.EXIT) {
       session.confirmationAuthority.revokeProposal(ownedPlan.proposalVersion, "EXIT_PLANNED");
@@ -582,22 +596,30 @@ export function initializeVoiceV2Session({
     tracked.abortController = abortController;
     const state = registerResponseState(tracked, responseId, "application_tts");
     state.abortController = abortController;
+    state.preparation = new SpeechPreparation({ preparationId: `${responseId}:preparation`, callSid, buildSha, requestId: tracked.requestId,
+      responseId, purpose: tracked.plan.purpose, proposalVersion: tracked.plan.proposalVersion,
+      wording: tracked.plan.speechContract.requiredMessage, language: tracked.plan.language, deadlineMs: preparationBudget, deadlineAt: performance.now() + preparationBudget });
+    tracked.preparation = state.preparation;
+    // This callback does not join the serialized caller queue or persistence promise.
+    session.watchdog.schedule(`preparation:${responseId}`, preparationBudget, () => failPreparation(state, "SPEECH_PREPARATION_TIMEOUT", true));
     timing.point("TTS_DISPATCH", timingDetails({ requestId: tracked.requestId, responseId }));
     timing.point("RESPONSE_CREATE_DISPATCH", timingDetails({ requestId: tracked.requestId, responseId }));
     callTrace.entry("SPEECH_SYNTHESIS_DISPATCHED", { ...timingDetails({ requestId: tracked.requestId, responseId }), attempt: tracked.attempt });
-    session.watchdog.schedule(`response:${tracked.requestId}`, 15000, () => enqueue(() => responseTimedOut(tracked.requestId)));
 
     Promise.resolve().then(() => speechAdapter.synthesize({
-      input: tracked.plan.speechContract.requiredMessage,
-      language: tracked.plan.language,
+      input: state.preparation.identity.wording,
+      language: state.preparation.identity.language,
       signal: abortController.signal,
       diagnosticContext: { callSid, buildSha, requestId: tracked.requestId, responseId, purpose: tracked.plan.purpose, proposalVersion: tracked.plan.proposalVersion, attempt: tracked.attempt },
       onFailureDiagnostic: safeEmit,
       onPhaseDiagnostic: safeEmit,
     })).then(
-      (result) => enqueue(() => synthesizedConfirmationCompleted(responseId, result)),
-      (error) => enqueue(() => synthesizedConfirmationFailed(responseId, error)),
-    );
+      (result) => synthesizedConfirmationCompleted(responseId, result),
+      (error) => synthesizedConfirmationFailed(responseId, error),
+    ).catch(() => {
+      if (state.preparation.snapshot.status === "SUBMITTED") terminateRecovery("SPEECH_PLAYBACK_SUBMISSION_FAILED");
+      else failPreparation(state, "SPEECH_PREPARATION_FAILED");
+    });
     return { accepted: true, requestId: tracked.requestId, responseId };
   }
 
@@ -605,6 +627,7 @@ export function initializeVoiceV2Session({
     const state = responses.get(responseId);
     const entry = session.responseRegistry.get(responseId);
     if (!state || lifecycle.terminated || entry?.invalidated || entry?.status !== "requested" || superseded.has(responseId)) return;
+    if (performance.now() >= state.preparation.identity.deadlineAt) return failPreparation(state, "SPEECH_PREPARATION_TIMEOUT", true);
     if (result?.format !== "audio/pcmu") return responseFailed(responseId, "TTS_INVALID_AUDIO");
     const audio = Buffer.isBuffer(result.audio) ? result.audio : Buffer.from(result.audio || []);
     if (!audio.length) return responseFailed(responseId, "TTS_EMPTY_AUDIO");
@@ -640,6 +663,75 @@ export function initializeVoiceV2Session({
       ? error.code : "TTS_ADAPTER_ERROR";
     callTrace.entry("SPEECH_SYNTHESIS_FAILED", { ...timingDetails({ responseId }), reason });
     return responseFailed(responseId, reason);
+  }
+
+  function preparationCurrent(state) {
+    return state.preparation?.active && !lifecycle.terminated && !localRecoveryStarted
+      && !session.responseRegistry.get(state.responseId)?.invalidated && !superseded.has(state.responseId)
+      && state.plan.proposalVersion === session.proposal.proposalVersion
+      && session.floorOwner.owns({ requestId: state.requestId, responseId: state.responseId, proposalVersion: state.plan.proposalVersion });
+  }
+
+  function invalidatePreparation(state, reason, timedOut = false) {
+    if (!state?.preparation?.invalidate(reason, timedOut)) return false;
+    session.watchdog.cancel(`preparation:${state.responseId}`);
+    session.responseRegistry.invalidate(state.responseId, reason);
+    superseded.add(state.responseId);
+    state.abortController?.abort(timedOut ? "RESPONSE_GENERATION_TIMEOUT" : undefined);
+    session.record("SPEECH_PREPARATION_INVALIDATED", { responseId: state.responseId, purpose: state.plan.purpose, reason, timedOut });
+    return true;
+  }
+
+  function failPreparation(state, reason, timedOut = false) {
+    if (!invalidatePreparation(state, reason, timedOut)) return;
+    session.floorOwner.release({ reason, requestId: state.requestId, responseId: state.responseId });
+    if (lifecycle.terminated) return;
+    session.record("RESPONSE_DELIVERY_FAILED", { responseId: state.responseId, purpose: state.plan.purpose, reason });
+    return startLocalRecovery();
+  }
+
+  function terminateRecovery(reason) {
+    Promise.resolve(lifecycle.terminate(reason)).catch(() => safeEmit({ event: "V2_LOCAL_RECOVERY_FINALIZATION_FAILED", callSid, buildSha }));
+  }
+
+  function startLocalRecovery() {
+    if (localRecoveryStarted || lifecycle.terminated) return { accepted: false, reason: "RECOVERY_ALREADY_STARTED" };
+    localRecoveryStarted = true;
+    session.watchdog.cancel("caller-silence");
+    const current = currentLifecycle();
+    if (current?.preparation?.active) invalidatePreparation(current, "CONTROLLED_RECOVERY");
+    if (current) session.floorOwner.release({ reason: "CONTROLLED_RECOVERY", requestId: current.requestId, responseId: current.responseId || null });
+    const requestId = `${callSid}:local-recovery`; const responseId = `${requestId}:audio`;
+    try {
+      const clip = localRecoveryAudioAdapter.getAudio(session.conversationLanguage.currentLanguage);
+      if (clip?.format !== "audio/pcmu" || !Buffer.isBuffer(clip.audio) || !clip.audio.length) throw new Error("invalid_clip");
+      const plan = planTerminalResponseRecovery({ proposal: session.proposal, language: session.conversationLanguage.currentLanguage });
+      const admission = session.floorOwner.plan({ purpose: ResponsePurpose.ERROR_RECOVERY, category: FloorPurpose.EXIT,
+        requestId, proposalVersion: plan.proposalVersion, source: "local_recovery", preparing: true });
+      if (!admission.accepted) throw new Error("recovery_owner_unavailable");
+      session.confirmationAuthority.revokeProposal(plan.proposalVersion, "EXIT_PLANNED");
+      const tracked = { requestId, responseId, plan, attempt: 1, timingContext: {}, localRecovery: true }; requests.set(requestId, tracked);
+      const state = registerResponseState(tracked, responseId, "local_recovery");
+      state.validation = { valid: true, failedInvariant: null }; state.audioBytes = clip.audio.length;
+      session.responseRegistry.complete(responseId, { validationResult: state.validation });
+      if (!session.floorOwner.beginSpeaking({ requestId, responseId, proposalVersion: plan.proposalVersion })) throw new Error("recovery_owner_mismatch");
+      twilio.submitAudio({ payload: clip.audio.toString("base64") }); state.submittedAudioBytes = clip.audio.length;
+      const markId = `${callSid}:mark:${++markSequence}`; twilio.sendMark({ markId }); state.markId = markId;
+      session.playbackRegistry.register({ markId, responseId, proposalVersion: plan.proposalVersion });
+      session.playbackRegistry.submit(markId, clip.audio.length); marks.set(markId, state);
+      if (!session.floorOwner.bindMark({ requestId, responseId, markId, audioSubmitted: true })) throw new Error("recovery_mark_mismatch");
+      callTrace.recordTwilioAudio(timingDetails({ responseId }));
+      session.record("LOCAL_RECOVERY_SUBMITTED", { responseId, markId, language: clip.language });
+      const audioDurationMs = Math.ceil(state.submittedAudioBytes / 8);
+      const acknowledgementMarginMs = 2000;
+      const recoveryPlaybackDeadlineMs = Math.min(17000, audioDurationMs + acknowledgementMarginMs);
+      session.watchdog.schedule(`playback:${markId}`, recoveryPlaybackDeadlineMs, () => terminateRecovery("LOCAL_RECOVERY_PLAYBACK_TIMEOUT"));
+      return { accepted: true, requestId, responseId };
+    } catch {
+      session.record("LOCAL_RECOVERY_UNAVAILABLE", { reason: "PRODUCTION_ASSETS_REQUIRED_OR_SUBMISSION_FAILED" });
+      terminateRecovery("LOCAL_RECOVERY_UNAVAILABLE");
+      return { accepted: false, reason: "LOCAL_RECOVERY_UNAVAILABLE" };
+    }
   }
 
   async function maybeRequestInitialGreeting() {
@@ -679,7 +771,7 @@ export function initializeVoiceV2Session({
 
   function responseCreated(event) {
     const tracked = requests.get(event.requestId); if (!tracked || lifecycle.terminated) return;
-    if (usesApplicationSpeech(tracked.plan)) {
+    if (usesApplicationSpeech(tracked.plan) || tracked.localRecovery) {
       session.record("APPLICATION_SPEECH_LEAK_QUARANTINED", { requestId: tracked.requestId, responseId: event.responseId, purpose: tracked.plan.purpose, proposalVersion: tracked.plan.proposalVersion });
       superseded.add(event.responseId);
       return;
@@ -734,7 +826,7 @@ export function initializeVoiceV2Session({
     state.providerCompletion = event;
     const completionDiagnostics = responseCompletionDiagnostics(state, event);
     callTrace.entry("RESPONSE_COMPLETED", { ...timingDetails({ responseId }), outcome: "PROVIDER_COMPLETED", ...completionDiagnostics });
-    session.watchdog.cancel(`response:${state.requestId}`);
+    if (!state.preparation) session.watchdog.cancel(`response:${state.requestId}`);
     const current = state.plan.proposalVersion === session.proposal.proposalVersion;
     const validation = requiresBufferedDelivery(state.plan)
       ? (state.transcript == null ? { valid: false, failedInvariant: "missing_transcript", extractionFailed: true } : coordinator.speechValidator(state.plan, state.transcript))
@@ -743,20 +835,33 @@ export function initializeVoiceV2Session({
     session.record("SPEECH_VALIDATED", { responseId, valid: validation.valid, failedInvariant: validation.failedInvariant || null });
     callTrace.entry("SPEECH_VALIDATED", { ...timingDetails({ responseId }), valid: validation.valid, reason: validation.failedInvariant || null, mismatchCategory: validation.mismatchCategory || (validation.failedInvariant === "missing_transcript" ? "missing_transcript" : null), ...completionDiagnostics });
     if (!current || !validation.valid || state.audioBytes <= 0) return responseFailed(responseId, !current ? "STALE_PROPOSAL" : validation.failedInvariant || "NO_AUDIO");
-    session.responseRegistry.complete(responseId, { validationResult: validation });
+    if (!state.preparation) session.responseRegistry.complete(responseId, { validationResult: validation });
     if (state.transcript != null) {
       const persistenceTiming = timing.start("TRANSCRIPT_PERSISTENCE", { ...timingDetails({ responseId }), turnId: `${responseId}:assistant`, role: "assistant" });
       try {
         const persisted = await lifecycle.appendTurn({ turnId: `${responseId}:assistant`, role: "assistant", text: state.transcript, timestamp: now() });
         emitPersistenceOutcome({ turnId: `${responseId}:assistant`, role: "assistant", itemId: state.assistantItemId, responseId, characterCount: state.transcript.length, result: persisted });
+        if (state.preparation && persisted?.success !== true) return failPreparation(state, "ASSISTANT_PERSISTENCE_FAILED");
       } catch (error) {
         emitPersistenceOutcome({ turnId: `${responseId}:assistant`, role: "assistant", itemId: state.assistantItemId, responseId, characterCount: state.transcript.length, error });
+        if (state.preparation) return failPreparation(state, "ASSISTANT_PERSISTENCE_FAILED");
         throw error;
       } finally { timing.end("TRANSCRIPT_PERSISTENCE", persistenceTiming, { ...timingDetails({ responseId }), turnId: `${responseId}:assistant`, role: "assistant" }); }
     }
-    if (requiresBufferedDelivery(state.plan)) {
+    if (state.preparation) {
+      if (performance.now() >= state.preparation.identity.deadlineAt) return failPreparation(state, "SPEECH_PREPARATION_TIMEOUT", true);
+      if (!preparationCurrent(state)) return;
+      if (!session.floorOwner.beginSpeaking({ requestId: state.requestId, responseId, proposalVersion: state.plan.proposalVersion })) return failPreparation(state, "PREPARATION_OWNER_MISMATCH");
+      if (!preparationCurrent(state)) return;
+      session.responseRegistry.complete(responseId, { validationResult: validation });
+    }
+    if (state.preparation || requiresBufferedDelivery(state.plan)) {
       twilio.submitAudio({ payload: Buffer.concat(state.audio.map((part) => Buffer.from(part, "base64"))).toString("base64") });
       state.submittedAudioBytes = state.audioBytes;
+      if (state.preparation) {
+        state.preparation.submitted();
+        session.watchdog.cancel(`preparation:${responseId}`);
+      }
       timing.once("FIRST_TWILIO_AUDIO_SUBMITTED", responseId, timingDetails({ responseId }));
       callTrace.recordTwilioAudio(timingDetails({ responseId }));
     }
@@ -824,6 +929,7 @@ export function initializeVoiceV2Session({
 
   async function responseFailed(responseId, reason) {
     const state = responses.get(responseId); if (!state) return;
+    if (state.preparation) return failPreparation(state, reason);
     const entry = session.responseRegistry.get(responseId);
     if (lifecycle.terminated || entry?.invalidated || entry?.status !== "requested"
       || state.plan.proposalVersion !== session.proposal.proposalVersion || superseded.has(responseId)) return;
@@ -930,27 +1036,15 @@ export function initializeVoiceV2Session({
   async function responseTimedOut(requestId) {
     const tracked = requests.get(requestId); if (!tracked || lifecycle.terminated) return;
     if (superseded.has(`request:${requestId}`) || (tracked.responseId && session.responseRegistry.get(tracked.responseId)?.invalidated)) return;
-    const state = responses.get(tracked.responseId);
-    const owner = session.floorOwner.snapshot;
-    const retryUnheardSpeech = state?.transport === "application_tts" && tracked.attempt === 1
-      && owner.requestId === requestId && owner.audioSubmitted === false
-      && state.audioBytes === 0 && state.submittedAudioBytes === 0 && !state.markId
-      && tracked.plan.proposalVersion === session.proposal.proposalVersion;
     if (tracked.responseId) session.responseRegistry.invalidate(tracked.responseId, "RESPONSE_GENERATION_TIMEOUT");
     const supersessionKey = tracked.responseId || `request:${tracked.requestId}`;
     if (!superseded.has(supersessionKey)) {
       superseded.add(supersessionKey);
-      if (state?.transport === "application_tts") tracked.abortController?.abort("RESPONSE_GENERATION_TIMEOUT");
-      else openai.supersedeResponse({ requestId: tracked.requestId, responseId: tracked.responseId || undefined, reason: "RESPONSE_GENERATION_TIMEOUT" });
+      openai.supersedeResponse({ requestId: tracked.requestId, responseId: tracked.responseId || undefined, reason: "RESPONSE_GENERATION_TIMEOUT" });
     }
     session.floorOwner.release({ reason: "RESPONSE_GENERATION_TIMEOUT", requestId: tracked.requestId, responseId: tracked.responseId || null });
     session.record("TIMEOUT_RECOVERY_PLANNED", { timeoutType: "RESPONSE_GENERATION_TIMEOUT", responseId: tracked.responseId || null, proposalVersion: tracked.plan.proposalVersion });
     if (session.proposal.terminal || tracked.plan.purpose === ResponsePurpose.AMBIGUITY_LIMIT_REACHED || tracked.plan.purpose === ResponsePurpose.ERROR_RECOVERY) return lifecycle.terminate("RESPONSE_GENERATION_TIMEOUT");
-    if (retryUnheardSpeech) {
-      // Reuse the rendered plan; no interpretation, availability effect or new wording.
-      const retry = await requestResponse(tracked.plan, 2, null, tracked.timingContext);
-      if (retry.accepted) return;
-    }
     if (tracked.plan.purpose !== ResponsePurpose.ERROR_RECOVERY) await requestResponse(coordinator.responsePlanner({ proposal: session.proposal, purpose: ResponsePurpose.ERROR_RECOVERY, language: tracked.plan.language }));
   }
 
@@ -1021,7 +1115,9 @@ export function initializeVoiceV2Session({
   function usesApplicationSpeech(plan) { return Boolean(speechAdapter && (plan?.speechContract?.applicationOwnedConfirmation === true || plan?.speechContract?.applicationOwnedReprompt === true || plan?.speechContract?.applicationOwnedSpeech === true)); }
   function supersedeResponse(state, reason) {
     superseded.add(state.responseId);
+    if (state.transport === "local_recovery") return { accepted: true, responseId: state.responseId, reason };
     if (state.transport === "application_tts") {
+      invalidatePreparation(state, reason);
       state.abortController?.abort();
       return { accepted: true, responseId: state.responseId, reason };
     }
@@ -1175,6 +1271,7 @@ export function initializeVoiceV2Session({
     if (startupAudio.length) session.record("STARTUP_CALLER_AUDIO_CLEARED", { clearedFrames: startupAudio.length, clearedBytes: startupAudioBytes });
     startupAudio.length = 0; startupAudioBytes = 0;
     const state = currentLifecycle();
+    for (const response of responses.values()) if (response.preparation?.active) invalidatePreparation(response, "CALL_TERMINATED");
     if (state?.responseId) { try { supersedeResponse(state, "CALL_TERMINATED"); } catch {} }
     if (twilio.identity.streamSid && !twilio.closed) { try { clearPlayback("CALL_TERMINATED", state); } catch {} }
     try { openai.close(1000, "session_terminated"); } catch {}

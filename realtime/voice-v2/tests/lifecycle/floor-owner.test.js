@@ -3,6 +3,28 @@ import assert from "node:assert/strict";
 
 import { FloorOwner, FloorPurpose, FloorState } from "../../lifecycle/FloorOwner.js";
 
+test("preparation reserves generation without audible playback or confirmation authority", () => {
+  const floor = new FloorOwner();
+  const identity = { requestId: "prepare", responseId: "prepared", proposalVersion: 4 };
+  floor.plan({ ...identity, purpose: "PRE_BOOKING_CONFIRMATION", category: FloorPurpose.CONFIRM, source: "application_tts", preparing: true });
+  assert.equal(floor.snapshot.state, FloorState.PREPARING); assert.equal(floor.snapshot.audioSubmitted, false);
+  assert.equal(floor.bindResponse(identity), true); assert.equal(floor.bindMark({ ...identity, markId: "premature" }), false);
+  assert.equal(floor.mayGrantConfirmation({ ...identity, markId: "premature" }).authorized, false);
+  assert.equal(floor.plan({ requestId: "competing", purpose: "ASK_TIME", category: FloorPurpose.COLLECT }).accepted, false);
+  assert.equal(floor.beginSpeaking({ ...identity, requestId: "wrong" }), false);
+  assert.equal(floor.beginSpeaking(identity), true); assert.equal(floor.snapshot.state, FloorState.SPEAKING);
+  assert.equal(floor.mayGrantConfirmation({ ...identity, markId: "not_submitted" }).authorized, false);
+  assert.equal(floor.bindMark({ ...identity, markId: "delivered" }), true);
+  assert.equal(floor.mayGrantConfirmation({ ...identity, markId: "delivered" }).authorized, true);
+});
+
+test("cancelled preparation cannot acquire audible ownership later", () => {
+  const floor = new FloorOwner(); const identity = { requestId: "old", responseId: "old-response", proposalVersion: 1 };
+  floor.plan({ ...identity, preparing: true, category: FloorPurpose.COLLECT }); floor.bindResponse(identity);
+  assert.equal(floor.release({ ...identity, reason: "CALLER_INTERRUPTION" }), true);
+  assert.equal(floor.beginSpeaking(identity), false); assert.equal(floor.snapshot.state, FloorState.LISTEN);
+});
+
 test("one response owns generation, playback, and confirmation consent", () => {
   const events = []; const floor = new FloorOwner({ record: (event, details) => events.push({ event, ...details }) });
   assert.equal(floor.plan({ purpose: "PRE_BOOKING_CONFIRMATION", category: FloorPurpose.CONFIRM, requestId: "req-1", proposalVersion: 4, source: "application_tts" }).accepted, true);
