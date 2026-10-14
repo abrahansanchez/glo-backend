@@ -1,3 +1,4 @@
+import { Agent, fetch as speechFetch } from "undici";
 import { SpeechPreparationDiagnostics, bufferSpeechBody } from "../audio/SpeechPreparationDiagnostics.js";
 import { extractPcm24kMonoFromWav, pcm24kToPcmu8k, speechAudioFormat } from "../audio/pcm24kToPcmu8k.js";
 
@@ -9,26 +10,35 @@ export class OpenAISpeechAdapter {
     model = "gpt-4o-mini-tts",
     voice = "alloy",
     endpoint = DEFAULT_ENDPOINT,
-    fetchFn = globalThis.fetch,
+    fetchFn,
+    agentFactory = () => new Agent(),
     monotonicNow = () => performance.now(),
   } = {}) {
     if (!apiKey) throw new TypeError("openai_api_key_required");
-    if (typeof fetchFn !== "function") throw new TypeError("fetch_required");
+    if (fetchFn !== undefined && typeof fetchFn !== "function") throw new TypeError("fetch_required");
+    if (typeof agentFactory !== "function") throw new TypeError("speech_agent_factory_required");
     this.apiKey = apiKey;
     this.model = model;
     this.voice = voice;
     this.endpoint = endpoint;
     this.fetchFn = fetchFn;
+    this.agentFactory = agentFactory;
     this.monotonicNow = monotonicNow;
   }
 
   async synthesize(request = {}) {
     const trace = speechPhaseTrace(request, this.monotonicNow);
     const measurement = request.preparationDiagnostics || new SpeechPreparationDiagnostics({ observer: request.onPreparationDiagnostic, context: request.diagnosticContext, clock: this.monotonicNow });
+    const transport = { agent: null, closeRequested: false };
+    const close = () => {
+      if (!transport.agent || transport.closeRequested) return;
+      transport.closeRequested = true;
+      try { Promise.resolve(transport.agent.close()).catch(() => {}); } catch { /* Cleanup never owns the synthesis result. */ }
+    };
     const onAbort = () => measurement.abort(request.signal?.reason);
     request.signal?.addEventListener("abort", onAbort, { once: true });
     if (request.signal?.aborted) onAbort();
-    try { return await this.#synthesize(request, trace, measurement); }
+    try { return await this.#synthesize(request, trace, measurement, transport); }
     catch (error) {
       const diagnostic = sanitizeSpeechDiagnostic(error?.diagnostic);
       const context = request.diagnosticContext;
@@ -42,17 +52,17 @@ export class OpenAISpeechAdapter {
       try { request.onFailureDiagnostic?.(event); } catch { /* Diagnostics cannot change synthesis behavior. */ }
       throw error;
     }
-    finally { trace.settle(); measurement.settle(); request.signal?.removeEventListener("abort", onAbort); }
+    finally { trace.settle(); measurement.settle(); request.signal?.removeEventListener("abort", onAbort); close(); }
   }
 
-  async #synthesize({ input, language = "en", signal } = {}, trace, measurement) {
+  async #synthesize({ input, language = "en", signal } = {}, trace, measurement, transport) {
     if (typeof input !== "string" || !input.trim()) throw new TypeError("speech_input_required");
     const startedAt = this.monotonicNow();
     let response;
     trace.phase("REQUEST_DISPATCH_STARTED");
     measurement.phase("REQUEST_DISPATCH_STARTED");
     try {
-      response = await this.fetchFn(this.endpoint, {
+      const options = {
         method: "POST",
         headers: {
           Authorization: `Bearer ${this.apiKey}`,
@@ -65,7 +75,12 @@ export class OpenAISpeechAdapter {
           response_format: "wav",
         }),
         signal,
-      });
+      };
+      if (this.fetchFn) response = await this.fetchFn(this.endpoint, options);
+      else {
+        transport.agent = this.agentFactory();
+        response = await speechFetch(this.endpoint, { ...options, dispatcher: transport.agent });
+      }
     } catch (error) {
       const diagnostic = fetchDiagnostic(error, signal);
       if (signal?.aborted || error?.name === "AbortError") throw typedError("speech_request_aborted", "TTS_ABORTED", diagnostic);
