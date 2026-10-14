@@ -15,7 +15,9 @@ export function extractTime(normalizedTurn, { currentTime = null } = {}) {
   } else {
     const minuteForm = text.match(/\b([a-z]+)\s+(thirty|y media|y cuarto)\b/);
     const englishQuarter = text.match(/\bquarter (?:past|after) (one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\b/);
-    const hourWord = minuteForm?.[1] ?? englishQuarter?.[1] ?? text.match(/\b(?:a las|las|at)?\s*(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|una|uno|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez|once|doce)\b/)?.[1];
+    // Preserve explicit a la una even when normalized punctuation leaves cita next.
+    const hourMatch = text.match(/\ba la\s+(una)\b|\b(?:a las|las|at)?\s*(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|una(?!\s+cita\b)|uno|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez|once|doce)\b/);
+    const hourWord = minuteForm?.[1] ?? englishQuarter?.[1] ?? hourMatch?.[1] ?? hourMatch?.[2];
     hour = EN_HOURS[hourWord] ?? ES_HOURS[hourWord];
     if (minuteForm?.[2] === "thirty" || minuteForm?.[2] === "y media") minute = 30;
     if (minuteForm?.[2] === "y cuarto" || englishQuarter) minute = 15;
