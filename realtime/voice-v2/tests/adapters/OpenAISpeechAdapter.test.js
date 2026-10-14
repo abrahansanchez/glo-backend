@@ -351,7 +351,7 @@ for (const behavior of ["throw", "reject", "pending"]) test(`preparation observe
     assert.equal(requests, 1); assert.deepEqual(unhandled, []);
     assert.equal(logs.length, 6); assert.equal(new Set(logs.map((event) => event.phase)).size, 6);
     for (const secret of ["private-key", "private-text", "private-error", wav.toString("base64")]) assert.equal(JSON.stringify(logs).includes(secret), false);
-    assert.deepEqual(Object.keys(logs[0]).sort(), ["event", "callSid", "requestId", "responseId", "purpose", "proposalVersion", "attempt", "phase", "elapsedMs", "phaseElapsedMs", "providerStatus", "bytesReceived", "chunkCount", "longestIdleMs", "settled", "reason"].sort());
+    assert.deepEqual(Object.keys(logs[0]).sort(), ["event", "callSid", "requestId", "responseId", "purpose", "proposalVersion", "attempt", "phase", "elapsedMs", "phaseElapsedMs", "lastByteElapsedMs", "idleSinceLastByteMs", "providerStatus", "bytesReceived", "chunkCount", "longestIdleMs", "settled", "reason"].sort());
   } finally { process.removeListener("unhandledRejection", listener); }
 });
 
@@ -465,4 +465,88 @@ test("aggregate counters saturate diagnostically without stopping byte buffering
   assert.deepEqual(await bufferSpeechBody(response, undefined, measurement), wav);
   measurement.phase("AUDIO_BODY_COMPLETED");
   assert.equal(events.at(-1).bytesReceived, Number.MAX_SAFE_INTEGER); assert.equal(events.at(-1).chunkCount, 3);
+});
+
+
+for (const nearAbort of [false, true]) test(`last-byte timing distinguishes burst-idle from near-abort progress: ${nearAbort}`, async () => {
+  const { SpeechPreparationDiagnostics, bufferSpeechBody } = await import("../../audio/SpeechPreparationDiagnostics.js");
+  let time = 0; let read = 0; let resolveLast; const events = []; const controller = new AbortController();
+  const measurement = new SpeechPreparationDiagnostics({ observer: (event) => events.push(event), clock: () => time });
+  time = 9000; measurement.headers(200);
+  const response = { body: { getReader: () => ({ read() {
+    if (read++ === 0) { time = 9001; return Promise.resolve({ done: false, value: new Uint8Array([1]) }); }
+    if (read === 2) { time = nearAbort ? 9990 : 9002; return Promise.resolve({ done: false, value: new Uint8Array([2]) }); }
+    return new Promise((resolve) => { resolveLast = resolve; });
+  }, cancel() {}, releaseLock() {} }) } };
+  const pending = bufferSpeechBody(response, controller.signal, measurement);
+  for (let i = 0; i < 10; i++) await Promise.resolve();
+  time = 10000; measurement.abort("RESPONSE_GENERATION_TIMEOUT"); controller.abort();
+  const abort = events.find((event) => event.phase === "PREPARATION_ABORT_REQUESTED");
+  assert.equal(abort.lastByteElapsedMs, nearAbort ? 9990 : 9002); assert.equal(abort.idleSinceLastByteMs, nearAbort ? 10 : 998);
+  time = 10005; resolveLast({ done: true }); await assert.rejects(pending, { code: "TTS_ABORTED" }); measurement.settle();
+  assert.equal(events.at(-1).idleSinceLastByteMs, nearAbort ? 15 : 1003); assert.equal(events.at(-1).bytesReceived, 2);
+});
+
+test("zero-length chunks and pre-byte abort retain normalized last-byte timing", async () => {
+  const { SpeechPreparationDiagnostics } = await import("../../audio/SpeechPreparationDiagnostics.js");
+  let time = 0; const events = []; const measurement = new SpeechPreparationDiagnostics({ observer: (event) => events.push(event), clock: () => time });
+  time = 1; measurement.chunk(0); measurement.abort("ABORTED"); measurement.settle();
+  assert.ok(events.every((event) => event.lastByteElapsedMs === null && event.idleSinceLastByteMs === null));
+  const more = []; const normal = new SpeechPreparationDiagnostics({ observer: (event) => more.push(event), clock: () => time });
+  time = 2; normal.chunk(4); time = 9; normal.chunk(0); time = 10; normal.chunk(6); time = 15; normal.chunk(0); normal.abort();
+  assert.equal(more.at(-1).lastByteElapsedMs, 9); assert.equal(more.at(-1).idleSinceLastByteMs, 5); assert.equal(more.at(-1).chunkCount, 2);
+});
+
+
+for (const stage of ["headers", "zero-body"]) test(`adapter abort at ${stage} retains null last-byte measurements`, async () => {
+  const events = []; let rejectFetch; let requests = 0; const controller = new AbortController();
+  const adapter = new OpenAISpeechAdapter({ apiKey: "offline", fetchFn: async () => {
+    requests++; return stage === "headers" ? new Promise((_resolve, reject) => { rejectFetch = reject; }) : new Response(new ReadableStream({}));
+  } });
+  const pending = adapter.synthesize({ input: "offline", signal: controller.signal, onPreparationDiagnostic: (event) => events.push(event) });
+  const rejection = assert.rejects(pending, { code: "TTS_ABORTED" });
+  for (let i = 0; i < 10; i++) await Promise.resolve();
+  controller.abort("RESPONSE_GENERATION_TIMEOUT"); if (rejectFetch) rejectFetch(new DOMException("offline abort", "AbortError")); await rejection;
+  for (const phase of ["PREPARATION_ABORT_REQUESTED", "OPERATION_SETTLED_AFTER_ABORT"]) {
+    const event = events.find((value) => value.phase === phase);
+    assert.equal(event.lastByteElapsedMs, null); assert.equal(event.idleSinceLastByteMs, null);
+    assert.equal(event.bytesReceived, 0); assert.equal(event.chunkCount, 0);
+  }
+  assert.equal(requests, 1); assert.ok(events.length <= 11);
+});
+
+test("successful adapter settlement reports final nonempty chunk timing and idle interval", async () => {
+  const bytes = pcmWav(Buffer.alloc(960)); const events = []; let time = 0; let read = 0;
+  const chunks = [bytes.subarray(0, 12), new Uint8Array(0), bytes.subarray(12), new Uint8Array(0)];
+  const adapter = new OpenAISpeechAdapter({ apiKey: "offline", monotonicNow: () => time, fetchFn: async () => ({ ok: true, status: 200, body: { getReader: () => ({ read: async () => {
+    time = [2, 4, 8, 10, 12][read]; return read < chunks.length ? { value: chunks[read++], done: false } : { done: true };
+  }, releaseLock() {} }) } }) });
+  const result = await adapter.synthesize({ input: "offline", onPreparationDiagnostic: (event) => events.push(event) });
+  const completed = events.find((event) => event.phase === "WAV_CONVERSION_COMPLETED");
+  assert.equal(completed.settled, true); assert.equal(completed.lastByteElapsedMs, 8); assert.equal(completed.idleSinceLastByteMs, 4);
+  assert.equal(completed.chunkCount, 2); assert.equal(events.length, 6);
+  assert.deepEqual(result.audio, pcm24kToPcmu8k(extractPcm24kMonoFromWav(bytes)));
+  assert.ok(events.filter((event) => !["WAV_CONVERSION_COMPLETED"].includes(event.phase)).every((event) => event.idleSinceLastByteMs === null));
+});
+
+test("rejected non-byte chunk establishes no last-byte timestamp or conversion", async () => {
+  const events = [];
+  const adapter = new OpenAISpeechAdapter({ apiKey: "offline", fetchFn: async () => new Response(new ReadableStream({ start(controller) { controller.enqueue("private-non-byte"); controller.close(); } })) });
+  await assert.rejects(adapter.synthesize({ input: "offline", onPreparationDiagnostic: (event) => events.push(event) }), (error) => {
+    const reason = ["TTS_EMPTY_AUDIO", "TTS_INVALID_AUDIO", "TTS_ABORTED"].includes(error.code) ? error.code : "TTS_ADAPTER_ERROR";
+    assert.equal(reason, "TTS_ADAPTER_ERROR"); return true;
+  });
+  assert.ok(events.every((event) => event.lastByteElapsedMs === null && event.idleSinceLastByteMs === null));
+  assert.equal(events.some((event) => event.phase === "WAV_CONVERSION_STARTED"), false);
+});
+
+test("body timing registers no global diagnostic subscriptions even for never-settling work", async () => {
+  const { channel } = await import("node:diagnostics_channel");
+  const names = ["undici:request:create", "undici:client:sendHeaders", "undici:request:bodySent", "undici:request:headers", "undici:request:error"];
+  const before = names.map((name) => channel(name).hasSubscribers);
+  const controller = new AbortController();
+  const adapter = new OpenAISpeechAdapter({ apiKey: "offline", fetchFn: () => new Promise(() => {}) });
+  void adapter.synthesize({ input: "offline", signal: controller.signal, onPreparationDiagnostic() {} });
+  await Promise.resolve(); controller.abort();
+  assert.deepEqual(names.map((name) => channel(name).hasSubscribers), before);
 });

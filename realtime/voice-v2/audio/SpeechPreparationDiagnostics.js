@@ -37,6 +37,8 @@ export class SpeechPreparationDiagnostics {
     const event = Object.freeze({ event: "V2_SPEECH_PREPARATION_PHASE", ...this.#context, phase,
       proposalVersion: integer(this.#context.proposalVersion), attempt: integer(this.#context.attempt, 1),
       elapsedMs: interval(time, this.#origin), phaseElapsedMs: interval(time, this.#phaseOrigin),
+      lastByteElapsedMs: this.#lastByte === null ? null : interval(this.#lastByte, this.#origin),
+      idleSinceLastByteMs: this.#lastByte === null || !(["PREPARATION_ABORT_REQUESTED", "OPERATION_SETTLED_AFTER_ABORT"].includes(phase) || (phase === "WAV_CONVERSION_COMPLETED" && this.#settled)) ? null : interval(time, this.#lastByte),
       providerStatus: httpStatus(this.#status), bytesReceived: integer(this.#bytes), chunkCount: integer(this.#chunks), longestIdleMs: duration(this.#idle),
       settled: this.#settled, reason: this.#reason });
     if (!["PREPARATION_ABORT_REQUESTED", "OPERATION_SETTLED_AFTER_ABORT"].includes(phase)) this.#phaseOrigin = time;

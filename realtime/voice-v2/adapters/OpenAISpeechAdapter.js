@@ -93,6 +93,7 @@ export class OpenAISpeechAdapter {
     try { audio = pcm24kToPcmu8k(extractPcm24kMonoFromWav(sourceAudio)); }
     catch (error) { throw typedError("speech_provider_invalid_audio", error?.code, { failureClass: error?.code === "TTS_INVALID_AUDIO" ? "INVALID_AUDIO" : "UNKNOWN", transient: error?.code === "TTS_INVALID_AUDIO" ? false : null }); }
     trace.phase("WAV_CONVERSION_COMPLETED");
+    measurement.settle();
     measurement.phase("WAV_CONVERSION_COMPLETED");
     const completedAt = this.monotonicNow();
     const latencyMs = Math.max(0, completedAt - startedAt);
