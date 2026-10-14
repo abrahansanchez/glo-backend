@@ -291,3 +291,99 @@ for (const language of ["en", "es"]) test(`${language} initialization caches app
   assert.equal(f.scheduler.active(Math.min(17000, Math.ceil(expected.audio.length / 8) + 2000)).length, 1);
   await acknowledge(f); assert.equal(f.finalized.length, 1); assert.deepEqual(f.counters, { availability: 0, booking: 0, sms: 0 });
 });
+
+
+const preparationPhases = (f) => f.logs.filter((event) => event.event === "V2_SPEECH_PREPARATION_PHASE");
+function measurementWav() {
+  const wav = Buffer.alloc(44 + 960);
+  wav.write("RIFF", 0); wav.writeUInt32LE(wav.length - 8, 4); wav.write("WAVE", 8);
+  wav.write("fmt ", 12); wav.writeUInt32LE(16, 16); wav.writeUInt16LE(1, 20); wav.writeUInt16LE(1, 22);
+  wav.writeUInt32LE(24000, 24); wav.writeUInt32LE(48000, 28); wav.writeUInt16LE(2, 32); wav.writeUInt16LE(16, 34);
+  wav.write("data", 36); wav.writeUInt32LE(960, 40); return wav;
+}
+
+for (const language of ["en", "es"]) test(`${language} preparation phases include persistence and media once with no Realtime events`, async () => {
+  let requests = 0;
+  const adapter = new OpenAISpeechAdapter({ apiKey: "private-key", fetchFn: async () => { requests++; return new Response(measurementWav()); } });
+  const f = await fixture({ language, speechAdapter: adapter }); assert.equal(preparationPhases(f).length, 0);
+  await request(f); const events = preparationPhases(f);
+  assert.deepEqual(events.map((event) => event.phase), ["REQUEST_DISPATCH_STARTED", "RESPONSE_HEADERS_RECEIVED", "AUDIO_FIRST_BYTE_RECEIVED", "AUDIO_BODY_COMPLETED", "WAV_CONVERSION_STARTED", "WAV_CONVERSION_COMPLETED", "ASSISTANT_PERSISTENCE_STARTED", "ASSISTANT_PERSISTENCE_COMPLETED", "FIRST_MEDIA_SUBMITTED"]);
+  assert.equal(requests, 1); assert.equal(media(f).length, 1); assert.equal(marks(f).length, 1);
+  for (const secret of ["private-key", "Haircut", "corte de pelo", "+15550000000", measurementWav().toString("base64")]) assert.equal(JSON.stringify(events).includes(secret), false);
+  const count = events.length;
+  f.openai.receive({ type: "conversation.item.input_audio_transcription.failed", item_id: "unrelated", error: { message: "private-transcript" } });
+  await settle(f.app); assert.equal(preparationPhases(f).length, count); await f.app.terminate("TEST_DONE");
+});
+
+for (const stage of ["headers", "zero-body", "partial-body"]) test(`${stage} deadline emits accumulated abort snapshot and one unchanged local recovery`, async () => {
+  let requests = 0; const pending = deferred();
+  const adapter = new OpenAISpeechAdapter({ apiKey: "offline", fetchFn: async () => {
+    requests++;
+    if (stage === "headers") return pending.promise;
+    return new Response(new ReadableStream({ start(controller) { if (stage === "partial-body") controller.enqueue(measurementWav().subarray(0, 12)); } }));
+  } });
+  const f = await fixture({ speechAdapter: adapter }); await request(f);
+  assert.equal(media(f).length, 0); assert.equal(marks(f).length, 0);
+  f.scheduler.fire(5000); await settle(f.app);
+  const abort = preparationPhases(f).find((event) => event.phase === "PREPARATION_ABORT_REQUESTED");
+  assert.equal(abort.providerStatus, stage === "headers" ? null : 200);
+  assert.equal(abort.bytesReceived, stage === "partial-body" ? 12 : 0);
+  assert.equal(abort.chunkCount, stage === "partial-body" ? 1 : 0);
+  assert.equal(abort.reason, "RESPONSE_GENERATION_TIMEOUT");
+  if (stage === "headers") { pending.resolve(new Response(measurementWav())); await settle(f.app); }
+  assert.equal(preparationPhases(f).filter((event) => event.phase === "OPERATION_SETTLED_AFTER_ABORT").length, 1);
+  assert.equal(preparationPhases(f).some((event) => event.phase === "WAV_CONVERSION_STARTED"), false);
+  assert.equal(requests, 1); assert.equal(media(f).length, 1); assert.equal(marks(f).length, 1);
+  assert.ok(Buffer.from(media(f)[0].media.payload, "base64").every((byte) => byte === 0xff));
+  await acknowledge(f); assert.equal(f.finalized.length, 1);
+});
+
+for (const late of ["resolve", "reject"]) test(`persistence abort measurement settles once after late ${late} without normal media`, async () => {
+  const pending = deferred();
+  const f = await fixture({ persist: () => pending.promise }); await request(f);
+  assert.equal(preparationPhases(f).filter((event) => event.phase === "ASSISTANT_PERSISTENCE_STARTED").length, 1);
+  f.scheduler.fire(5000); await settle(f.app); const owner = f.app.session.floorOwner.snapshot;
+  const abort = preparationPhases(f).find((event) => event.phase === "PREPARATION_ABORT_REQUESTED"); assert.equal(abort.settled, false);
+  assert.equal(preparationPhases(f).some((event) => event.phase === "OPERATION_SETTLED_AFTER_ABORT"), false);
+  if (late === "resolve") pending.resolve({ success: true }); else pending.reject(new Error("private-persistence"));
+  await settle(f.app);
+  assert.equal(preparationPhases(f).filter((event) => event.phase === "ASSISTANT_PERSISTENCE_COMPLETED").length, 1);
+  assert.equal(preparationPhases(f).filter((event) => event.phase === "OPERATION_SETTLED_AFTER_ABORT").length, 1);
+  assert.equal(preparationPhases(f).some((event) => event.phase === "FIRST_MEDIA_SUBMITTED"), false);
+  assert.deepEqual(f.app.session.floorOwner.snapshot, owner); assert.equal(media(f).length, 1); assert.equal(marks(f).length, 1);
+  await acknowledge(f);
+});
+
+test("simultaneous real Speech calls isolate aggregate counters and preparation measurements", async () => {
+  const wav = measurementWav();
+  const a = await fixture({ speechAdapter: new OpenAISpeechAdapter({ apiKey: "offline", fetchFn: async () => new Response(wav) }) });
+  const b = await fixture({ language: "es", speechAdapter: new OpenAISpeechAdapter({ apiKey: "offline", fetchFn: async () => new Response(new ReadableStream({ start(controller) { controller.enqueue(wav.subarray(0, 12)); controller.enqueue(wav.subarray(12)); controller.close(); } })) }) });
+  await Promise.all([request(a), request(b)]);
+  const done = (f) => preparationPhases(f).find((event) => event.phase === "AUDIO_BODY_COMPLETED");
+  assert.equal(done(a).chunkCount, 1); assert.equal(done(b).chunkCount, 2);
+  assert.equal(done(a).bytesReceived, wav.length); assert.equal(done(b).bytesReceived, wav.length);
+  assert.notEqual(done(a).callSid, done(b).callSid); assert.notEqual(done(a).responseId, done(b).responseId);
+  assert.equal(media(a).length, 1); assert.equal(media(b).length, 1); await Promise.all([a.app.terminate("TEST_DONE"), b.app.terminate("TEST_DONE")]);
+});
+
+
+for (const phase of ["headers", "body", "persistence"]) test(`caller cancellation during measured ${phase} requests abort without recovery`, async () => {
+  const pending = deferred(); let requests = 0;
+  const adapter = new OpenAISpeechAdapter({ apiKey: "offline", fetchFn: async () => {
+    requests++;
+    if (phase === "headers") return pending.promise;
+    if (phase === "body") return new Response(new ReadableStream({}));
+    return new Response(measurementWav());
+  } });
+  const f = await fixture({ speechAdapter: adapter, persist: () => phase === "persistence" ? pending.promise : Promise.resolve({ success: true }) });
+  await request(f);
+  f.openai.receive({ type: "input_audio_buffer.speech_started", item_id: "measured-caller" }); await settle(f.app);
+  const abort = preparationPhases(f).find((event) => event.phase === "PREPARATION_ABORT_REQUESTED");
+  assert.equal(abort.reason, "ABORTED"); assert.equal(media(f).length, 0); assert.equal(marks(f).length, 0);
+  assert.equal(f.app.session.floorOwner.snapshot.state, "LISTEN"); assert.equal(requests, 1);
+  if (phase === "headers") pending.resolve(new Response(measurementWav()));
+  if (phase === "persistence") pending.resolve({ success: true });
+  await settle(f.app); assert.equal(media(f).length, 0); assert.equal(marks(f).length, 0);
+  assert.equal(f.app.session.journal().some((event) => event.event === "LOCAL_RECOVERY_SUBMITTED"), false);
+  await f.app.terminate("TEST_DONE");
+});

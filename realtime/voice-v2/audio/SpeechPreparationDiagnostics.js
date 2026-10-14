@@ -1,0 +1,101 @@
+import { types } from "node:util";
+
+const PHASES = new Set([
+  "REQUEST_DISPATCH_STARTED", "RESPONSE_HEADERS_RECEIVED", "AUDIO_FIRST_BYTE_RECEIVED", "AUDIO_BODY_COMPLETED",
+  "WAV_CONVERSION_STARTED", "WAV_CONVERSION_COMPLETED", "ASSISTANT_PERSISTENCE_STARTED", "ASSISTANT_PERSISTENCE_COMPLETED",
+  "FIRST_MEDIA_SUBMITTED", "PREPARATION_ABORT_REQUESTED", "OPERATION_SETTLED_AFTER_ABORT",
+]);
+const identifier = (value) => typeof value === "string" && value.length <= 128 && /^[A-Za-z0-9_:./-]+$/.test(value) ? value : null;
+
+const MAX_DIAGNOSTIC = Number.MAX_SAFE_INTEGER;
+function duration(value) {
+  return typeof value === "number" && Number.isFinite(value) ? Math.min(MAX_DIAGNOSTIC, Math.max(0, value)) : null;
+}
+function integer(value, minimum = 0) {
+  return typeof value === "number" && Number.isFinite(value) && Number.isInteger(value) && value >= minimum
+    ? Math.min(MAX_DIAGNOSTIC, value) : null;
+}
+function interval(end, start) {
+  return typeof end === "number" && Number.isFinite(end) && typeof start === "number" && Number.isFinite(start)
+    ? duration(end - start) : null;
+}
+const httpStatus = (value) => Number.isInteger(value) && value >= 100 && value <= 599 ? value : null;
+const addCounter = (current, increment) => Math.min(MAX_DIAGNOSTIC, current + increment);
+
+export class SpeechPreparationDiagnostics {
+  #observer; #clock; #origin; #phaseOrigin; #seen = new Set(); #context; #lastByte = null;
+  #bytes = 0; #chunks = 0; #idle = 0; #status = null; #settled = false; #aborted = false; #reason = null;
+  constructor({ observer, context = {}, clock = () => performance.now() } = {}) {
+    this.#observer = observer; this.#clock = clock;
+    this.#origin = this.#phaseOrigin = typeof observer === "function" ? clock() : 0;
+    this.#context = Object.freeze({ callSid: identifier(context.callSid), requestId: identifier(context.requestId), responseId: identifier(context.responseId), purpose: identifier(context.purpose),
+      proposalVersion: context.proposalVersion, attempt: context.attempt });
+  }
+  phase(phase) {
+    if (!PHASES.has(phase) || this.#seen.has(phase) || typeof this.#observer !== "function") return;
+    this.#seen.add(phase); const time = this.#clock();
+    const event = Object.freeze({ event: "V2_SPEECH_PREPARATION_PHASE", ...this.#context, phase,
+      proposalVersion: integer(this.#context.proposalVersion), attempt: integer(this.#context.attempt, 1),
+      elapsedMs: interval(time, this.#origin), phaseElapsedMs: interval(time, this.#phaseOrigin),
+      providerStatus: httpStatus(this.#status), bytesReceived: integer(this.#bytes), chunkCount: integer(this.#chunks), longestIdleMs: duration(this.#idle),
+      settled: this.#settled, reason: this.#reason });
+    if (!["PREPARATION_ABORT_REQUESTED", "OPERATION_SETTLED_AFTER_ABORT"].includes(phase)) this.#phaseOrigin = time;
+    try { Promise.resolve(this.#observer(event)).catch(() => {}); } catch { /* Measurement cannot affect speech. */ }
+  }
+  headers(status) { this.#status = status; this.phase("RESPONSE_HEADERS_RECEIVED"); }
+  chunk(size) {
+    // Only nonempty accepted byte chunks contribute to diagnostic counters.
+    const increment = integer(size, 1);
+    if (increment === null || this.#aborted) return;
+    const time = typeof this.#observer === "function" ? this.#clock() : 0;
+    if (this.#lastByte !== null) {
+      const gap = interval(time, this.#lastByte);
+      this.#idle = gap === null ? null : Math.max(this.#idle ?? 0, gap);
+    }
+    this.#lastByte = time; this.#bytes = addCounter(this.#bytes, increment); this.#chunks = addCounter(this.#chunks, 1);
+    if (this.#chunks === 1) this.phase("AUDIO_FIRST_BYTE_RECEIVED");
+  }
+  pending() { this.#settled = false; }
+  settle() { this.#settled = true; if (this.#aborted) this.phase("OPERATION_SETTLED_AFTER_ABORT"); }
+  abort(reason) {
+    if (this.#aborted) return;
+    this.#aborted = true; this.#reason = reason === "RESPONSE_GENERATION_TIMEOUT" ? "RESPONSE_GENERATION_TIMEOUT" : "ABORTED";
+    this.phase("PREPARATION_ABORT_REQUESTED");
+    if (this.#settled) this.phase("OPERATION_SETTLED_AFTER_ABORT");
+  }
+}
+
+export async function bufferSpeechBody(response, signal, measurement) {
+  // Compatibility for injected fetch implementations without a Web ReadableStream.
+  if (!response.body?.getReader) {
+    const bytes = Buffer.from(await response.arrayBuffer());
+    if (signal?.aborted) throw Object.assign(new Error("speech_aborted"), { name: "AbortError", code: "TTS_ABORTED" });
+    measurement.chunk(bytes.length); return bytes;
+  }
+  const reader = response.body.getReader(); const chunks = [];
+  let cancellationRequested = false;
+  const cancel = () => {
+    if (cancellationRequested) return;
+    cancellationRequested = true;
+    try { Promise.resolve(reader.cancel()).catch(() => {}); } catch { /* Keep the original error. */ }
+  };
+  signal?.addEventListener("abort", cancel, { once: true });
+  try {
+    if (signal?.aborted) cancel();
+    while (true) {
+      const result = await reader.read();
+      if (signal?.aborted) throw Object.assign(new Error("speech_aborted"), { name: "AbortError", code: "TTS_ABORTED" });
+      if (result.done) break;
+      if (!types.isUint8Array(result.value)) throw new TypeError("speech_body_chunk_not_bytes");
+      const bytes = Buffer.from(result.value); chunks.push(bytes); measurement.chunk(bytes.length);
+    }
+    return Buffer.concat(chunks);
+  } catch (error) {
+    cancel();
+    if (signal?.aborted) throw Object.assign(new Error("speech_aborted"), { name: "AbortError", code: "TTS_ABORTED" });
+    throw error;
+  } finally {
+    signal?.removeEventListener("abort", cancel);
+    try { reader.releaseLock(); } catch { /* A reader error cannot replace synthesis failure. */ }
+  }
+}

@@ -143,8 +143,7 @@ test("ordinary abort phase reason is normalized and phase observer errors cannot
   const logs = []; const controller = new AbortController();
   const adapter = new OpenAISpeechAdapter({ apiKey: "test", fetchFn: async () => new Response(pcmWav(Buffer.alloc(960))) });
   controller.abort("secret-transcript");
-  const result = await adapter.synthesize({ input: "text", signal: controller.signal, onPhaseDiagnostic: (event) => { logs.push(event); throw new Error("observer"); } });
-  assert.equal(result.format, "audio/pcmu");
+  await assert.rejects(adapter.synthesize({ input: "text", signal: controller.signal, onPhaseDiagnostic: (event) => { logs.push(event); throw new Error("observer"); } }), { code: "TTS_ABORTED" });
   assert.ok(logs.filter(({ abortReason }) => abortReason).every(({ abortReason }) => abortReason === "ABORTED"));
   assert.equal(JSON.stringify(logs).includes("secret"), false);
 });
@@ -318,4 +317,152 @@ test("audio read failure retains the public error code and adds only sanitized m
     assert.equal(error.code, "TTS_ABORTED"); assert.equal(error.diagnostic.failureClass, "ABORTED");
     assert.equal(error.cause, undefined); assert.equal(JSON.stringify(error).includes("secret"), false); return true;
   });
+});
+
+
+test("preparation measurements reconstruct single and multiple chunks without per-chunk events", async () => {
+  const { bufferSpeechBody, SpeechPreparationDiagnostics } = await import("../../audio/SpeechPreparationDiagnostics.js");
+  const wav = pcmWav(Buffer.alloc(960));
+  for (const slices of [[wav], [wav.subarray(0, 17), wav.subarray(17, 60), wav.subarray(60)]]) {
+    let time = 0; const logs = []; let reads = 0;
+    const response = { body: { getReader: () => ({ read: async () => { time = [30, 60, 110, 120][reads]; return reads < slices.length ? { value: slices[reads++], done: false } : { done: true }; }, releaseLock() {} }) } };
+    const measure = new SpeechPreparationDiagnostics({ observer: (event) => logs.push(event), clock: () => time });
+    measure.phase("REQUEST_DISPATCH_STARTED"); time = 10; measure.headers(200);
+    const rebuilt = await bufferSpeechBody(response, undefined, measure); measure.phase("AUDIO_BODY_COMPLETED");
+    assert.deepEqual(rebuilt, wav); assert.equal(logs.length, 4);
+    assert.equal(logs[2].phase, "AUDIO_FIRST_BYTE_RECEIVED"); assert.equal(logs[2].elapsedMs, 30);
+    assert.equal(logs[3].bytesReceived, wav.length); assert.equal(logs[3].chunkCount, slices.length);
+    assert.equal(logs[3].longestIdleMs, slices.length === 1 ? 0 : 50);
+  }
+});
+
+for (const behavior of ["throw", "reject", "pending"]) test(`preparation observer ${behavior} cannot change conversion, request count or rejection handling`, async () => {
+  const logs = []; const unhandled = []; let requests = 0;
+  const listener = (error) => unhandled.push(error); process.on("unhandledRejection", listener);
+  try {
+    const wav = pcmWav(Buffer.alloc(960));
+    const adapter = new OpenAISpeechAdapter({ apiKey: "private-key", fetchFn: async () => { requests++; return new Response(wav); } });
+    const result = await adapter.synthesize({ input: "private-text", onPreparationDiagnostic(event) {
+      logs.push(event); if (behavior === "throw") throw new Error("private-error");
+      if (behavior === "reject") return Promise.reject(new Error("private-error")); return new Promise(() => {});
+    } });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(result.audio, pcm24kToPcmu8k(extractPcm24kMonoFromWav(wav)));
+    assert.equal(requests, 1); assert.deepEqual(unhandled, []);
+    assert.equal(logs.length, 6); assert.equal(new Set(logs.map((event) => event.phase)).size, 6);
+    for (const secret of ["private-key", "private-text", "private-error", wav.toString("base64")]) assert.equal(JSON.stringify(logs).includes(secret), false);
+    assert.deepEqual(Object.keys(logs[0]).sort(), ["event", "callSid", "requestId", "responseId", "purpose", "proposalVersion", "attempt", "phase", "elapsedMs", "phaseElapsedMs", "providerStatus", "bytesReceived", "chunkCount", "longestIdleMs", "settled", "reason"].sort());
+  } finally { process.removeListener("unhandledRejection", listener); }
+});
+
+for (const [bytes, code] of [[Buffer.alloc(0), "TTS_EMPTY_AUDIO"], [Buffer.from("malformed-private-wav"), "TTS_INVALID_AUDIO"]]) test(`measured body preserves ${code} behavior`, async () => {
+  const adapter = new OpenAISpeechAdapter({ apiKey: "offline", fetchFn: async () => new Response(bytes) });
+  await assert.rejects(adapter.synthesize({ input: "offline", onPreparationDiagnostic() {} }), { code });
+});
+
+for (const partial of [false, true]) test(`body abort partial=${partial} cancels reader, reports counts and discards late chunks`, async () => {
+  const logs = []; let resolveRead; let cancelled = 0; let released = 0; let reads = 0;
+  const controller = new AbortController(); const wav = pcmWav(Buffer.alloc(960));
+  const adapter = new OpenAISpeechAdapter({ apiKey: "offline", fetchFn: async () => ({ ok: true, status: 200, body: { getReader: () => ({
+    read() { if (partial && reads++ === 0) return Promise.resolve({ done: false, value: wav.subarray(0, 12) }); return new Promise((resolve) => { resolveRead = resolve; }); },
+    cancel() { cancelled++; return Promise.reject(new Error("cancel-private")); }, releaseLock() { released++; },
+  }) } }) });
+  const pending = adapter.synthesize({ input: "offline", signal: controller.signal, onPreparationDiagnostic: (event) => logs.push(event) });
+  for (let i = 0; i < 10; i++) await Promise.resolve();
+  controller.abort("RESPONSE_GENERATION_TIMEOUT");
+  const abort = logs.find((event) => event.phase === "PREPARATION_ABORT_REQUESTED");
+  assert.equal(abort.bytesReceived, partial ? 12 : 0); assert.equal(abort.chunkCount, partial ? 1 : 0);
+  assert.equal(logs.some((event) => event.phase === "OPERATION_SETTLED_AFTER_ABORT"), false);
+  resolveRead({ done: false, value: wav }); await assert.rejects(pending, { code: "TTS_ABORTED" });
+  assert.equal(cancelled, 1); assert.equal(released, 1);
+  assert.equal(logs.filter((event) => event.phase === "OPERATION_SETTLED_AFTER_ABORT").length, 1);
+  assert.equal(logs.some((event) => event.phase === "WAV_CONVERSION_STARTED"), false);
+});
+
+
+test("one thousand body chunks still emit only six adapter measurement events", async () => {
+  const wav = pcmWav(Buffer.alloc(1960)); const logs = []; let requests = 0;
+  const chunks = Array.from({ length: 1000 }, (_, index) => wav.subarray(Math.floor(index * wav.length / 1000), Math.floor((index + 1) * wav.length / 1000)));
+  const adapter = new OpenAISpeechAdapter({ apiKey: "offline", fetchFn: async () => {
+    requests++; return new Response(new ReadableStream({ start(controller) { for (const chunk of chunks) controller.enqueue(chunk); controller.close(); } }));
+  } });
+  const result = await adapter.synthesize({ input: "offline", onPreparationDiagnostic: (event) => logs.push(event) });
+  assert.deepEqual(result.audio, pcm24kToPcmu8k(extractPcm24kMonoFromWav(wav)));
+  assert.equal(requests, 1); assert.equal(logs.length, 6);
+  const completed = logs.find((event) => event.phase === "AUDIO_BODY_COMPLETED");
+  assert.equal(completed.chunkCount, 1000); assert.equal(completed.bytesReceived, wav.length);
+});
+
+
+test("real adapter measures delayed headers, first byte and inter-chunk idle intervals", async () => {
+  let time = 0; let reads = 0; let requests = 0; const logs = []; const wav = pcmWav(Buffer.alloc(960));
+  const slices = [wav.subarray(0, 12), wav.subarray(12, 44), wav.subarray(44)];
+  const adapter = new OpenAISpeechAdapter({ apiKey: "offline", monotonicNow: () => time, fetchFn: async () => {
+    requests++; time = 10;
+    return { ok: true, status: 200, body: { getReader: () => ({ read: async () => { time = [30, 60, 110, 120][reads]; return reads < slices.length ? { done: false, value: slices[reads++] } : { done: true }; }, releaseLock() {} }) } };
+  } });
+  const result = await adapter.synthesize({ input: "offline", onPreparationDiagnostic: (event) => logs.push(event) });
+  assert.equal(requests, 1); assert.equal(logs[1].elapsedMs, 10); assert.equal(logs[2].elapsedMs, 30);
+  const body = logs.find((event) => event.phase === "AUDIO_BODY_COMPLETED");
+  assert.equal(body.elapsedMs, 120); assert.equal(body.phaseElapsedMs, 90);
+  assert.equal(body.longestIdleMs, 50); assert.equal(body.chunkCount, 3); assert.equal(body.bytesReceived, wav.length);
+  assert.deepEqual(result.audio, pcm24kToPcmu8k(extractPcm24kMonoFromWav(wav)));
+  assert.equal(logs.length, 6);
+});
+
+
+for (const value of ["not-byte-data", {}, 42, null, new Uint16Array([1])]) test(`unsupported ${Object.prototype.toString.call(value)} body chunk fails before conversion even followed by WAV`, async () => {
+  const events = []; let reads = 0; let cancelled = 0; let released = 0; let requests = 0;
+  const adapter = new OpenAISpeechAdapter({ apiKey: "offline", fetchFn: async () => {
+    requests++; return { ok: true, status: 200, body: { getReader: () => ({
+      read: async () => reads >= 2 ? { done: true } : ({ done: false, value: reads++ === 0 ? value : pcmWav(Buffer.alloc(960)) }),
+      cancel() { cancelled++; return Promise.reject(new Error("private-cancel")); }, releaseLock() { released++; throw new Error("private-release"); },
+    }) } };
+  } });
+  await assert.rejects(adapter.synthesize({ input: "offline", onPreparationDiagnostic: (event) => events.push(event) }), (error) => {
+    // HEAD body-read errors are mapped to this reason by the session boundary.
+    const reason = ["TTS_EMPTY_AUDIO", "TTS_INVALID_AUDIO", "TTS_ABORTED"].includes(error.code) ? error.code : "TTS_ADAPTER_ERROR";
+    assert.equal(reason, "TTS_ADAPTER_ERROR"); assert.equal(error.diagnostic.failureClass, "UNKNOWN"); return true;
+  });
+  assert.equal(reads, 1); assert.equal(requests, 1); assert.equal(cancelled, 1); assert.equal(released, 1);
+  assert.equal(events.some((event) => event.phase === "WAV_CONVERSION_STARTED"), false);
+});
+
+for (const type of ["Uint8Array", "Buffer"]) test(`${type} byte chunks and empty chunks preserve complete audio and nonempty chunk counts`, async () => {
+  const events = []; const wav = pcmWav(Buffer.alloc(960));
+  const chunks = [new Uint8Array(0), type === "Buffer" ? wav : new Uint8Array(wav), new Uint8Array(0)];
+  const adapter = new OpenAISpeechAdapter({ apiKey: "offline", fetchFn: async () => new Response(new ReadableStream({ start(controller) { for (const chunk of chunks) controller.enqueue(chunk); controller.close(); } })) });
+  const result = await adapter.synthesize({ input: "offline", onPreparationDiagnostic: (event) => events.push(event) });
+  assert.deepEqual(result.audio, pcm24kToPcmu8k(extractPcm24kMonoFromWav(wav)));
+  const body = events.find((event) => event.phase === "AUDIO_BODY_COMPLETED");
+  assert.equal(body.bytesReceived, wav.length); assert.equal(body.chunkCount, 1); assert.equal(events.length, 6);
+});
+
+const diagnosticValues = [12, -1, NaN, Infinity, -Infinity, Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER + 2, 1.25, "12", undefined, null];
+for (const value of diagnosticValues) test(`numeric diagnostic boundaries ${String(value)} normalize the emitted object`, async () => {
+  const { SpeechPreparationDiagnostics } = await import("../../audio/SpeechPreparationDiagnostics.js");
+  const events = []; let time = 0;
+  const measurement = new SpeechPreparationDiagnostics({ observer: (event) => events.push(event), clock: () => time, context: { attempt: value, proposalVersion: value } });
+  time = value; measurement.headers(value); measurement.chunk(value); measurement.phase("AUDIO_BODY_COMPLETED");
+  const event = events.at(-1);
+  for (const key of ["elapsedMs", "phaseElapsedMs", "bytesReceived", "chunkCount", "longestIdleMs", "attempt", "proposalVersion", "providerStatus"]) {
+    const number = event[key]; assert.ok(number === null || (typeof number === "number" && Number.isFinite(number) && number >= 0 && number <= Number.MAX_SAFE_INTEGER), key);
+    if (!["elapsedMs", "phaseElapsedMs", "longestIdleMs"].includes(key)) assert.ok(number === null || Number.isSafeInteger(number), key);
+  }
+  const integer = typeof value === "number" && Number.isFinite(value) && value >= 0 && Number.isInteger(value);
+  assert.equal(event.proposalVersion, integer ? Math.min(value, Number.MAX_SAFE_INTEGER) : null);
+  assert.equal(event.attempt, integer && value > 0 ? Math.min(value, Number.MAX_SAFE_INTEGER) : null);
+  assert.equal(event.providerStatus, Number.isInteger(value) && value >= 100 && value <= 599 ? value : null);
+  if (value === 1.25) assert.equal(event.elapsedMs, 1.25);
+  if (["12", undefined, null].includes(value)) assert.equal(event.elapsedMs, null);
+});
+
+test("aggregate counters saturate diagnostically without stopping byte buffering", async () => {
+  const { SpeechPreparationDiagnostics, bufferSpeechBody } = await import("../../audio/SpeechPreparationDiagnostics.js");
+  const events = []; const measurement = new SpeechPreparationDiagnostics({ observer: (event) => events.push(event) });
+  measurement.chunk(Number.MAX_SAFE_INTEGER); measurement.chunk(1);
+  const wav = pcmWav(Buffer.alloc(960)); const response = new Response(wav);
+  assert.deepEqual(await bufferSpeechBody(response, undefined, measurement), wav);
+  measurement.phase("AUDIO_BODY_COMPLETED");
+  assert.equal(events.at(-1).bytesReceived, Number.MAX_SAFE_INTEGER); assert.equal(events.at(-1).chunkCount, 3);
 });

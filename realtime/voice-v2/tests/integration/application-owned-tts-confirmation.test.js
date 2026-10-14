@@ -244,7 +244,7 @@ for (const outcome of ["reject", "resolve"]) test(`local recovery precedes abort
   assert.equal(f.twilio.sent.filter((entry) => entry.event === "media").length, mediaCount);
   assert.equal(f.twilio.sent.filter((entry) => entry.event === "mark").length, markCount);
   assert.equal(mediaCount, 1); assert.equal(markCount, 1);
-  const settlement = logs.filter((entry) => entry.phase === "OPERATION_SETTLED_AFTER_ABORT");
+  const settlement = logs.filter((entry) => entry.event === "V2_TTS_HTTP_PHASE" && entry.phase === "OPERATION_SETTLED_AFTER_ABORT");
   assert.equal(settlement.length, 1); assert.equal(settlement[0].responseId, oldId);
   assert.equal(f.app.session.playbackRegistry.get(owner.markId).responseId, owner.responseId);
   await f.app.terminate("TEST_COMPLETE");

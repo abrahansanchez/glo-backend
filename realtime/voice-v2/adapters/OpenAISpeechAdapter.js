@@ -1,3 +1,4 @@
+import { SpeechPreparationDiagnostics, bufferSpeechBody } from "../audio/SpeechPreparationDiagnostics.js";
 import { extractPcm24kMonoFromWav, pcm24kToPcmu8k, speechAudioFormat } from "../audio/pcm24kToPcmu8k.js";
 
 const DEFAULT_ENDPOINT = "https://api.openai.com/v1/audio/speech";
@@ -23,7 +24,11 @@ export class OpenAISpeechAdapter {
 
   async synthesize(request = {}) {
     const trace = speechPhaseTrace(request, this.monotonicNow);
-    try { return await this.#synthesize(request, trace); }
+    const measurement = request.preparationDiagnostics || new SpeechPreparationDiagnostics({ observer: request.onPreparationDiagnostic, context: request.diagnosticContext, clock: this.monotonicNow });
+    const onAbort = () => measurement.abort(request.signal?.reason);
+    request.signal?.addEventListener("abort", onAbort, { once: true });
+    if (request.signal?.aborted) onAbort();
+    try { return await this.#synthesize(request, trace, measurement); }
     catch (error) {
       const diagnostic = sanitizeSpeechDiagnostic(error?.diagnostic);
       const context = request.diagnosticContext;
@@ -37,14 +42,15 @@ export class OpenAISpeechAdapter {
       try { request.onFailureDiagnostic?.(event); } catch { /* Diagnostics cannot change synthesis behavior. */ }
       throw error;
     }
-    finally { trace.settle(); }
+    finally { trace.settle(); measurement.settle(); request.signal?.removeEventListener("abort", onAbort); }
   }
 
-  async #synthesize({ input, language = "en", signal } = {}, trace) {
+  async #synthesize({ input, language = "en", signal } = {}, trace, measurement) {
     if (typeof input !== "string" || !input.trim()) throw new TypeError("speech_input_required");
     const startedAt = this.monotonicNow();
     let response;
     trace.phase("REQUEST_DISPATCH_STARTED");
+    measurement.phase("REQUEST_DISPATCH_STARTED");
     try {
       response = await this.fetchFn(this.endpoint, {
         method: "POST",
@@ -67,19 +73,27 @@ export class OpenAISpeechAdapter {
     }
 
     trace.headers(response?.status);
+    measurement.headers(response?.status);
+    if (signal?.aborted) {
+      try { Promise.resolve(response?.body?.cancel()).catch(() => {}); } catch {}
+      throw typedError("speech_request_aborted", "TTS_ABORTED", fetchDiagnostic(null, signal));
+    }
     if (!response?.ok) throw typedError(`speech_provider_http_${response?.status || "unknown"}`, "TTS_ADAPTER_ERROR", {
       providerStatus: response?.status, providerCode: await readProviderCode(response), ...httpClassification(response?.status),
     });
     let sourceAudio;
     trace.phase("AUDIO_BODY_READ_STARTED");
-    try { sourceAudio = Buffer.from(await response.arrayBuffer()); }
+    try { sourceAudio = await bufferSpeechBody(response, signal, measurement); }
     catch (error) { throw typedError("speech_provider_audio_read_failed", error?.code, fetchDiagnostic(error, signal)); }
     trace.phase("AUDIO_BODY_READ_COMPLETED");
+    measurement.phase("AUDIO_BODY_COMPLETED");
     if (!sourceAudio.length) throw typedError("speech_provider_empty_audio", "TTS_EMPTY_AUDIO", { failureClass: "EMPTY_AUDIO", transient: false });
+    measurement.phase("WAV_CONVERSION_STARTED");
     let audio;
     try { audio = pcm24kToPcmu8k(extractPcm24kMonoFromWav(sourceAudio)); }
     catch (error) { throw typedError("speech_provider_invalid_audio", error?.code, { failureClass: error?.code === "TTS_INVALID_AUDIO" ? "INVALID_AUDIO" : "UNKNOWN", transient: error?.code === "TTS_INVALID_AUDIO" ? false : null }); }
     trace.phase("WAV_CONVERSION_COMPLETED");
+    measurement.phase("WAV_CONVERSION_COMPLETED");
     const completedAt = this.monotonicNow();
     const latencyMs = Math.max(0, completedAt - startedAt);
 

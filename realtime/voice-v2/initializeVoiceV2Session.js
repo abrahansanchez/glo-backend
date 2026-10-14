@@ -1,3 +1,4 @@
+import { SpeechPreparationDiagnostics } from "./audio/SpeechPreparationDiagnostics.js";
 import { CallSession } from "./CallSession.js";
 import { LatencyDiagnostics } from "./diagnostics/LatencyDiagnostics.js";
 import { CallTrace } from "./diagnostics/CallTrace.js";
@@ -600,6 +601,7 @@ export function initializeVoiceV2Session({
       responseId, purpose: tracked.plan.purpose, proposalVersion: tracked.plan.proposalVersion,
       wording: tracked.plan.speechContract.requiredMessage, language: tracked.plan.language, deadlineMs: preparationBudget, deadlineAt: performance.now() + preparationBudget });
     tracked.preparation = state.preparation;
+    state.preparationDiagnostics = new SpeechPreparationDiagnostics({ observer: emit, context: { callSid, requestId: tracked.requestId, responseId, purpose: tracked.plan.purpose, proposalVersion: tracked.plan.proposalVersion, attempt: tracked.attempt } });
     // This callback does not join the serialized caller queue or persistence promise.
     session.watchdog.schedule(`preparation:${responseId}`, preparationBudget, () => failPreparation(state, "SPEECH_PREPARATION_TIMEOUT", true));
     timing.point("TTS_DISPATCH", timingDetails({ requestId: tracked.requestId, responseId }));
@@ -613,6 +615,7 @@ export function initializeVoiceV2Session({
       diagnosticContext: { callSid, buildSha, requestId: tracked.requestId, responseId, purpose: tracked.plan.purpose, proposalVersion: tracked.plan.proposalVersion, attempt: tracked.attempt },
       onFailureDiagnostic: safeEmit,
       onPhaseDiagnostic: safeEmit,
+      preparationDiagnostics: state.preparationDiagnostics,
     })).then(
       (result) => synthesizedConfirmationCompleted(responseId, result),
       (error) => synthesizedConfirmationFailed(responseId, error),
@@ -677,6 +680,7 @@ export function initializeVoiceV2Session({
     session.watchdog.cancel(`preparation:${state.responseId}`);
     session.responseRegistry.invalidate(state.responseId, reason);
     superseded.add(state.responseId);
+    state.preparationDiagnostics?.abort(timedOut ? "RESPONSE_GENERATION_TIMEOUT" : "ABORTED");
     state.abortController?.abort(timedOut ? "RESPONSE_GENERATION_TIMEOUT" : undefined);
     session.record("SPEECH_PREPARATION_INVALIDATED", { responseId: state.responseId, purpose: state.plan.purpose, reason, timedOut });
     return true;
@@ -838,6 +842,8 @@ export function initializeVoiceV2Session({
     if (!state.preparation) session.responseRegistry.complete(responseId, { validationResult: validation });
     if (state.transcript != null) {
       const persistenceTiming = timing.start("TRANSCRIPT_PERSISTENCE", { ...timingDetails({ responseId }), turnId: `${responseId}:assistant`, role: "assistant" });
+      state.preparationDiagnostics?.pending();
+      state.preparationDiagnostics?.phase("ASSISTANT_PERSISTENCE_STARTED");
       try {
         const persisted = await lifecycle.appendTurn({ turnId: `${responseId}:assistant`, role: "assistant", text: state.transcript, timestamp: now() });
         emitPersistenceOutcome({ turnId: `${responseId}:assistant`, role: "assistant", itemId: state.assistantItemId, responseId, characterCount: state.transcript.length, result: persisted });
@@ -846,7 +852,11 @@ export function initializeVoiceV2Session({
         emitPersistenceOutcome({ turnId: `${responseId}:assistant`, role: "assistant", itemId: state.assistantItemId, responseId, characterCount: state.transcript.length, error });
         if (state.preparation) return failPreparation(state, "ASSISTANT_PERSISTENCE_FAILED");
         throw error;
-      } finally { timing.end("TRANSCRIPT_PERSISTENCE", persistenceTiming, { ...timingDetails({ responseId }), turnId: `${responseId}:assistant`, role: "assistant" }); }
+      } finally {
+        state.preparationDiagnostics?.phase("ASSISTANT_PERSISTENCE_COMPLETED");
+        state.preparationDiagnostics?.settle();
+        timing.end("TRANSCRIPT_PERSISTENCE", persistenceTiming, { ...timingDetails({ responseId }), turnId: `${responseId}:assistant`, role: "assistant" });
+      }
     }
     if (state.preparation) {
       if (performance.now() >= state.preparation.identity.deadlineAt) return failPreparation(state, "SPEECH_PREPARATION_TIMEOUT", true);
@@ -861,6 +871,7 @@ export function initializeVoiceV2Session({
       if (state.preparation) {
         state.preparation.submitted();
         session.watchdog.cancel(`preparation:${responseId}`);
+        state.preparationDiagnostics?.phase("FIRST_MEDIA_SUBMITTED");
       }
       timing.once("FIRST_TWILIO_AUDIO_SUBMITTED", responseId, timingDetails({ responseId }));
       callTrace.recordTwilioAudio(timingDetails({ responseId }));
