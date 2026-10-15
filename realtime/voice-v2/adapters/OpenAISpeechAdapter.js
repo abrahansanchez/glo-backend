@@ -55,10 +55,12 @@ export class OpenAISpeechAdapter {
     finally { trace.settle(); measurement.settle(); request.signal?.removeEventListener("abort", onAbort); close(); }
   }
 
-  async #synthesize({ input, language = "en", signal } = {}, trace, measurement, transport) {
+  async #synthesize({ input, language = "en", signal, clientRequestId: directClientRequestId, lifecycleDiagnostics } = {}, trace, measurement, transport) {
     if (typeof input !== "string" || !input.trim()) throw new TypeError("speech_input_required");
+    const clientRequestId = lifecycleDiagnostics ? lifecycleDiagnostics.clientRequestId : directClientRequestId;
     const startedAt = this.monotonicNow();
     let response;
+    let fetchInvoked = false;
     trace.phase("REQUEST_DISPATCH_STARTED");
     measurement.phase("REQUEST_DISPATCH_STARTED");
     try {
@@ -67,6 +69,7 @@ export class OpenAISpeechAdapter {
         headers: {
           Authorization: `Bearer ${this.apiKey}`,
           "Content-Type": "application/json",
+          ...(typeof clientRequestId === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(clientRequestId) ? { "X-Client-Request-Id": clientRequestId } : {}),
         },
         body: JSON.stringify({
           model: this.model,
@@ -76,17 +79,25 @@ export class OpenAISpeechAdapter {
         }),
         signal,
       };
-      if (this.fetchFn) response = await this.fetchFn(this.endpoint, options);
+      if (this.fetchFn) {
+        fetchInvoked = true;
+        lifecycleDiagnostics?.phase("FETCH_INVOCATION_STARTED", { inputCharacterCount: input.length });
+        response = await this.fetchFn(this.endpoint, options);
+      }
       else {
         transport.agent = this.agentFactory();
+        fetchInvoked = true;
+        lifecycleDiagnostics?.phase("FETCH_INVOCATION_STARTED", { inputCharacterCount: input.length });
         response = await speechFetch(this.endpoint, { ...options, dispatcher: transport.agent });
       }
     } catch (error) {
+      if (fetchInvoked) lifecycleDiagnostics?.phase("FETCH_REJECTED", { errorCode: error?.cause?.code ?? error?.code });
       const diagnostic = fetchDiagnostic(error, signal);
       if (signal?.aborted || error?.name === "AbortError") throw typedError("speech_request_aborted", "TTS_ABORTED", diagnostic);
       throw typedError("speech_provider_request_failed", "TTS_ADAPTER_ERROR", diagnostic);
     }
 
+    lifecycleDiagnostics?.resolved(response);
     trace.headers(response?.status);
     measurement.headers(response?.status);
     if (signal?.aborted) {

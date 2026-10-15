@@ -1,7 +1,9 @@
-export function preparationDeadlineMs(value) {
+export function resolvePreparationDeadline(value) {
   const number = typeof value === "number" ? value : typeof value === "string" && value.trim() ? Number(value) : NaN;
-  return Number.isInteger(number) && number >= 1000 && number <= 10000 ? number : 5000;
+  const valid = Number.isInteger(number) && number >= 1000 && number <= 10000;
+  return Object.freeze({ preparationBudgetMs: valid ? number : 5000, budgetSource: valid ? "env" : "fallback" });
 }
+export function preparationDeadlineMs(value) { return resolvePreparationDeadline(value).preparationBudgetMs; }
 
 export class SpeechPreparation {
   #state = Object.freeze({ status: "PREPARING", cancelled: false, timedOut: false, reason: null });

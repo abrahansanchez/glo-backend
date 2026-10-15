@@ -1,4 +1,5 @@
-import { SpeechPreparationDiagnostics } from "./audio/SpeechPreparationDiagnostics.js";
+import { randomUUID } from "node:crypto";
+import { SpeechPreparationDiagnostics, SpeechLifecycleDiagnostics } from "./audio/SpeechPreparationDiagnostics.js";
 import { CallSession } from "./CallSession.js";
 import { LatencyDiagnostics } from "./diagnostics/LatencyDiagnostics.js";
 import { CallTrace } from "./diagnostics/CallTrace.js";
@@ -19,7 +20,7 @@ import { SharedSmsAdapter } from "./adapters/SharedSmsAdapter.js";
 import { SharedTranscriptAdapter } from "./adapters/SharedTranscriptAdapter.js";
 import { FloorPurpose, FloorState } from "./lifecycle/FloorOwner.js";
 import { PlaybackStatus } from "./lifecycle/PlaybackRegistry.js";
-import { SpeechPreparation, preparationDeadlineMs } from "./lifecycle/SpeechPreparation.js";
+import { SpeechPreparation, resolvePreparationDeadline } from "./lifecycle/SpeechPreparation.js";
 import { LocalRecoveryAudioAdapter } from "./adapters/LocalRecoveryAudioAdapter.js";
 
 const STARTUP_AUDIO_MAX_FRAMES = 500;
@@ -49,7 +50,8 @@ export function initializeVoiceV2Session({
   requireSessionInputs({ callSid, callerNumber, businessContext, buildSha, twilioSocket, openaiSocketFactory });
   let lifecycle; let consentDiagnostics; let processing = Promise.resolve(); let effectsProcessing = Promise.resolve(); let turnSequence = 0; let responseSequence = 0; let markSequence = 0; let twilioStarted = false; let openaiSessionCreated = false; let openaiConfigured = false; let initialGreetingRequested = false; let callerTurnSeen = false; let lastAcknowledgedState = null; let transcriptionLanguage = openaiSession.input_audio_transcription?.language || null; let languageUpdateAttempted = false;
   const providerTurns = new Set(); const requests = new Map(); const responses = new Map(); const marks = new Map(); const superseded = new Set(); const ambiguityPurposes = []; const startupAudio = []; let startupAudioBytes = 0; let callTerminationRequested = false;
-  const preparationBudget = preparationDeadlineMs(speechPreparationTimeoutMs);
+  const preparationConfiguration = resolvePreparationDeadline(speechPreparationTimeoutMs);
+  const preparationBudget = preparationConfiguration.preparationBudgetMs;
   let localRecoveryStarted = false;
   const safeEmit = (event) => { try { emit(event); } catch { /* Logging cannot terminate a call. */ } };
   try { localRecoveryAudioAdapter.prepare?.(); }
@@ -592,18 +594,23 @@ export function initializeVoiceV2Session({
 
   function requestSynthesizedConfirmation(tracked) {
     const responseId = `${tracked.requestId}:tts`;
+    const clientRequestId = randomUUID();
     const abortController = new AbortController();
     tracked.responseId = responseId;
     tracked.abortController = abortController;
     const state = registerResponseState(tracked, responseId, "application_tts");
     state.abortController = abortController;
-    state.preparation = new SpeechPreparation({ preparationId: `${responseId}:preparation`, callSid, buildSha, requestId: tracked.requestId,
+    const preparationCreatedAt = performance.now();
+    state.preparation = new SpeechPreparation({ preparationId: `${responseId}:preparation`, callSid, buildSha, requestId: tracked.requestId, clientRequestId,
       responseId, purpose: tracked.plan.purpose, proposalVersion: tracked.plan.proposalVersion,
-      wording: tracked.plan.speechContract.requiredMessage, language: tracked.plan.language, deadlineMs: preparationBudget, deadlineAt: performance.now() + preparationBudget });
+      wording: tracked.plan.speechContract.requiredMessage, language: tracked.plan.language, deadlineMs: preparationBudget, deadlineAt: preparationCreatedAt + preparationBudget });
     tracked.preparation = state.preparation;
     state.preparationDiagnostics = new SpeechPreparationDiagnostics({ observer: emit, context: { callSid, requestId: tracked.requestId, responseId, purpose: tracked.plan.purpose, proposalVersion: tracked.plan.proposalVersion, attempt: tracked.attempt } });
+    state.lifecycleDiagnostics = new SpeechLifecycleDiagnostics({ observer: emit, configuration: preparationConfiguration, createdAt: preparationCreatedAt, signal: abortController.signal,
+      context: { callSid, requestId: tracked.requestId, responseId, purpose: tracked.plan.purpose, proposalVersion: tracked.plan.proposalVersion, language: tracked.plan.language, clientRequestId } });
     // This callback does not join the serialized caller queue or persistence promise.
     session.watchdog.schedule(`preparation:${responseId}`, preparationBudget, () => failPreparation(state, "SPEECH_PREPARATION_TIMEOUT", true));
+    state.lifecycleDiagnostics.phase("PREPARATION_CREATED");
     timing.point("TTS_DISPATCH", timingDetails({ requestId: tracked.requestId, responseId }));
     timing.point("RESPONSE_CREATE_DISPATCH", timingDetails({ requestId: tracked.requestId, responseId }));
     callTrace.entry("SPEECH_SYNTHESIS_DISPATCHED", { ...timingDetails({ requestId: tracked.requestId, responseId }), attempt: tracked.attempt });
@@ -612,6 +619,7 @@ export function initializeVoiceV2Session({
       input: state.preparation.identity.wording,
       language: state.preparation.identity.language,
       signal: abortController.signal,
+      lifecycleDiagnostics: state.lifecycleDiagnostics,
       diagnosticContext: { callSid, buildSha, requestId: tracked.requestId, responseId, purpose: tracked.plan.purpose, proposalVersion: tracked.plan.proposalVersion, attempt: tracked.attempt },
       onFailureDiagnostic: safeEmit,
       onPhaseDiagnostic: safeEmit,
@@ -682,6 +690,7 @@ export function initializeVoiceV2Session({
     superseded.add(state.responseId);
     state.preparationDiagnostics?.abort(timedOut ? "RESPONSE_GENERATION_TIMEOUT" : "ABORTED");
     state.abortController?.abort(timedOut ? "RESPONSE_GENERATION_TIMEOUT" : undefined);
+    state.lifecycleDiagnostics?.abort(state.preparation.snapshot.reason ?? state.abortController?.signal.reason);
     session.record("SPEECH_PREPARATION_INVALIDATED", { responseId: state.responseId, purpose: state.plan.purpose, reason, timedOut });
     return true;
   }

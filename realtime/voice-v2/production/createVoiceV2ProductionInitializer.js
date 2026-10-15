@@ -20,7 +20,10 @@ export function createVoiceV2ProductionInitializer({
   findBarberById = (barberId) => Barber.findById(barberId).lean(),
   smsServiceDependencies = {},
   speechAdapter,
-  emit = (event) => console.log(event),
+  emit = (event) => {
+    if (event?.event !== "V2_SPEECH_LIFECYCLE") return console.log(event);
+    try { console.log(JSON.stringify(event)); } catch { /* Diagnostic output cannot affect the call. */ }
+  },
 } = {}) {
   const approvedBusinessId = String(env.VOICE_V2_TEST_BUSINESS_ID || "").trim();
 

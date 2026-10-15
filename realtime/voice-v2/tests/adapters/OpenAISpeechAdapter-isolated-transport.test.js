@@ -1,5 +1,6 @@
 ﻿import test from "node:test";
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import { execFileSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
@@ -69,7 +70,8 @@ for (const mode of cases) test(`HEAD/package-fetch compatibility: ${mode}`, { ti
   });
   try {
     const before = await outcome(HeadAdapter, f.endpoint);
-    const after = await outcome(OpenAISpeechAdapter, f.endpoint, { agentFactory: factory(records) });
+    const clientRequestId = randomUUID();
+    const after = await outcome(OpenAISpeechAdapter, f.endpoint, { agentFactory: factory(records) }, { clientRequestId });
     assert.deepEqual(after, before);
     if (after.success) assert.equal(after.bytes, wav().length);
     assert.equal(records.length, 1); assert.equal(records[0].closes, 1); await records[0].closePromise;
@@ -91,9 +93,9 @@ for (const mode of cases) test(`HEAD/package-fetch compatibility: ${mode}`, { ti
       assert.deepEqual(JSON.parse(b.body), { model: "gpt-4o-mini-tts", voice: "alloy", input: input.input, response_format: "wav" });
       assert.equal(a.headers.authorization, b.headers.authorization); assert.equal(a.headers["content-type"], b.headers["content-type"]);
       const { "user-agent": oldUA, ...oldHeaders } = a.headers;
-      const { "user-agent": newUA, ...newHeaders } = b.headers;
+      const { "user-agent": newUA, "x-client-request-id": actualClientRequestId, ...newHeaders } = b.headers;
+      assert.equal(actualClientRequestId, clientRequestId);
       assert.deepEqual(newHeaders, oldHeaders);
-      if (mode === "plain") console.log(JSON.stringify({ wireHeaders: { HEAD: a.headers, PATCH: b.headers }, userAgentDifference: { HEAD: oldUA, PATCH: newUA } }));
     }
   } finally { await f.close(); await target.close(); }
 });

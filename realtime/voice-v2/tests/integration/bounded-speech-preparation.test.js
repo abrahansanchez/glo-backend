@@ -20,7 +20,7 @@ async function settle(app) { for (let i = 0; i < 20; i++) { await Promise.resolv
 const audio = () => ({ format: "audio/pcmu", audio: Buffer.alloc(160, 0x7f) });
 let sequence = 0;
 async function fixture({ synthesize = async () => audio(), persist = async () => ({ success: true }), language = "en", proposal = null,
-  recovery = localRecoveryFixture(), speechAdapter = null, deadline = undefined } = {}) {
+  recovery = localRecoveryFixture(), speechAdapter = null, deadline = undefined, lifecycleObserver = null } = {}) {
   const scheduler = clock(); const logs = []; const calls = []; const counters = { availability: 0, booking: 0, sms: 0 }; const finalized = [];
   const twilio = new FakeSocket(); const openai = new FakeSocket(); openai.readyState = 0;
   const callSid = `CA-preparation-${++sequence}`; const streamSid = `MZ-${callSid}`;
@@ -33,7 +33,9 @@ async function fixture({ synthesize = async () => audio(), persist = async () =>
     bookingAdapter: { createAppointment: async () => { counters.booking++; return { success: true, appointmentId: "durable-test-appointment" }; } },
     smsAdapter: { sendAppointmentConfirmation: async () => { counters.sms++; return { success: true }; } },
     transcriptAdapter: { appendTurn: persist, finalizeCall: async (request) => { finalized.push(request); return { success: true }; } },
-    turnContext: { language, referenceDate: "2026-10-12", availableServices: [{ canonical: "Haircut", aliases: ["corte de pelo"] }] }, emit: (entry) => logs.push(entry) });
+    turnContext: { language, referenceDate: "2026-10-12", availableServices: [{ canonical: "Haircut", aliases: ["corte de pelo"] }] }, emit: (entry) => {
+      logs.push(entry); return entry.event === "V2_SPEECH_LIFECYCLE" ? lifecycleObserver?.(entry) : undefined;
+    } });
   openai.open(); twilio.receive({ event: "start", start: { callSid, streamSid } }); openai.receive({ type: "session.created" }); await settle(app);
   openai.receive({ type: "session.updated" }); await settle(app);
   const greeting = openai.sent.find((entry) => entry.type === "response.create");
@@ -45,6 +47,7 @@ async function fixture({ synthesize = async () => audio(), persist = async () =>
   return { app, scheduler, twilio, openai, streamSid, calls, counters, logs, finalized };
 }
 const media = (f) => f.twilio.sent.filter((entry) => entry.event === "media");
+const lifecycleEvents = f => f.logs.filter(event => event.event === "V2_SPEECH_LIFECYCLE");
 const marks = (f) => f.twilio.sent.filter((entry) => entry.event === "mark");
 async function request(f, purpose = ResponsePurpose.ASK_SERVICE) { await f.app.requestResponse(planResponse({ proposal: f.app.session.proposal, purpose, language: f.app.session.conversationLanguage.currentLanguage })); await settle(f.app); }
 async function acknowledge(f) { f.twilio.receive({ event: "mark", streamSid: f.streamSid, mark: marks(f).at(-1).mark }); await settle(f.app); }
@@ -367,6 +370,81 @@ test("simultaneous real Speech calls isolate aggregate counters and preparation 
 });
 
 
+test("lifecycle UUID is final at preparation creation and matches the one HTTP header", async () => {
+  const fetches = [];
+  const f = await fixture({ deadline: "1000", speechAdapter: new OpenAISpeechAdapter({ apiKey: "offline", fetchFn: async (_url, options) => {
+    fetches.push(options); return new Response(measurementWav(), { headers: { "x-request-id": "req_local-1" } });
+  } }) });
+  await request(f);
+  const events = lifecycleEvents(f);
+  assert.deepEqual(events.map(e => e.phase), ["PREPARATION_CREATED", "FETCH_INVOCATION_STARTED", "FETCH_RESOLVED"]);
+  assert.match(events[0].clientRequestId, /^[0-9a-f-]{36}$/);
+  assert.equal(events[0].preparationBudgetMs, 1000); assert.equal(events[0].budgetSource, "env");
+  assert.equal(events[2].providerRequestId, "req_local-1");
+  for (const event of events) assert.equal(event.clientRequestId, fetches[0].headers["X-Client-Request-Id"]);
+  assert.equal(f.scheduler.active(1000).length, 0); assert.equal(media(f).length, 1);
+  await f.app.terminate("TEST_DONE");
+  assert.equal(lifecycleEvents(f).length, 3, "submitted preparation does not acquire a spurious abort");
+});
+
+test("independent deadline records abort before late rejection and never resubmits audio", async () => {
+  const pending = deferred();
+  const f = await fixture({ speechAdapter: new OpenAISpeechAdapter({ apiKey: "offline", fetchFn: () => pending.promise }) });
+  await request(f); f.scheduler.fire(5000); await settle(f.app);
+  const events = lifecycleEvents(f);
+  assert.deepEqual(events.map(e => e.phase), ["PREPARATION_CREATED", "FETCH_INVOCATION_STARTED", "ABORT_OBSERVED"]);
+  assert.equal(events[2].abortReason, "SPEECH_PREPARATION_TIMEOUT"); assert.equal(events[2].signalAborted, true);
+  assert.equal(media(f).length, 1);
+  pending.reject(Object.assign(new Error("private error"), { code: "ECONNRESET" })); await settle(f.app);
+  assert.deepEqual(lifecycleEvents(f).map(e => e.phase), [...events.map(e => e.phase), "FETCH_REJECTED"]);
+  assert.equal(media(f).length, 1); assert.equal(marks(f).length, 1);
+  await f.app.terminate("TEST_DONE");
+});
+
+test("invalidation before adapter entry is correlated before an already-aborted fetch invocation", async () => {
+  let f;
+  const adapter = new OpenAISpeechAdapter({ apiKey: "offline", fetchFn: () => { throw new DOMException("private", "AbortError"); } });
+  f = await fixture({ synthesize: request => { f.scheduler.fire(5000); return adapter.synthesize(request); } });
+  await request(f);
+  const events = lifecycleEvents(f);
+  assert.deepEqual(events.map(e => e.phase), ["PREPARATION_CREATED", "ABORT_OBSERVED", "FETCH_INVOCATION_STARTED", "FETCH_REJECTED"]);
+  assert.equal(events[2].signalAborted, true);
+  assert.equal(new Set(events.map(e => e.clientRequestId)).size, 1);
+  assert.equal(media(f).length, 1); await f.app.terminate("TEST_DONE");
+});
+
+for (const mode of ["throws", "rejects", "pending"]) test(`lifecycle observer ${mode} preserves delivery, recovery and deadline ownership`, { timeout: 3000 }, async () => {
+  let fetches = 0;
+  const f = await fixture({ deadline: 1000, lifecycleObserver: () => {
+    if (mode === "throws") throw new Error("private observer");
+    if (mode === "rejects") return Promise.reject(new Error("private observer"));
+    return new Promise(() => {});
+  }, speechAdapter: new OpenAISpeechAdapter({ apiKey: "offline", fetchFn: async () => { fetches++; return new Response(measurementWav()); } }) });
+  await request(f); assert.equal(fetches, 1); assert.equal(media(f).length, 1); assert.equal(marks(f).length, 1);
+  assert.equal(f.scheduler.active(1000).length, 0);
+  assert.equal(f.app.session.journal().some(e => e.event === "LOCAL_RECOVERY_SUBMITTED"), false);
+  assert.deepEqual(f.counters, { availability: 0, booking: 0, sms: 0 });
+  await f.app.terminate("TEST_DONE");
+});
+
+test("concurrent sessions isolate lifecycle IDs, UUIDs, detailed abort reasons and late failures", async () => {
+  const first = deferred(), second = deferred();
+  const a = await fixture({ speechAdapter: new OpenAISpeechAdapter({ apiKey: "offline", fetchFn: () => first.promise }) });
+  const b = await fixture({ language: "es", speechAdapter: new OpenAISpeechAdapter({ apiKey: "offline", fetchFn: () => second.promise }) });
+  await Promise.all([request(a), request(b)]);
+  a.scheduler.fire(5000); await settle(a.app);
+  b.openai.receive({ type: "input_audio_buffer.speech_started", item_id: "caller-b" }); await settle(b.app);
+  const ea = lifecycleEvents(a), eb = lifecycleEvents(b);
+  assert.equal(ea.at(-1).abortReason, "SPEECH_PREPARATION_TIMEOUT"); assert.equal(eb.at(-1).abortReason, "CALLER_INTERRUPTION");
+  for (const field of ["callSid", "requestId", "responseId", "clientRequestId"]) assert.notEqual(ea[0][field], eb[0][field]);
+  assert.equal(ea[0].language, "en"); assert.equal(eb[0].language, "es");
+  first.reject(new DOMException("private", "AbortError")); second.reject(new DOMException("private", "AbortError"));
+  await Promise.all([settle(a.app), settle(b.app)]);
+  for (const f of [a, b]) { const events = lifecycleEvents(f); assert.equal(new Set(events.map(e => e.clientRequestId)).size, 1); assert.equal(events.filter(e => e.phase === "FETCH_REJECTED").length, 1); }
+  assert.equal(media(a).length, 1); assert.equal(media(b).length, 0);
+  await Promise.all([a.app.terminate("TEST_DONE"), b.app.terminate("TEST_DONE")]);
+});
+
 for (const phase of ["headers", "body", "persistence"]) test(`caller cancellation during measured ${phase} requests abort without recovery`, async () => {
   const pending = deferred(); let requests = 0;
   const adapter = new OpenAISpeechAdapter({ apiKey: "offline", fetchFn: async () => {
@@ -380,6 +458,9 @@ for (const phase of ["headers", "body", "persistence"]) test(`caller cancellatio
   f.openai.receive({ type: "input_audio_buffer.speech_started", item_id: "measured-caller" }); await settle(f.app);
   const abort = preparationPhases(f).find((event) => event.phase === "PREPARATION_ABORT_REQUESTED");
   assert.equal(abort.reason, "ABORTED"); assert.equal(media(f).length, 0); assert.equal(marks(f).length, 0);
+  const correlatedAbort = lifecycleEvents(f).find(event => event.phase === "ABORT_OBSERVED");
+  assert.equal(correlatedAbort.abortReason, "CALLER_INTERRUPTION");
+  assert.equal(correlatedAbort.providerStatus, phase === "headers" ? null : 200);
   assert.equal(f.app.session.floorOwner.snapshot.state, "LISTEN"); assert.equal(requests, 1);
   if (phase === "headers") pending.resolve(new Response(measurementWav()));
   if (phase === "persistence") pending.resolve({ success: true });

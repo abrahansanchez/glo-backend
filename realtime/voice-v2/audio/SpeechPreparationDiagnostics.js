@@ -67,6 +67,59 @@ export class SpeechPreparationDiagnostics {
   }
 }
 
+const LIFECYCLE_PHASES = new Set(["PREPARATION_CREATED", "FETCH_INVOCATION_STARTED", "FETCH_RESOLVED", "FETCH_REJECTED", "ABORT_OBSERVED"]);
+const codeToken = value => typeof value === "string" && /^[A-Z0-9_]{3,40}$/.test(value);
+const clientId = value => typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value) ? value : null;
+// Existing internal invalidation reasons, not a new abort-source classification.
+const FIXED_ABORT_REASONS = new Set([
+  "SPEECH_PREPARATION_TIMEOUT", "SPEECH_PREPARATION_FAILED", "TTS_INVALID_AUDIO", "TTS_EMPTY_AUDIO", "TTS_ABORTED", "TTS_ADAPTER_ERROR",
+  "ASSISTANT_PERSISTENCE_FAILED", "PREPARATION_OWNER_MISMATCH", "STALE_PROPOSAL", "NO_AUDIO", "CALLER_INTERRUPTION", "PROPOSAL_CHANGED",
+  "CONTROLLED_RECOVERY", "CALL_TERMINATED", "RESPONSE_FAILED", "RESPONSE_CANCELLED", "RESPONSE_GENERATION_TIMEOUT",
+  "unsupported_purpose", "missing_transcript", "application_owned_speech_mismatch", "application_owned_confirmation_mismatch",
+  "application_owned_reprompt_mismatch", "terminal_recovery_contract_mismatch", "premature_booking_claim", "unsupported_time_claim",
+  "unsupported_availability_operation_claim", "unsupported_availability_result_claim", "premature_success", "missing_confirmation_question",
+  "missing_name", "service_extraction_failed", "service_mismatch", "conflicting_service", "date_extraction_failed", "date_mismatch",
+  "conflicting_date", "time_extraction_failed", "missing_expected_time", "conflicting_time",
+]);
+const abortReason = value => FIXED_ABORT_REASONS.has(value) ? codeToken(value) ? value : null : value == null ? null : "OTHER";
+
+export class SpeechLifecycleDiagnostics {
+  #observer; #context; #configuration; #origin; #clock; #signal; #seen = new Set(); #elapsed = 0; #status = null;
+  constructor({ observer, context = {}, configuration, createdAt, clock = () => performance.now(), signal }) {
+    this.#observer = observer; this.#configuration = configuration; this.#origin = createdAt; this.#clock = clock; this.#signal = signal;
+    this.#context = Object.freeze({ callSid: identifier(context.callSid), requestId: identifier(context.requestId), responseId: identifier(context.responseId),
+      purpose: identifier(context.purpose), proposalVersion: integer(context.proposalVersion), language: ["en", "es"].includes(context.language) ? context.language : null,
+      clientRequestId: clientId(context.clientRequestId) });
+  }
+  get clientRequestId() { return this.#context.clientRequestId; }
+  phase(phase, details = {}) {
+    try {
+      if (!LIFECYCLE_PHASES.has(phase) || this.#seen.has(phase)) return;
+      this.#seen.add(phase);
+      this.#elapsed = Math.max(this.#elapsed, interval(this.#clock(), this.#origin) ?? this.#elapsed);
+      if (phase === "FETCH_RESOLVED") this.#status = httpStatus(details.providerStatus);
+      const event = Object.freeze({ event: "V2_SPEECH_LIFECYCLE", ...this.#context, phase,
+        elapsedMs: this.#elapsed, preparationBudgetMs: this.#configuration.preparationBudgetMs,
+        remainingBudgetMs: Math.max(0, this.#configuration.preparationBudgetMs - this.#elapsed),
+        ...(phase === "PREPARATION_CREATED" ? { budgetSource: this.#configuration.budgetSource } : {}),
+        signalAborted: this.#signal?.aborted === true, providerStatus: this.#status,
+        providerRequestId: phase === "FETCH_RESOLVED" && typeof details.providerRequestId === "string" && /^[A-Za-z0-9_.:-]{1,128}$/.test(details.providerRequestId) ? details.providerRequestId : null,
+        errorCode: codeToken(details.errorCode) ? details.errorCode : null,
+        abortReason: phase === "ABORT_OBSERVED" ? abortReason(details.abortReason) : null,
+        ...(phase === "FETCH_INVOCATION_STARTED" ? { inputCharacterCount: integer(details.inputCharacterCount) } : {}),
+      });
+      Promise.resolve(this.#observer?.(event)).catch(() => {});
+    } catch { /* Diagnostic observers and metadata never own synthesis. */ }
+  }
+  resolved(response) {
+    let providerRequestId = null, providerStatus = null;
+    try { providerStatus = response?.status; } catch { /* A diagnostic cannot change response handling. */ }
+    try { providerRequestId = response?.headers?.get("x-request-id"); } catch { /* No other header is inspected. */ }
+    this.phase("FETCH_RESOLVED", { providerStatus, providerRequestId });
+  }
+  abort(reason) { this.phase("ABORT_OBSERVED", { abortReason: reason }); }
+}
+
 export async function bufferSpeechBody(response, signal, measurement) {
   // Compatibility for injected fetch implementations without a Web ReadableStream.
   if (!response.body?.getReader) {
