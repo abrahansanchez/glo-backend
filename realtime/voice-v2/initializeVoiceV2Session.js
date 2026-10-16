@@ -4,6 +4,7 @@ import { CallSession } from "./CallSession.js";
 import { LatencyDiagnostics } from "./diagnostics/LatencyDiagnostics.js";
 import { CallTrace } from "./diagnostics/CallTrace.js";
 import { ConsentBoundaryDiagnostics } from "./diagnostics/ConsentBoundaryDiagnostics.js";
+import { TurnOrderDiagnostics } from "./diagnostics/TurnOrderDiagnostics.js";
 import { VoiceCoordinator } from "./VoiceCoordinator.js";
 import { BookingRequirement, createBookingProposal, deriveBookingRequirement, deriveSlotKey } from "./domain/BookingProposal.js";
 import { applyAvailabilityResult, applySchedulingSearchResult } from "./domain/BookingLifecycleTransitions.js";
@@ -94,6 +95,8 @@ export function initializeVoiceV2Session({
     CONFIRMATION_REJECTED: async () => ({ success: true }),
   };
   const session = new CallSession({ callSid, buildSha, proposal, businessContext, effectHandlers, watchdogOptions: scheduler, preferredLanguage: turnContext.language || "en", recordObserver: observeSessionRecord });
+  const turnOrderDiagnostics = new TurnOrderDiagnostics({ callSid, streamSid: () => twilio.identity.streamSid,
+    clock: () => callTrace.stamp().elapsedMs, activeSnapshot: () => session.turnRegistry.activeSpeechSnapshot(), observer: emit });
   consentDiagnostics = new ConsentBoundaryDiagnostics({
     trace: callTrace,
     preferredLanguage: session.conversationLanguage.preferredLanguage,
@@ -106,7 +109,7 @@ export function initializeVoiceV2Session({
   });
   function observeConsent(method, ...args) { try { return consentDiagnostics?.[method]?.(...args); } catch { /* Diagnostics cannot affect a call. */ } }
   const twilio = new TwilioMediaAdapter({ socket: twilioSocket, onEvent: (event) => receive(event, onTwilio) });
-  const openai = new OpenAIRealtimeAdapter({ socketFactory: openaiSocketFactory, onEvent: (event) => receive(event, onOpenAI) });
+  const openai = new OpenAIRealtimeAdapter({ socketFactory: openaiSocketFactory, onEvent: (event) => receive(event, onOpenAI), onTurnOrderMetadata: metadata => turnOrderDiagnostics.observe(metadata) });
   lifecycle = new SessionLifecycle({ session, transcriptAdapter, callerNumber, cleanup });
   session.record("V2_SESSION_STARTED", { proposalVersion: proposal.proposalVersion });
   session.record("BUSINESS_CONTEXT_BOUND", { businessId: businessContext.businessId, barberId: businessContext.barberId });
@@ -282,14 +285,17 @@ export function initializeVoiceV2Session({
   async function acceptTurn(event) {
     const providerId = event.itemId || event.eventId;
     if (session.floorOwner.snapshot.category === FloorPurpose.EXIT) {
+      turnOrderDiagnostics.admission(event, "REJECTED", "EXIT_CALLER_SPEECH_OBSERVED");
       session.record("EXIT_CALLER_SPEECH_OBSERVED", { itemId: providerId || null, proposalVersion: session.proposal.proposalVersion });
       return;
     }
     if (lifecycle.terminated || session.proposal.terminal || session.ambiguityRecovery.limitReached) {
+      turnOrderDiagnostics.admission(event, "REJECTED", lifecycle.terminated ? "CALL_TERMINATED" : session.proposal.terminal ? "PROPOSAL_TERMINAL" : "AMBIGUITY_LIMIT_REACHED");
       observeConsent("admission", providerId, { status: "REJECTED", reason: lifecycle.terminated ? "CALL_TERMINATED" : session.proposal.terminal ? "PROPOSAL_TERMINAL" : "AMBIGUITY_LIMIT_REACHED" });
       return;
     }
     if (!providerId || providerTurns.has(providerId)) {
+      turnOrderDiagnostics.admission(event, "STALE", !providerId ? "MISSING_ITEM_ID" : "DUPLICATE_ITEM_ID");
       observeConsent("admission", providerId, { status: "STALE", reason: !providerId ? "MISSING_ITEM_ID" : "DUPLICATE_ITEM_ID" });
       return;
     }
@@ -298,6 +304,8 @@ export function initializeVoiceV2Session({
     const turnId = `${callSid}:turn:${++turnSequence}`;
     observeConsent("admission", providerId, { status: event.transcript.trim() ? "ACCEPTED" : "EMPTY", reason: event.transcript.trim() ? "TURN_ACCEPTED" : "EMPTY_TRANSCRIPT", turnId });
     const callerSpeechOverlap = session.turnRegistry.hasActiveSpeechOtherThan(providerId);
+    turnOrderDiagnostics.admission(event, callerSpeechOverlap ? "QUARANTINED" : event.transcript.trim() ? "ACCEPTED" : "EMPTY",
+      callerSpeechOverlap ? "NEWER_CALLER_SPEECH_ACTIVE" : event.transcript.trim() ? "TURN_ACCEPTED" : "EMPTY_TRANSCRIPT");
     // A finalized transcript closes its own speech episode even if the
     // provider omitted or reordered the matching speech_stopped event.
     session.turnRegistry.speechStopped(providerId);
@@ -1287,6 +1295,7 @@ export function initializeVoiceV2Session({
     if (role === "caller") callTrace.entry("CALLER_TRANSCRIPT_PERSISTED", { turnId, itemId, characterCount, persistenceOutcome: error ? "FAILED" : result?.replayed ? "REPLAYED" : result?.success === true ? "SUCCESS" : "NOT_CONFIRMED" });
   }
   async function cleanup(reason) {
+    turnOrderDiagnostics.dispose();
     timing.flush();
     if (startupAudio.length) session.record("STARTUP_CALLER_AUDIO_CLEARED", { clearedFrames: startupAudio.length, clearedBytes: startupAudioBytes });
     startupAudio.length = 0; startupAudioBytes = 0;

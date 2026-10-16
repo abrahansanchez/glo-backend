@@ -1,4 +1,5 @@
 import { bindSocket, parseJsonMessage, sendJson, transportEvent, TransportEvent } from "./transportMessages.js";
+import { rawTurnOrderMetadata, notifyTurnOrderObserver } from "../diagnostics/TurnOrderDiagnostics.js";
 
 const ACTIVE_ERROR = /active response|conversation.*already.*response|response.*in progress/i;
 
@@ -6,6 +7,7 @@ export class OpenAIRealtimeAdapter {
   #socketFactory;
   #socket = null;
   #emit;
+  #turnOrderObserver;
   #connected = false;
   #configurationRequested = false;
   #configured = false;
@@ -24,9 +26,10 @@ export class OpenAIRealtimeAdapter {
   #startupStartedAt = null;
   #opened = false;
 
-  constructor({ socketFactory, onEvent = () => {}, now = () => Date.now() }) {
+  constructor({ socketFactory, onEvent = () => {}, now = () => Date.now(), onTurnOrderMetadata = null }) {
     if (typeof socketFactory !== "function") throw new TypeError("socket_factory_required");
     this.#socketFactory = socketFactory; this.#emit = onEvent; this.#now = now;
+    this.#turnOrderObserver = onTurnOrderMetadata;
   }
 
   get connected() { return this.#connected; }
@@ -111,6 +114,7 @@ export class OpenAIRealtimeAdapter {
 
   #onMessage(raw) {
     let message; try { message = parseJsonMessage(raw); } catch (error) { return this.#onError(error); }
+    try { notifyTurnOrderObserver(this.#turnOrderObserver, rawTurnOrderMetadata(message)); } catch { /* Metadata is observation only. */ }
     const type = message.type; const identity = providerIdentity(message);
     if (type === "session.created") return this.#publish(TransportEvent.OPENAI_SESSION_CREATED, identity);
     if (type === "session.updated" && this.#configurationRequested) {

@@ -6,6 +6,11 @@ export class TurnRegistry {
   speechStopped(itemId) { if (itemId) this.#activeSpeechItems.delete(itemId); }
   hasActiveSpeechOtherThan(itemId) { return [...this.#activeSpeechItems].some((activeItemId) => activeItemId !== itemId); }
   get callerSpeechActive() { return this.#activeSpeechItems.size > 0; }
+  activeSpeechSnapshot() {
+    const ids = [];
+    for (const id of this.#activeSpeechItems) { if (ids.length === 4) break; ids.push(id); }
+    return Object.freeze({ count: this.#activeSpeechItems.size, ids: Object.freeze(ids) });
+  }
   acquire({ turnId, transcript }, processor) {
     if (!turnId) throw new TypeError("missing_turn_id");
     const existing = this.#records.get(turnId);
