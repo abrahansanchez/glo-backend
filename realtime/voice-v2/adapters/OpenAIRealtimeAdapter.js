@@ -8,6 +8,8 @@ export class OpenAIRealtimeAdapter {
   #socket = null;
   #emit;
   #turnOrderObserver;
+  #transcriptionObserver;
+  #transcriptionClosed;
   #connected = false;
   #configurationRequested = false;
   #configured = false;
@@ -26,10 +28,11 @@ export class OpenAIRealtimeAdapter {
   #startupStartedAt = null;
   #opened = false;
 
-  constructor({ socketFactory, onEvent = () => {}, now = () => Date.now(), onTurnOrderMetadata = null }) {
+  constructor({ socketFactory, onEvent = () => {}, now = () => Date.now(), onTurnOrderMetadata = null, onTranscriptionLifecycleMetadata = null, onTranscriptionLifecycleClosed = null }) {
     if (typeof socketFactory !== "function") throw new TypeError("socket_factory_required");
     this.#socketFactory = socketFactory; this.#emit = onEvent; this.#now = now;
     this.#turnOrderObserver = onTurnOrderMetadata;
+    this.#transcriptionObserver = onTranscriptionLifecycleMetadata; this.#transcriptionClosed = onTranscriptionLifecycleClosed;
   }
 
   get connected() { return this.#connected; }
@@ -114,6 +117,7 @@ export class OpenAIRealtimeAdapter {
 
   #onMessage(raw) {
     let message; try { message = parseJsonMessage(raw); } catch (error) { return this.#onError(error); }
+    try { notifyTurnOrderObserver(this.#transcriptionObserver, rawTurnOrderMetadata(message)); } catch { /* Receipt observation only. */ }
     try { notifyTurnOrderObserver(this.#turnOrderObserver, rawTurnOrderMetadata(message)); } catch { /* Metadata is observation only. */ }
     const type = message.type; const identity = providerIdentity(message);
     if (type === "session.created") return this.#publish(TransportEvent.OPENAI_SESSION_CREATED, identity);
@@ -180,8 +184,8 @@ export class OpenAIRealtimeAdapter {
     return this.#publish(TransportEvent.OPENAI_TRANSPORT_ERROR, providerDetails);
   }
 
-  #onClose(details) { if (!this.#connected && !this.#socket) return; const type = this.#opened ? TransportEvent.OPENAI_SOCKET_CLOSED : TransportEvent.OPENAI_SOCKET_CLOSED_BEFORE_READY; this.#connected = false; if (this.#pendingLanguageUpdate) { const pending = this.#pendingLanguageUpdate; this.#pendingLanguageUpdate = null; this.#publish(TransportEvent.OPENAI_LANGUAGE_UPDATE_REJECTED, { ...this.#startupMetadata(), updateId: pending.updateId, requestedLanguage: pending.requestedLanguage, reason: "SOCKET_CLOSED" }); } this.#publish(type, { ...this.#startupMetadata(), readyState: this.#socket?.readyState ?? null, closeCode: details?.code ?? null, closeReason: details?.reason?.toString?.() || null }); this.#publish(TransportEvent.OPENAI_CONNECTION_CLOSED, { code: details?.code ?? null, reason: details?.reason?.toString?.() || null }); }
-  #onError(error) { this.#publish(TransportEvent.OPENAI_SOCKET_ERROR, { ...this.#startupMetadata(), phase: this.#opened ? "CONNECTED" : "STARTUP", readyState: this.#socket?.readyState ?? null, errorCode: safeString(error?.code), errorName: safeString(error?.name) || "Error" }); this.#publish(TransportEvent.OPENAI_TRANSPORT_ERROR, { error: normalizeError(error) }); }
+  #onClose(details) { notifyTurnOrderObserver(this.#transcriptionClosed, Object.freeze({})); if (!this.#connected && !this.#socket) return; const type = this.#opened ? TransportEvent.OPENAI_SOCKET_CLOSED : TransportEvent.OPENAI_SOCKET_CLOSED_BEFORE_READY; this.#connected = false; if (this.#pendingLanguageUpdate) { const pending = this.#pendingLanguageUpdate; this.#pendingLanguageUpdate = null; this.#publish(TransportEvent.OPENAI_LANGUAGE_UPDATE_REJECTED, { ...this.#startupMetadata(), updateId: pending.updateId, requestedLanguage: pending.requestedLanguage, reason: "SOCKET_CLOSED" }); } this.#publish(type, { ...this.#startupMetadata(), readyState: this.#socket?.readyState ?? null, closeCode: details?.code ?? null, closeReason: details?.reason?.toString?.() || null }); this.#publish(TransportEvent.OPENAI_CONNECTION_CLOSED, { code: details?.code ?? null, reason: details?.reason?.toString?.() || null }); }
+  #onError(error) { notifyTurnOrderObserver(this.#transcriptionClosed, Object.freeze({})); this.#publish(TransportEvent.OPENAI_SOCKET_ERROR, { ...this.#startupMetadata(), phase: this.#opened ? "CONNECTED" : "STARTUP", readyState: this.#socket?.readyState ?? null, errorCode: safeString(error?.code), errorName: safeString(error?.name) || "Error" }); this.#publish(TransportEvent.OPENAI_TRANSPORT_ERROR, { error: normalizeError(error) }); }
   #requireWritable() { if (!this.#socket || this.#socket.readyState === 2 || this.#socket.readyState === 3) throw new TypeError("openai_transport_not_writable"); }
   #requireConfigured() { this.#requireWritable(); if (!this.#configured) throw new TypeError("openai_session_not_configured"); }
   #id(prefix) { this.#sequence += 1; return `v2-${prefix}-${this.#sequence}`; }

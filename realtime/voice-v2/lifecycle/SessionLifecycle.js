@@ -6,12 +6,13 @@ export class SessionLifecycle {
   #finalization = null;
   #pendingBooking = new Set();
   #cleanup;
+  #onTerminating;
 
-  constructor({ session, transcriptAdapter, callerNumber, cleanup = async () => {} }) {
+  constructor({ session, transcriptAdapter, callerNumber, cleanup = async () => {}, onTerminating = () => {} }) {
     this.#session = session;
     this.#transcript = transcriptAdapter;
     this.#identity = Object.freeze({ callSid: session.callSid, barberId: session.businessContext.barberId, callerNumber });
-    this.#cleanup = cleanup;
+    this.#cleanup = cleanup; this.#onTerminating = onTerminating;
   }
   get terminated() { return this.#terminated; }
   get finalized() { return Boolean(this.#finalization); }
@@ -25,6 +26,7 @@ export class SessionLifecycle {
   async terminate(reason = "CALL_TERMINATED") {
     if (!this.#terminated) {
       this.#terminated = true;
+      try { this.#onTerminating(); } catch { /* Diagnostic teardown cannot affect lifecycle. */ }
       this.#session.floorOwner?.terminate({ reason });
       this.#session.confirmationAuthority.revokeProposal(this.#session.proposal.proposalVersion, reason);
       this.#session.responseRegistry.invalidateProposal(this.#session.proposal.proposalVersion, reason);

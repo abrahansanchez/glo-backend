@@ -4,6 +4,7 @@ import { CallSession } from "./CallSession.js";
 import { LatencyDiagnostics } from "./diagnostics/LatencyDiagnostics.js";
 import { CallTrace } from "./diagnostics/CallTrace.js";
 import { ConsentBoundaryDiagnostics } from "./diagnostics/ConsentBoundaryDiagnostics.js";
+import { TranscriptionLifecycleDiagnostics } from "./diagnostics/TranscriptionLifecycleDiagnostics.js";
 import { TurnOrderDiagnostics } from "./diagnostics/TurnOrderDiagnostics.js";
 import { VoiceCoordinator } from "./VoiceCoordinator.js";
 import { BookingRequirement, createBookingProposal, deriveBookingRequirement, deriveSlotKey } from "./domain/BookingProposal.js";
@@ -64,6 +65,8 @@ export function initializeVoiceV2Session({
     return { streamSid: twilio?.identity.streamSid || null, ...state?.timingContext, requestId: value.requestId || state?.requestId || null, responseId: value.responseId || state?.responseId || null, markId: value.markId || null, itemId: value.itemId || null, purpose: state?.plan.purpose || null, proposalVersion: state?.plan.proposalVersion ?? null };
   };
   function receive(event, handler) {
+    if ([TransportEvent.TWILIO_STREAM_STOPPED, TransportEvent.TWILIO_CONNECTION_CLOSED, TransportEvent.TWILIO_TRANSPORT_ERROR,
+      TransportEvent.OPENAI_CONNECTION_CLOSED, TransportEvent.OPENAI_TRANSPORT_ERROR].includes(event.type)) transcriptionDiagnostics.close();
     if ([TransportEvent.CALLER_AUDIO, TransportEvent.RESPONSE_AUDIO_DELTA].includes(event.type)) {
       if (event.type === TransportEvent.CALLER_AUDIO) { callTrace.recordAudio("caller", event.bytes); observeConsent("inboundAudio", event.bytes); }
       else {
@@ -95,6 +98,8 @@ export function initializeVoiceV2Session({
     CONFIRMATION_REJECTED: async () => ({ success: true }),
   };
   const session = new CallSession({ callSid, buildSha, proposal, businessContext, effectHandlers, watchdogOptions: scheduler, preferredLanguage: turnContext.language || "en", recordObserver: observeSessionRecord });
+  const transcriptionDiagnostics = new TranscriptionLifecycleDiagnostics({ callSid, streamSid: () => twilio.identity.streamSid,
+    clock: () => callTrace.stamp().elapsedMs, observer: emit });
   const turnOrderDiagnostics = new TurnOrderDiagnostics({ callSid, streamSid: () => twilio.identity.streamSid,
     clock: () => callTrace.stamp().elapsedMs, activeSnapshot: () => session.turnRegistry.activeSpeechSnapshot(), observer: emit });
   consentDiagnostics = new ConsentBoundaryDiagnostics({
@@ -109,8 +114,9 @@ export function initializeVoiceV2Session({
   });
   function observeConsent(method, ...args) { try { return consentDiagnostics?.[method]?.(...args); } catch { /* Diagnostics cannot affect a call. */ } }
   const twilio = new TwilioMediaAdapter({ socket: twilioSocket, onEvent: (event) => receive(event, onTwilio) });
-  const openai = new OpenAIRealtimeAdapter({ socketFactory: openaiSocketFactory, onEvent: (event) => receive(event, onOpenAI), onTurnOrderMetadata: metadata => turnOrderDiagnostics.observe(metadata) });
-  lifecycle = new SessionLifecycle({ session, transcriptAdapter, callerNumber, cleanup });
+  const openai = new OpenAIRealtimeAdapter({ socketFactory: openaiSocketFactory, onEvent: (event) => receive(event, onOpenAI), onTurnOrderMetadata: metadata => turnOrderDiagnostics.observe(metadata),
+    onTranscriptionLifecycleMetadata: metadata => transcriptionDiagnostics.observe(metadata), onTranscriptionLifecycleClosed: () => transcriptionDiagnostics.close() });
+  lifecycle = new SessionLifecycle({ session, transcriptAdapter, callerNumber, cleanup, onTerminating: () => transcriptionDiagnostics.close() });
   session.record("V2_SESSION_STARTED", { proposalVersion: proposal.proposalVersion });
   session.record("BUSINESS_CONTEXT_BOUND", { businessId: businessContext.businessId, barberId: businessContext.barberId });
   openai.connect({ callSid, model: openaiSession.model });
@@ -1295,6 +1301,7 @@ export function initializeVoiceV2Session({
     if (role === "caller") callTrace.entry("CALLER_TRANSCRIPT_PERSISTED", { turnId, itemId, characterCount, persistenceOutcome: error ? "FAILED" : result?.replayed ? "REPLAYED" : result?.success === true ? "SUCCESS" : "NOT_CONFIRMED" });
   }
   async function cleanup(reason) {
+    transcriptionDiagnostics.close();
     turnOrderDiagnostics.dispose();
     timing.flush();
     if (startupAudio.length) session.record("STARTUP_CALLER_AUDIO_CLEARED", { clearedFrames: startupAudio.length, clearedBytes: startupAudioBytes });
@@ -1344,7 +1351,7 @@ export function initializeVoiceV2Session({
     return openai.configureSession(openaiSession);
   }
 
-  return Object.freeze({ session, coordinator, lifecycle, twilio, openai, ready: () => Promise.all([processing, effectsProcessing]), terminate: (reason) => enqueue(() => lifecycle.terminate(reason)), requestResponse: (plan) => enqueue(() => requestResponse(plan)), processEffects: kickEffects });
+  return Object.freeze({ session, coordinator, lifecycle, twilio, openai, ready: () => Promise.all([processing, effectsProcessing]), terminate: (reason) => { transcriptionDiagnostics.close(); return enqueue(() => lifecycle.terminate(reason)); }, requestResponse: (plan) => enqueue(() => requestResponse(plan)), processEffects: kickEffects });
 }
 
 function floorPurposeFor(plan) {
