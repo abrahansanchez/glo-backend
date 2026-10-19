@@ -1,3 +1,4 @@
+import { disposeSpeechUndiciStages } from "./diagnostics/SpeechUndiciStages.js";
 import { randomUUID } from "node:crypto";
 import { SpeechPreparationDiagnostics, SpeechLifecycleDiagnostics } from "./audio/SpeechPreparationDiagnostics.js";
 import { CallSession } from "./CallSession.js";
@@ -66,7 +67,7 @@ export function initializeVoiceV2Session({
   };
   function receive(event, handler) {
     if ([TransportEvent.TWILIO_STREAM_STOPPED, TransportEvent.TWILIO_CONNECTION_CLOSED, TransportEvent.TWILIO_TRANSPORT_ERROR,
-      TransportEvent.OPENAI_CONNECTION_CLOSED, TransportEvent.OPENAI_TRANSPORT_ERROR].includes(event.type)) transcriptionDiagnostics.close();
+      TransportEvent.OPENAI_CONNECTION_CLOSED, TransportEvent.OPENAI_TRANSPORT_ERROR].includes(event.type)) { disposeSpeechUndiciStages(callSid); transcriptionDiagnostics.close(); }
     if ([TransportEvent.CALLER_AUDIO, TransportEvent.RESPONSE_AUDIO_DELTA].includes(event.type)) {
       if (event.type === TransportEvent.CALLER_AUDIO) { callTrace.recordAudio("caller", event.bytes); observeConsent("inboundAudio", event.bytes); }
       else {
@@ -116,7 +117,7 @@ export function initializeVoiceV2Session({
   const twilio = new TwilioMediaAdapter({ socket: twilioSocket, onEvent: (event) => receive(event, onTwilio) });
   const openai = new OpenAIRealtimeAdapter({ socketFactory: openaiSocketFactory, onEvent: (event) => receive(event, onOpenAI), onTurnOrderMetadata: metadata => turnOrderDiagnostics.observe(metadata),
     onTranscriptionLifecycleMetadata: metadata => transcriptionDiagnostics.observe(metadata), onTranscriptionLifecycleClosed: () => transcriptionDiagnostics.close() });
-  lifecycle = new SessionLifecycle({ session, transcriptAdapter, callerNumber, cleanup, onTerminating: () => transcriptionDiagnostics.close() });
+  lifecycle = new SessionLifecycle({ session, transcriptAdapter, callerNumber, cleanup, onTerminating: () => { disposeSpeechUndiciStages(callSid); transcriptionDiagnostics.close(); } });
   session.record("V2_SESSION_STARTED", { proposalVersion: proposal.proposalVersion });
   session.record("BUSINESS_CONTEXT_BOUND", { businessId: businessContext.businessId, barberId: businessContext.barberId });
   openai.connect({ callSid, model: openaiSession.model });
@@ -637,6 +638,7 @@ export function initializeVoiceV2Session({
       diagnosticContext: { callSid, buildSha, requestId: tracked.requestId, responseId, purpose: tracked.plan.purpose, proposalVersion: tracked.plan.proposalVersion, attempt: tracked.attempt },
       onFailureDiagnostic: safeEmit,
       onPhaseDiagnostic: safeEmit,
+      onUndiciStageDiagnostic: emit,
       preparationDiagnostics: state.preparationDiagnostics,
     })).then(
       (result) => synthesizedConfirmationCompleted(responseId, result),
@@ -1301,6 +1303,7 @@ export function initializeVoiceV2Session({
     if (role === "caller") callTrace.entry("CALLER_TRANSCRIPT_PERSISTED", { turnId, itemId, characterCount, persistenceOutcome: error ? "FAILED" : result?.replayed ? "REPLAYED" : result?.success === true ? "SUCCESS" : "NOT_CONFIRMED" });
   }
   async function cleanup(reason) {
+    disposeSpeechUndiciStages(callSid);
     transcriptionDiagnostics.close();
     turnOrderDiagnostics.dispose();
     timing.flush();
@@ -1351,7 +1354,7 @@ export function initializeVoiceV2Session({
     return openai.configureSession(openaiSession);
   }
 
-  return Object.freeze({ session, coordinator, lifecycle, twilio, openai, ready: () => Promise.all([processing, effectsProcessing]), terminate: (reason) => { transcriptionDiagnostics.close(); return enqueue(() => lifecycle.terminate(reason)); }, requestResponse: (plan) => enqueue(() => requestResponse(plan)), processEffects: kickEffects });
+  return Object.freeze({ session, coordinator, lifecycle, twilio, openai, ready: () => Promise.all([processing, effectsProcessing]), terminate: (reason) => { disposeSpeechUndiciStages(callSid); transcriptionDiagnostics.close(); return enqueue(() => lifecycle.terminate(reason)); }, requestResponse: (plan) => enqueue(() => requestResponse(plan)), processEffects: kickEffects });
 }
 
 function floorPurposeFor(plan) {

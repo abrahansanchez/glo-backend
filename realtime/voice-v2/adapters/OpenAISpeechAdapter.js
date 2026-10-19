@@ -1,4 +1,5 @@
 import { Agent, fetch as speechFetch } from "undici";
+import { beginSpeechUndiciStages, invokeSpeechUndiciStages } from "../diagnostics/SpeechUndiciStages.js";
 import { SpeechPreparationDiagnostics, bufferSpeechBody } from "../audio/SpeechPreparationDiagnostics.js";
 import { extractPcm24kMonoFromWav, pcm24kToPcmu8k, speechAudioFormat } from "../audio/pcm24kToPcmu8k.js";
 
@@ -29,13 +30,13 @@ export class OpenAISpeechAdapter {
   async synthesize(request = {}) {
     const trace = speechPhaseTrace(request, this.monotonicNow);
     const measurement = request.preparationDiagnostics || new SpeechPreparationDiagnostics({ observer: request.onPreparationDiagnostic, context: request.diagnosticContext, clock: this.monotonicNow });
-    const transport = { agent: null, closeRequested: false };
+    const transport = { agent: null, closeRequested: false, undiciStage: null };
     const close = () => {
       if (!transport.agent || transport.closeRequested) return;
       transport.closeRequested = true;
       try { Promise.resolve(transport.agent.close()).catch(() => {}); } catch { /* Cleanup never owns the synthesis result. */ }
     };
-    const onAbort = () => measurement.abort(request.signal?.reason);
+    const onAbort = () => { measurement.abort(request.signal?.reason); transport.undiciStage?.abort(); };
     request.signal?.addEventListener("abort", onAbort, { once: true });
     if (request.signal?.aborted) onAbort();
     try { return await this.#synthesize(request, trace, measurement, transport); }
@@ -52,15 +53,20 @@ export class OpenAISpeechAdapter {
       try { request.onFailureDiagnostic?.(event); } catch { /* Diagnostics cannot change synthesis behavior. */ }
       throw error;
     }
-    finally { trace.settle(); measurement.settle(); request.signal?.removeEventListener("abort", onAbort); close(); }
+    finally { transport.undiciStage?.settle(); trace.settle(); measurement.settle(); request.signal?.removeEventListener("abort", onAbort); close(); }
   }
 
-  async #synthesize({ input, language = "en", signal, clientRequestId: directClientRequestId, lifecycleDiagnostics } = {}, trace, measurement, transport) {
+  async #synthesize({ input, language = "en", signal, clientRequestId: directClientRequestId, lifecycleDiagnostics, diagnosticContext, onPhaseDiagnostic, onUndiciStageDiagnostic } = {}, trace, measurement, transport) {
     if (typeof input !== "string" || !input.trim()) throw new TypeError("speech_input_required");
     const clientRequestId = lifecycleDiagnostics ? lifecycleDiagnostics.clientRequestId : directClientRequestId;
     const startedAt = this.monotonicNow();
     let response;
     let fetchInvoked = false;
+    const observeFetch = () => {
+      if (!lifecycleDiagnostics || typeof signal?.addEventListener !== "function") return;
+      transport.undiciStage = beginSpeechUndiciStages({ clientRequestId,
+        context: diagnosticContext, observer: onUndiciStageDiagnostic || onPhaseDiagnostic, clock: this.monotonicNow, signalAborted: signal.aborted });
+    };
     trace.phase("REQUEST_DISPATCH_STARTED");
     measurement.phase("REQUEST_DISPATCH_STARTED");
     try {
@@ -82,21 +88,25 @@ export class OpenAISpeechAdapter {
       if (this.fetchFn) {
         fetchInvoked = true;
         lifecycleDiagnostics?.phase("FETCH_INVOCATION_STARTED", { inputCharacterCount: input.length });
-        response = await this.fetchFn(this.endpoint, options);
+        observeFetch();
+        response = await invokeSpeechUndiciStages(transport.undiciStage, () => this.fetchFn(this.endpoint, options));
       }
       else {
         transport.agent = this.agentFactory();
         fetchInvoked = true;
         lifecycleDiagnostics?.phase("FETCH_INVOCATION_STARTED", { inputCharacterCount: input.length });
-        response = await speechFetch(this.endpoint, { ...options, dispatcher: transport.agent });
+        observeFetch();
+        response = await invokeSpeechUndiciStages(transport.undiciStage, () => speechFetch(this.endpoint, { ...options, dispatcher: transport.agent }));
       }
     } catch (error) {
+      transport.undiciStage?.settle();
       if (fetchInvoked) lifecycleDiagnostics?.phase("FETCH_REJECTED", { errorCode: error?.cause?.code ?? error?.code });
       const diagnostic = fetchDiagnostic(error, signal);
       if (signal?.aborted || error?.name === "AbortError") throw typedError("speech_request_aborted", "TTS_ABORTED", diagnostic);
       throw typedError("speech_provider_request_failed", "TTS_ADAPTER_ERROR", diagnostic);
     }
 
+    transport.undiciStage?.settle();
     lifecycleDiagnostics?.resolved(response);
     trace.headers(response?.status);
     measurement.headers(response?.status);

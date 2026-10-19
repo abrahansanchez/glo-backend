@@ -21,7 +21,7 @@ export function createVoiceV2ProductionInitializer({
   smsServiceDependencies = {},
   speechAdapter,
   emit = (event) => {
-    if (event?.event !== "V2_SPEECH_LIFECYCLE" && event?.event !== "V2_TURN_ORDER_DIAGNOSTIC" && event?.event !== "V2_TRANSCRIPTION_LIFECYCLE") return console.log(event);
+    if (event?.event !== "V2_SPEECH_LIFECYCLE" && event?.event !== "V2_TURN_ORDER_DIAGNOSTIC" && event?.event !== "V2_TRANSCRIPTION_LIFECYCLE" && event?.event !== "V2_SPEECH_UNDICI_STAGE") return console.log(event);
     try { console.log(JSON.stringify(event)); } catch { /* Diagnostic output cannot affect the call. */ }
   },
 } = {}) {
