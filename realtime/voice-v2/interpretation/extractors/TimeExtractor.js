@@ -2,7 +2,7 @@ const EN_HOURS = Object.freeze({ one: 1, two: 2, three: 3, four: 4, five: 5, six
 const ES_HOURS = Object.freeze({ una: 1, uno: 1, dos: 2, tres: 3, cuatro: 4, cinco: 5, seis: 6, siete: 7, ocho: 8, nueve: 9, diez: 10, once: 11, doce: 12 });
 
 export function extractTime(normalizedTurn, { currentTime = null } = {}) {
-  const text = normalizedTurn?.text ?? "";
+  const text = (normalizedTurn?.text ?? "").replace(/\buna\s+cita\b/g, "cita");
   let hour;
   let minute = 0;
   let meridiem = null;
