@@ -66,8 +66,11 @@ export function reduceBooking(currentProposal, action) {
 }
 
 function requestAvailableTimesForDate(current, action) {
-  if (!current.service) return unchanged(current, [{ type: BookingEffectType.REQUEST_CLARIFICATION, proposalVersion: current.proposalVersion }]);
+  const service = action.service === undefined ? current.service : action.service;
+  if (service !== null && !isValidFieldValue("service", service)) return rejected(current, "invalid_service");
+  if (!service) return unchanged(current, [{ type: BookingEffectType.REQUEST_CLARIFICATION, proposalVersion: current.proposalVersion }]);
   return prepareSchedulingSearch(current, action, {
+    service,
     type: BookingEffectType.REQUEST_AVAILABLE_TIMES_FOR_DATE,
     searchType: "DATE",
     requestedDate: action.date,
@@ -123,22 +126,25 @@ function currentSchedulingAlternatives(current) {
 }
 
 function prepareSchedulingSearch(current, action, search) {
-  const proposalChanged = current.date !== search.requestedDate || current.time !== null;
+  const service = search.service ?? current.service;
+  const proposalChanged = current.service !== service || current.date !== search.requestedDate || current.time !== null;
   const nextVersion = proposalChanged ? current.proposalVersion + 1 : current.proposalVersion;
   const next = proposalChanged
     ? createBookingProposal({
         ...current,
         proposalVersion: nextVersion,
+        service,
         date: search.requestedDate,
         time: null,
         source: {
           ...current.source,
+          serviceTurnId: current.service !== service ? action.sourceTurnId : current.source.serviceTurnId,
           dateTurnId: current.date !== search.requestedDate ? action.sourceTurnId : current.source.dateTurnId,
           timeTurnId: null,
         },
         availability: {
           proposalVersion: nextVersion,
-          slotKey: deriveSlotKey({ service: current.service, date: search.requestedDate, time: null }),
+          slotKey: deriveSlotKey({ service, date: search.requestedDate, time: null }),
           status: AvailabilityStatus.UNKNOWN,
           alternatives: [],
         },

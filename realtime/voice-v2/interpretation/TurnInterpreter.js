@@ -121,9 +121,14 @@ function buildInterpretation(action, normalizedTurn, sourceTurnId, context) {
       break;
     case CallerActionType.SET_DATE:
     case CallerActionType.MODIFY_DATE:
-    case CallerActionType.REQUEST_AVAILABLE_TIMES_FOR_DATE:
       value.date = extractDate(normalizedTurn, context);
       break;
+    case CallerActionType.REQUEST_AVAILABLE_TIMES_FOR_DATE: {
+      value.date = extractDate(normalizedTurn, context);
+      const service = extractService(normalizedTurn, context);
+      if (service) value.service = service;
+      break;
+    }
     case CallerActionType.SET_SERVICE:
     case CallerActionType.MODIFY_SERVICE:
       value.service = extractService(normalizedTurn, context);
