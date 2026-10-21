@@ -67,7 +67,8 @@ export class SpeechPreparationDiagnostics {
   }
 }
 
-const LIFECYCLE_PHASES = new Set(["PREPARATION_CREATED", "FETCH_INVOCATION_STARTED", "FETCH_RESOLVED", "FETCH_REJECTED", "ABORT_OBSERVED"]);
+const LIFECYCLE_PHASES = new Set(["PREPARATION_CREATED", "FETCH_INVOCATION_STARTED", "FETCH_RESOLVED", "FETCH_REJECTED", "ABORT_OBSERVED",
+  "SPEECH_RETRY_ELIGIBLE", "SPEECH_RETRY_STARTED", "SPEECH_RETRY_SUPPRESSED", "SPEECH_RETRY_COMPLETED", "SPEECH_RETRY_EXHAUSTED"]);
 const codeToken = value => typeof value === "string" && /^[A-Z0-9_]{3,40}$/.test(value);
 const clientId = value => typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value) ? value : null;
 // Existing internal invalidation reasons, not a new abort-source classification.
@@ -84,12 +85,13 @@ const FIXED_ABORT_REASONS = new Set([
 const abortReason = value => FIXED_ABORT_REASONS.has(value) ? codeToken(value) ? value : null : value == null ? null : "OTHER";
 
 export class SpeechLifecycleDiagnostics {
-  #observer; #context; #configuration; #origin; #clock; #signal; #seen = new Set(); #elapsed = 0; #status = null;
+  #observer; #context; #configuration; #origin; #clock; #signal; #seen = new Set(); #elapsed = 0; #status = null; #attemptOrigin; #providerRequestId = null;
   constructor({ observer, context = {}, configuration, createdAt, clock = () => performance.now(), signal }) {
     this.#observer = observer; this.#configuration = configuration; this.#origin = createdAt; this.#clock = clock; this.#signal = signal;
+    this.#attemptOrigin = clock();
     this.#context = Object.freeze({ callSid: identifier(context.callSid), requestId: identifier(context.requestId), responseId: identifier(context.responseId),
       purpose: identifier(context.purpose), proposalVersion: integer(context.proposalVersion), language: ["en", "es"].includes(context.language) ? context.language : null,
-      clientRequestId: clientId(context.clientRequestId) });
+      clientRequestId: clientId(context.clientRequestId), ...([1, 2].includes(context.attempt) ? { attempt: context.attempt } : {}) });
   }
   get clientRequestId() { return this.#context.clientRequestId; }
   phase(phase, details = {}) {
@@ -98,12 +100,15 @@ export class SpeechLifecycleDiagnostics {
       this.#seen.add(phase);
       this.#elapsed = Math.max(this.#elapsed, interval(this.#clock(), this.#origin) ?? this.#elapsed);
       if (phase === "FETCH_RESOLVED") this.#status = httpStatus(details.providerStatus);
+      if (phase === "FETCH_RESOLVED") this.#providerRequestId = typeof details.providerRequestId === "string" && /^[A-Za-z0-9_.:-]{1,128}$/.test(details.providerRequestId) ? details.providerRequestId : null;
       const event = Object.freeze({ event: "V2_SPEECH_LIFECYCLE", ...this.#context, phase,
         elapsedMs: this.#elapsed, preparationBudgetMs: this.#configuration.preparationBudgetMs,
         remainingBudgetMs: Math.max(0, this.#configuration.preparationBudgetMs - this.#elapsed),
         ...(phase === "PREPARATION_CREATED" ? { budgetSource: this.#configuration.budgetSource } : {}),
         signalAborted: this.#signal?.aborted === true, providerStatus: this.#status,
-        providerRequestId: phase === "FETCH_RESOLVED" && typeof details.providerRequestId === "string" && /^[A-Za-z0-9_.:-]{1,128}$/.test(details.providerRequestId) ? details.providerRequestId : null,
+        providerRequestId: this.#providerRequestId,
+        ...(this.#context.attempt ? { attemptElapsedMs: interval(this.#clock(), this.#attemptOrigin), headersReceived: this.#seen.has("FETCH_RESOLVED"),
+          retryReason: ["HEADERS_TIMEOUT", "TRANSIENT_TRANSPORT", "OWNER_STALE", "ATTEMPT_FAILED", "TOTAL_DEADLINE"].includes(details.retryReason) ? details.retryReason : null } : {}),
         errorCode: codeToken(details.errorCode) ? details.errorCode : null,
         abortReason: phase === "ABORT_OBSERVED" ? abortReason(details.abortReason) : null,
         ...(phase === "FETCH_INVOCATION_STARTED" ? { inputCharacterCount: integer(details.inputCharacterCount) } : {}),

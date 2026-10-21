@@ -56,7 +56,7 @@ export class OpenAISpeechAdapter {
     finally { transport.undiciStage?.settle(); trace.settle(); measurement.settle(); request.signal?.removeEventListener("abort", onAbort); close(); }
   }
 
-  async #synthesize({ input, language = "en", signal, clientRequestId: directClientRequestId, lifecycleDiagnostics, diagnosticContext, onPhaseDiagnostic, onUndiciStageDiagnostic } = {}, trace, measurement, transport) {
+  async #synthesize({ input, language = "en", signal, clientRequestId: directClientRequestId, lifecycleDiagnostics, diagnosticContext, onPhaseDiagnostic, onUndiciStageDiagnostic, onResponseHeaders } = {}, trace, measurement, transport) {
     if (typeof input !== "string" || !input.trim()) throw new TypeError("speech_input_required");
     const clientRequestId = lifecycleDiagnostics ? lifecycleDiagnostics.clientRequestId : directClientRequestId;
     const startedAt = this.monotonicNow();
@@ -107,6 +107,9 @@ export class OpenAISpeechAdapter {
     }
 
     transport.undiciStage?.settle();
+    // Operational receipt boundary, separate from diagnostic observers. Never pass
+    // a Response or headers to the delivery controller.
+    try { onResponseHeaders?.(); } catch { /* Preserve adapter compatibility. */ }
     lifecycleDiagnostics?.resolved(response);
     trace.headers(response?.status);
     measurement.headers(response?.status);

@@ -78,6 +78,7 @@ export function beginSpeechUndiciStages({ clientRequestId, context = {}, observe
     let fields = Object.freeze({ event: "V2_SPEECH_UNDICI_STAGE", callSid: id(context.callSid),
       requestId: id(context.requestId), responseId: id(context.responseId), purpose: id(context.purpose),
       proposalVersion: Number.isSafeInteger(context.proposalVersion) && context.proposalVersion >= 0 ? context.proposalVersion : null,
+      ...([1, 2].includes(context.attempt) ? { attempt: context.attempt } : {}),
       clientRequestId });
     context = null;
     let sink = observer; observer = null;

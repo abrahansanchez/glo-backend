@@ -378,7 +378,11 @@ scenario(38, "Silence after unavailable-slot response", async () => {
 
 scenario(39, "Response-generation timeout", async () => {
   const clock = manualScheduler(); const f = fixture({ scheduler: clock.options }); start(f); await caller(f, "haircut");
-  assert.equal(clock.active(15000).length, 1); clock.fire(15000); await settle(f.app); assert.ok(events(f, "RESPONSE_PLANNED").some((entry) => entry.purpose === ResponsePurpose.ERROR_RECOVERY));
+  assert.equal(clock.active(15000).length, 1); clock.fire(15000); await settle(f.app);
+  assert.equal(events(f, "RESPONSE_DELIVERY_RETRY_STARTED").length, 1);
+  assert.equal(creates(f, ResponsePurpose.ERROR_RECOVERY).length, 0);
+  assert.equal(clock.active(15000).length, 1); clock.fire(15000); await settle(f.app);
+  assert.ok(events(f, "RESPONSE_PLANNED").some((entry) => entry.purpose === ResponsePurpose.ERROR_RECOVERY));
   assert.equal(clock.active(25).length, 0); assert.equal(lastPurpose(f), ResponsePurpose.ERROR_RECOVERY);
   assert.equal(creates(f, ResponsePurpose.ERROR_RECOVERY).length, 1);
 });
