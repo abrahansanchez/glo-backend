@@ -8,6 +8,7 @@ import {
   hasRequiredBookingFacts,
 } from "./BookingProposal.js";
 import { ResponsePurpose } from "../planning/ResponsePlanner.js";
+import { preferenceAllows } from './AvailabilityState.js';
 
 const infrastructureFailureReasons = new Set([
   "PERSISTENCE_ERROR", "PROVIDER_ERROR", "TIMEOUT", "UNKNOWN_ERROR", "NOT_FOUND", "INVALID_SLOT",
@@ -44,9 +45,14 @@ export function applySchedulingSearchResult(currentProposal, result, command) {
   for (const field of ["searchType", "requestedDate", "afterTime"]) {
     if ((result?.[field] ?? null) !== (command?.[field] ?? null)) return refused(currentProposal, true, "STALE_SEARCH_IDENTITY");
   }
+  if (JSON.stringify(result?.searchPreference ?? null) !== JSON.stringify(command?.searchPreference ?? null)) return refused(currentProposal, true, 'STALE_SEARCH_IDENTITY');
+  if (result.reason === 'AMBIGUOUS_TIME_REFERENCE' && command.searchPreference?.ambiguousHour) {
+    if (!Array.isArray(result.alternatives) || result.alternatives.length) return refused(currentProposal, false, 'INVALID_ALTERNATIVES');
+    return refused(currentProposal, false, 'AMBIGUOUS_TIME_REFERENCE', ResponsePurpose.CLARIFY_LATER_REFERENCE);
+  }
   if (!Array.isArray(result?.alternatives)) return refused(currentProposal, false, "INVALID_ALTERNATIVES");
   if (infrastructureFailureReasons.has(result.reason)) return refused(currentProposal, false, result.reason, ResponsePurpose.ERROR_RECOVERY);
-  if (!validSchedulingAlternatives(result.alternatives, currentProposal.service, command)) {
+  if (!validSchedulingAlternatives(result.alternatives, currentProposal.service, command, result.resolvedLowerTime)) {
     return refused(currentProposal, false, "INVALID_ALTERNATIVES", ResponsePurpose.ERROR_RECOVERY);
   }
   const searchContext = Object.freeze({
@@ -56,6 +62,8 @@ export function applySchedulingSearchResult(currentProposal, result, command) {
     requestedDate: command.requestedDate,
     afterTime: command.afterTime || null,
     reason: result.reason || null,
+    ...(command.searchPreference ? { searchPreference: command.searchPreference } : {}),
+    ...(result.resolvedLowerTime ? { resolvedLowerTime: result.resolvedLowerTime } : {}),
   });
   const nextProposal = createBookingProposal({
     ...currentProposal,
@@ -134,11 +142,12 @@ function availabilityResponsePurpose(nextProposal) {
   return byRequirement[deriveBookingRequirement(nextProposal)] ?? null;
 }
 
-function validSchedulingAlternatives(alternatives, service, command) {
+function validSchedulingAlternatives(alternatives, service, command, resolvedLowerTime) {
   const threshold = command.searchType === "LATER" ? `${command.requestedDate}T${command.afterTime}` : null;
   return alternatives.every((alternative) => {
     if (!/^\d{4}-\d{2}-\d{2}$/.test(alternative?.date || "") || !/^([01]\d|2[0-3]):[0-5]\d$/.test(alternative?.time || "")) return false;
     if (alternative.slotKey !== deriveSlotKey({ service, date: alternative.date, time: alternative.time })) return false;
-    return !threshold || `${alternative.date}T${alternative.time}` > threshold;
+    return (!threshold || `${alternative.date}T${alternative.time}` > threshold)
+      && (!command.searchPreference || (alternative.date === command.requestedDate && preferenceAllows(alternative.time, command.searchPreference, resolvedLowerTime)));
   });
 }

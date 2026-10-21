@@ -218,7 +218,7 @@ test("later options are proposal-bound and selecting one performs the required a
   await f.app.terminate("TEST_DONE");
 });
 
-test("selected time then delivered alternatives then another later request preserves context and asks which reference to use", async () => {
+test("selected time then delivered alternatives then another later request searches after the latest offered option", async () => {
   const alternatives = [
     { date: "2026-10-16", time: "10:30", slotKey: deriveSlotKey({ service: "Haircut", date: "2026-10-16", time: "10:30" }) },
     { date: "2026-10-16", time: "11:00", slotKey: deriveSlotKey({ service: "Haircut", date: "2026-10-16", time: "11:00" }) },
@@ -241,22 +241,25 @@ test("selected time then delivered alternatives then another later request prese
 
   const version = f.app.session.proposal.proposalVersion;
   await caller(f, "second-later", "Anything later?");
-  await waitFor(() => lastPurpose(f.openai) === ResponsePurpose.CLARIFY_LATER_REFERENCE, f.app);
+  await waitFor(() => f.searchCalls.length === 2 && lastPurpose(f.openai) === ResponsePurpose.SCHEDULING_ALTERNATIVES, f.app);
 
-  assert.equal(f.searchCalls.length, 1, "ambiguous offered choices must not select a reference silently");
-  assert.equal(f.app.session.proposal.proposalVersion, version);
+  assert.equal(f.searchCalls.length, 2, 'one additional search, strictly after the latest same-day offer');
+  assert.equal(f.searchCalls[1].afterTime, '11:00');
+  assert.deepEqual(f.searchCalls[1].searchPreference, { kind: 'AFTER', time: '11:00' });
+  assert.equal(f.app.session.proposal.proposalVersion, version + 1);
   assert.equal(f.app.session.proposal.time, null);
   assert.equal(f.app.session.proposal.confirmation.status, "none");
   const serialized = JSON.parse(lastCreate(f.openai).response.instructions);
-  assert.deepEqual(serialized.expectedFacts.alternatives, alternatives.map(({ date, time }) => ({ date, time })));
-  assert.equal(serialized.expectedFacts.afterTime, "10:00");
-  await deliverLastResponse(f, "Which offered time should I search after, or what time should I use?");
+  assert.deepEqual(serialized.expectedFacts.alternatives, afterEleven.map(({ date, time }) => ({ date, time })));
+  assert.equal(serialized.expectedFacts.afterTime, "11:00");
+  assert.equal(creates(f.openai, ResponsePurpose.CLARIFY_LATER_REFERENCE).length, 0);
+  assert.equal(f.app.session.journal().filter(e => e.event === 'CONFIRMATION_AUTHORITY_GRANTED').length, 0);
+  await deliverLastResponse(f, "I have 11:30 AM. Which works?");
 
   await caller(f, "explicit-later-reference", "later than 11");
-  await waitFor(() => f.searchCalls.length === 2 && lastPurpose(f.openai) === ResponsePurpose.SCHEDULING_ALTERNATIVES, f.app);
-  assert.equal(f.app.session.journal().filter((entry) => entry.event === "TURN_INTERPRETED").at(-1).action, "REQUEST_LATER_TIME");
-  assert.equal(f.searchCalls[1].afterTime, "11:00");
-  assert.equal(f.searchCalls[1].searchType, "LATER");
+  await waitFor(() => f.searchCalls.length === 3 && lastPurpose(f.openai) === ResponsePurpose.SCHEDULING_ALTERNATIVES, f.app);
+  assert.equal(f.app.session.journal().filter((entry) => entry.event === "TURN_INTERPRETED").at(-1).action, "REQUEST_AVAILABLE_TIMES_FOR_DATE");
+  assert.deepEqual(f.searchCalls[2].searchPreference, { kind: 'AFTER', time: '11:00' });
   assert.equal(f.app.session.proposal.time, null);
   assert.equal(f.app.session.proposal.confirmation.status, "none");
   assert.ok(f.app.session.proposal.availability.alternatives.every((slot) => `${slot.date}T${slot.time}` > "2026-10-16T11:00"));
@@ -267,7 +270,8 @@ test("selected time then delivered alternatives then another later request prese
 
 test("ordinal answer to later-reference clarification searches after the referenced option instead of selecting it", async () => {
   const alternatives = [
-    { date: "2026-10-16", time: "10:30", slotKey: deriveSlotKey({ service: "Haircut", date: "2026-10-16", time: "10:30" }) },
+    // Cross-date offers still lack a safe cursor for the grounded requested day.
+    { date: "2026-10-17", time: "10:30", slotKey: deriveSlotKey({ service: "Haircut", date: "2026-10-17", time: "10:30" }) },
     { date: "2026-10-16", time: "11:00", slotKey: deriveSlotKey({ service: "Haircut", date: "2026-10-16", time: "11:00" }) },
   ];
   const afterSecond = [{ date: "2026-10-16", time: "11:30", slotKey: deriveSlotKey({ service: "Haircut", date: "2026-10-16", time: "11:30" }) }];
@@ -298,7 +302,7 @@ for (const [language, firstTurn, referenceTurn] of [
   ["en", "Anything later?", "later than 11"],
   ["es", "Algo mas tarde?", "despues de las once"],
 ]) {
-  test(`${language} ambiguous later clarification establishes a real shared-helper search cursor`, async () => {
+  test(`${language} latest offered cursor advances to exhaustion and an explicit bound reopens the real search`, async () => {
     await withSchedulingDatabase([], async () => {
       const calls = [];
       const barber = schedulingBarber({ durationMinutes: 30, hours: { fri: open("09:00", "12:00") }, blackoutDates: [] });
@@ -312,15 +316,20 @@ for (const [language, firstTurn, referenceTurn] of [
       await waitFor(() => calls.length === 1 && lastPurpose(f.openai) === ResponsePurpose.SCHEDULING_ALTERNATIVES, f.app);
       await deliverLastResponse(f, language === "es" ? "Tengo 10:30, 11:00 u 11:30. ¿Cuál prefieres?" : "I have 10:30, 11:00, or 11:30. Which works?");
       await caller(f, `${language}-real-ambiguous-later`, firstTurn);
-      await waitFor(() => lastPurpose(f.openai) === ResponsePurpose.CLARIFY_LATER_REFERENCE, f.app);
-      await deliverLastResponse(f, language === "es" ? "¿Después de cuál hora debo buscar?" : "Which time should I search after?");
+      await waitFor(() => calls.length === 2 && lastPurpose(f.openai) === ResponsePurpose.NO_AVAILABLE_TIMES, f.app);
+      assert.equal(calls[1].afterTime, '11:30');
+      assert.deepEqual(calls[1].searchPreference, { kind: 'AFTER', time: '11:30' });
+      assert.deepEqual(f.app.session.proposal.availability.alternatives, []);
+      assert.equal(f.bookingCalls.length, 0); assert.equal(f.smsCalls.length, 0);
+      assert.equal(f.app.session.journal().filter(e => e.event === 'CONFIRMATION_AUTHORITY_GRANTED').length, 0);
+      await deliverLastResponse(f, language === "es" ? "No tengo más horarios disponibles. ¿Otro día?" : "No later times are available. Another day?");
 
       await caller(f, `${language}-real-reference`, referenceTurn);
-      await waitFor(() => calls.length === 2 && lastPurpose(f.openai) === ResponsePurpose.SCHEDULING_ALTERNATIVES, f.app);
+      await waitFor(() => calls.length === 3 && lastPurpose(f.openai) === ResponsePurpose.SCHEDULING_ALTERNATIVES, f.app);
 
-      assert.equal(f.app.session.journal().filter((entry) => entry.event === "TURN_INTERPRETED").at(-1).action, "REQUEST_LATER_TIME");
-      assert.equal(calls[1].afterTime, "11:00");
-      assert.equal(calls[1].searchType, "LATER");
+      assert.equal(f.app.session.journal().filter((entry) => entry.event === "TURN_INTERPRETED").at(-1).action, "REQUEST_AVAILABLE_TIMES_FOR_DATE");
+      assert.equal(calls[2].searchPreference.time, '11:00');
+      assert.equal(calls[2].searchPreference.kind, 'AFTER');
       assert.equal(f.app.session.proposal.time, null);
       assert.equal(f.app.session.proposal.confirmation.status, "none");
       assert.ok(f.app.session.proposal.availability.alternatives.length > 0);
@@ -710,7 +719,9 @@ function fixture({ callSid = null, proposal = serviceProposal(), language = "en"
       searchCalls.push(request);
       const pending = searchResults[Math.min(searchIndex++, searchResults.length - 1)];
       const alternatives = await Promise.resolve(pending);
-      return { proposalVersion: request.proposalVersion, proposalSlotKey: request.proposalSlotKey, searchType: request.searchType, requestedDate: request.requestedDate, afterTime: request.afterTime, alternatives, reason: alternatives.length ? null : "UNAVAILABLE" };
+      return { proposalVersion: request.proposalVersion, proposalSlotKey: request.proposalSlotKey, searchType: request.searchType, requestedDate: request.requestedDate, afterTime: request.afterTime,
+        ...(request.searchPreference ? { searchPreference: request.searchPreference } : {}),
+        alternatives, reason: alternatives.length ? null : "UNAVAILABLE", metadata: { durationMinutes: 30, timeZone: request.timeZone } };
     },
     checkAvailability: async (request) => { checkCalls.push(request); return { proposalVersion: request.proposalVersion, slotKey: request.slotKey, available: selectedAvailable, alternatives: [], reason: selectedAvailable ? null : "UNAVAILABLE" }; },
     getAlternatives: async (request) => ({ slotKey: request.slotKey, alternatives: [], reason: null }),

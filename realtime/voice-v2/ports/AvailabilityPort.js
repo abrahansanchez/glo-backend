@@ -1,4 +1,5 @@
 import { requireNonEmpty } from "./PortErrors.js";
+import { createSearchPreference } from '../domain/AvailabilityState.js';
 
 export class AvailabilityPort {
   async checkAvailability(_request) { throw new Error("checkAvailability_not_implemented"); }
@@ -28,5 +29,6 @@ export function validateAvailabilitySearchRequest(request) {
   if (!Object.values(AvailabilitySearchType).includes(request.searchType)) throw new TypeError("invalid_search_type");
   if (request.searchType === AvailabilitySearchType.LATER && !/^([01]\d|2[0-3]):[0-5]\d$/.test(request.afterTime || "")) throw new TypeError("invalid_after_time");
   if (request.limit !== undefined && (!Number.isInteger(request.limit) || request.limit < 1 || request.limit > 3)) throw new TypeError("invalid_limit");
+  if (request.searchPreference !== undefined) createSearchPreference(request.searchPreference);
   return request;
 }

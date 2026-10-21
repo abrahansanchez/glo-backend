@@ -4,7 +4,7 @@ import {
   createCallerAction,
   validateCallerAction,
 } from "../domain/CallerAction.js";
-import { AvailabilityStatus } from "../domain/AvailabilityState.js";
+import { AvailabilityStatus, createSearchPreference } from "../domain/AvailabilityState.js";
 import { deriveSlotKey } from "../domain/BookingProposal.js";
 import { normalizeTurn } from "./TurnNormalizer.js";
 import { languageEvidenceFor, matchesRuleGroup } from "./InterpretationRules.js";
@@ -43,6 +43,8 @@ export async function interpretTurn({
   const normalizedTurn = normalizeTurn(transcript);
   const languageEvidence = languageEvidenceFor(normalizedTurn.text);
   const context = Object.freeze({ currentProposal, currentAlternatives, confirmationContext, referenceDate, businessTimeZone, availableServices, laterReferenceClarification, nameCollectionContext });
+  const search = contextualSearch(normalizedTurn, sourceTurnId, context);
+  if (search) return validateOrClarify(search, context, 'deterministic', sourceTurnId, languageEvidence);
   const selectedAction = classifyOneAction(normalizedTurn, context);
   if (selectedAction !== CallerActionType.UNKNOWN) {
     const candidate = buildInterpretation(selectedAction, normalizedTurn, sourceTurnId, context);
@@ -61,6 +63,51 @@ export async function interpretTurn({
     return result(clarify(sourceTurnId), "llm_fallback", "failure", languageEvidence);
   }
   return result(unknown(sourceTurnId), "deterministic", "not_used", languageEvidence);
+}
+
+function contextualSearch(turn, sourceTurnId, context) {
+  const text = turn.text;
+  const schedulingMeaning = /\b(?:times?|availability|available|openings?|appointments?|later|earlier|morning|afternoon|horarios?|disponibles?|disponibilidad|citas?|tarde|mas temprano|(?:por|en|de) la manana)\b/.test(text);
+  const availabilityQuestion = schedulingMeaning
+    && /\b(?:what times|what (?:else )?do you have|what is available|what times are available|que horarios|que (?:otros )?horarios|que tienen|tienen algo|anything later|anything after|do you have (?:anything |later )|algo (?:mas tarde|despues))\b/.test(text);
+  const morning = /\b(?:morning|(?:por|en|de) la manana)\b/.test(text);
+  const afternoon = /\b(?:afternoon|(?:por|en|de) la tarde)\b/.test(text);
+  const preferenceCue = /\b(?:prefer|prefiero|morning times|afternoon times)\b/.test(text)
+    || /^(?:in the|por la|en la) (?:morning|afternoon|manana|tarde)$/.test(text);
+  const explicitBound = /\b(?:after|later than|despues de|mas tarde de|o despues)\b/.test(text);
+  // A clock selection owns the historical exact-slot path; a relational bound
+  // describes a search instead. A broad daypart must not erase an exact hour.
+  if (!explicitBound && extractTime(turn) !== null) return null;
+  let preference;
+  if (explicitBound) {
+    const time = extractTime(turn);
+    if (time) {
+      const unqualifiedSpanish = /\b(?:despues de|mas tarde de|o despues)\b/.test(text)
+        && !/\b(?:am|pm|manana|tarde|noche)\b/.test(text.replace(/mas tarde de/g, 'despues de')) && Number(time.slice(0, 2)) <= 12;
+      preference = createSearchPreference({ kind: /\b(?:at or after|o despues)\b/.test(text) ? 'AT_OR_AFTER' : 'AFTER', time, ...(unqualifiedSpanish ? { ambiguousHour: true } : {}) });
+    }
+  }
+  if (!preference && morning !== afternoon && (availabilityQuestion || preferenceCue)) preference = createSearchPreference({ kind: morning ? 'MORNING' : 'AFTERNOON' });
+  const later = !explicitBound && /\b(?:anything later|what else do you have|do you have (?:anything later|later times)|tienen algo mas tarde|algo mas tarde|que otros horarios tienen)\b/.test(text);
+  const wide = availabilityQuestion && (!morning || afternoon) && !explicitBound;
+  if (!preference && !later && !wide) return null;
+  const dateTurn = normalizeTurn(text.replace(/\b(?:in the|por la|en la|de la) (?:morning|afternoon|manana|tarde)\b/g, ''));
+  const suppliedService = extractService(turn, context);
+  const suppliedDate = extractDate(dateTurn, context);
+  // Complete date-wide requests keep their historical action and versioning.
+  // A daypart in their description is not a new contextual preference.
+  if ((suppliedService || suppliedDate) && !explicitBound && !preferenceCue) return null;
+  const service = suppliedService || context.currentProposal?.service;
+  const date = suppliedDate || context.currentProposal?.date;
+  if (!service || !date || !isAllowedService(service, context.availableServices)) return clarify(sourceTurnId);
+  // Keep existing ordinal/reference clarification and selected-slot behavior.
+  if (later && (context.laterReferenceClarification || context.currentProposal?.time)) return null;
+  return {
+    action: later ? CallerActionType.REQUEST_LATER_TIME : CallerActionType.REQUEST_AVAILABLE_TIMES_FOR_DATE,
+    confidence: CallerActionConfidence.CONTEXTUAL, sourceTurnId,
+    ...(later ? { latestAlternatives: true } : { service, date, contextualSearch: true }),
+    ...(preference ? { searchPreference: preference } : {}),
+  };
 }
 
 export function classifyOneAction(normalizedTurn, context) {

@@ -9,6 +9,7 @@ import {
 import { deriveSlotKey } from "../domain/BookingProposal.js";
 import { AvailabilityPort, AvailabilitySearchType, validateAvailabilityRequest, validateAvailabilitySearchRequest } from "../ports/AvailabilityPort.js";
 import { BusinessReason, normalizeBusinessError } from "../ports/PortErrors.js";
+import { preferenceAllows } from '../domain/AvailabilityState.js';
 
 export const V1_AVAILABILITY_SIGNATURE = Object.freeze({
   isSlotAvailableArity: 1,
@@ -102,6 +103,27 @@ export class V1AvailabilityAdapter extends AvailabilityPort {
       if (!timeZonesAgree(barber, request.timeZone)) return schedulingResult(request, [], BusinessReason.INVALID_SLOT);
       const durationMinutes = this.getServiceDurationFn(barber, request.service);
       const limit = request.limit ?? 3;
+      if (request.searchPreference) {
+        const preference = request.searchPreference;
+        let resolvedLowerTime = null;
+        if (preference.ambiguousHour) {
+          const hour = Number(preference.time.slice(0, 2)) % 12;
+          const candidates = [hour, hour + 12].map(h => `${String(h).padStart(2, '0')}:${preference.time.slice(3)}`)
+            .filter(time => withinBusinessHours(barber, request, time, durationMinutes));
+          if (candidates.length !== 1) return schedulingResult(request, [], 'AMBIGUOUS_TIME_REFERENCE', durationMinutes);
+          resolvedLowerTime = candidates[0];
+        }
+        // The shared helper advances in 30-minute steps: one local day has at
+        // most 48 candidates. Filter before taking three, so morning slots
+        // cannot hide eligible afternoon slots. No cross-date preference guess.
+        const raw = await this.getAvailableSlotsFn({ barber, date: request.requestedDate, durationMinutes, limit: 48, startAfterTime: null });
+        const alternatives = normalizeSearchAlternatives(Array.isArray(raw) ? raw : [], request)
+          .filter(slot => slot.date === request.requestedDate && withinBusinessHours(barber, request, slot.time, durationMinutes)
+            && preferenceAllows(slot.time, preference, resolvedLowerTime))
+          .sort((a, b) => a.time.localeCompare(b.time)).slice(0, limit);
+        return schedulingResult(request, alternatives, closedDateReason(barber, request.requestedDate, request.timeZone)
+          || (alternatives.length ? null : BusinessReason.UNAVAILABLE), durationMinutes, resolvedLowerTime);
+      }
       const startAfterTime = request.searchType === AvailabilitySearchType.LATER
         ? toV1Time(request.requestedDate, request.afterTime, request.timeZone)
         : null;
@@ -201,7 +223,17 @@ function closedDateReason(barber, date, timeZone) {
   return blackedOut ? BusinessReason.BUSINESS_CLOSED : null;
 }
 
-function schedulingResult(request, alternatives, reason, durationMinutes = null) {
+function withinBusinessHours(barber, request, time, durationMinutes) {
+  const start = moment.tz(`${request.requestedDate} ${time}`, 'YYYY-MM-DD HH:mm', true, request.timeZone);
+  if (!start.isValid() || start.format('HH:mm') !== time) return false;
+  const hours = barber.availability?.businessHours?.[['sun','mon','tue','wed','thu','fri','sat'][start.day()]];
+  if (!hours || hours.isClosed || !Number.isFinite(durationMinutes) || durationMinutes <= 0) return false;
+  const open = moment.tz(`${request.requestedDate} ${hours.open}`, 'YYYY-MM-DD HH:mm', true, request.timeZone);
+  const close = moment.tz(`${request.requestedDate} ${hours.close}`, 'YYYY-MM-DD HH:mm', true, request.timeZone);
+  return open.isValid() && close.isValid() && start.isSameOrAfter(open) && start.clone().add(durationMinutes, 'minutes').isSameOrBefore(close);
+}
+
+function schedulingResult(request, alternatives, reason, durationMinutes = null, resolvedLowerTime = null) {
   return Object.freeze({
     proposalVersion: request?.proposalVersion ?? null,
     proposalSlotKey: request?.proposalSlotKey ?? null,
@@ -210,6 +242,8 @@ function schedulingResult(request, alternatives, reason, durationMinutes = null)
     afterTime: request?.afterTime ?? null,
     alternatives: Object.freeze(alternatives),
     reason,
+    ...(request?.searchPreference ? { searchPreference: request.searchPreference } : {}),
+    ...(resolvedLowerTime ? { resolvedLowerTime } : {}),
     metadata: Object.freeze({ durationMinutes, timeZone: request?.timeZone ?? null }),
   });
 }

@@ -553,6 +553,7 @@ export function initializeVoiceV2Session({
       proposalSlotKey: command.proposalSlotKey,
       searchType: command.searchType,
       limit: 3,
+      ...(command.searchPreference ? { searchPreference: command.searchPreference } : {}),
     });
   }
 
@@ -565,6 +566,7 @@ export function initializeVoiceV2Session({
       afterTime: command.afterTime,
       alternatives: [],
       reason: "TIMEOUT",
+      ...(command.searchPreference ? { searchPreference: command.searchPreference } : {}),
     };
   }
 

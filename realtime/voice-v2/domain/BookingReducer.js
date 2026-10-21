@@ -8,6 +8,7 @@ import {
   validateBookingProposal,
 } from "./BookingProposal.js";
 import { isConfirmationAuthoritativeFor } from "./ConfirmationState.js";
+import { createSearchPreference } from "./AvailabilityState.js";
 
 export const BookingEffectType = Object.freeze({
   CHECK_AVAILABILITY: "CHECK_AVAILABILITY",
@@ -34,6 +35,9 @@ export function reduceBooking(currentProposal, action) {
   if (currentProposal.terminal) return rejected(currentProposal, "booking_already_terminal");
   const actionValidation = validateCallerAction(action);
   if (!actionValidation.valid) return rejected(currentProposal, actionValidation.reason);
+  if (action.searchPreference !== undefined) {
+    try { createSearchPreference(action.searchPreference); } catch { return rejected(currentProposal, 'invalid_search_preference'); }
+  }
 
   if ([CallerActionType.UNKNOWN, CallerActionType.CLARIFY, CallerActionType.NO_INFORMATION].includes(action.action)) {
     return unchanged(currentProposal, [{ type: BookingEffectType.REQUEST_CLARIFICATION }]);
@@ -68,13 +72,14 @@ export function reduceBooking(currentProposal, action) {
 function requestAvailableTimesForDate(current, action) {
   const service = action.service === undefined ? current.service : action.service;
   if (service !== null && !isValidFieldValue("service", service)) return rejected(current, "invalid_service");
-  if (!service) return unchanged(current, [{ type: BookingEffectType.REQUEST_CLARIFICATION, proposalVersion: current.proposalVersion }]);
+  if (!service || !isValidFieldValue('date', action.date)) return unchanged(current, [{ type: BookingEffectType.REQUEST_CLARIFICATION, proposalVersion: current.proposalVersion }]);
   return prepareSchedulingSearch(current, action, {
     service,
     type: BookingEffectType.REQUEST_AVAILABLE_TIMES_FOR_DATE,
     searchType: "DATE",
     requestedDate: action.date,
     afterTime: null,
+    searchPreference: action.searchPreference,
   });
 }
 
@@ -96,10 +101,19 @@ function requestLaterTime(current, action) {
     searchType: "LATER",
     requestedDate: reference.requestedDate,
     afterTime: reference.afterTime,
+    searchPreference: action.searchPreference || (action.latestAlternatives ? { kind: 'AFTER', time: reference.afterTime } : undefined),
   });
 }
 
 function laterSearchReference(current, action) {
+  if (action.latestAlternatives) {
+    const offered = currentSchedulingAlternatives(current);
+    if (offered?.length) {
+      if (offered.some(slot => slot.date !== current.date)) return { ambiguous: true };
+      return { requestedDate: current.date, afterTime: offered.reduce((latest, slot) => slot.time > latest ? slot.time : latest, '00:00') };
+    }
+    return current.time ? { requestedDate: current.date, afterTime: current.time } : null;
+  }
   if (isValidFieldValue("time", action.time)) return { requestedDate: current.date, afterTime: action.time };
   if (Number.isInteger(action.referenceAlternativeIndex)) {
     const alternatives = currentSchedulingAlternatives(current);
@@ -127,7 +141,8 @@ function currentSchedulingAlternatives(current) {
 
 function prepareSchedulingSearch(current, action, search) {
   const service = search.service ?? current.service;
-  const proposalChanged = current.service !== service || current.date !== search.requestedDate || current.time !== null;
+  const proposalChanged = !!search.searchPreference || action.contextualSearch === true
+    || current.service !== service || current.date !== search.requestedDate || current.time !== null;
   const nextVersion = proposalChanged ? current.proposalVersion + 1 : current.proposalVersion;
   const next = proposalChanged
     ? createBookingProposal({
@@ -159,6 +174,7 @@ function prepareSchedulingSearch(current, action, search) {
     requestedDate: search.requestedDate,
     afterTime: search.afterTime,
     searchType: search.searchType,
+    ...(search.searchPreference ? { searchPreference: createSearchPreference(search.searchPreference) } : {}),
   };
   return proposalChanged ? changed(next, [effect]) : unchanged(next, [effect]);
 }
