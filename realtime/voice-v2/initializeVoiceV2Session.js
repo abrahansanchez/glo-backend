@@ -70,7 +70,7 @@ export function initializeVoiceV2Session({
   speechHeadersTimeoutMs = process.env.VOICE_V2_SPEECH_HEADERS_TIMEOUT_MS,
 } = {}) {
   requireSessionInputs({ callSid, callerNumber, businessContext, buildSha, twilioSocket, openaiSocketFactory });
-  let lifecycle; let consentDiagnostics; let processing = Promise.resolve(); let effectsProcessing = Promise.resolve(); let turnSequence = 0; let responseSequence = 0; let markSequence = 0; let twilioStarted = false; let openaiSessionCreated = false; let openaiConfigured = false; let initialGreetingRequested = false; let callerTurnSeen = false; let lastAcknowledgedState = null; let transcriptionLanguage = openaiSession.input_audio_transcription?.language || null; let languageUpdateAttempted = false;
+  let lifecycle; let consentDiagnostics; let processing = Promise.resolve(); let effectsProcessing = Promise.resolve(); let turnSequence = 0; let responseSequence = 0; let markSequence = 0; let twilioStarted = false; let openaiSessionCreated = false; let openaiConfigured = false; let initialGreetingRequested = false; let callerTurnSeen = false; let lastAcknowledgedState = null; let transcriptionLanguage = openaiSession.input_audio_transcription?.language || null; let languageUpdatePending = false; let languageUpdateAttemptedFor = null;
   const providerTurns = new Set(); const requests = new Map(); const responses = new Map(); const marks = new Map(); const superseded = new Set(); const ambiguityPurposes = []; const startupAudio = []; let startupAudioBytes = 0; let callTerminationRequested = false;
   const preparationConfiguration = resolvePreparationDeadline(speechPreparationTimeoutMs);
   const preparationBudget = preparationConfiguration.preparationBudgetMs;
@@ -388,7 +388,7 @@ export function initializeVoiceV2Session({
       }
       return interruptCurrent(event.itemId || null);
     }
-    if (event.type === TransportEvent.CALLER_SPEECH_STOPPED) { observeConsent("speechStopped", event.itemId, listeningTraceDetails(event)); session.turnRegistry.speechStopped(event.itemId); callTrace.speechStopped(listeningTraceDetails(event)); return; }
+    if (event.type === TransportEvent.CALLER_SPEECH_STOPPED) { observeConsent("speechStopped", event.itemId, listeningTraceDetails(event)); session.turnRegistry.speechStopped(event.itemId); callTrace.speechStopped(listeningTraceDetails(event)); requestTranscriptionAlignment(); return; }
     if (event.type === TransportEvent.RESPONSE_CREATED) return responseCreated(event);
     if (event.type === TransportEvent.RESPONSE_AUDIO_DELTA) return responseAudio(event);
     if (event.type === TransportEvent.RESPONSE_AUDIO_COMPLETED) {
@@ -518,7 +518,7 @@ export function initializeVoiceV2Session({
     }
     const languageTransition = session.conversationLanguage.observe({ languageEvidence: outcome?.interpreted?.languageEvidence, turnId, action: outcome?.interpreted?.interpretation?.action });
     if (languageTransition.changed) session.record("CONVERSATION_LANGUAGE_CHANGED", { turnId, previousLanguage: languageTransition.previousLanguage, currentLanguage: languageTransition.currentLanguage, reason: languageTransition.reason, confidence: languageTransition.languageEvidence?.confidence || null });
-    if (languageTransition.changed && languageTransition.previousLanguage === "en" && languageTransition.currentLanguage === "es") requestSpanishTranscriptionUpdate(turnId);
+    if (languageTransition.changed) { languageUpdateAttemptedFor = null; requestTranscriptionAlignment(turnId); }
     const ambiguousAction = ["UNKNOWN", "CLARIFY"].includes(interpretedAction);
     if (!consentClaim.claimed) {
       const recovery = interpretedAction === "NO_INFORMATION"
@@ -542,25 +542,36 @@ export function initializeVoiceV2Session({
     return effectsProcessing;
   }
 
-  function requestSpanishTranscriptionUpdate(turnId) {
-    if (languageUpdateAttempted || transcriptionLanguage !== "en" || typeof openai.updateTranscriptionLanguage !== "function") return;
-    languageUpdateAttempted = true;
-    const request = openai.updateTranscriptionLanguage("es");
+  function requestTranscriptionAlignment(turnId) {
+    const language = session.conversationLanguage.currentLanguage;
+    if (lifecycle.terminated || deliveryStopping || !openaiConfigured || languageUpdatePending
+      || session.turnRegistry.callerSpeechActive || openai.callerSpeechActive
+      || !["en", "es"].includes(transcriptionLanguage) || language === transcriptionLanguage
+      || languageUpdateAttemptedFor === language || typeof openai.updateTranscriptionLanguage !== "function") return;
+    languageUpdateAttemptedFor = language;
+    let request;
+    try { request = openai.updateTranscriptionLanguage(language); }
+    catch { request = { accepted: false, reason: "LANGUAGE_UPDATE_SEND_FAILED" }; }
     if (!request.accepted) return callTrace.entry("LANGUAGE_UPDATE_REJECTED", languageUpdateDetails({ ...request, turnId, reason: request.reason || "NOT_ACCEPTED" }));
-    timing.point("LANGUAGE_UPDATE_REQUESTED", { requestId: request.updateId, turnId, previousTranscriptionLanguage: transcriptionLanguage, requestedLanguage: "es" });
-    callTrace.entry("LANGUAGE_UPDATE_REQUESTED", { ...languageUpdateDetails({ ...request, turnId, reason: "REQUESTED" }), previousTranscriptionLanguage: transcriptionLanguage, requestedLanguage: "es" });
+    languageUpdatePending = true;
+    timing.point("LANGUAGE_UPDATE_REQUESTED", { requestId: request.updateId, turnId, previousTranscriptionLanguage: transcriptionLanguage, requestedLanguage: language });
+    callTrace.entry("LANGUAGE_UPDATE_REQUESTED", { ...languageUpdateDetails({ ...request, turnId, reason: "REQUESTED" }), previousTranscriptionLanguage: transcriptionLanguage, requestedLanguage: language });
   }
 
   function languageUpdateAcknowledged(event) {
+    languageUpdatePending = false;
     transcriptionLanguage = event.acknowledgedLanguage;
     consentDiagnostics.setTranscriptionLanguage(transcriptionLanguage);
     timing.point("LANGUAGE_UPDATE_ACKNOWLEDGED", languageUpdateDetails(event));
-    return callTrace.entry("LANGUAGE_UPDATE_ACKNOWLEDGED", languageUpdateDetails({ ...event, reason: "ACKNOWLEDGED" }));
+    callTrace.entry("LANGUAGE_UPDATE_ACKNOWLEDGED", languageUpdateDetails({ ...event, reason: "ACKNOWLEDGED" }));
+    requestTranscriptionAlignment();
   }
 
   function languageUpdateRejected(event) {
+    languageUpdatePending = false;
     timing.point("LANGUAGE_UPDATE_REJECTED", languageUpdateDetails(event));
-    return callTrace.entry("LANGUAGE_UPDATE_REJECTED", languageUpdateDetails(event));
+    callTrace.entry("LANGUAGE_UPDATE_REJECTED", languageUpdateDetails(event));
+    requestTranscriptionAlignment();
   }
 
   function languageUpdateDetails(event = {}) {

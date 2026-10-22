@@ -22,6 +22,8 @@ export class OpenAIRealtimeAdapter {
   #audioInput = null;
   #transcription = null;
   #pendingLanguageUpdate = null;
+  #languageSpeechItems = new Set();
+  #languageSpeechUncertain = false;
   #now;
   #callSid = null;
   #model = null;
@@ -39,6 +41,7 @@ export class OpenAIRealtimeAdapter {
   get configurationRequested() { return this.#configurationRequested; }
   get configured() { return this.#configured; }
   get activeRequestId() { return this.#activeRequestId; }
+  get callerSpeechActive() { return this.#languageSpeechUncertain || this.#languageSpeechItems.size > 0; }
 
   connect(options = {}) {
     if (this.#socket) throw new TypeError("openai_socket_already_created");
@@ -73,11 +76,14 @@ export class OpenAIRealtimeAdapter {
   updateTranscriptionLanguage(language, { updateId = this.#id("language") } = {}) {
     this.#requireWritable();
     if (this.#pendingLanguageUpdate) return Object.freeze({ accepted: false, reason: "LANGUAGE_UPDATE_PENDING", updateId: this.#pendingLanguageUpdate.updateId });
-    if (!this.#audioInput?.transcription || this.#transcription?.language !== "en" || language !== "es") return Object.freeze({ accepted: false, reason: "LANGUAGE_UPDATE_NOT_ALLOWED", updateId });
+    if (this.callerSpeechActive) return Object.freeze({ accepted: false, reason: "CALLER_SPEECH_ACTIVE", updateId });
+    if (!this.#audioInput?.transcription || !["en", "es"].includes(this.#transcription?.language)
+      || !["en", "es"].includes(language) || language === this.#transcription.language) return Object.freeze({ accepted: false, reason: "LANGUAGE_UPDATE_NOT_ALLOWED", updateId });
     const transcription = freezePlain({ ...this.#audioInput.transcription, language });
     const audioInput = freezePlain({ ...this.#audioInput, transcription });
     this.#pendingLanguageUpdate = Object.freeze({ updateId, requestedLanguage: language, audioInput, transcription });
-    sendJson(this.#socket, { event_id: updateId, type: "session.update", session: { audio: { input: audioInput } } });
+    try { sendJson(this.#socket, { event_id: updateId, type: "session.update", session: { type: "realtime", audio: { input: audioInput } } }); }
+    catch { this.#pendingLanguageUpdate = null; return Object.freeze({ accepted: false, reason: "LANGUAGE_UPDATE_SEND_FAILED", updateId }); }
     return Object.freeze({ accepted: true, updateId, transcription });
   }
 
@@ -117,6 +123,14 @@ export class OpenAIRealtimeAdapter {
 
   #onMessage(raw) {
     let message; try { message = parseJsonMessage(raw); } catch (error) { return this.#onError(error); }
+    // Configuration safety follows receipt, including speech queued behind a
+    // pending application operation. This set never participates in admission.
+    if (message.type === "input_audio_buffer.speech_started") {
+      if (typeof message.item_id !== "string" || !message.item_id || message.item_id.length > 256
+        || (this.#languageSpeechItems.size >= 64 && !this.#languageSpeechItems.has(message.item_id))) this.#languageSpeechUncertain = true;
+      else this.#languageSpeechItems.add(message.item_id);
+    }
+    if (message.type === "input_audio_buffer.speech_stopped") this.#languageSpeechItems.delete(message.item_id);
     try { notifyTurnOrderObserver(this.#transcriptionObserver, rawTurnOrderMetadata(message)); } catch { /* Receipt observation only. */ }
     try { notifyTurnOrderObserver(this.#turnOrderObserver, rawTurnOrderMetadata(message)); } catch { /* Metadata is observation only. */ }
     const type = message.type; const identity = providerIdentity(message);
@@ -184,7 +198,7 @@ export class OpenAIRealtimeAdapter {
     return this.#publish(TransportEvent.OPENAI_TRANSPORT_ERROR, providerDetails);
   }
 
-  #onClose(details) { notifyTurnOrderObserver(this.#transcriptionClosed, Object.freeze({})); if (!this.#connected && !this.#socket) return; const type = this.#opened ? TransportEvent.OPENAI_SOCKET_CLOSED : TransportEvent.OPENAI_SOCKET_CLOSED_BEFORE_READY; this.#connected = false; if (this.#pendingLanguageUpdate) { const pending = this.#pendingLanguageUpdate; this.#pendingLanguageUpdate = null; this.#publish(TransportEvent.OPENAI_LANGUAGE_UPDATE_REJECTED, { ...this.#startupMetadata(), updateId: pending.updateId, requestedLanguage: pending.requestedLanguage, reason: "SOCKET_CLOSED" }); } this.#publish(type, { ...this.#startupMetadata(), readyState: this.#socket?.readyState ?? null, closeCode: details?.code ?? null, closeReason: details?.reason?.toString?.() || null }); this.#publish(TransportEvent.OPENAI_CONNECTION_CLOSED, { code: details?.code ?? null, reason: details?.reason?.toString?.() || null }); }
+  #onClose(details) { this.#languageSpeechItems.clear(); this.#languageSpeechUncertain = false; notifyTurnOrderObserver(this.#transcriptionClosed, Object.freeze({})); if (!this.#connected && !this.#socket) return; const type = this.#opened ? TransportEvent.OPENAI_SOCKET_CLOSED : TransportEvent.OPENAI_SOCKET_CLOSED_BEFORE_READY; this.#connected = false; if (this.#pendingLanguageUpdate) { const pending = this.#pendingLanguageUpdate; this.#pendingLanguageUpdate = null; this.#publish(TransportEvent.OPENAI_LANGUAGE_UPDATE_REJECTED, { ...this.#startupMetadata(), updateId: pending.updateId, requestedLanguage: pending.requestedLanguage, reason: "SOCKET_CLOSED" }); } this.#publish(type, { ...this.#startupMetadata(), readyState: this.#socket?.readyState ?? null, closeCode: details?.code ?? null, closeReason: details?.reason?.toString?.() || null }); this.#publish(TransportEvent.OPENAI_CONNECTION_CLOSED, { code: details?.code ?? null, reason: details?.reason?.toString?.() || null }); }
   #onError(error) { notifyTurnOrderObserver(this.#transcriptionClosed, Object.freeze({})); this.#publish(TransportEvent.OPENAI_SOCKET_ERROR, { ...this.#startupMetadata(), phase: this.#opened ? "CONNECTED" : "STARTUP", readyState: this.#socket?.readyState ?? null, errorCode: safeString(error?.code), errorName: safeString(error?.name) || "Error" }); this.#publish(TransportEvent.OPENAI_TRANSPORT_ERROR, { error: normalizeError(error) }); }
   #requireWritable() { if (!this.#socket || this.#socket.readyState === 2 || this.#socket.readyState === 3) throw new TypeError("openai_transport_not_writable"); }
   #requireConfigured() { this.#requireWritable(); if (!this.#configured) throw new TypeError("openai_session_not_configured"); }

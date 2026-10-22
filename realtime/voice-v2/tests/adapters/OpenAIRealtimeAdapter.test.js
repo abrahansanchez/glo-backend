@@ -34,7 +34,7 @@ test("Spanish language update preserves the complete audio input object and wait
   const initialInput = state.socket.sent[0].session.audio.input;
   const update = state.adapter.updateTranscriptionLanguage("es", { updateId: "language-update-1" });
   assert.equal(update.accepted, true);
-  assert.deepEqual(state.socket.sent.at(-1), { event_id: "language-update-1", type: "session.update", session: { audio: { input: {
+  assert.deepEqual(state.socket.sent.at(-1), { event_id: "language-update-1", type: "session.update", session: { type: "realtime", audio: { input: {
     format: { type: "audio/pcmu" },
     transcription: { model: "gpt-4o-mini-transcribe", language: "es", prompt: "Expect haircut appointment words." },
     turn_detection: { type: "server_vad", threshold: 0.71, silence_duration_ms: 650, create_response: false, interrupt_response: false },
