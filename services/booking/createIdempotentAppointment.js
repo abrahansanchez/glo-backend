@@ -13,6 +13,7 @@ import {
 } from "./atomicScheduleMutation.js";
 
 export function canonicalizeBookingRequest(request, durationMinutes) {
+  if (request.notes !== undefined && (typeof request.notes !== "string" || !request.notes.trim() || request.notes.length > 1024)) throw new TypeError("invalid_appointment_notes");
   const timeZone = String(request.timeZone || "").trim();
   if (!moment.tz.zone(timeZone)) throw new TypeError("invalid_time_zone");
   const local = moment.tz(
@@ -36,6 +37,7 @@ export function canonicalizeBookingRequest(request, durationMinutes) {
     durationMinutes: Number(durationMinutes),
     callerNumber,
     clientName,
+    ...(request.notes !== undefined ? { notes: request.notes } : {}),
   });
 }
 
@@ -91,6 +93,7 @@ export async function createIdempotentAppointment(request, dependencies = {}) {
     clientName: request.clientName,
     clientPhone: canonical.callerNumber,
     service: request.service,
+    ...(canonical.notes !== undefined ? { notes: canonical.notes } : {}),
     date: startAt,
     time: v1Time,
     startAt,

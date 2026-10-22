@@ -1,4 +1,5 @@
 import { requireNonEmpty } from "./PortErrors.js";
+import { MAX_APPOINTMENT_NOTES } from "../domain/AdditionalServices.js";
 
 export class BookingPort {
   async createAppointment(_request) { throw new Error("createAppointment_not_implemented"); }
@@ -7,6 +8,7 @@ export class BookingPort {
 
 export function validateBookingRequest(request) {
   if (!request || typeof request !== "object") throw new TypeError("invalid_booking_request");
+  if (request.notes !== undefined && (typeof request.notes !== "string" || !request.notes.trim() || request.notes.length > MAX_APPOINTMENT_NOTES)) throw new TypeError("invalid_appointment_notes");
   for (const field of ["commandId", "idempotencyKey", "callSid", "barberId", "clientName", "callerNumber", "service", "date", "time", "timeZone"]) {
     requireNonEmpty(request[field], field);
   }

@@ -1,7 +1,10 @@
+import { additionalServicesNote } from "../domain/AdditionalServices.js";
+
 export function buildCreateAppointmentCommand({ authorization, proposal, callSid, callerNumber, businessContext }) {
   if (authorization?.type !== "AUTHORIZE_BOOKING") throw new TypeError("booking_authorization_required");
   if (authorization.proposalVersion !== proposal?.proposalVersion) throw new TypeError("stale_booking_authorization");
   if (proposal.terminal) throw new TypeError("booking_already_terminal");
+  const notes = additionalServicesNote(proposal);
   for (const [field, value] of Object.entries({ callSid, callerNumber, barberId: businessContext?.barberId, timeZone: businessContext?.timeZone })) {
     if (typeof value !== "string" || !value.trim()) throw new TypeError(`missing_${field}`);
   }
@@ -13,6 +16,7 @@ export function buildCreateAppointmentCommand({ authorization, proposal, callSid
     callerNumber,
     clientName: proposal.name,
     service: proposal.service,
+    ...(notes ? { notes } : {}),
     date: proposal.date,
     time: proposal.time,
     timeZone: businessContext.timeZone,

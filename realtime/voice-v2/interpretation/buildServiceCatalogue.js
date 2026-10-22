@@ -3,7 +3,7 @@
 // SpeechValidator. They are aliases only when that exact service is offered.
 const ALIASES = Object.freeze({
   haircut: Object.freeze(['hair cut', 'corte', 'corte de pelo', 'cortarme el pelo']),
-  'beard trim': Object.freeze(['recorte de barba', 'barba']),
+  'beard trim': Object.freeze(['recorte de barba', 'barba', 'beard cut']),
 });
 
 export function buildServiceCatalogue(services = []) {

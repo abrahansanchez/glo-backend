@@ -12,7 +12,7 @@ import { extractAlternativeIndex, matchAlternativeTime } from "./extractors/Alte
 import { extractConfirmation } from "./extractors/ConfirmationExtractor.js";
 import { extractDate } from "./extractors/DateExtractor.js";
 import { extractName } from "./extractors/NameExtractor.js";
-import { extractService, hasServiceSignal } from "./extractors/ServiceExtractor.js";
+import { extractService, extractRequestedServices, extractServiceRemoval } from "./extractors/ServiceExtractor.js";
 import { extractTime } from "./extractors/TimeExtractor.js";
 
 const FIELD_BY_ACTION = Object.freeze({
@@ -42,7 +42,15 @@ export async function interpretTurn({
 }) {
   const normalizedTurn = normalizeTurn(transcript);
   const languageEvidence = languageEvidenceFor(normalizedTurn.text);
-  const context = Object.freeze({ currentProposal, currentAlternatives, confirmationContext, referenceDate, businessTimeZone, availableServices, laterReferenceClarification, nameCollectionContext });
+  const requestedServices = extractRequestedServices(normalizedTurn, { availableServices });
+  if (requestedServices?.length === 0) return result(clarify(sourceTurnId), "deterministic", "not_used", languageEvidence);
+  const context = Object.freeze({ currentProposal, currentAlternatives, confirmationContext, referenceDate, businessTimeZone, availableServices, laterReferenceClarification, nameCollectionContext, requestedServices });
+  const retainedServices = extractServiceRemoval(normalizedTurn, context);
+  if (retainedServices) {
+    if (!retainedServices.length) return result(clarify(sourceTurnId), "deterministic", "not_used", languageEvidence);
+    return validateOrClarify({ action: CallerActionType.MODIFY_SERVICE, confidence: CallerActionConfidence.EXPLICIT,
+      sourceTurnId, service: retainedServices[0], additionalServices: retainedServices.slice(1) }, context, "deterministic", sourceTurnId, languageEvidence);
+  }
   const search = contextualSearch(normalizedTurn, sourceTurnId, context);
   if (search) return validateOrClarify(search, context, 'deterministic', sourceTurnId, languageEvidence);
   const selectedAction = classifyOneAction(normalizedTurn, context);
@@ -92,7 +100,7 @@ function contextualSearch(turn, sourceTurnId, context) {
   const wide = availabilityQuestion && (!morning || afternoon) && !explicitBound;
   if (!preference && !later && !wide) return null;
   const dateTurn = normalizeTurn(text.replace(/\b(?:in the|por la|en la|de la) (?:morning|afternoon|manana|tarde)\b/g, ''));
-  const suppliedService = extractService(turn, context);
+  const suppliedService = selectedService(turn, context);
   const suppliedDate = extractDate(dateTurn, context);
   // Complete date-wide requests keep their historical action and versioning.
   // A daypart in their description is not a new contextual preference.
@@ -106,6 +114,8 @@ function contextualSearch(turn, sourceTurnId, context) {
     action: later ? CallerActionType.REQUEST_LATER_TIME : CallerActionType.REQUEST_AVAILABLE_TIMES_FOR_DATE,
     confidence: CallerActionConfidence.CONTEXTUAL, sourceTurnId,
     ...(later ? { latestAlternatives: true } : { service, date, contextualSearch: true }),
+    ...(!later && context.requestedServices ? { additionalServices: context.requestedServices.slice(1) } : {}),
+    ...(!later && !suppliedService && context.currentProposal?.additionalServices?.length ? { additionalServices: context.currentProposal.additionalServices } : {}),
     ...(preference ? { searchPreference: preference } : {}),
   };
 }
@@ -118,7 +128,7 @@ export function classifyOneAction(normalizedTurn, context) {
     || matchesRuleGroup("half_hour_forms", text)
     || matchesRuleGroup("quarter_hour_forms", text);
   const dateSignal = matchesRuleGroup("day_date_requests", text);
-  const serviceSignal = hasServiceSignal(normalizedTurn, context);
+  const serviceSignal = selectedService(normalizedTurn, context) !== null;
   const nameSignal = matchesRuleGroup("name_setting_cues", text);
   const bookRequest = matchesRuleGroup("book_request_cues", text);
 
@@ -172,13 +182,13 @@ function buildInterpretation(action, normalizedTurn, sourceTurnId, context) {
       break;
     case CallerActionType.REQUEST_AVAILABLE_TIMES_FOR_DATE: {
       value.date = extractDate(normalizedTurn, context);
-      const service = extractService(normalizedTurn, context);
+      const service = selectedService(normalizedTurn, context);
       if (service) value.service = service;
       break;
     }
     case CallerActionType.SET_SERVICE:
     case CallerActionType.MODIFY_SERVICE:
-      value.service = extractService(normalizedTurn, context);
+      value.service = selectedService(normalizedTurn, context);
       break;
     case CallerActionType.SET_NAME:
       value.name = extractName(normalizedTurn, { allowBare: context.nameCollectionContext });
@@ -200,7 +210,7 @@ function buildInterpretation(action, normalizedTurn, sourceTurnId, context) {
       break;
     }
     case CallerActionType.BOOK_REQUEST: {
-      const service = extractService(normalizedTurn, context);
+      const service = selectedService(normalizedTurn, context);
       const name = nameSignalFor(normalizedTurn) ? extractName(normalizedTurn) : null;
       const date = matchesRuleGroup("day_date_requests", normalizedTurn.text) ? extractDate(normalizedTurn, context) : null;
       const time = hasTimeSignal(normalizedTurn.text) ? extractTime(normalizedTurn, { currentTime: context.currentProposal?.time }) : null;
@@ -211,8 +221,13 @@ function buildInterpretation(action, normalizedTurn, sourceTurnId, context) {
       break;
     }
   }
+  if (value.service !== undefined && (context.requestedServices || context.currentProposal?.additionalServices?.length)) {
+    value.additionalServices = context.requestedServices?.slice(1) || [];
+  }
   return value;
 }
+
+function selectedService(turn, context) { return context.requestedServices?.[0] || extractService(turn, context); }
 
 function matchCurrentAlternativeTime(normalizedTurn, context) {
   const proposal = context.currentProposal;
@@ -254,6 +269,9 @@ function validateCandidate(candidate, context, sourceTurnId) {
     if (!Number.isInteger(value.referenceAlternativeIndex) || value.referenceAlternativeIndex < 0 || value.referenceAlternativeIndex >= (context.currentAlternatives?.length ?? 0)) return { valid: false };
   }
   if (value.service !== undefined && !isAllowedService(value.service, context.availableServices)) return { valid: false };
+  if (value.additionalServices !== undefined && (!Array.isArray(value.additionalServices) || value.additionalServices.length > 7
+    || value.additionalServices.some(service => !isAllowedService(service, context.availableServices) || service === value.service || service.length > 128)
+    || new Set(value.additionalServices).size !== value.additionalServices.length)) return { valid: false };
   return { valid: true, value };
 }
 

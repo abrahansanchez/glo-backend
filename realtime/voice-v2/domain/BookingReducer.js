@@ -9,6 +9,7 @@ import {
 } from "./BookingProposal.js";
 import { isConfirmationAuthoritativeFor } from "./ConfirmationState.js";
 import { createSearchPreference } from "./AvailabilityState.js";
+import { validAdditionalServices } from "./AdditionalServices.js";
 
 export const BookingEffectType = Object.freeze({
   CHECK_AVAILABILITY: "CHECK_AVAILABILITY",
@@ -35,6 +36,7 @@ export function reduceBooking(currentProposal, action) {
   if (currentProposal.terminal) return rejected(currentProposal, "booking_already_terminal");
   const actionValidation = validateCallerAction(action);
   if (!actionValidation.valid) return rejected(currentProposal, actionValidation.reason);
+  if (action.additionalServices !== undefined && (!action.service || !validAdditionalServices(action.additionalServices, action.service))) return rejected(currentProposal, "invalid_additional_services");
   if (action.searchPreference !== undefined) {
     try { createSearchPreference(action.searchPreference); } catch { return rejected(currentProposal, 'invalid_search_preference'); }
   }
@@ -141,14 +143,16 @@ function currentSchedulingAlternatives(current) {
 
 function prepareSchedulingSearch(current, action, search) {
   const service = search.service ?? current.service;
+  const serviceSet = serviceSetChanges(current, action);
   const proposalChanged = !!search.searchPreference || action.contextualSearch === true
-    || current.service !== service || current.date !== search.requestedDate || current.time !== null;
+    || current.service !== service || current.date !== search.requestedDate || current.time !== null || Object.keys(serviceSet).length > 0;
   const nextVersion = proposalChanged ? current.proposalVersion + 1 : current.proposalVersion;
   const next = proposalChanged
     ? createBookingProposal({
         ...current,
         proposalVersion: nextVersion,
         service,
+        ...serviceSet,
         date: search.requestedDate,
         time: null,
         source: {
@@ -182,8 +186,16 @@ function prepareSchedulingSearch(current, action, search) {
 function replaceField(current, action, field) {
   const value = action[field];
   if (!isValidFieldValue(field, value)) return rejected(current, `invalid_${field}`);
-  if (current[field] === value) return unchanged(current);
-  return replaceFacts(current, { [field]: value }, { [field]: action.sourceTurnId });
+  const serviceSet = field === "service" ? serviceSetChanges(current, action) : {};
+  if (current[field] === value && !Object.keys(serviceSet).length) return unchanged(current);
+  return replaceFacts(current, { ...(current[field] !== value ? { [field]: value } : {}), ...serviceSet }, { [field]: action.sourceTurnId });
+}
+
+function serviceSetChanges(current, action) {
+  if (action.service === undefined) return {};
+  const next = action.additionalServices || [];
+  const previous = current.additionalServices || [];
+  return JSON.stringify(next) === JSON.stringify(previous) ? {} : { additionalServices: next };
 }
 
 function applyBookRequest(current, action) {
@@ -194,7 +206,7 @@ function applyBookRequest(current, action) {
   for (const [field, value] of Object.entries(supplied)) {
     if (!isValidFieldValue(field, value)) return rejected(current, `invalid_${field}`);
   }
-  const changes = Object.fromEntries(Object.entries(supplied).filter(([field, value]) => current[field] !== value));
+  const changes = { ...Object.fromEntries(Object.entries(supplied).filter(([field, value]) => current[field] !== value)), ...serviceSetChanges(current, action) };
   if (!Object.keys(changes).length) return unchanged(current);
   const sourceChanges = Object.fromEntries(Object.keys(changes).map((field) => [field, action.sourceTurnId]));
   return replaceFacts(current, changes, sourceChanges);

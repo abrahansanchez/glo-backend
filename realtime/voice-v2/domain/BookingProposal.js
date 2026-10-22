@@ -1,3 +1,4 @@
+import { validAdditionalServices } from "./AdditionalServices.js";
 import {
   AvailabilityStatus,
   createAvailabilityState,
@@ -28,6 +29,7 @@ export function createBookingProposal({
   proposalId,
   proposalVersion = 1,
   service = null,
+  additionalServices = [],
   name = null,
   date = null,
   time = null,
@@ -40,6 +42,7 @@ export function createBookingProposal({
   if (!Number.isInteger(proposalVersion) || proposalVersion < 1) throw new TypeError("invalid_proposal_version");
 
   const slotKey = deriveSlotKey({ service, date, time });
+  if (!validAdditionalServices(additionalServices, service)) throw new TypeError("invalid_additional_services");
   const nextAvailability = availability
     ? createAvailabilityState(availability)
     : createUnknownAvailability(proposalVersion, slotKey);
@@ -50,6 +53,7 @@ export function createBookingProposal({
     proposalId,
     proposalVersion,
     service,
+    ...(additionalServices.length ? { additionalServices: Object.freeze([...additionalServices]) } : {}),
     name,
     date,
     time,
@@ -69,6 +73,7 @@ export function createBookingProposal({
 }
 
 export function validateBookingProposal(proposal) {
+  if (proposal?.additionalServices !== undefined && !validAdditionalServices(proposal.additionalServices, proposal.service)) return { valid: false, reason: "invalid_additional_services" };
   if (!proposal || typeof proposal !== "object") return { valid: false, reason: "proposal_must_be_an_object" };
   if (typeof proposal.proposalId !== "string" || !proposal.proposalId.trim()) return { valid: false, reason: "missing_proposal_id" };
   if (!Number.isInteger(proposal.proposalVersion) || proposal.proposalVersion < 1) return { valid: false, reason: "invalid_proposal_version" };

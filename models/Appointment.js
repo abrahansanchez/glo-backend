@@ -25,6 +25,7 @@ const appointmentSchema = new mongoose.Schema(
     clientName: { type: String, required: true },
     clientPhone: { type: String, default: "" },
     service: { type: String },
+    notes: { type: String, maxlength: 1024 },
     // Legacy fields kept for backward compatibility
     date: { type: Date },
     time: { type: String },
