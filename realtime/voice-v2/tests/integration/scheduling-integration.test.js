@@ -13,6 +13,41 @@ import { FakeSocket } from "../helpers/FakeSocket.js";
 const BUSINESS = Object.freeze({ businessId: "business-scheduling", barberId: "barber-scheduling", timeZone: "America/New_York" });
 const REFERENCE_DATE = new Date("2026-10-12T16:00:00Z");
 
+for (const [language, question, answer] of [
+  ["en", "What times are available tomorrow afternoon?", "I can offer 2 pm, 3 pm, or 4 pm. Which time would you prefer?"],
+  ["es", "¿Qué horarios tienes disponibles mañana por la tarde?", "Puedo ofrecerte las 2 pm, 3 pm o 4 pm. ¿Cuál prefieres?"],
+]) {
+  test(`${language} constrained scheduling generation delivers alternatives without business authority`, async () => {
+    const alternatives = ["14:00", "15:00", "16:00"].map(time => ({ date: "2026-10-13", time,
+      slotKey: deriveSlotKey({ service: "Haircut", date: "2026-10-13", time }) }));
+    const f = fixture({ language, searchResults: [alternatives] });
+    try {
+      await start(f);
+      await caller(f, `constraint-${language}`, question);
+      await waitFor(() => creates(f.openai, ResponsePurpose.SCHEDULING_ALTERNATIVES).length === 1, f.app);
+      const request = creates(f.openai, ResponsePurpose.SCHEDULING_ALTERNATIVES)[0];
+      const instructions = JSON.parse(request.response.instructions);
+      assert.match(instructions.taskInstruction, /Do not select, reserve or confirm a time/);
+      assert.match(instructions.taskInstruction, /No selecciones, reserves ni confirmes un horario/);
+      assert.deepEqual(instructions.expectedFacts.alternatives, alternatives.map(({ date, time }) => ({ date, time })));
+      await deliverLastResponse(f, answer);
+      assert.equal(f.searchCalls.length, 1);
+      assert.equal(f.checkCalls.length, 0);
+      assert.equal(creates(f.openai, ResponsePurpose.SCHEDULING_ALTERNATIVES).length, 1);
+      assert.equal(f.twilio.sent.filter(event => event.event === "media").length, 1);
+      assert.equal(f.twilio.sent.filter(event => event.event === "mark").length, 1);
+      assert.equal(f.app.session.proposal.time, null);
+      assert.equal(f.bookingCalls.length, 0);
+      assert.equal(f.smsCalls.length, 0);
+      assert.equal(creates(f.openai, ResponsePurpose.PRE_BOOKING_CONFIRMATION).length, 0);
+      assert.equal(creates(f.openai, ResponsePurpose.ERROR_RECOVERY).length, 0);
+      assert.equal(f.app.session.confirmationAuthority.verifyGrant({ proposalVersion: f.app.session.proposal.proposalVersion,
+        responseId: "none", markId: "none", responseRegistry: f.app.session.responseRegistry,
+        playbackRegistry: f.app.session.playbackRegistry }).reason, "NO_CURRENT_CONFIRMATION");
+    } finally { await f.app.terminate("TEST_DONE"); }
+  });
+}
+
 test("real shared scheduling helpers search beyond a closed day and retain timezone and service duration", async () => {
   const originalFindOne = Appointment.findOne;
   const originalMomentNow = moment.now;
