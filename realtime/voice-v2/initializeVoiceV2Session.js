@@ -38,6 +38,24 @@ const SAFE_REPROMPT_FAILURES = new Set([
   "unsupported_time_claim", "unsupported_availability_operation_claim", "unsupported_availability_result_claim",
   "application_owned_confirmation_mismatch",
 ]);
+const DELIVERY_BOUNDARIES = new Set(["PLAN_ACCEPTED", "REQUEST_CREATED", "REQUEST_BODY_SENT", "RESPONSE_HEADERS_RECEIVED", "RESPONSE_BODY_COMPLETED",
+  "AUDIO_CONVERTED", "AUDIO_PREPARED", "ASSISTANT_PERSISTED", "MEDIA_SUBMITTED", "MARK_CREATED", "MARK_ACKNOWLEDGED",
+  "RECOVERY_STARTED", "RECOVERY_MEDIA_SUBMITTED", "RECOVERY_MARK_CREATED", "RECOVERY_MARK_ACKNOWLEDGED", "TERMINATION_REQUESTED"]);
+const DELIVERY_DISPOSITIONS = new Set(["DELIVERED", "GENERATION_FAILED", "BODY_CONSUMPTION_FAILED", "AUDIO_PREPARATION_FAILED", "MEDIA_SUBMISSION_FAILED",
+  "MARK_SUBMISSION_FAILED", "PLAYBACK_TIMED_OUT", "RETRY_STARTED", "RETRY_SUPPRESSED", "RETRY_EXHAUSTED", "STALE", "RECOVERY_BEGAN", "RECOVERY_SUCCEEDED", "RECOVERY_PLAYBACK_TIMED_OUT", "RECOVERY_FAILED", "TERMINATION_REQUESTED"]);
+const DELIVERY_REASONS = new Set(["NONE", "OTHER_FAILURE", "HEADERS_TIMEOUT", "TRANSIENT_TRANSPORT", "TRANSIENT_PROVIDER", "RESPONSE_GENERATION_TIMEOUT",
+  "HEADERS_ALREADY_RECEIVED", "ATTEMPTS_EXHAUSTED", "TOTAL_DEADLINE", "OWNER_NOT_CURRENT", "CALLER_SPEECH", "PROPOSAL_CHANGED", "SUPERSEDED", "TERMINATING",
+  "PLAYBACK_ALREADY_STARTED", "AUDIO_ALREADY_RECEIVED", "PURPOSE_NOT_RETRYABLE", "NON_TRANSIENT_FAILURE", "BODY_READ_FAILED", "AUDIO_CONVERSION_FAILED",
+  "MEDIA_SUBMISSION_FAILED", "MARK_SUBMISSION_FAILED", "PLAYBACK_TIMEOUT", "LOCAL_RECOVERY_PLAYBACK_TIMEOUT", "LOCAL_RECOVERY_UNAVAILABLE",
+  "SPEECH_PREPARATION_TIMEOUT", "SPEECH_PREPARATION_FAILED", "TTS_INVALID_AUDIO", "TTS_EMPTY_AUDIO", "TTS_ABORTED", "TTS_ADAPTER_ERROR",
+  "ASSISTANT_PERSISTENCE_FAILED", "PREPARATION_OWNER_MISMATCH", "STALE_PROPOSAL", "NO_AUDIO", "CALLER_INTERRUPTION", "CONTROLLED_RECOVERY", "CALL_TERMINATED", "AUTHORITY_REFUSED", "RESPONSE_DELIVERED", "RESPONSE_RECOVERY_DELIVERED",
+  "RESPONSE_FAILED", "RESPONSE_CANCELLED", "RESPONSE_CREATE_REJECTED", "LOCAL_ACTIVE_RESPONSE", "PROVIDER_ACTIVE_RESPONSE", "missing_transcript", "unsupported_purpose", "premature_booking_claim", "premature_success",
+  "missing_confirmation_question", "missing_name", "service_extraction_failed", "service_mismatch", "conflicting_service", "date_extraction_failed", "date_mismatch",
+  "conflicting_date", "time_extraction_failed", "missing_expected_time", "conflicting_time", "application_owned_speech_mismatch", "application_owned_reprompt_mismatch", "terminal_recovery_contract_mismatch", ...SAFE_REPROMPT_FAILURES]);
+const DELIVERY_PROVIDER_CODES = new Set(["rate_limit_exceeded", "insufficient_quota", "invalid_api_key", "invalid_request_error", "authentication_error",
+  "permission_denied", "model_not_found", "unsupported_model", "unsupported_voice", "invalid_voice", "invalid_value", "server_error", "internal_server_error"]);
+const deliveryId = value => typeof value === "string" && /^[A-Za-z0-9_:./-]{1,128}$/.test(value) ? value : null;
+const deliveryReason = value => DELIVERY_REASONS.has(value) ? value : "OTHER_FAILURE";
 
 export function initializeVoiceV2Session({
   callSid, callerNumber, businessContext, buildSha, twilioSocket, openaiSocketFactory,
@@ -60,7 +78,98 @@ export function initializeVoiceV2Session({
     ? Number(speechHeadersTimeoutMs) : 3000;
   let callerSpeechEpoch = 0; let deliveryStopping = false;
   let localRecoveryStarted = false;
+  let recoveryObservationOrigin = null;
   const safeEmit = (event) => { try { emit(event); } catch { /* Logging cannot terminate a call. */ } };
+  // Diagnostic snapshots only. Never consulted by an operational decision.
+  function observeDeliveryPlan(tracked, transport, correlation = null) {
+    const observation = { correlation: correlation || { requestId: deliveryId(tracked.requestId), responseId: null }, transport,
+      purpose: Object.values(ResponsePurpose).includes(tracked.plan.purpose) || tracked.plan.purpose === "BOOKING_ABANDONED" ? tracked.plan.purpose : null,
+      proposalVersion: Number.isSafeInteger(tracked.plan.proposalVersion) ? tracked.plan.proposalVersion : null,
+      attempt: tracked.delivery?.attempts || tracked.attempt || 1, clientRequestId: null, providerRequestId: null,
+      last: "PLAN_ACCEPTED", pending: transport === "HTTP_SPEECH" ? "RESPONSE_HEADERS_RECEIVED" : "REQUEST_CREATED",
+      headersReceived: false, audioReceived: false, audioPrepared: false, mediaSubmitted: false, markCreated: false, markAcknowledged: false,
+      providerStatus: null, providerCode: null, timeout: false, reason: "NONE", seen: new Set(), settled: false };
+    tracked.deliveryObservation = observation; return observation;
+  }
+  function deliveryBoundary(state, boundary) {
+    const d = state?.deliveryObservation;
+    if (!d || d.settled || !DELIVERY_BOUNDARIES.has(boundary)) return;
+    d.last = boundary;
+    const next = { REQUEST_CREATED: d.transport === "HTTP_SPEECH" ? "RESPONSE_HEADERS_RECEIVED" : "AUDIO_PREPARED", REQUEST_BODY_SENT: "RESPONSE_HEADERS_RECEIVED", RESPONSE_HEADERS_RECEIVED: "RESPONSE_BODY_COMPLETED",
+      RESPONSE_BODY_COMPLETED: d.transport === "HTTP_SPEECH" ? "AUDIO_CONVERTED" : "AUDIO_PREPARED", AUDIO_CONVERTED: "AUDIO_PREPARED",
+      AUDIO_PREPARED: "ASSISTANT_PERSISTED", ASSISTANT_PERSISTED: "MEDIA_SUBMITTED", MEDIA_SUBMITTED: "MARK_CREATED", MARK_CREATED: "MARK_ACKNOWLEDGED",
+      RECOVERY_STARTED: "AUDIO_PREPARED", RECOVERY_MEDIA_SUBMITTED: "RECOVERY_MARK_CREATED", RECOVERY_MARK_CREATED: "RECOVERY_MARK_ACKNOWLEDGED" };
+    d.pending = next[boundary] || null;
+    if (boundary === "RESPONSE_HEADERS_RECEIVED") d.headersReceived = true;
+    if (boundary === "AUDIO_PREPARED") d.audioPrepared = true;
+    if (["MEDIA_SUBMITTED", "RECOVERY_MEDIA_SUBMITTED"].includes(boundary)) d.mediaSubmitted = true;
+    if (["MARK_CREATED", "RECOVERY_MARK_CREATED"].includes(boundary)) d.markCreated = true;
+    if (["MARK_ACKNOWLEDGED", "RECOVERY_MARK_ACKNOWLEDGED"].includes(boundary)) d.markAcknowledged = true;
+  }
+  function observeSpeechDelivery(d, event) {
+    // Project primitive metadata from existing safe diagnostics, never retain event.
+    if (!d || d.settled) return;
+    const state = { deliveryObservation: d };
+    if (event.phase === "REQUEST_CREATED") deliveryBoundary(state, "REQUEST_CREATED");
+    if (event.phase === "REQUEST_BODY_SENT") deliveryBoundary(state, "REQUEST_BODY_SENT");
+    if (["FETCH_RESOLVED", "RESPONSE_HEADERS_RECEIVED"].includes(event.phase)) deliveryBoundary(state, "RESPONSE_HEADERS_RECEIVED");
+    if (["AUDIO_BODY_COMPLETED", "AUDIO_BODY_READ_COMPLETED"].includes(event.phase)) deliveryBoundary(state, "RESPONSE_BODY_COMPLETED");
+    if (event.phase === "AUDIO_FIRST_BYTE_RECEIVED") d.audioReceived = true;
+    if (event.phase === "WAV_CONVERSION_COMPLETED") deliveryBoundary(state, "AUDIO_CONVERTED");
+    if (Number.isInteger(event.providerStatus) && event.providerStatus >= 100 && event.providerStatus <= 599) d.providerStatus = event.providerStatus;
+    if (typeof event.providerRequestId === "string" && /^[A-Za-z0-9_.:-]{1,128}$/.test(event.providerRequestId)) d.providerRequestId = event.providerRequestId;
+    if (event.phase === "REQUEST_DISPATCH_STARTED") d.pending = "RESPONSE_HEADERS_RECEIVED";
+  }
+  function deliveryStaleReason(state) {
+    if (deliveryStopping || lifecycle?.terminated) return "TERMINATING";
+    if (state.delivery?.speechEpoch !== callerSpeechEpoch || session.turnRegistry.callerSpeechActive) return "CALLER_SPEECH";
+    if (state.plan.proposalVersion !== session.proposal.proposalVersion) return "PROPOSAL_CHANGED";
+    if (state.submittedAudioBytes || state.markId) return "PLAYBACK_ALREADY_STARTED";
+    if (localRecoveryStarted || superseded.has(`request:${state.requestId}`) || superseded.has(state.responseId) || session.responseRegistry.get(state.responseId)?.invalidated) return "SUPERSEDED";
+    return "OWNER_NOT_CURRENT";
+  }
+  function observeDisposition(state, disposition, reason = "NONE", decision = "NOT_APPLICABLE", retryReason = "NONE", failed = undefined) {
+    try {
+      const d = state?.deliveryObservation;
+      if (!d || !DELIVERY_DISPOSITIONS.has(disposition) || d.seen.has(disposition)) return;
+      d.seen.add(disposition); d.reason = deliveryReason(reason);
+      const failedBoundary = failed === undefined ? d.pending : failed;
+      const status = Number.isInteger(d.providerStatus) && d.providerStatus >= 100 && d.providerStatus <= 599
+        || ["completed", "failed", "cancelled", "incomplete", "in_progress"].includes(d.providerStatus) ? d.providerStatus : null;
+      const event = Object.freeze({ event: "V2_RESPONSE_DELIVERY_DISPOSITION", callSid: deliveryId(callSid), streamSid: deliveryId(twilio?.identity.streamSid), buildSha: deliveryId(buildSha),
+        requestId: d.correlation.requestId, responseId: d.correlation.responseId, purpose: d.purpose, proposalVersion: d.proposalVersion, transport: d.transport,
+        attempt: d.attempt, clientRequestId: d.clientRequestId, providerRequestId: d.providerRequestId, lastSuccessfulBoundary: d.last,
+        failedBoundary: DELIVERY_BOUNDARIES.has(failedBoundary) ? failedBoundary : null, disposition, reason: d.reason, retryEligible: decision === "STARTED",
+        retryDecision: ["STARTED", "SUPPRESSED", "EXHAUSTED", "NOT_ELIGIBLE", "NOT_APPLICABLE"].includes(decision) ? decision : "NOT_APPLICABLE",
+        retryReason: deliveryReason(retryReason), providerStatus: status, providerCode: DELIVERY_PROVIDER_CODES.has(d.providerCode) ? d.providerCode : null,
+        timeout: d.timeout, headersReceived: d.headersReceived, audioReceived: d.audioReceived, audioPrepared: d.audioPrepared, mediaSubmitted: d.mediaSubmitted,
+        markCreated: d.markCreated, markAcknowledged: d.markAcknowledged, callerSpeechActive: session.turnRegistry.callerSpeechActive,
+        terminating: deliveryStopping || lifecycle?.terminated === true });
+      if (!["RETRY_SUPPRESSED", "RECOVERY_BEGAN"].includes(disposition)) d.settled = true;
+      try { Promise.resolve(emit(event)).catch(() => {}); } catch { /* Observer failure is inert. */ }
+    } catch { /* Diagnostic state never owns delivery. */ }
+  }
+  function observeDeliveryWrite(state, boundary, operation) {
+    const d = state.deliveryObservation; if (d && !d.settled) d.pending = boundary;
+    try { const result = operation(); deliveryBoundary(state, boundary); return result; }
+    catch (error) {
+      observeDisposition(state, boundary.includes("MARK") ? "MARK_SUBMISSION_FAILED" : "MEDIA_SUBMISSION_FAILED",
+        boundary.includes("MARK") ? "MARK_SUBMISSION_FAILED" : "MEDIA_SUBMISSION_FAILED");
+      throw error; // Preserve the existing operational catch/recovery path exactly.
+    }
+  }
+  function observeRequestDispatch(tracked, operation) {
+    if (tracked.deliveryObservation && !tracked.deliveryObservation.settled) tracked.deliveryObservation.pending = "REQUEST_CREATED";
+    try {
+      const result = operation();
+      if (result.accepted) deliveryBoundary(tracked, "REQUEST_CREATED");
+      else observeDisposition(tracked, "GENERATION_FAILED", DELIVERY_REASONS.has(result.reason) ? result.reason : "RESPONSE_CREATE_REJECTED", "NOT_ELIGIBLE", "RESPONSE_CREATE_REJECTED");
+      return result;
+    } catch (error) {
+      observeDisposition(tracked, "GENERATION_FAILED", "RESPONSE_CREATE_REJECTED", "NOT_ELIGIBLE", "RESPONSE_CREATE_REJECTED");
+      throw error;
+    }
+  }
   try { localRecoveryAudioAdapter.prepare?.(); }
   catch { safeEmit({ event: "V2_LOCAL_RECOVERY_ASSETS_REQUIRED", callSid, buildSha, reason: "PRODUCTION_ASSETS_REQUIRED" }); }
   const timing = new LatencyDiagnostics({ ...timingOptions, callSid, buildSha, emit: safeEmit });
@@ -399,6 +508,7 @@ export function initializeVoiceV2Session({
         const requestId = openai.activeRequestId;
         superseded.add(`request:${requestId}`);
         session.watchdog.cancel(`response:${requestId}`);
+        observeDisposition(requests.get(requestId), "STALE", "AUTHORITY_REFUSED");
         openai.supersedeResponse({ requestId, reason: "AUTHORITY_REFUSED" });
       }
       session.record("AUTHORITY_REFUSAL_CONTINUATION", { turnId, reason: outcome.authority.reason, purpose: continuation?.plan?.purpose || null });
@@ -608,12 +718,13 @@ export function initializeVoiceV2Session({
     }
     const tracked = { requestId, plan: ownedPlan, attempt, retried: false, response: buildRealtimeResponseRequest(ownedPlan, { businessContext, availableServices: turnContext.availableServices }), timingContext,
       delivery: { attempts: 1, speechEpoch: callerSpeechEpoch } };
+    observeDeliveryPlan(tracked, source === "application_tts" ? "HTTP_SPEECH" : "REALTIME");
     requests.set(requestId, tracked);
     session.record("RESPONSE_PLANNED", { requestId, purpose: ownedPlan.purpose, proposalVersion: ownedPlan.proposalVersion });
     if (usesApplicationSpeech(ownedPlan)) return requestSynthesizedConfirmation(tracked);
     timing.point("RESPONSE_CREATE_DISPATCH", timingDetails({ requestId }));
     callTrace.entry("RESPONSE_CREATE_DISPATCHED", { ...timingDetails({ requestId }), attempt });
-    const result = openai.createResponse({ requestId, eventId: `${requestId}:create`, response: tracked.response });
+    const result = observeRequestDispatch(tracked, () => openai.createResponse({ requestId, eventId: `${requestId}:create`, response: tracked.response }));
     timing.point("RESPONSE_CREATE_RETURN", { ...timingDetails({ requestId }), accepted: result.accepted });
     if (result.accepted) session.watchdog.schedule(`response:${requestId}`, 15000, () => enqueue(() => responseTimedOut(requestId)));
     else session.floorOwner.release({ reason: result.reason || "RESPONSE_CREATE_REJECTED", requestId });
@@ -645,8 +756,10 @@ export function initializeVoiceV2Session({
     const attempt = { number: state.delivery.attempts, abortController, headers: false };
     state.speechAttempt = attempt;
     state.abortController = abortController;
-    state.preparationDiagnostics = new SpeechPreparationDiagnostics({ observer: emit, context: { callSid, requestId, responseId, purpose: plan.purpose, proposalVersion: plan.proposalVersion, attempt: attempt.number } });
-    state.lifecycleDiagnostics = new SpeechLifecycleDiagnostics({ observer: emit, configuration: preparationConfiguration, createdAt: state.preparationCreatedAt, signal: abortController.signal,
+    const observed = attempt.number === 1 ? state.deliveryObservation : observeDeliveryPlan(state, "HTTP_SPEECH", state.deliveryObservation?.correlation);
+    observed.clientRequestId = clientRequestId;
+    state.preparationDiagnostics = new SpeechPreparationDiagnostics({ observer: event => { observeSpeechDelivery(observed, event); return emit(event); }, context: { callSid, requestId, responseId, purpose: plan.purpose, proposalVersion: plan.proposalVersion, attempt: attempt.number } });
+    state.lifecycleDiagnostics = new SpeechLifecycleDiagnostics({ observer: event => { observeSpeechDelivery(observed, event); return emit(event); }, configuration: preparationConfiguration, createdAt: state.preparationCreatedAt, signal: abortController.signal,
       context: { callSid, requestId, responseId, purpose: plan.purpose, proposalVersion: plan.proposalVersion, language: plan.language, clientRequestId, attempt: attempt.number } });
     const measurement = state.preparationDiagnostics, diagnostics = state.lifecycleDiagnostics;
     diagnostics.phase("PREPARATION_CREATED");
@@ -661,7 +774,7 @@ export function initializeVoiceV2Session({
 
     Promise.resolve().then(() => {
       if (deliveryStopping || lifecycle.terminated || !state.preparation.active || state.speechAttempt !== attempt || abortController.signal.aborted
-        || (attempt.number === 2 && !deliveryCurrent(state))) return;
+        || (attempt.number === 2 && !deliveryCurrent(state))) { observeDisposition({ deliveryObservation: observed }, "STALE", deliveryStaleReason(state)); return; }
       if (performance.now() >= state.preparation.identity.deadlineAt) return failPreparation(state, "SPEECH_PREPARATION_TIMEOUT", true);
       return speechAdapter.synthesize({
       input: state.preparation.identity.wording,
@@ -674,19 +787,26 @@ export function initializeVoiceV2Session({
       },
       diagnosticContext: { callSid, buildSha, requestId, responseId, purpose: plan.purpose, proposalVersion: plan.proposalVersion, attempt: attempt.number },
       onFailureDiagnostic: safeEmit,
-      onPhaseDiagnostic: safeEmit,
-      onUndiciStageDiagnostic: emit,
+      onPhaseDiagnostic: event => { observeSpeechDelivery(observed, event); safeEmit(event); },
+      onUndiciStageDiagnostic: event => { observeSpeechDelivery(observed, event); return emit(event); },
       preparationDiagnostics: measurement,
     }); }).then(
       (result) => {
-        if (state.speechAttempt !== attempt || abortController.signal.aborted || (attempt.number === 2 && !deliveryCurrent(state))) return;
+        if (state.speechAttempt !== attempt || abortController.signal.aborted || (attempt.number === 2 && !deliveryCurrent(state))) { observeDisposition({ deliveryObservation: observed }, "STALE", deliveryStaleReason(state)); return; }
         session.watchdog.cancel(`speech-headers:${responseId}`);
         return synthesizedConfirmationCompleted(responseId, result);
       },
       (error) => {
-        if (state.speechAttempt !== attempt || abortController.signal.aborted || (attempt.number === 2 && !deliveryCurrent(state))) return;
+        if (state.speechAttempt !== attempt || abortController.signal.aborted || (attempt.number === 2 && !deliveryCurrent(state))) { observeDisposition({ deliveryObservation: observed }, "STALE", deliveryStaleReason(state)); return; }
         session.watchdog.cancel(`speech-headers:${responseId}`);
         if (!attempt.headers && error?.diagnostic?.transient === true && retrySpeech(state, "TRANSIENT_TRANSPORT")) return;
+        observed.providerCode = DELIVERY_PROVIDER_CODES.has(error?.diagnostic?.providerCode) ? error.diagnostic.providerCode : null;
+        observed.timeout = error?.diagnostic?.timeout === true;
+        const failure = observed.pending === "RESPONSE_BODY_COMPLETED" && !(observed.providerStatus >= 400) ? "BODY_CONSUMPTION_FAILED"
+          : ["AUDIO_CONVERTED", "AUDIO_PREPARED"].includes(observed.pending) ? "AUDIO_PREPARATION_FAILED" : "GENERATION_FAILED";
+        observeDisposition(state, failure, failure === "BODY_CONSUMPTION_FAILED" ? "BODY_READ_FAILED" : failure === "AUDIO_PREPARATION_FAILED" ? "AUDIO_CONVERSION_FAILED" : "TTS_ADAPTER_ERROR",
+          attempt.number === 2 ? "EXHAUSTED" : "NOT_ELIGIBLE", attempt.number === 2 ? "ATTEMPTS_EXHAUSTED" : attempt.headers ? "HEADERS_ALREADY_RECEIVED" : "NON_TRANSIENT_FAILURE",
+          observed.providerStatus >= 400 ? "RESPONSE_HEADERS_RECEIVED" : undefined);
         if (attempt.number === 2) diagnostics.phase("SPEECH_RETRY_EXHAUSTED", { retryReason: "ATTEMPT_FAILED", headersReceived: attempt.headers });
         return synthesizedConfirmationFailed(responseId, error);
       },
@@ -711,10 +831,13 @@ export function initializeVoiceV2Session({
     if (state.delivery.attempts >= 2 || !state.preparation.active || state.speechAttempt.headers) return false;
     diagnostics.phase("SPEECH_RETRY_ELIGIBLE", { retryReason: reason });
     if (!deliveryCurrent(state) || performance.now() >= state.preparation.identity.deadlineAt) {
+      observeDisposition(state, "RETRY_SUPPRESSED", reason, "SUPPRESSED", performance.now() >= state.preparation.identity.deadlineAt ? "TOTAL_DEADLINE" : deliveryStaleReason(state));
       diagnostics.phase("SPEECH_RETRY_SUPPRESSED", { retryReason: "OWNER_STALE" });
       return false;
     }
     state.delivery.attempts = 2; state.retryReason = reason;
+    if (state.deliveryObservation) state.deliveryObservation.timeout = reason === "HEADERS_TIMEOUT";
+    observeDisposition(state, "RETRY_STARTED", reason, "STARTED", reason);
     // Revoke the attempt before abort can synchronously dispatch callbacks.
     const previous = state.speechAttempt; state.speechAttempt = null;
     state.preparationDiagnostics.abort("RESPONSE_GENERATION_TIMEOUT");
@@ -729,6 +852,7 @@ export function initializeVoiceV2Session({
     const state = responses.get(responseId);
     const entry = session.responseRegistry.get(responseId);
     if (!state || lifecycle.terminated || entry?.invalidated || entry?.status !== "requested" || superseded.has(responseId)) return;
+    if (state.deliveryObservation && !state.deliveryObservation.settled) state.deliveryObservation.pending = "AUDIO_PREPARED";
     if (performance.now() >= state.preparation.identity.deadlineAt) return failPreparation(state, "SPEECH_PREPARATION_TIMEOUT", true);
     if (result?.format !== "audio/pcmu") return responseFailed(responseId, "TTS_INVALID_AUDIO");
     const audio = Buffer.isBuffer(result.audio) ? result.audio : Buffer.from(result.audio || []);
@@ -738,6 +862,8 @@ export function initializeVoiceV2Session({
     state.audio = [audio.toString("base64")];
     state.audioBytes = audio.length;
     state.audioCompletedEventReceived = true;
+    if (state.deliveryObservation) state.deliveryObservation.audioReceived = true;
+    deliveryBoundary(state, "AUDIO_PREPARED");
     timing.once("FIRST_RESPONSE_AUDIO_RECEIVED", responseId, timingDetails({ responseId }));
     timing.point("TTS_FIRST_AUDIO_READY", timingDetails({ responseId }));
     timing.point("TTS_COMPLETE_BUFFER_READY", timingDetails({ responseId }));
@@ -777,6 +903,7 @@ export function initializeVoiceV2Session({
 
   function invalidatePreparation(state, reason, timedOut = false) {
     if (!state?.preparation?.invalidate(reason, timedOut)) return false;
+    if (["CALLER_INTERRUPTION", "PROPOSAL_CHANGED", "CALL_TERMINATED", "CONTROLLED_RECOVERY"].includes(reason)) observeDisposition(state, "STALE", reason);
     session.watchdog.cancel(`preparation:${state.responseId}`);
     session.watchdog.cancel(`speech-headers:${state.responseId}`);
     if (timedOut && state.delivery.attempts === 2) state.lifecycleDiagnostics?.phase("SPEECH_RETRY_EXHAUSTED", { retryReason: "TOTAL_DEADLINE", headersReceived: state.speechAttempt?.headers === true });
@@ -791,6 +918,13 @@ export function initializeVoiceV2Session({
 
   function failPreparation(state, reason, timedOut = false) {
     if (!invalidatePreparation(state, reason, timedOut)) return;
+    if (state.deliveryObservation) {
+      state.deliveryObservation.timeout ||= timedOut;
+      if (!state.deliveryObservation.settled) observeDisposition(state, state.delivery.attempts === 2 ? "RETRY_EXHAUSTED"
+        : ["AUDIO_CONVERTED", "AUDIO_PREPARED", "ASSISTANT_PERSISTED"].includes(state.deliveryObservation.pending) ? "AUDIO_PREPARATION_FAILED" : "GENERATION_FAILED",
+        reason, state.delivery.attempts === 2 ? "EXHAUSTED" : "NOT_ELIGIBLE", state.delivery.attempts === 2 ? "ATTEMPTS_EXHAUSTED" : state.speechAttempt?.headers ? "HEADERS_ALREADY_RECEIVED" : timedOut ? "TOTAL_DEADLINE" : "NON_TRANSIENT_FAILURE");
+      recoveryObservationOrigin = state.deliveryObservation;
+    }
     if (state.delivery.attempts === 2) state.lifecycleDiagnostics?.phase("SPEECH_RETRY_EXHAUSTED", { retryReason: timedOut ? "TOTAL_DEADLINE" : "ATTEMPT_FAILED" });
     session.floorOwner.release({ reason, requestId: state.requestId, responseId: state.responseId });
     if (lifecycle.terminated) return;
@@ -810,21 +944,29 @@ export function initializeVoiceV2Session({
     if (current?.preparation?.active) invalidatePreparation(current, "CONTROLLED_RECOVERY");
     if (current) session.floorOwner.release({ reason: "CONTROLLED_RECOVERY", requestId: current.requestId, responseId: current.responseId || null });
     const requestId = `${callSid}:local-recovery`; const responseId = `${requestId}:audio`;
+    const origin = recoveryObservationOrigin; recoveryObservationOrigin = null;
+    const recoveryObservation = observeDeliveryPlan({ requestId, plan: { purpose: ResponsePurpose.ERROR_RECOVERY, proposalVersion: session.proposal.proposalVersion } }, "LOCAL_RECOVERY", origin?.correlation);
+    recoveryObservation.correlation.responseId ||= deliveryId(responseId);
+    const recoveryState = { deliveryObservation: recoveryObservation };
+    deliveryBoundary(recoveryState, "RECOVERY_STARTED");
+    observeDisposition(recoveryState, "RECOVERY_BEGAN", origin?.reason || "NONE", "NOT_APPLICABLE", "NONE", null);
     try {
       const clip = localRecoveryAudioAdapter.getAudio(session.conversationLanguage.currentLanguage);
       if (clip?.format !== "audio/pcmu" || !Buffer.isBuffer(clip.audio) || !clip.audio.length) throw new Error("invalid_clip");
+      recoveryObservation.audioReceived = true; deliveryBoundary(recoveryState, "AUDIO_PREPARED"); recoveryObservation.pending = "PLAN_ACCEPTED";
       const plan = planTerminalResponseRecovery({ proposal: session.proposal, language: session.conversationLanguage.currentLanguage });
       const admission = session.floorOwner.plan({ purpose: ResponsePurpose.ERROR_RECOVERY, category: FloorPurpose.EXIT,
         requestId, proposalVersion: plan.proposalVersion, source: "local_recovery", preparing: true });
       if (!admission.accepted) throw new Error("recovery_owner_unavailable");
+      recoveryObservation.pending = "RECOVERY_MEDIA_SUBMITTED";
       session.confirmationAuthority.revokeProposal(plan.proposalVersion, "EXIT_PLANNED");
-      const tracked = { requestId, responseId, plan, attempt: 1, timingContext: {}, localRecovery: true }; requests.set(requestId, tracked);
+      const tracked = { requestId, responseId, plan, attempt: 1, timingContext: {}, localRecovery: true, deliveryObservation: recoveryObservation }; requests.set(requestId, tracked);
       const state = registerResponseState(tracked, responseId, "local_recovery");
       state.validation = { valid: true, failedInvariant: null }; state.audioBytes = clip.audio.length;
       session.responseRegistry.complete(responseId, { validationResult: state.validation });
       if (!session.floorOwner.beginSpeaking({ requestId, responseId, proposalVersion: plan.proposalVersion })) throw new Error("recovery_owner_mismatch");
-      twilio.submitAudio({ payload: clip.audio.toString("base64") }); state.submittedAudioBytes = clip.audio.length;
-      const markId = `${callSid}:mark:${++markSequence}`; twilio.sendMark({ markId }); state.markId = markId;
+      observeDeliveryWrite(state, "RECOVERY_MEDIA_SUBMITTED", () => twilio.submitAudio({ payload: clip.audio.toString("base64") })); state.submittedAudioBytes = clip.audio.length;
+      const markId = `${callSid}:mark:${++markSequence}`; observeDeliveryWrite(state, "RECOVERY_MARK_CREATED", () => twilio.sendMark({ markId })); state.markId = markId;
       session.playbackRegistry.register({ markId, responseId, proposalVersion: plan.proposalVersion });
       session.playbackRegistry.submit(markId, clip.audio.length); marks.set(markId, state);
       if (!session.floorOwner.bindMark({ requestId, responseId, markId, audioSubmitted: true })) throw new Error("recovery_mark_mismatch");
@@ -833,9 +975,14 @@ export function initializeVoiceV2Session({
       const audioDurationMs = Math.ceil(state.submittedAudioBytes / 8);
       const acknowledgementMarginMs = 2000;
       const recoveryPlaybackDeadlineMs = Math.min(17000, audioDurationMs + acknowledgementMarginMs);
-      session.watchdog.schedule(`playback:${markId}`, recoveryPlaybackDeadlineMs, () => terminateRecovery("LOCAL_RECOVERY_PLAYBACK_TIMEOUT"));
+      session.watchdog.schedule(`playback:${markId}`, recoveryPlaybackDeadlineMs, () => {
+        recoveryObservation.timeout = true;
+        observeDisposition(state, "RECOVERY_PLAYBACK_TIMED_OUT", "LOCAL_RECOVERY_PLAYBACK_TIMEOUT");
+        terminateRecovery("LOCAL_RECOVERY_PLAYBACK_TIMEOUT");
+      });
       return { accepted: true, requestId, responseId };
     } catch {
+      if (!recoveryObservation.settled) observeDisposition(recoveryState, "RECOVERY_FAILED", "LOCAL_RECOVERY_UNAVAILABLE");
       session.record("LOCAL_RECOVERY_UNAVAILABLE", { reason: "PRODUCTION_ASSETS_REQUIRED_OR_SUBMISSION_FAILED" });
       terminateRecovery("LOCAL_RECOVERY_UNAVAILABLE");
       return { accepted: false, reason: "LOCAL_RECOVERY_UNAVAILABLE" };
@@ -891,9 +1038,14 @@ export function initializeVoiceV2Session({
   function registerResponseState(tracked, responseId, transport) {
     const state = { ...tracked, responseId, transport, audio: [], audioBytes: 0, submittedAudioBytes: 0, audioCompletedEventReceived: false, transcript: null, assistantItemId: null, markId: null, providerCompletion: null, validation: null };
     responses.set(responseId, state);
+    if (state.deliveryObservation) {
+      state.deliveryObservation.correlation.responseId ||= deliveryId(responseId);
+      if (transport === "openai_realtime") { state.deliveryObservation.providerRequestId = deliveryId(responseId); deliveryBoundary(state, "REQUEST_CREATED"); }
+    }
     session.responseRegistry.register({ responseId, proposalVersion: tracked.plan.proposalVersion, purpose: tracked.plan.purpose === ResponsePurpose.CONSENT_REASK ? ResponsePurpose.PRE_BOOKING_CONFIRMATION : tracked.plan.purpose });
     session.responseRegistry.request(responseId);
     if (!session.floorOwner.bindResponse({ requestId: tracked.requestId, responseId })) {
+      observeDisposition(state, "STALE", "OWNER_NOT_CURRENT");
       session.responseRegistry.invalidate(responseId, "FLOOR_OWNER_MISMATCH");
       superseded.add(responseId);
     }
@@ -906,16 +1058,21 @@ export function initializeVoiceV2Session({
   function responseAudio(event) {
     const state = responses.get(event.responseId); if (!state || lifecycle.terminated) return;
     const entry = session.responseRegistry.get(event.responseId);
-    if (entry?.invalidated || entry?.status !== "requested") return;
-    if (state.delivery.attempts === 2 && !deliveryCurrent(state, true)) return;
+    if (entry?.invalidated || entry?.status !== "requested") { observeDisposition(state, "STALE", deliveryStaleReason(state)); return; }
+    if (state.delivery.attempts === 2 && !deliveryCurrent(state, true)) { observeDisposition(state, "STALE", deliveryStaleReason(state)); return; }
     if (!session.floorOwner.owns({ requestId: state.requestId, responseId: event.responseId, proposalVersion: state.plan.proposalVersion })) {
+      observeDisposition(state, "STALE", "OWNER_NOT_CURRENT");
       session.record("FLOOR_PLAN_REJECTED", { requestId: state.requestId, responseId: event.responseId, purpose: state.plan.purpose, proposalVersion: state.plan.proposalVersion, reason: "AUDIO_OWNER_MISMATCH" });
       return;
     }
     const bytes = Buffer.from(event.delta, "base64").length; state.audioBytes += bytes;
+    if (state.deliveryObservation && !state.deliveryObservation.settled && bytes > 0) {
+      state.deliveryObservation.audioReceived = true; state.deliveryObservation.pending = "RESPONSE_BODY_COMPLETED";
+    }
     if (requiresBufferedDelivery(state.plan)) state.audio.push(event.delta);
     else {
-      twilio.submitAudio({ payload: event.delta });
+      observeDeliveryWrite(state, "MEDIA_SUBMITTED", () => twilio.submitAudio({ payload: event.delta }));
+      if (state.deliveryObservation && !state.deliveryObservation.settled) state.deliveryObservation.pending = "RESPONSE_BODY_COMPLETED";
       state.submittedAudioBytes += bytes;
       timing.once("FIRST_TWILIO_AUDIO_SUBMITTED", event.responseId, timingDetails(event));
       callTrace.recordTwilioAudio(timingDetails(event));
@@ -926,13 +1083,18 @@ export function initializeVoiceV2Session({
     const responseId = event.responseId;
     const state = responses.get(responseId); if (!state) return;
     const entry = session.responseRegistry.get(responseId);
-    if (lifecycle.terminated || entry?.invalidated || entry?.status !== "requested") return;
+    if (lifecycle.terminated || entry?.invalidated || entry?.status !== "requested") { observeDisposition(state, "STALE", deliveryStaleReason(state)); return; }
     if (!session.floorOwner.owns({ requestId: state.requestId, responseId, proposalVersion: state.plan.proposalVersion })) {
+      observeDisposition(state, "STALE", "OWNER_NOT_CURRENT");
       session.responseRegistry.invalidate(responseId, "FLOOR_OWNER_MISMATCH");
       superseded.add(responseId);
       return session.record("FLOOR_PLAN_REJECTED", { requestId: state.requestId, responseId, purpose: state.plan.purpose, proposalVersion: state.plan.proposalVersion, reason: "COMPLETION_OWNER_MISMATCH" });
     }
     state.providerCompletion = event;
+    if (!state.preparation) {
+      if (state.deliveryObservation) state.deliveryObservation.providerStatus = ["completed", "failed", "cancelled", "incomplete"].includes(event.providerStatus) ? event.providerStatus : null;
+      deliveryBoundary(state, "RESPONSE_BODY_COMPLETED");
+    }
     const completionDiagnostics = responseCompletionDiagnostics(state, event);
     callTrace.entry("RESPONSE_COMPLETED", { ...timingDetails({ responseId }), outcome: "PROVIDER_COMPLETED", ...completionDiagnostics });
     if (!state.preparation) session.watchdog.cancel(`response:${state.requestId}`);
@@ -944,6 +1106,7 @@ export function initializeVoiceV2Session({
     session.record("SPEECH_VALIDATED", { responseId, valid: validation.valid, failedInvariant: validation.failedInvariant || null });
     callTrace.entry("SPEECH_VALIDATED", { ...timingDetails({ responseId }), valid: validation.valid, reason: validation.failedInvariant || null, mismatchCategory: validation.mismatchCategory || (validation.failedInvariant === "missing_transcript" ? "missing_transcript" : null), ...completionDiagnostics });
     if (!current || !validation.valid || state.audioBytes <= 0) return responseFailed(responseId, !current ? "STALE_PROPOSAL" : validation.failedInvariant || "NO_AUDIO");
+    if (!state.preparation) deliveryBoundary(state, "AUDIO_PREPARED");
     if (!state.preparation) session.responseRegistry.complete(responseId, { validationResult: validation });
     if (state.transcript != null) {
       const persistenceTiming = timing.start("TRANSCRIPT_PERSISTENCE", { ...timingDetails({ responseId }), turnId: `${responseId}:assistant`, role: "assistant" });
@@ -951,6 +1114,7 @@ export function initializeVoiceV2Session({
       state.preparationDiagnostics?.phase("ASSISTANT_PERSISTENCE_STARTED");
       try {
         const persisted = await lifecycle.appendTurn({ turnId: `${responseId}:assistant`, role: "assistant", text: state.transcript, timestamp: now() });
+        if (persisted?.success === true) deliveryBoundary(state, "ASSISTANT_PERSISTED");
         emitPersistenceOutcome({ turnId: `${responseId}:assistant`, role: "assistant", itemId: state.assistantItemId, responseId, characterCount: state.transcript.length, result: persisted });
         if (state.preparation && persisted?.success !== true) return failPreparation(state, "ASSISTANT_PERSISTENCE_FAILED");
       } catch (error) {
@@ -963,16 +1127,16 @@ export function initializeVoiceV2Session({
         timing.end("TRANSCRIPT_PERSISTENCE", persistenceTiming, { ...timingDetails({ responseId }), turnId: `${responseId}:assistant`, role: "assistant" });
       }
     }
-    if (state.delivery.attempts === 2 && !deliveryCurrent(state, true)) return;
+    if (state.delivery.attempts === 2 && !deliveryCurrent(state, true)) { observeDisposition(state, "STALE", deliveryStaleReason(state)); return; }
     if (state.preparation) {
       if (performance.now() >= state.preparation.identity.deadlineAt) return failPreparation(state, "SPEECH_PREPARATION_TIMEOUT", true);
-      if (!preparationCurrent(state)) return;
+      if (!preparationCurrent(state)) { observeDisposition(state, "STALE", deliveryStaleReason(state)); return; }
       if (!session.floorOwner.beginSpeaking({ requestId: state.requestId, responseId, proposalVersion: state.plan.proposalVersion })) return failPreparation(state, "PREPARATION_OWNER_MISMATCH");
-      if (!preparationCurrent(state)) return;
+      if (!preparationCurrent(state)) { observeDisposition(state, "STALE", deliveryStaleReason(state)); return; }
       session.responseRegistry.complete(responseId, { validationResult: validation });
     }
     if (state.preparation || requiresBufferedDelivery(state.plan)) {
-      twilio.submitAudio({ payload: Buffer.concat(state.audio.map((part) => Buffer.from(part, "base64"))).toString("base64") });
+      observeDeliveryWrite(state, "MEDIA_SUBMITTED", () => twilio.submitAudio({ payload: Buffer.concat(state.audio.map((part) => Buffer.from(part, "base64"))).toString("base64") }));
       state.submittedAudioBytes = state.audioBytes;
       if (state.preparation) {
         state.preparation.submitted();
@@ -983,7 +1147,7 @@ export function initializeVoiceV2Session({
       timing.once("FIRST_TWILIO_AUDIO_SUBMITTED", responseId, timingDetails({ responseId }));
       callTrace.recordTwilioAudio(timingDetails({ responseId }));
     }
-    const markId = `${callSid}:mark:${++markSequence}`; twilio.sendMark({ markId });
+    const markId = `${callSid}:mark:${++markSequence}`; observeDeliveryWrite(state, "MARK_CREATED", () => twilio.sendMark({ markId }));
     timing.point("PLAYBACK_MARK_SUBMITTED", timingDetails({ responseId, markId }));
     callTrace.entry("PLAYBACK_MARK_SUBMITTED", timingDetails({ responseId, markId }));
     session.playbackRegistry.register({ markId, responseId, proposalVersion: state.plan.proposalVersion });
@@ -1015,6 +1179,8 @@ export function initializeVoiceV2Session({
     timing.point("PLAYBACK_MARK_ACKNOWLEDGED", timingDetails({ responseId: state.responseId, markId }));
     callTrace.playbackEnded();
     session.record("PLAYBACK_ACKNOWLEDGED", { responseId: state.responseId, markId, proposalVersion: state.plan.proposalVersion });
+    deliveryBoundary(state, state.transport === "local_recovery" ? "RECOVERY_MARK_ACKNOWLEDGED" : "MARK_ACKNOWLEDGED");
+    observeDisposition(state, state.transport === "local_recovery" ? "RECOVERY_SUCCEEDED" : "DELIVERED", "NONE", "NOT_APPLICABLE", "NONE", null);
     lastAcknowledgedState = state;
     if ([ResponsePurpose.PRE_BOOKING_CONFIRMATION, ResponsePurpose.CONSENT_REASK].includes(state.plan.purpose)) {
       const floorGrant = session.floorOwner.mayGrantConfirmation({ requestId: state.requestId, proposalVersion: state.plan.proposalVersion, responseId: state.responseId, markId });
@@ -1048,11 +1214,18 @@ export function initializeVoiceV2Session({
   async function responseFailed(responseId, reason, providerCode = null) {
     const state = responses.get(responseId); if (!state) return;
     if (state.preparation) return failPreparation(state, reason);
+    if (state.deliveryObservation) {
+      state.deliveryObservation.providerCode = DELIVERY_PROVIDER_CODES.has(providerCode) ? providerCode : null;
+      if (reason === TransportEvent.RESPONSE_FAILED) state.deliveryObservation.providerStatus = "failed";
+    }
     if (reason === TransportEvent.RESPONSE_FAILED && ["server_error", "internal_server_error", "rate_limit_exceeded"].includes(providerCode)
       && retryRealtimeDelivery(requests.get(state.requestId), "TRANSIENT_PROVIDER")) return;
     const entry = session.responseRegistry.get(responseId);
     if (lifecycle.terminated || entry?.invalidated || entry?.status !== "requested"
       || state.plan.proposalVersion !== session.proposal.proposalVersion || superseded.has(responseId)) return;
+    if (!state.deliveryObservation?.settled) observeDisposition(state, state.validation?.valid === false || reason === "NO_AUDIO" ? "AUDIO_PREPARATION_FAILED" : "GENERATION_FAILED",
+      reason, "NOT_ELIGIBLE", state.audioBytes ? "AUDIO_ALREADY_RECEIVED" : "NON_TRANSIENT_FAILURE");
+    recoveryObservationOrigin = state.deliveryObservation || null;
     session.watchdog.cancel(`response:${state.requestId}`);
     if (state.markId) session.watchdog.cancel(`playback:${state.markId}`);
     session.responseRegistry.fail(responseId, { valid: false, failedInvariant: reason });
@@ -1125,6 +1298,7 @@ export function initializeVoiceV2Session({
   function supersedeProposal(proposalVersion) {
     for (const tracked of new Set(requests.values())) {
       if (tracked.plan.proposalVersion !== proposalVersion || tracked.responseId || superseded.has(`request:${tracked.requestId}`)) continue;
+      observeDisposition(tracked, "STALE", "PROPOSAL_CHANGED");
       superseded.add(`request:${tracked.requestId}`); openai.supersedeResponse({ requestId: tracked.requestId, reason: "PROPOSAL_CHANGED" });
     }
     for (const state of responses.values()) {
@@ -1147,9 +1321,13 @@ export function initializeVoiceV2Session({
     tracked.retried = true;
     session.watchdog.schedule(`active-response:${tracked.requestId}`, 25, () => enqueue(() => {
       const retryId = `${tracked.requestId}:retry`; requests.set(retryId, { ...tracked, requestId: retryId, attempt: 2 });
+      const observedRetry = requests.get(retryId);
+      observeDeliveryPlan(observedRetry, "REALTIME", tracked.deliveryObservation?.correlation).attempt = 2;
       session.floorOwner.rebindRequest({ previousRequestId: tracked.requestId, requestId: retryId });
       timing.point("RESPONSE_CREATE_DISPATCH", { ...timingDetails({ requestId: retryId }), attempt: 2 });
-      return openai.createResponse({ requestId: retryId, eventId: `${retryId}:create`, response: tracked.response });
+      const result = observeRequestDispatch(observedRetry, () => openai.createResponse({ requestId: retryId, eventId: `${retryId}:create`, response: tracked.response }));
+      if (result.accepted) observeDisposition(tracked, "RETRY_STARTED", "PROVIDER_ACTIVE_RESPONSE", "STARTED", "PROVIDER_ACTIVE_RESPONSE");
+      return result;
     }));
   }
 
@@ -1157,6 +1335,7 @@ export function initializeVoiceV2Session({
     const tracked = requests.get(requestId); if (!tracked || lifecycle.terminated) return;
     if (superseded.has(`request:${requestId}`) || (tracked.responseId && session.responseRegistry.get(tracked.responseId)?.invalidated)) return;
     if (retryRealtimeDelivery(tracked, "RESPONSE_GENERATION_TIMEOUT")) return;
+    recoveryObservationOrigin = tracked.deliveryObservation || null;
     if (tracked.responseId) session.responseRegistry.invalidate(tracked.responseId, "RESPONSE_GENERATION_TIMEOUT");
     const supersessionKey = tracked.responseId || `request:${tracked.requestId}`;
     if (!superseded.has(supersessionKey)) {
@@ -1170,10 +1349,20 @@ export function initializeVoiceV2Session({
   }
 
   function retryRealtimeDelivery(tracked, reason) {
+    const observedState = tracked?.responseId ? responses.get(tracked.responseId) || tracked : tracked;
+    const ineligible = why => {
+      if (observedState?.deliveryObservation) observedState.deliveryObservation.timeout = reason === "RESPONSE_GENERATION_TIMEOUT";
+      const entry = observedState?.responseId ? session.responseRegistry.get(observedState.responseId) : null;
+      const stale = lifecycle.terminated || entry?.invalidated || (entry && entry.status !== "requested");
+      observeDisposition(observedState, stale ? "STALE" : why === "ATTEMPTS_EXHAUSTED" ? "RETRY_EXHAUSTED" : "GENERATION_FAILED", reason,
+        why === "ATTEMPTS_EXHAUSTED" ? "EXHAUSTED" : "NOT_ELIGIBLE", why);
+      return false;
+    };
     if (!tracked || tracked.localRecovery || tracked.delivery?.attempts !== 1 || tracked.attempt >= 2
-      || [ResponsePurpose.INITIAL_GREETING, ResponsePurpose.ERROR_RECOVERY].includes(tracked.plan.purpose)) return false;
+      || [ResponsePurpose.INITIAL_GREETING, ResponsePurpose.ERROR_RECOVERY].includes(tracked.plan.purpose)) return ineligible(tracked?.delivery?.attempts >= 2 || tracked?.attempt >= 2 ? "ATTEMPTS_EXHAUSTED" : "PURPOSE_NOT_RETRYABLE");
     const state = tracked.responseId ? responses.get(tracked.responseId) : tracked;
-    if (!state || state.audioBytes || !deliveryCurrent(state)) return false;
+    if (!state || state.audioBytes || !deliveryCurrent(state)) return ineligible(state?.audioBytes ? "AUDIO_ALREADY_RECEIVED" : state ? deliveryStaleReason(state) : "OWNER_NOT_CURRENT");
+    if (state.deliveryObservation) state.deliveryObservation.timeout = reason === "RESPONSE_GENERATION_TIMEOUT";
     tracked.delivery.attempts = 2;
     session.watchdog.cancel(`response:${tracked.requestId}`);
     // Adapter and application registries retire the old identity before the new
@@ -1188,15 +1377,20 @@ export function initializeVoiceV2Session({
     const requestId = `${tracked.requestId}:delivery:${randomUUID()}`;
     const admission = session.floorOwner.plan({ purpose: tracked.plan.purpose, category: floorPurposeFor(tracked.plan), requestId,
       proposalVersion: tracked.plan.proposalVersion, source: "openai_realtime" });
-    if (!admission.accepted) return false;
+    if (!admission.accepted) { observeDisposition(state, "RETRY_SUPPRESSED", reason, "SUPPRESSED", "OWNER_NOT_CURRENT"); return false; }
     const next = { ...tracked, requestId, responseId: null, attempt: 2, retried: true };
+    observeDeliveryPlan(next, "REALTIME", state.deliveryObservation?.correlation);
+    next.deliveryObservation.clientRequestId = requestId.slice(-36);
     requests.set(requestId, next);
     session.record("RESPONSE_DELIVERY_RETRY_STARTED", { requestId, previousRequestId: tracked.requestId, purpose: tracked.plan.purpose, proposalVersion: tracked.plan.proposalVersion, reason, attempt: 2 });
-    if (!deliveryCurrent(next)) return true;
-    const result = openai.createResponse({ requestId, eventId: `${requestId}:create`, response: tracked.response });
+    if (!deliveryCurrent(next)) { observeDisposition(state, "RETRY_SUPPRESSED", reason, "SUPPRESSED", deliveryStaleReason(next)); return true; }
+    const result = observeRequestDispatch(next, () => openai.createResponse({ requestId, eventId: `${requestId}:create`, response: tracked.response }));
+    if (result.accepted) observeDisposition(state, "RETRY_STARTED", reason, "STARTED", reason);
+    else observeDisposition(state, "RETRY_SUPPRESSED", "RESPONSE_CREATE_REJECTED", "SUPPRESSED", "OWNER_NOT_CURRENT");
     if (result.accepted) session.watchdog.schedule(`response:${requestId}`, 15000, () => enqueue(() => responseTimedOut(requestId)));
     else {
       session.floorOwner.release({ reason: "RESPONSE_CREATE_REJECTED", requestId });
+      recoveryObservationOrigin = state.deliveryObservation || null;
       if (speechAdapter) startLocalRecovery();
       else lifecycle.terminate("RESPONSE_RECOVERY_UNAVAILABLE");
     }
@@ -1228,6 +1422,9 @@ export function initializeVoiceV2Session({
         reason: "NOT_CURRENT_PENDING_PLAYBACK",
       });
     }
+    if (state.deliveryObservation) state.deliveryObservation.timeout = true;
+    observeDisposition(state, "PLAYBACK_TIMED_OUT", "PLAYBACK_TIMEOUT", "NOT_ELIGIBLE", "PLAYBACK_ALREADY_STARTED");
+    recoveryObservationOrigin = state.deliveryObservation || null;
     coordinator.handleTimeout(session, "PLAYBACK_TIMEOUT", { responseId: state.responseId, markId });
     session.floorOwner.release({ reason: "PLAYBACK_TIMEOUT", requestId: state.requestId, responseId: state.responseId, markId });
     if (session.proposal.terminal || state.plan.purpose === ResponsePurpose.AMBIGUITY_LIMIT_REACHED || state.plan.purpose === ResponsePurpose.ERROR_RECOVERY) return lifecycle.terminate("PLAYBACK_TIMEOUT");
@@ -1269,6 +1466,7 @@ export function initializeVoiceV2Session({
   function requiresBufferedDelivery(plan) { return plan?.critical === true || plan?.deliveryValidationRequired === true; }
   function usesApplicationSpeech(plan) { return Boolean(speechAdapter && (plan?.speechContract?.applicationOwnedConfirmation === true || plan?.speechContract?.applicationOwnedReprompt === true || plan?.speechContract?.applicationOwnedSpeech === true)); }
   function supersedeResponse(state, reason) {
+    observeDisposition(state, "STALE", reason);
     superseded.add(state.responseId);
     if (state.transport === "local_recovery") return { accepted: true, responseId: state.responseId, reason };
     if (state.transport === "application_tts") {
@@ -1422,6 +1620,15 @@ export function initializeVoiceV2Session({
     if (role === "caller") callTrace.entry("CALLER_TRANSCRIPT_PERSISTED", { turnId, itemId, characterCount, persistenceOutcome: error ? "FAILED" : result?.replayed ? "REPLAYED" : result?.success === true ? "SUCCESS" : "NOT_CONFIRMED" });
   }
   async function cleanup(reason) {
+    for (const tracked of new Set(requests.values())) {
+      if (!tracked.responseId && tracked.deliveryObservation && !tracked.deliveryObservation.settled) observeDisposition(tracked, "STALE", "TERMINATING");
+    }
+    const endingObservation = (currentLifecycle() || [...responses.values()].at(-1))?.deliveryObservation;
+    if (endingObservation) {
+      // A separate terminal snapshot does not overwrite the original failure pair.
+      observeDisposition({ deliveryObservation: { ...endingObservation, last: "TERMINATION_REQUESTED", pending: null, seen: new Set(), settled: false } },
+        "TERMINATION_REQUESTED", reason, "NOT_APPLICABLE", "NONE", null);
+    }
     disposeSpeechUndiciStages(callSid);
     transcriptionDiagnostics.close();
     turnOrderDiagnostics.dispose();
