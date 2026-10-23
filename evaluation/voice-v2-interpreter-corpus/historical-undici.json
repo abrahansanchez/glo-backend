@@ -1,0 +1,98 @@
+{
+  "testName": "real pinned fetch/default per-synthesis Agent stages and request/audio match historical HEAD",
+  "introduction": "9eaab4ac49b27af235b6f949d7514af0252bbe36 diag(voice-v2): record speech request stages",
+  "rows": [
+    {
+      "reference": "cf8560b9ea9cea5515d3a9feac314ba78f02fac0",
+      "sha": "cf8560b9ea9cea5515d3a9feac314ba78f02fac0",
+      "testName": "real pinned fetch/default per-synthesis Agent stages and request/audio match historical HEAD",
+      "command": [
+        "C:\\Program Files\\nodejs\\node.exe",
+        "--experimental-loader",
+        "file:///C:/Users/sanch/AppData/Local/Temp/voice-v2-corpus-history-3MW4EB/dependencies.mjs",
+        "--test",
+        "--test-name-pattern=real pinned fetch/default per-synthesis Agent stages and request/audio match historical HEAD",
+        "C:\\Users\\sanch\\AppData\\Local\\Temp\\voice-v2-corpus-history-3MW4EB\\cf8560b9ea9cea5515d3a9feac314ba78f02fac0\\realtime\\voice-v2\\tests\\adapters\\speech-undici-stages.test.js"
+      ],
+      "node": "v22.13.1",
+      "npm": "10.9.2",
+      "undici": "6.21.1",
+      "exitCode": 1,
+      "errorCode": "ERR_UNSUPPORTED_RESOLVE_REQUEST",
+      "passed": false,
+      "failed": true,
+      "nativeCommittedTest": true,
+      "activeFilesReplaced": false,
+      "stack": [
+        "    moduleResolve (node:internal/modules/esm/resolve:922:23)",
+        "    defaultResolve (node:internal/modules/esm/resolve:1056:11)"
+      ],
+      "loopbackServerStarted": false,
+      "loopbackEvidence": "The data-URL baseline import throws before createServer()/listen() in the selected test.",
+      "unsupportedResolutionDetected": true,
+      "dependencyBoundary": "file: snapshot imports use authorized root dependencies; data: imports retain native Node resolution"
+    },
+    {
+      "reference": "9eaab4ac",
+      "sha": "9eaab4ac49b27af235b6f949d7514af0252bbe36",
+      "testName": "real pinned fetch/default per-synthesis Agent stages and request/audio match historical HEAD",
+      "command": [
+        "C:\\Program Files\\nodejs\\node.exe",
+        "--experimental-loader",
+        "file:///C:/Users/sanch/AppData/Local/Temp/voice-v2-corpus-history-3MW4EB/dependencies.mjs",
+        "--test",
+        "--test-name-pattern=real pinned fetch/default per-synthesis Agent stages and request/audio match historical HEAD",
+        "C:\\Users\\sanch\\AppData\\Local\\Temp\\voice-v2-corpus-history-3MW4EB\\9eaab4ac49b27af235b6f949d7514af0252bbe36\\realtime\\voice-v2\\tests\\adapters\\speech-undici-stages.test.js"
+      ],
+      "node": "v22.13.1",
+      "npm": "10.9.2",
+      "undici": "6.21.1",
+      "exitCode": 1,
+      "errorCode": "ERR_UNSUPPORTED_RESOLVE_REQUEST",
+      "passed": false,
+      "failed": true,
+      "nativeCommittedTest": true,
+      "activeFilesReplaced": false,
+      "stack": [
+        "    moduleResolve (node:internal/modules/esm/resolve:922:23)",
+        "    defaultResolve (node:internal/modules/esm/resolve:1056:11)"
+      ],
+      "loopbackServerStarted": false,
+      "loopbackEvidence": "The data-URL baseline import throws before createServer()/listen() in the selected test.",
+      "unsupportedResolutionDetected": true,
+      "dependencyBoundary": "file: snapshot imports use authorized root dependencies; data: imports retain native Node resolution"
+    },
+    {
+      "reference": "21ec066f939f8820478ce6997398ad9a6b554373",
+      "sha": "21ec066f939f8820478ce6997398ad9a6b554373",
+      "testName": "real pinned fetch/default per-synthesis Agent stages and request/audio match historical HEAD",
+      "command": [
+        "C:\\Program Files\\nodejs\\node.exe",
+        "--experimental-loader",
+        "file:///C:/Users/sanch/AppData/Local/Temp/voice-v2-corpus-history-3MW4EB/dependencies.mjs",
+        "--test",
+        "--test-name-pattern=real pinned fetch/default per-synthesis Agent stages and request/audio match historical HEAD",
+        "C:\\Users\\sanch\\AppData\\Local\\Temp\\voice-v2-corpus-history-3MW4EB\\21ec066f939f8820478ce6997398ad9a6b554373\\realtime\\voice-v2\\tests\\adapters\\speech-undici-stages.test.js"
+      ],
+      "node": "v22.13.1",
+      "npm": "10.9.2",
+      "undici": "6.21.1",
+      "exitCode": 1,
+      "errorCode": "ERR_UNSUPPORTED_RESOLVE_REQUEST",
+      "passed": false,
+      "failed": true,
+      "nativeCommittedTest": true,
+      "activeFilesReplaced": false,
+      "stack": [
+        "    moduleResolve (node:internal/modules/esm/resolve:922:23)",
+        "    defaultResolve (node:internal/modules/esm/resolve:1056:11)"
+      ],
+      "loopbackServerStarted": false,
+      "loopbackEvidence": "The data-URL baseline import throws before createServer()/listen() in the selected test.",
+      "unsupportedResolutionDetected": true,
+      "dependencyBoundary": "file: snapshot imports use authorized root dependencies; data: imports retain native Node resolution"
+    }
+  ],
+  "scratch": "C:\\Users\\sanch\\AppData\\Local\\Temp\\voice-v2-corpus-history-3MW4EB",
+  "conclusion": "All three committed versions fail under this Node/dependency environment before loopback begins. The immediate cause is the test importing a historical adapter via data: while retaining a bare undici import. This is an environment-sensitive test/module-loading defect, not evidence of a provider or production transport failure. Git proves the test was introduced at 9eaab4ac; historical CI/runtime onset is not established."
+}
