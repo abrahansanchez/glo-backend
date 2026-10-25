@@ -1,3 +1,4 @@
+import { CallOutcomeDiagnosis } from "./diagnostics/CallOutcomeDiagnosis.js";
 import { disposeSpeechUndiciStages } from "./diagnostics/SpeechUndiciStages.js";
 import { randomUUID } from "node:crypto";
 import { SpeechPreparationDiagnostics, SpeechLifecycleDiagnostics } from "./audio/SpeechPreparationDiagnostics.js";
@@ -79,7 +80,17 @@ export function initializeVoiceV2Session({
   let callerSpeechEpoch = 0; let deliveryStopping = false;
   let localRecoveryStarted = false;
   let recoveryObservationOrigin = null;
-  const safeEmit = (event) => { try { emit(event); } catch { /* Logging cannot terminate a call. */ } };
+  const outcomeDiagnosis = new CallOutcomeDiagnosis();
+  const safeEmit = (event) => { try {
+    if (event?.traceEvent === "CALL_SUMMARY") {
+      const summary = outcomeDiagnosis.summary(event, session.proposal.terminal);
+      Promise.resolve(emit(summary)).catch(() => {});
+    } else {
+      outcomeDiagnosis.observe(event);
+      if (event?.event === "V2_LOCAL_RECOVERY_FINALIZATION_FAILED") { outcomeDiagnosis.finalizationFailed(); emitCallSummary("UNKNOWN"); }
+      emit(event);
+    }
+  } catch { /* Logging cannot terminate a call. */ } };
   // Diagnostic snapshots only. Never consulted by an operational decision.
   function observeDeliveryPlan(tracked, transport, correlation = null) {
     const observation = { correlation: correlation || { requestId: deliveryId(tracked.requestId), responseId: null }, transport,
@@ -146,7 +157,7 @@ export function initializeVoiceV2Session({
         markCreated: d.markCreated, markAcknowledged: d.markAcknowledged, callerSpeechActive: session.turnRegistry.callerSpeechActive,
         terminating: deliveryStopping || lifecycle?.terminated === true });
       if (!["RETRY_SUPPRESSED", "RECOVERY_BEGAN"].includes(disposition)) d.settled = true;
-      try { Promise.resolve(emit(event)).catch(() => {}); } catch { /* Observer failure is inert. */ }
+      try { outcomeDiagnosis.delivery(event); Promise.resolve(emit(event)).catch(() => {}); } catch { /* Observer failure is inert. */ }
     } catch { /* Diagnostic state never owns delivery. */ }
   }
   function observeDeliveryWrite(state, boundary, operation) {
@@ -179,6 +190,7 @@ export function initializeVoiceV2Session({
     return { streamSid: twilio?.identity.streamSid || null, ...state?.timingContext, requestId: value.requestId || state?.requestId || null, responseId: value.responseId || state?.responseId || null, markId: value.markId || null, itemId: value.itemId || null, purpose: state?.plan.purpose || null, proposalVersion: state?.plan.proposalVersion ?? null };
   };
   function receive(event, handler) {
+    if (!lifecycle?.terminated && event.error?.code !== "response_cancel_not_active") outcomeDiagnosis.connection(event.type);
     // Receipt, rather than queue processing, revokes pending retry permission.
     if (event.type === TransportEvent.CALLER_SPEECH_STARTED) callerSpeechEpoch++;
     if ([TransportEvent.TWILIO_STREAM_STOPPED, TransportEvent.TWILIO_CONNECTION_CLOSED, TransportEvent.TWILIO_TRANSPORT_ERROR,
@@ -234,7 +246,7 @@ export function initializeVoiceV2Session({
   function observeConsent(method, ...args) { try { return consentDiagnostics?.[method]?.(...args); } catch { /* Diagnostics cannot affect a call. */ } }
   const twilio = new TwilioMediaAdapter({ socket: twilioSocket, onEvent: (event) => receive(event, onTwilio) });
   const openai = new OpenAIRealtimeAdapter({ socketFactory: openaiSocketFactory, onEvent: (event) => receive(event, onOpenAI), onTurnOrderMetadata: metadata => turnOrderDiagnostics.observe(metadata),
-    onTranscriptionLifecycleMetadata: metadata => transcriptionDiagnostics.observe(metadata), onTranscriptionLifecycleClosed: () => transcriptionDiagnostics.close() });
+    onTranscriptionLifecycleMetadata: metadata => { outcomeDiagnosis.transcription(metadata); transcriptionDiagnostics.observe(metadata); }, onTranscriptionLifecycleClosed: () => transcriptionDiagnostics.close() });
   lifecycle = new SessionLifecycle({ session, transcriptAdapter, callerNumber, cleanup, onTerminating: () => { disposeSpeechUndiciStages(callSid); transcriptionDiagnostics.close(); } });
   session.record("V2_SESSION_STARTED", { proposalVersion: proposal.proposalVersion });
   session.record("BUSINESS_CONTEXT_BOUND", { businessId: businessContext.businessId, barberId: businessContext.barberId });
@@ -244,6 +256,10 @@ export function initializeVoiceV2Session({
     processing = processing.then(operation, operation).catch((error) => {
       session.record("SESSION_OPERATION_FAILED", { reason: error?.message || String(error) });
       return lifecycle.terminate("SESSION_OPERATION_FAILED");
+    });
+    // Observe rejection without replacing/awaiting the operational promise.
+    processing.then(undefined, () => {
+      try { if (lifecycle?.terminated) { emitCallSummary("UNKNOWN"); } } catch {}
     });
     return processing;
   }
@@ -1517,7 +1533,26 @@ export function initializeVoiceV2Session({
     callTrace.entry("TWILIO_CLEAR_SUBMITTED", { ...timingDetails({ responseId: state?.responseId, markId: state?.markId }), reason });
     return result;
   }
+  function emitCallSummary(outcome) {
+    try {
+      const activeResponses = [...responses.values()].filter((state) => ["planned", "requested"].includes(session.responseRegistry.get(state.responseId)?.status)).length;
+      const uncreatedActiveRequest = openai.activeRequestId && ![...responses.values()].some((state) => state.requestId === openai.activeRequestId) ? 1 : 0;
+      const activePlaybacks = [...marks.keys()].filter((markId) => ["not_submitted", "submitted"].includes(session.playbackRegistry.get(markId)?.status)).length;
+      callTrace.summary({
+        durationMs: callTrace.stamp().elapsedMs,
+        finalProposalVersion: session.proposal.proposalVersion,
+        finalRequirement: session.proposal.terminal ? null : deriveBookingRequirement(session.proposal),
+        appointmentId: session.proposal.terminal?.appointmentId || null,
+        finalOutcome: outcome,
+        remainingTimerCount: session.watchdog.pendingCount,
+        remainingEffectCount: session.effectQueue.pending().length,
+        remainingResponseCount: activeResponses + uncreatedActiveRequest,
+        remainingPlaybackCount: activePlaybacks,
+      });
+    } catch { /* Terminal diagnostics cannot affect finalization. */ }
+  }
   function observeSessionRecord(entry) {
+    outcomeDiagnosis.observe(entry);
     const common = {
       turnId: entry.turnId,
       proposalVersion: entry.proposalVersion,
@@ -1553,20 +1588,7 @@ export function initializeVoiceV2Session({
       callTrace.counters.finalizations += 1;
       callTrace.entry("TRANSCRIPT_FINALIZED", { ...common, outcome: entry.outcome, persistenceOutcome: entry.replayed ? "REPLAYED" : entry.success ? "SUCCESS" : "NOT_CONFIRMED" });
       observeConsent("complete");
-      const activeResponses = [...responses.values()].filter((state) => ["planned", "requested"].includes(session.responseRegistry.get(state.responseId)?.status)).length;
-      const uncreatedActiveRequest = openai.activeRequestId && ![...responses.values()].some((state) => state.requestId === openai.activeRequestId) ? 1 : 0;
-      const activePlaybacks = [...marks.keys()].filter((markId) => ["not_submitted", "submitted"].includes(session.playbackRegistry.get(markId)?.status)).length;
-      callTrace.summary({
-        durationMs: callTrace.stamp().elapsedMs,
-        finalProposalVersion: session.proposal.proposalVersion,
-        finalRequirement: session.proposal.terminal ? null : deriveBookingRequirement(session.proposal),
-        appointmentId: session.proposal.terminal?.appointmentId || null,
-        finalOutcome: entry.outcome,
-        remainingTimerCount: session.watchdog.pendingCount,
-        remainingEffectCount: session.effectQueue.pending().length,
-        remainingResponseCount: activeResponses + uncreatedActiveRequest,
-        remainingPlaybackCount: activePlaybacks,
-      });
+      emitCallSummary(entry.outcome);
     } else if ([
       "FLOOR_TRANSITION",
       "FLOOR_PLAN_ACCEPTED",
