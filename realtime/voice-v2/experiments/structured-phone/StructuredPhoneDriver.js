@@ -109,7 +109,24 @@ export class StructuredPhoneDriver {
           const result = await this.invoke(call.name, call.args, current);
           if (!current()) return;
           this.log('TOOL_RESULT', { turn: this.turns, tool: call.name, status: result.status, elapsedMs: performance.now() - toolStartedMs,
-            reason: ['STALE_BINDING', 'INVALID_CHANGE', 'STALE_OR_FOREIGN_ALTERNATIVE', 'UNSUPPORTED_SERVICE_BUNDLE', 'FRESH_BUNDLE_REQUIRED', 'CONFIRMATION_NOT_DELIVERED', 'NOT_AFFIRMATIVE'].includes(result.reason) ? result.reason : result.reason ? 'REJECTED' : null });
+            reason: ['STALE_BINDING', 'INVALID_CHANGE', 'STALE_OR_FOREIGN_ALTERNATIVE', 'UNSUPPORTED_SERVICE_BUNDLE', 'FRESH_BUNDLE_REQUIRED', 'CONFIRMATION_NOT_DELIVERED', 'NOT_AFFIRMATIVE', 'UNAVAILABLE', 'BUSINESS_CLOSED'].includes(result.reason) ? result.reason : result.reason ? 'REJECTED' : null,
+            ...(['check_availability', 'request_canonical_confirmation'].includes(call.name) ? {
+              available: typeof result.available === 'boolean' ? result.available : null, evidenceCurrent: Boolean(this.freshEvidence()),
+              ...(call.name === 'request_canonical_confirmation' ? { eligibilityReason: result.eligibilityReason || 'STALE_BINDING', missingFields: result.missingFields || [] } : {}),
+            } : {}) });
+          // Only a valid explicit confirmation request may finish the last
+          // model response through the application-owned readiness gate.
+          if (call.name === 'request_canonical_confirmation' && calls.length === 1 && round === PHONE_LIMITS.perTurnRequests - 1
+            && result.reason !== 'STALE_BINDING') {
+            const plan = this.confirmationRecoveryPlan();
+            if (plan && current()) {
+              this.log('PLAN_VALIDATED', { turn: this.turns, proposalVersion: this.session.proposal.proposalVersion, source: 'APPLICATION_CONFIRMATION_GATE', atMs: performance.now() });
+              stage = 'SPEECH_SUBMISSION'; const delivery = await this.speak(plan);
+              stage = 'TOOL_RESULT_SUBMISSION';
+              if (current()) this.model.toolResult(call.callId, { ...result, delivery: { status: delivery?.accepted ? 'SPEECH_PREPARING' : 'WITHHELD', playbackAcknowledged: false } }, this.context());
+              return;
+            }
+          }
           stage = 'TOOL_RESULT_SUBMISSION'; this.model.toolResult(call.callId, result, this.context());
         }
       }
@@ -121,6 +138,27 @@ export class StructuredPhoneDriver {
   same(args) { const b = this.binding(); return Object.keys(b).every(key => JSON.stringify(args[key]) === JSON.stringify(b[key])) && Object.keys(args).length === Object.keys(b).length; }
   freshEvidence() { return this.evidence?.version === this.session.proposal.proposalVersion && performance.now() - this.evidence.checkedAt <= 60000 && this.evidence.revision === this.business.revision
     && JSON.stringify(this.evidence.ids) === JSON.stringify(this.ids()); }
+  confirmationEligibility() {
+    const p = this.session.proposal, core = [];
+    if (!this.ids().length) core.push('service');
+    if (!p.date) core.push('date'); if (!p.time) core.push('time');
+    const missingFields = [...core, ...(!p.name ? ['name'] : [])], current = Boolean(this.freshEvidence());
+    const available = current && typeof this.evidence.result.available === 'boolean' ? this.evidence.result.available : null;
+    const eligibilityReason = core.length ? 'MISSING_INFORMATION' : available === false ? 'BUNDLE_UNAVAILABLE'
+      : !p.name ? 'MISSING_INFORMATION' : available === true ? 'READY' : 'AVAILABILITY_REQUIRED';
+    const nextAction = core.length ? 'ASK_MISSING' : available === false
+      ? (this.evidence.result.alternatives.length ? 'OFFER_ALTERNATIVES' : 'EXPLAIN_RESULT')
+      : !p.name ? 'ASK_MISSING' : available === true ? 'CANONICAL_CONFIRMATION' : 'CHECK_AVAILABILITY';
+    return { ...(eligibilityReason === 'READY' ? { status: 'OK' } : rejected('FRESH_BUNDLE_REQUIRED')),
+      eligible: eligibilityReason === 'READY', eligibilityReason, available, evidenceCurrent: current, missingFields, nextAction };
+  }
+  confirmationRecoveryPlan() {
+    const eligibility = this.confirmationEligibility(), args = { ...this.binding(), type: eligibility.nextAction };
+    if (args.type === 'CHECK_AVAILABILITY') return null;
+    if (args.type === 'ASK_MISSING') args.field = eligibility.missingFields[0];
+    if (args.type === 'OFFER_ALTERNATIVES') args.alternativeIds = this.evidence.result.alternatives.slice(0, 3).map(a => a.alternativeId);
+    return this.render(args);
+  }
   async invoke(name, args, current) {
     if (name === 'read_business_context') return { status: 'OK', ...this.context() };
     const { changes, meaning, ...binding } = args;
@@ -163,7 +201,7 @@ export class StructuredPhoneDriver {
       this.evidence = { checkedAt: performance.now(), revision: this.business.revision, version: this.session.proposal.proposalVersion, ids: this.ids(), result: { ...result, alternatives } };
       return { ...this.evidence.result };
     }
-    if (name === 'request_canonical_confirmation') return this.freshEvidence() && this.evidence.result.available && this.session.proposal.name ? { status: 'OK', eligible: true } : rejected('FRESH_BUNDLE_REQUIRED');
+    if (name === 'request_canonical_confirmation') return this.confirmationEligibility();
     if (name === 'submit_confirmation_meaning') {
       // Existing deterministic confirmation extractor is a veto, never a new phrase interpreter.
       const affirmative = meaning === 'AFFIRM' && extractConfirmation(normalizeTurn(this.callerText)) === 'affirm' && !/[?¿]/.test(this.callerText);
@@ -191,7 +229,7 @@ export class StructuredPhoneDriver {
     const display = labels.join(es ? ' y ' : ' and '), locale = es ? 'es' : 'en';
     const slot = value => new Intl.DateTimeFormat(locale, { weekday: 'long', month: 'long', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZone: 'UTC' }).format(new Date(value.date + 'T' + value.time + ':00Z'));
     const explanation = evidence?.reason === 'BUSINESS_CLOSED' ? (es ? 'El negocio está cerrado para el día solicitado.' : 'The business is closed on the requested day.')
-      : evidence?.reason === 'UNAVAILABLE' ? (es ? 'El horario solicitado no está disponible para todos los servicios.' : 'The requested time is unavailable for the complete service bundle.') : null;
+      : evidence?.reason === 'UNAVAILABLE' ? (es ? 'El horario solicitado no está disponible.' : 'The requested time is unavailable.') : null;
     let text, purpose = 'CLARIFICATION';
     if (type === 'ASK_MISSING') {
       if (field === 'service' ? this.ids().length : p[field]) return null;
@@ -204,7 +242,7 @@ export class StructuredPhoneDriver {
       if (!evidence || !alternativeIds.length || new Set(alternativeIds).size !== alternativeIds.length) return null;
       const alternatives = alternativeIds.map(id => evidence.alternatives.find(a => a.alternativeId === id));
       if (alternatives.some(a => !a)) return null;
-      text = (explanation ? explanation + ' ' : '') + (es ? `Para ${display}, puedo ofrecer ${alternatives.map(slot).join(' o ')}. ¿Cuál prefieres?` : `For ${display}, I can offer ${alternatives.map(slot).join(' or ')}. Which would you prefer?`);
+      text = (explanation ? explanation + ' ' : '') + (es ? `Puedo ofrecer ${alternatives.map(slot).join(' o ')}. ¿Cuál prefieres?` : `I can offer ${alternatives.map(slot).join(' or ')}. Which would you prefer?`);
       purpose = 'OFFER_ALTERNATIVES';
     } else if (type === 'CANONICAL_CONFIRMATION') {
       if (!evidence?.available || !p.name || !p.date || !p.time) return null;

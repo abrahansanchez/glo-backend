@@ -906,3 +906,76 @@ test('phone latency: selected alternative becomes unavailable during synthesis a
     assert.equal(f.app.session.journal().some(e => e.event === 'CONFIRMATION_AUTHORITY_GRANTED'), false); assert.equal(f.executorCalls, 0);
   } finally { await f.app.terminate('TEST_DONE'); }
 });
+
+for (const mode of ['missing name', 'available', 'unavailable', 'missing date', 'missing time']) test(`phone confirmation recovery: recorded four-request sequence - ${mode}`, async () => {
+  const raw = business(); raw.services = [{ _id: '507f1f77bcf86cd799439011', name: 'Haircut', price: 25, durationMinutes: 30 }];
+  raw.availability.bufferMinutes = 10;
+  raw.availability.businessHours.wed = { open: '09:00', close: '09:30', isClosed: false };
+  raw.availability.businessHours.thu = { open: '09:00', close: '18:00', isClosed: false };
+  const initial = structuredClone(raw), original = Appointment.findOne; Appointment.findOne = () => Promise.resolve(null);
+  let f;
+  try {
+    f = await harness({ raw, labels: {}, language: 'es', script: (m, input) => {
+      if (m.round === 1) {
+        const changes = [{ kind: 'SET_SERVICE', serviceId: input.context.business.services[0].id }];
+        if (mode !== 'missing date') changes.push({ kind: 'SET_DATE', date: '2026-10-28' });
+        if (mode !== 'missing time') changes.push({ kind: 'SET_TIME', time: mode === 'unavailable' ? '10:00' : '09:00' });
+        if (mode !== 'missing name') changes.push({ kind: 'SET_NAME', name: 'Synthetic Tester' });
+        return [call('update_appointment_draft', { ...m.binding, changes })];
+      }
+      return [call(m.round === 3 ? 'check_availability' : 'request_canonical_confirmation', m.binding)];
+    } });
+    f.availability.checkSlot = isSlotAvailable; f.availability.listSlots = getAvailableSlots;
+    await f.turn('Miércoles veintiocho de octubre a las nueve a.m.');
+    assert.equal(f.requests.length, 4); assert.equal(f.app.lifecycle.terminated, false); assert.equal(f.speech.length, 1);
+    assert.deepEqual(f.models[0].results.map(r => r.status), ['OK', 'REJECTED', mode === 'missing date' ? 'REJECTED' : 'OK', mode === 'available' ? 'OK' : 'REJECTED']);
+    assert.equal(f.models[0].results[3].delivery.status, 'SPEECH_PREPARING');
+    const text = f.speech[0].input;
+    if (mode === 'available') { assert.match(text, /Haircut/); assert.match(text, /\$25/); }
+    if (mode === 'missing name') {
+      assert.match(text, /nombre/); assert.equal(f.models[0].results[2].available, true);
+      assert.equal(f.models[0].results[3].eligibilityReason, 'MISSING_INFORMATION'); assert.deepEqual(f.models[0].results[3].missingFields, ['name']);
+    }
+    if (mode === 'missing date') assert.match(text, /fecha/);
+    if (mode === 'missing time') assert.match(text, /hora/);
+    if (mode === 'unavailable') {
+      assert.equal(f.models[0].results[2].available, false); assert.match(text, /horario solicitado no está disponible/);
+      assert.doesNotMatch(text, /Haircut|servicios|cerrado|fuera del horario/i); assert.equal(f.app.session.proposal.time, '10:00');
+    }
+    assert.equal(f.app.session.journal().some(e => e.event === 'CONFIRMATION_AUTHORITY_GRANTED'), false);
+    assert.equal(f.executorCalls, 0); assert.deepEqual(raw, initial);
+  } finally { Appointment.findOne = original; await f?.app.terminate('TEST_DONE'); }
+});
+
+for (const mode of ['stale binding', 'foreign binding', 'interrupted synthesis', 'stale synthesis', 'interrupted playback']) test(`phone confirmation recovery boundary: ${mode}`, async () => {
+  const f = await harness({
+    beforeSpeech: async (_request, app) => {
+      if (mode === 'interrupted synthesis') app.twilio.clearPlayback();
+      if (mode === 'stale synthesis') f.raw.services[0].price++;
+    },
+    script: m => {
+      if (m.round === 1) return seedScript(m);
+      if (m.round === 3) return [call('check_availability', m.binding)];
+      const binding = { ...m.binding };
+      if (m.round === 4 && mode === 'stale binding') binding.proposalVersion--;
+      if (m.round === 4 && mode === 'foreign binding') binding.turnId = 'foreign-turn';
+      return [call('request_canonical_confirmation', binding)];
+    },
+  });
+  try {
+    await f.turn(); assert.equal(f.requests.length, 4); assert.equal(f.executorCalls, 0);
+    if (mode.endsWith('binding')) {
+      assert.equal(f.models[0].results.at(-1).reason, 'STALE_BINDING');
+      assert.equal(f.speech.length, 0); assert.equal(f.app.lifecycle.terminated, true);
+    } else if (mode === 'interrupted playback') {
+      const mark = f.twilio.sent.find(p => p.event === 'mark').mark.name;
+      f.app.twilio.clearPlayback(); await f.ack(mark); await f.ack(mark);
+      assert.equal(f.app.session.playbackRegistry.get(mark).invalidated, true);
+    } else {
+      assert.equal(f.speech.length, 1);
+      assert.equal(f.twilio.sent.some(p => p.event === 'media' || p.event === 'mark'), false);
+    }
+    assert.equal(f.emitted.some(e => e.stage === 'WOULD_AUTHORIZE'), false);
+    assert.equal(f.app.session.journal().some(e => e.event === 'CONFIRMATION_AUTHORITY_GRANTED'), false);
+  } finally { await f.app.terminate('TEST_DONE'); }
+});

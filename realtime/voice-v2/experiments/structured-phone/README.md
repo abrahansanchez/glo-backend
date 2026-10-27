@@ -265,3 +265,28 @@ This would bound the observed 12.055-second wait but can discard a response that
 would later succeed; it does not identify the remote cause or impose a cost cap.
 Streaming after headers cannot remove a pre-header wait. Existing header/time
 budgets, provider/model/voice settings and interruption behavior are unchanged.
+
+## Confirmation readiness recovery
+
+The recorded Wednesday 09:00 helper checks returned available. The old
+FRESH_BUNDLE_REQUIRED response conflated missing name with missing, expired,
+revision-mismatched, proposal-mismatched or ordered-service-mismatched evidence,
+and with an unavailable result. The private tool envelope and name presence were
+not logged, so missing name is a source-based inference, not a recorded account fact.
+
+Eligibility now returns bounded eligibilityReason, missingFields, available,
+evidenceCurrent and nextAction fields. Missing draft information is not proof that
+the caller omitted it. Availability OK describes a completed check, not necessarily
+an available slot or permission to confirm.
+
+On the fourth response only, a single, structurally valid, current-bound explicit
+canonical-confirmation request hands off to the existing application renderer:
+ready evidence produces canonical readback, missing fields produce collection,
+and unavailable evidence produces its verified explanation/current alternatives.
+Unknown or stale availability cannot produce confirmation. No fifth model request,
+slot substitution, delivery acknowledgment or booking authority is introduced.
+The rendered plan retains all asynchronous release and mark freshness checks.
+
+Ordinary offers omit service enumeration; canonical readback retains it. Generic
+unavailability describes the requested time, without inventing an hours or closure
+cause. Only a verified BUSINESS_CLOSED result supplies a closure explanation.

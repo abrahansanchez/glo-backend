@@ -26,7 +26,7 @@ export function phoneContracts(ids) {
     ['read_business_context', 'Read current application-owned business facts, clock, catalogue and draft.', object({})],
     ['update_appointment_draft', 'Apply ordered changes atomically. SET_DATE is a real YYYY-MM-DD date within the supplied booking window. Resolve alternative IDs against the current originating bundle before any changes. Never book.', object({ ...binding, changes: array(changes) })],
     ['check_availability', 'Check the complete ordered service bundle with its summed duration. No reservation.', object(binding)],
-    ['request_canonical_confirmation', 'Read eligibility for application-owned confirmation. Does not speak or deliver it.', object(binding)],
+    ['request_canonical_confirmation', 'Check confirmation eligibility. Read eligibilityReason, missingFields and nextAction: missing draft fields require collection, unknown/stale evidence requires check_availability, and unavailable results require explanation/current alternatives. On the last allowed model response this explicit request hands off to application-owned validated confirmation or supported recovery. Never grants delivery or booking authority.', object(binding)],
     ['submit_confirmation_meaning', 'Propose consent meaning; existing delivered-confirmation authority and caller evidence decide. Simulation only.', object({ ...binding, meaning: { enum: ['AFFIRM', 'DENY', 'UNKNOWN', 'CORRECTION'] } })],
     ['propose_response_plan', 'End the turn with a communication purpose and current bindings. No arbitrary wording or facts.', wire],
   ].map(([name, description, parameters]) => ({ type: 'function', name, description, parameters }));
