@@ -12,6 +12,30 @@ import { planResponse, ResponsePurpose, bindApplicationOwnedLifecycleSpeech } fr
 import { FakeSocket } from "../helpers/FakeSocket.js";
 import { localRecoveryFixture } from "../helpers/localRecoveryFixture.js";
 
+test('call diagnosis: structured failure after greeting precedes teardown transport errors', () => {
+  const d = new CallOutcomeDiagnosis();
+  d.delivery({ disposition: 'DELIVERED', purpose: 'INITIAL_GREETING' });
+  d.observe({ event: 'TURN_PROCESSING_STARTED' });
+  d.observe({ event: 'STRUCTURED_DECISION_FAILED' });
+  d.observe({ event: 'SESSION_TERMINATING', reason: 'STRUCTURED_PHONE_FAILED' });
+  d.connection('TWILIO_TRANSPORT_ERROR');
+  const s = d.summary({ finalOutcome: 'STRUCTURED_PHONE_FAILED' });
+  assert.equal(s.primaryFailureCategory, 'STRUCTURED_DECISION');
+  assert.equal(s.primaryFailureReason, 'STRUCTURED_PHONE_FAILED');
+  assert.equal(s.communicationOutcome, 'STRUCTURED_DECISION_FAILED');
+  assert.equal(s.acceptedTurnCount, 1); assert.equal(s.bookingAttemptCount, 0);
+});
+
+test('call diagnosis: explicit structured terminal failures cannot be successful greeting-only calls', () => {
+  for (const reason of ['STRUCTURED_PHONE_FAILED', 'STRUCTURED_MODEL_PROTOCOL_FAILED', 'STRUCTURED_DECISION_TIMEOUT', 'STRUCTURED_STALE_EVIDENCE', 'STRUCTURED_CALL_LIMIT', 'STRUCTURED_SPEECH_LIMIT', 'STRUCTURED_EFFECT_REFUSED', 'STRUCTURED_UNEXPECTED_MODEL_AUDIO']) {
+    const d = new CallOutcomeDiagnosis(); d.delivery({ disposition: 'DELIVERED', purpose: 'INITIAL_GREETING' });
+    d.observe({ event: 'SESSION_TERMINATING', reason });
+    const s = d.summary({ finalOutcome: reason });
+    assert.equal(s.primaryFailureCategory, 'STRUCTURED_DECISION');
+    assert.equal(s.communicationOutcome, 'STRUCTURED_DECISION_FAILED'); assert.equal(s.finalOutcome, reason);
+  }
+});
+
 function deferred() { let resolve; let reject; const promise = new Promise((a, b) => { resolve = a; reject = b; }); return { promise, resolve, reject }; }
 function clock() {
   const tasks = [];
@@ -182,7 +206,7 @@ test('call diagnosis: rejected transcript finalization gets one diagnostic fallb
 test('call diagnosis: historical initializer and patched initializer have identical operational behavior',async()=>{
  const source=execFileSync('git',['show','HEAD:realtime/voice-v2/initializeVoiceV2Session.js'],{encoding:'utf8'});
  const originalURL=new URL('../../initializeVoiceV2Session.js',import.meta.url);
- const linked=source.replace(/from "(\.[^"]+)"/g,(_,path)=>`from "${new URL(path,originalURL).href}"`);
+ const linked=source.replace(/from (["'])(\.[^"']+)\1/g,(_,quote,path)=>`from "${new URL(path,originalURL).href}"`);
  const baseline=(await import('data:text/javascript;base64,'+Buffer.from(linked).toString('base64'))).initializeVoiceV2Session;
  async function exercise(initialize,kind=null){
   const f=await fixture({initialize,fixedId:'CA-equivalence',proposal:confirmationProposal(),sink:e=>{if(e.traceEvent!=='CALL_SUMMARY')return;if(kind==='throw')throw Error('PRIVATE');if(kind==='reject')return Promise.reject(Error('PRIVATE'));if(kind==='never')return new Promise(()=>{});}});await request(f,ResponsePurpose.PRE_BOOKING_CONFIRMATION);await acknowledge(f);await caller(f,'yes','yes');await acknowledge(f);await settle(f.app);

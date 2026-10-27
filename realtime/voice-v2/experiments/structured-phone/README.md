@@ -182,3 +182,28 @@ production/createVoiceV2ProductionInitializer.js; and
 tests/integration/structured-phone.test.js. Exclude the pre-existing shared adapter
 and speech-undici test edits, evaluation artifacts, and the standalone lab files.
 No files have been staged or committed during preparation.
+
+## Live-failure diagnostics
+
+Decision failures log a bounded stage/category/code and allowlisted provider
+code/type/parameter, plus turn/request/connection counts. Business read/validation,
+connection/configuration, request, argument validation, tool dispatch, plan and
+speech submission are distinguished before cleanup. Unknown values are UNKNOWN
+or UNCLASSIFIED; no arbitrary exception messages, stacks, model arguments, raw
+provider payloads or headers are emitted. A configuration rejection is evidence
+only for its reported parameter, not proof of a particular schema defect.
+
+Failure callbacks are bound to the owning decision connection. Delayed failures
+from retired connections cannot terminate their replacement; a failure on a reused
+current connection still stops the call. Existing cancellation/limits are retained.
+Structured admitted turns now enter turn counters after overlap quarantine, and
+explicit structured failures are classified even after a delivered greeting.
+Structured HTTP speech byte counters describe successful media submission, not
+provider-generated chunks or proof of audible playback.
+
+Greeting speech is currently requested after Twilio start and intake configuration
+acknowledgment, then waits for complete HTTP WAV delivery, conversion/validation
+and persistence before media submission. This is not an immediate or streaming
+greeting guarantee. Missing earlier phase logs or saved WAV evidence cannot prove
+the cause of provider/header delay or a subjective slow-speech report. This repair
+does not change synthesis format, speed, pacing, prompts or startup authority.

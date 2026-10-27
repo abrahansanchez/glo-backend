@@ -34,7 +34,7 @@ function seedScript(m) {
   if (m.round === 2) return [call('check_availability', m.binding)];
   return plan(m, 'CANONICAL_CONFIRMATION');
 }
-async function harness({ language = 'en', script = seedScript, available = true, beforeSpeech, afterAssistantPersist, raw = business(), scheduler, wire = false } = {}) {
+async function harness({ language = 'en', script = seedScript, available = true, beforeSpeech, beforeGreeting, afterAssistantPersist, raw = business(), scheduler, wire = false, wireConfigurationError = null } = {}) {
   const requests = [], models = [], speech = [], emitted = [], checks = []; let executorCalls = 0;
   const availability = new LiveBundleAvailability({ loadBusiness: async () => raw, now: () => new Date('2026-10-25T16:00:00Z'),
     labels: { 'service-cut-91': { es: 'corte de pelo' }, 'service-beard-72': { es: 'recorte de barba' } },
@@ -50,15 +50,17 @@ async function harness({ language = 'en', script = seedScript, available = true,
     smsAdapter: { sendAppointmentConfirmation() { executorCalls++; throw Error('FORBIDDEN'); } },
     transcriptAdapter: { appendTurn: async request => { if (request.role === 'assistant') afterAssistantPersist?.(request); return { success: true }; }, finalizeCall: async () => ({ success: true }) },
     applicationOwnedCollectSpeech: true, applicationOwnedAvailabilitySpeech: true,
-    speechAdapter: { async synthesize(request) { speech.push(request); if (beforeSpeech && !request.input.includes('AI receptionist')) await beforeSpeech(request, app);
+    speechAdapter: { async synthesize(request) { speech.push(request); if (beforeGreeting && request.input.includes('AI receptionist')) await beforeGreeting(request, app);
+      if (beforeSpeech && !request.input.includes('AI receptionist')) await beforeSpeech(request, app);
       return { audio: Buffer.from([1, 2, 3]), format: 'audio/pcmu' }; } },
     structuredPhone: { availability, createModel: (tools, onFailure) => {
-      if (!wire) return fakeModel(script, requests, models);
+      if (!wire) { const model = fakeModel(script, requests, models); model.onFailure = onFailure; return model; }
       const socket = new FakeSocket(), state = { turn: 0, round: 0, results: [] }; let sequence = 0;
       const baseSend = socket.send.bind(socket);
       socket.send = raw => {
         baseSend(raw); const p = JSON.parse(raw);
-        if (p.type === 'session.update') queueMicrotask(() => socket.receive({ type: 'session.updated', session: p.session }));
+        if (p.type === 'session.update') queueMicrotask(() => socket.receive(wireConfigurationError
+          ? { type: 'error', error: wireConfigurationError } : { type: 'session.updated', session: p.session }));
         if (p.item?.type === 'message') { const data = JSON.parse(p.item.content[0].text); state.binding = data.applicationContext.binding; state.context = data.applicationContext; state.turn++; state.round = 0; }
         if (p.item?.type === 'function_call_output') { const data = JSON.parse(p.item.output); state.results.push(data.result); state.context = data.applicationContext; state.binding = state.context.binding; }
         if (p.type === 'response.create') queueMicrotask(async () => {
@@ -492,4 +494,115 @@ test('phone repair: offered alternative expires during the final read before med
     assert.equal(f.speech.length, 1); assert.equal(f.twilio.sent.filter(p => p.event === 'media').length, 0);
     assert.equal(f.app.lifecycle.terminated, true); assert.equal(f.executorCalls, 0);
   } finally { await f.app.terminate('TEST_DONE'); }
+});
+
+test('phone live failure: recorded overlap ordering admits only the third transcript and counts/classifies it', async () => {
+  const f = await harness({ script() { throw Error('PRIVATE_SENTINEL'); } });
+  const event = async p => { f.input.receive(p); await settle(f.app); };
+  await event({ type: 'input_audio_buffer.speech_started', item_id: 'a' });
+  await event({ type: 'input_audio_buffer.speech_stopped', item_id: 'a' });
+  await event({ type: 'input_audio_buffer.speech_started', item_id: 'b' });
+  await event({ type: 'conversation.item.input_audio_transcription.completed', item_id: 'a', transcript: 'Synthetic first' });
+  await event({ type: 'input_audio_buffer.speech_stopped', item_id: 'b' });
+  await event({ type: 'input_audio_buffer.speech_started', item_id: 'c' });
+  await event({ type: 'conversation.item.input_audio_transcription.completed', item_id: 'b', transcript: 'Synthetic second' });
+  await event({ type: 'input_audio_buffer.speech_stopped', item_id: 'c' });
+  await event({ type: 'conversation.item.input_audio_transcription.completed', item_id: 'c', transcript: 'Synthetic third' });
+  const summary = f.emitted.find(e => e.traceEvent === 'CALL_SUMMARY');
+  assert.equal(f.requests.length, 1);
+  assert.equal(f.app.session.journal().filter(e => e.event === 'SUPERSEDED_CALLER_TRANSCRIPT_IGNORED').length, 2);
+  assert.equal(summary.callerTurnCount, 1); assert.equal(summary.acceptedTurnCount, 1);
+  assert.equal(summary.assistantAudioBytes, 3); assert.equal(summary.assistantAudioChunks, 1);
+  assert.equal(summary.primaryFailureCategory, 'STRUCTURED_DECISION');
+  assert.equal(summary.communicationOutcome, 'STRUCTURED_DECISION_FAILED');
+  assert.equal(f.executorCalls, 0); assert.ok(!JSON.stringify(f.emitted).includes('PRIVATE_SENTINEL'));
+});
+
+test('phone live failure: business-read initiating cause is bounded and recorded before cleanup', async () => {
+  const f = await harness();
+  f.availability.read = async () => { throw Error('UNSUPPORTED_CATALOGUE'); };
+  await f.turn();
+  const stop = f.emitted.find(e => e.stage === 'STOPPED');
+  assert.equal(stop.failureStage, 'BUSINESS_CONTEXT_READ'); assert.equal(stop.failureCode, 'UNSUPPORTED_CATALOGUE');
+  assert.equal(f.models.length, 0); assert.equal(f.executorCalls, 0);
+  assert.equal(f.emitted.find(e => e.traceEvent === 'CALL_SUMMARY').primaryFailureCategory, 'STRUCTURED_DECISION');
+});
+
+test('phone live failure: obsolete connection callback cannot terminate a later generation', async () => {
+  let release;
+  const f = await harness({ script: m => m.turn === 1 && !release ? new Promise(resolve => { release = resolve; }) : plan(m, 'ASK_MISSING', { field: 'service' }) });
+  try {
+    await f.turn(); const obsolete = f.models[0];
+    await f.turn('Synthetic replacement');
+    obsolete.onFailure(); await settle(f.app);
+    assert.equal(f.app.lifecycle.terminated, false); assert.equal(f.models.length, 2); assert.equal(f.executorCalls, 0);
+  } finally { release?.([call('read_business_context', {})]); await f.app.terminate('TEST_DONE'); }
+});
+
+test('phone live failure: provider configuration error retains only allowlisted code/type/param', async () => {
+  const socket = new FakeSocket(); let failure;
+  const model = new PhoneModelTransport(socket, phoneContracts(['service-cut-91']).tools, 'gpt-realtime', e => { failure = e; });
+  socket.open();
+  socket.receive({ type: 'error', error: { code: 'invalid_function_parameters', type: 'invalid_request_error', param: 'session.tools[5].parameters', message: 'SECRET_SENTINEL', headers: { Authorization: 'SECRET_SENTINEL' } } });
+  await assert.rejects(model.ready, error => {
+    assert.equal(error.safeDiagnostic.failureStage, 'MODEL_CONFIGURATION');
+    assert.equal(error.safeDiagnostic.providerCode, 'invalid_function_parameters');
+    assert.equal(error.safeDiagnostic.providerType, 'invalid_request_error');
+    assert.equal(error.safeDiagnostic.providerParam, 'session.tools[5].parameters'); return true;
+  });
+  assert.equal(failure.safeDiagnostic.providerCode, 'invalid_function_parameters');
+  assert.ok(!JSON.stringify(failure).includes('SECRET_SENTINEL'));
+});
+
+test('phone live failure: unknown provider error values and parameter paths are never retained', async () => {
+  const socket = new FakeSocket(); let failure;
+  const model = new PhoneModelTransport(socket, phoneContracts(['service-cut-91']).tools, 'gpt-realtime', e => { failure = e; });
+  socket.open(); socket.receive({ type: 'error', error: { code: 'PRIVATE_SENTINEL', type: 'PRIVATE_SENTINEL', param: 'session.tools[5].PRIVATE_SENTINEL', message: 'PRIVATE_SENTINEL' } });
+  await assert.rejects(model.ready);
+  assert.equal(failure.safeDiagnostic.providerCode, 'UNKNOWN'); assert.equal(failure.safeDiagnostic.providerType, 'UNKNOWN');
+  assert.equal(failure.safeDiagnostic.providerParam, 'UNKNOWN'); assert.ok(!JSON.stringify(failure).includes('PRIVATE_SENTINEL'));
+});
+
+test('phone live failure: reused current connection failure still stops the current turn', async () => {
+  const f = await harness({ script: m => plan(m, 'ASK_MISSING', { field: 'service' }) });
+  await f.turn(); await f.ack(f.twilio.sent.filter(p => p.event === 'mark').at(-1).mark.name);
+  await f.turn(); f.models[0].onFailure(); await settle(f.app);
+  assert.equal(f.models.length, 1); assert.equal(f.app.lifecycle.terminated, true); assert.equal(f.executorCalls, 0);
+  assert.equal(f.emitted.find(e => e.traceEvent === 'CALL_SUMMARY').communicationOutcome, 'STRUCTURED_DECISION_FAILED');
+});
+
+test('phone live failure: real intake configuration remains PCMU/VAD/transcription with automatic responses disabled', async () => {
+  const f = await harness({ language: 'es' });
+  try {
+    const session = f.input.sent.find(p => p.type === 'session.update').session;
+    assert.equal(session.audio.input.format.type, 'audio/pcmu');
+    assert.equal(session.audio.input.transcription.model, 'gpt-4o-mini-transcribe'); assert.equal(session.audio.input.transcription.language, 'es');
+    assert.equal(session.audio.input.turn_detection.type, 'server_vad');
+    assert.equal(session.audio.input.turn_detection.create_response, false); assert.equal(session.audio.input.turn_detection.interrupt_response, false);
+    assert.equal(f.input.sent.filter(p => p.type === 'response.create').length, 0); assert.equal(f.executorCalls, 0);
+  } finally { await f.app.terminate('TEST_DONE'); }
+});
+
+test('phone live failure: integrated configuration rejection stops before any decision request and preserves safe cause', async () => {
+  const f = await harness({ wire: true, wireConfigurationError: { code: 'invalid_function_parameters', type: 'invalid_request_error', param: 'session.tools[5].parameters', message: 'PRIVATE_SENTINEL' } });
+  await f.turn();
+  const failure = f.emitted.find(e => e.stage === 'MODEL_PROTOCOL_FAILED');
+  assert.equal(failure.failureStage, 'MODEL_CONFIGURATION'); assert.equal(failure.providerCode, 'invalid_function_parameters');
+  assert.equal(failure.providerParam, 'session.tools[5].parameters'); assert.equal(f.requests.length, 0); assert.equal(f.speech.length, 0);
+  assert.equal(f.app.lifecycle.terminated, true); assert.equal(f.executorCalls, 0);
+  assert.ok(!JSON.stringify(f.emitted).includes('PRIVATE_SENTINEL'));
+  assert.equal(f.emitted.find(e => e.traceEvent === 'CALL_SUMMARY').communicationOutcome, 'STRUCTURED_DECISION_FAILED');
+});
+
+test('phone live failure: pending greeting cannot play without prepared audio and disconnect cancels late completion', async () => {
+  let release, request;
+  const f = await harness({ beforeGreeting: async r => { request = r; await new Promise(resolve => { release = resolve; }); } });
+  try {
+    assert.equal(typeof release, 'function'); assert.equal(f.twilio.sent.some(p => p.event === 'media'), false);
+    f.twilio.receive({ event: 'stop', streamSid: 'MZ-phone' }); await settle(f.app);
+    assert.equal(request.signal.aborted, true); release(); await settle(f.app);
+    assert.equal(f.twilio.sent.some(p => p.event === 'media'), false); assert.equal(f.executorCalls, 0);
+    const summary = f.emitted.find(e => e.traceEvent === 'CALL_SUMMARY');
+    assert.equal(summary.callerTurnCount, 0); assert.equal(summary.acceptedTurnCount, 0); assert.equal(summary.deliverySuccessCount, 0);
+  } finally { release?.(); await f.app.terminate('TEST_DONE'); }
 });

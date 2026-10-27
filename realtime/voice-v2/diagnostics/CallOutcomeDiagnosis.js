@@ -58,6 +58,8 @@ export class CallOutcomeDiagnosis {
    if(entry.event==='BOOKING_FAILED'&&this.#once(this.#command('CREATE_APPOINTMENT',entry.commandId),'failed','bookingFailureCount'))this.#failure('BOOKING','BOOKING_OPERATION_FAILED');
    if(entry.event==='EFFECT_QUEUED'&&entry.effectType==='REQUEST_CLARIFICATION')this.#increment('clarificationCount');
    if(entry.event==='SESSION_OPERATION_FAILED')this.#failure('UNKNOWN','SESSION_OPERATION_FAILED');
+   if(entry.event==='STRUCTURED_DECISION_FAILED')this.#failure('STRUCTURED_DECISION','STRUCTURED_PHONE_FAILED');
+   if(entry.event==='SESSION_TERMINATING'&&['STRUCTURED_PHONE_FAILED','STRUCTURED_MODEL_PROTOCOL_FAILED','STRUCTURED_DECISION_TIMEOUT','STRUCTURED_STALE_EVIDENCE','STRUCTURED_CALL_LIMIT','STRUCTURED_SPEECH_LIMIT','STRUCTURED_EFFECT_REFUSED','STRUCTURED_UNEXPECTED_MODEL_AUDIO'].includes(entry.reason))this.#failure('STRUCTURED_DECISION',entry.reason);
    if(entry.event==='SESSION_TERMINATING'&&entry.reason==='OPENAI_STARTUP_TIMEOUT')this.#failure('PROVIDER_CONNECTION','PROVIDER_STARTUP_TIMEOUT');
    if(entry.event==='TIMEOUT_RECOVERY_PLANNED'&&entry.timeoutType==='AVAILABILITY_TIMEOUT')this.#failure('AVAILABILITY','AVAILABILITY_TIMEOUT');
    if(entry.event==='BOOKING_SETTLEMENT_UNKNOWN')this.#failure('BOOKING','BOOKING_SETTLEMENT_UNKNOWN');
@@ -109,7 +111,7 @@ export class CallOutcomeDiagnosis {
    :this.#counts.bookingSuccessCount>0;
   const businessOutcome=booked?'BOOKED':terminal?.outcome==='BOOKED'?'UNKNOWN':['BOOKING_FAILED','BOOKING_CONFLICT'].includes(terminal?.outcome)?'BOOKING_FAILED':this.#counts.bookingAttemptCount?'UNKNOWN':'NOT_BOOKED';
   const root=this.#first;
-  const comm={TRANSCRIPTION:'TRANSCRIPTION_UNRESOLVED',INTERPRETATION_UNRESOLVED:'INTERPRETATION_UNRESOLVED',AVAILABILITY:'AVAILABILITY_FAILED',SPEECH_DELIVERY:'SPEECH_DELIVERY_FAILED',PLAYBACK:'PLAYBACK_FAILED',PROVIDER_CONNECTION:'PROVIDER_CONNECTION_FAILED',CALLER_DISCONNECTED:'CALLER_DISCONNECTED'};
+  const comm={STRUCTURED_DECISION:'STRUCTURED_DECISION_FAILED',TRANSCRIPTION:'TRANSCRIPTION_UNRESOLVED',INTERPRETATION_UNRESOLVED:'INTERPRETATION_UNRESOLVED',AVAILABILITY:'AVAILABILITY_FAILED',SPEECH_DELIVERY:'SPEECH_DELIVERY_FAILED',PLAYBACK:'PLAYBACK_FAILED',PROVIDER_CONNECTION:'PROVIDER_CONNECTION_FAILED',CALLER_DISCONNECTED:'CALLER_DISCONNECTED'};
   let communicationOutcome=root?(comm[root.category]||'UNKNOWN'):this.#limited||this.#interpretation?'UNKNOWN':this.#lastDelivery?'COMPLETED':'UNKNOWN';
   if(this.#lastDelivery>this.#lastFailure&&!this.#limited&&(root||!this.#interpretation))communicationOutcome=this.#recovery?'RECOVERY_DELIVERED':'COMPLETED';
   // Preserve the original CallTrace schema and values exactly. Only new fields are diagnostic.

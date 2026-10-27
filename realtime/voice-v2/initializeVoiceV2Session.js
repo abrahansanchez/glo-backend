@@ -264,7 +264,12 @@ export function initializeVoiceV2Session({
           return lifecycle.terminate('STRUCTURED_STALE_EVIDENCE');
         }
         return requestResponse(plan);
-      }), terminate: reason => { structuredDriver.close(); return enqueue(() => lifecycle.terminate(reason)); }, emit: safeEmit });
+      }), terminate: reason => { structuredDriver.close(); return enqueue(() => lifecycle.terminate(reason)); }, emit: event => {
+        if (['STOPPED', 'MODEL_PROTOCOL_FAILED'].includes(event.stage)) session.record('STRUCTURED_DECISION_FAILED', {
+          failureStage: event.failureStage, failureCode: event.failureCode,
+        });
+        safeEmit(event);
+      } });
     session.watchdog.schedule('structured-call-deadline', PHONE_LIMITS.callMs, () => { structuredDriver.close(); void lifecycle.terminate('STRUCTURED_CALL_LIMIT'); });
     safeEmit({ event: 'V2_STRUCTURED_PHONE_SELECTED', buildSha, mode: 'SIMULATION_ONLY', limits: PHONE_LIMITS });
   }
@@ -503,6 +508,9 @@ export function initializeVoiceV2Session({
     if (structuredDriver) {
       // One decision owner. Never run the ordinary interpreter/effect planner
       // for an experimental turn; do not hold the intake queue across model I/O.
+      session.record('TURN_PROCESSING_STARTED', { turnId, providerId, proposalVersion: session.proposal.proposalVersion });
+      callTrace.counters.callerTurns += 1;
+      callTrace.entry('CALLER_TURN_FINALIZED', { turnId, itemId: providerId, proposalVersion: session.proposal.proposalVersion });
       void structuredDriver.turn({ turnId, transcript: event.transcript, authority: consentClaim.claimed ? consentClaim.authority : null });
       return;
     }
@@ -1215,6 +1223,7 @@ export function initializeVoiceV2Session({
     if (state.preparation || requiresBufferedDelivery(state.plan)) {
       observeDeliveryWrite(state, "MEDIA_SUBMITTED", () => twilio.submitAudio({ payload: Buffer.concat(state.audio.map((part) => Buffer.from(part, "base64"))).toString("base64") }));
       state.submittedAudioBytes = state.audioBytes;
+      if (structuredPhone && state.transport === 'application_tts') callTrace.recordAudio('assistant', state.audioBytes, { ...timingDetails({ responseId }), audioBoundary: 'MEDIA_SUBMITTED', transport: 'HTTP_SPEECH' });
       if (state.preparation) {
         state.preparation.submitted();
         session.watchdog.cancel(`preparation:${responseId}`);

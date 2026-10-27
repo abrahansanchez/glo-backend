@@ -5,6 +5,7 @@ import { renderPreBookingConfirmation } from '../../planning/renderPreBookingCon
 import { normalizeTurn } from '../../interpretation/TurnNormalizer.js';
 import { extractConfirmation } from '../../interpretation/extractors/ConfirmationExtractor.js';
 import { phoneContracts, matches, PHONE_LIMITS } from './PhoneContracts.js';
+import { phoneFailure } from './PhoneModelTransport.js';
 
 const rejected = reason => ({ status: 'REJECTED', reason });
 export class StructuredPhoneDriver {
@@ -13,6 +14,7 @@ export class StructuredPhoneDriver {
     this.generation = 0; this.turns = 0; this.requests = 0; this.connections = 0; this.model = null; this.active = false;
     this.evidence = null; this.preference = null; this.bindings = new WeakSet(); this.seenCalls = new Set(); this.closed = false;
     this.applicability = new Set(); this.decisionTimer = null;
+    this.modelOwner = null;
   }
   log(stage, details = {}) { this.emit({ event: 'V2_STRUCTURED_PHONE', callSid: this.session.callSid, buildSha: this.session.buildSha, stage, ...details }); }
   interrupt(reason = 'CALLER_SPEECH') {
@@ -20,11 +22,11 @@ export class StructuredPhoneDriver {
     clearTimeout(this.decisionTimer); this.decisionTimer = null;
     for (const pending of this.applicability) { clearTimeout(pending.timer); pending.resolve(false); }
     this.applicability.clear();
-    if (this.active) { this.model?.close(); this.model = null; }
+    if (this.active) { this.modelOwner = null; this.model?.close(); this.model = null; }
     this.active = false;
     this.log('GENERATION_RETIRED', { reason });
   }
-  close() { this.closed = true; this.interrupt('CLOSED'); this.model?.close(); this.model = null; }
+  close() { this.closed = true; this.modelOwner = null; this.interrupt('CLOSED'); this.model?.close(); this.model = null; }
   ids(business = this.business) {
     return [this.session.proposal.service, ...(this.session.proposal.additionalServices || [])].filter(Boolean).map(name => {
       const service = business.services.find(s => s.name === name); if (!service) throw Error('CATALOGUE_CHANGED'); return service.id;
@@ -44,28 +46,44 @@ export class StructuredPhoneDriver {
     const current = () => !this.closed && generation === this.generation;
     const timer = setTimeout(() => { if (current()) { this.interrupt('DECISION_TIMEOUT'); this.terminate('STRUCTURED_DECISION_TIMEOUT'); } }, PHONE_LIMITS.decisionMs);
     this.decisionTimer = timer;
+    let stage = 'BUSINESS_CONTEXT_READ';
     try {
-      if (++this.turns > PHONE_LIMITS.turns) throw Error('LIMIT');
+      if (++this.turns > PHONE_LIMITS.turns) throw Error('TURN_LIMIT');
+      this.log('BUSINESS_CONTEXT_READ');
       const business = await this.availability.read(); if (!current()) return;
+      stage = 'BUSINESS_CONTEXT_VALIDATE';
       if (business.timeZone !== this.businessContext.timeZone) throw Error('BUSINESS_TIMEZONE_CHANGED');
-      if (this.model && this.business?.revision !== business.revision) { this.model.close(); this.model = null; }
+      if (this.model && this.business?.revision !== business.revision) { this.modelOwner = null; this.model.close(); this.model = null; }
       this.business = business; this.contracts = phoneContracts(business.services.map(s => s.id));
       if (this.evidence && this.evidence.revision !== business.revision) this.evidence = null;
       if (!this.model) {
-        if (this.connections >= PHONE_LIMITS.decisionConnections) throw Error('LIMIT'); this.connections++;
-        this.model = this.createModel(this.contracts.tools, () => {
-          this.log('MODEL_PROTOCOL_FAILED'); this.interrupt('MODEL_PROTOCOL_FAILURE'); this.terminate('STRUCTURED_MODEL_PROTOCOL_FAILED');
-        }); await this.model.ready;
+        stage = 'MODEL_CONNECTION';
+        if (this.connections >= PHONE_LIMITS.decisionConnections) throw Error('CONNECTION_LIMIT'); this.connections++;
+        const owner = {}; this.modelOwner = owner;
+        this.log('MODEL_CONNECTION', { connection: this.connections });
+        const model = this.createModel(this.contracts.tools, error => {
+          // Intentional close/cancellation can finish after a replacement turn.
+          // Ownership follows the connection, including intentional reuse.
+          if (this.closed || this.modelOwner !== owner) return;
+          this.log('MODEL_PROTOCOL_FAILED', phoneFailure(error, 'MODEL_CONNECTION'));
+          this.interrupt('MODEL_PROTOCOL_FAILURE'); this.terminate('STRUCTURED_MODEL_PROTOCOL_FAILED');
+        });
+        if (!current()) { model.close(); return; }
+        this.model = model; stage = 'MODEL_CONFIGURATION';
+        this.log('MODEL_CONFIGURATION'); await model.ready;
+        if (current()) this.log('MODEL_READY');
       }
       if (!current()) return;
       for (let round = 0; round < PHONE_LIMITS.perTurnRequests; round++) {
-        if (++this.requests > PHONE_LIMITS.modelRequests) throw Error('LIMIT');
+        stage = 'MODEL_REQUEST';
+        if (++this.requests > PHONE_LIMITS.modelRequests) throw Error('MODEL_REQUEST_LIMIT');
         this.log('MODEL_REQUEST', { turn: this.turns, request: this.requests });
         const modelStartedMs = performance.now();
         const response = await this.model.request({ callerText: round === 0 ? transcript : null, context: this.context() });
         if (!current()) return;
         this.log('MODEL_COMPLETED', { turn: this.turns, request: this.requests, elapsedMs: performance.now() - modelStartedMs });
         // Whole-batch structural validation before any dispatch or mutation.
+        stage = 'TOOL_ARGUMENT_VALIDATION';
         const calls = response.calls.map(call => {
           if (this.seenCalls.has(call.callId)) throw Error('REPLAY');
           const tool = this.contracts.tools.find(t => t.name === call.name), args = JSON.parse(call.argumentsJson);
@@ -77,24 +95,27 @@ export class StructuredPhoneDriver {
         for (const call of calls) {
           this.seenCalls.add(call.callId);
           if (call.name === 'propose_response_plan') {
+            stage = 'PLAN_VALIDATION';
             const plan = this.render(call.args);
             if (!plan || !current()) throw Error('INVALID_PLAN');
             this.log('PLAN_VALIDATED', { turn: this.turns, proposalVersion: this.session.proposal.proposalVersion, atMs: performance.now() });
-            const delivery = await this.speak(plan);
+            stage = 'SPEECH_SUBMISSION'; const delivery = await this.speak(plan);
+            stage = 'TOOL_RESULT_SUBMISSION';
             if (current()) this.model.toolResult(call.callId, { status: delivery?.accepted ? 'SPEECH_PREPARING' : 'WITHHELD', playbackAcknowledged: false }, this.context());
             return;
           }
           const toolStartedMs = performance.now();
+          stage = 'TOOL_DISPATCH';
           const result = await this.invoke(call.name, call.args, current);
           if (!current()) return;
           this.log('TOOL_RESULT', { turn: this.turns, tool: call.name, status: result.status, elapsedMs: performance.now() - toolStartedMs,
             reason: ['STALE_BINDING', 'INVALID_CHANGE', 'STALE_OR_FOREIGN_ALTERNATIVE', 'UNSUPPORTED_SERVICE_BUNDLE', 'FRESH_BUNDLE_REQUIRED', 'CONFIRMATION_NOT_DELIVERED', 'NOT_AFFIRMATIVE'].includes(result.reason) ? result.reason : result.reason ? 'REJECTED' : null });
-          this.model.toolResult(call.callId, result, this.context());
+          stage = 'TOOL_RESULT_SUBMISSION'; this.model.toolResult(call.callId, result, this.context());
         }
       }
-      throw Error('LIMIT');
-    } catch {
-      if (current()) { this.log('STOPPED', { reason: 'DECISION_FAILED_OR_LIMIT' }); this.close(); this.terminate('STRUCTURED_PHONE_FAILED'); }
+      throw Error('TURN_REQUEST_LIMIT');
+    } catch (error) {
+      if (current()) { this.log('STOPPED', { reason: 'DECISION_FAILED_OR_LIMIT', ...phoneFailure(error, stage), turn: this.turns, requests: this.requests, connections: this.connections }); this.close(); this.terminate('STRUCTURED_PHONE_FAILED'); }
     } finally { clearTimeout(timer); if (this.decisionTimer === timer) this.decisionTimer = null; if (current()) this.active = false; }
   }
   same(args) { const b = this.binding(); return Object.keys(b).every(key => JSON.stringify(args[key]) === JSON.stringify(b[key])) && Object.keys(args).length === Object.keys(b).length; }
