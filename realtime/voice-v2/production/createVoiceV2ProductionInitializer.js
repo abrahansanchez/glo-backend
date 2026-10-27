@@ -10,6 +10,9 @@ import { initializeVoiceV2Session } from "../initializeVoiceV2Session.js";
 import { isValidVoiceV2BusinessId } from "../routing/selectVoiceMediaPath.js";
 import { buildServiceCatalogue } from "../interpretation/buildServiceCatalogue.js";
 import { buildBusinessSessionInstructions } from "../planning/businessGrounding.js";
+import { selectStructuredPhone } from '../experiments/structured-phone/PhoneContracts.js';
+import { PhoneModelTransport } from '../experiments/structured-phone/PhoneModelTransport.js';
+import { LiveBundleAvailability } from '../experiments/structured-phone/LiveBundleAvailability.js';
 
 export function createVoiceV2ProductionInitializer({
   env = process.env,
@@ -68,6 +71,22 @@ export function createVoiceV2ProductionInitializer({
               if (String(businessContext.businessId) !== approvedBusinessId) throw Object.assign(new Error("UNAPPROVED_BUSINESS"), { code: "UNAPPROVED_BUSINESS" });
               cleanup();
               const preferredLanguage = businessContext.preferredLanguage === "es" ? "es" : "en";
+              const structuredSelected = selectStructuredPhone(env, businessContext.businessId);
+              emit({ event: 'V2_STRUCTURED_PHONE_ROUTE', callSid: identity.callSid, businessId: businessContext.businessId, buildSha, selected: structuredSelected, mode: structuredSelected ? 'SIMULATION_ONLY' : 'DEFAULT' });
+              let structuredPhone;
+              if (structuredSelected) {
+                let labels = {};
+                try {
+                  const configured = JSON.parse(env.VOICE_V2_STRUCTURED_SERVICE_LABELS_JSON || '{}');
+                  if (!configured || typeof configured !== 'object' || Array.isArray(configured)) throw Error();
+                  labels = configured[businessContext.businessId] || {};
+                  if (!labels || typeof labels !== 'object' || Array.isArray(labels)) throw Error();
+                } catch { throw Object.assign(Error('STRUCTURED_LABEL_CONFIGURATION_INVALID'), { code: 'STRUCTURED_LABEL_CONFIGURATION_INVALID' }); }
+                structuredPhone = {
+                  createModel: (tools, onFailure) => new PhoneModelTransport(dependencies.openaiSocketFactory(), tools, env.OPENAI_MODEL, onFailure),
+                  availability: new LiveBundleAvailability({ loadBusiness: () => findBarberById(businessContext.barberId), labels }),
+                };
+              }
               return initializeSession({
                 callSid: identity.callSid, callerNumber: identity.callerNumber, businessContext, buildSha,
                 twilioSocket: socket, openaiSocketFactory: dependencies.openaiSocketFactory,
@@ -75,6 +94,7 @@ export function createVoiceV2ProductionInitializer({
                 speechAdapter: dependencies.speechAdapter,
                 applicationOwnedCollectSpeech: true,
                 applicationOwnedAvailabilitySpeech: true,
+                ...(structuredPhone ? { structuredPhone, speechPreparationTimeoutMs: 60000, speechHeadersTimeoutMs: 60000 } : {}),
                 callControlAdapter: dependencies.callControlAdapter,
                 openaiSession: {
                   ...dependencies.openaiSession,

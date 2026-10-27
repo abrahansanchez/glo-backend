@@ -26,6 +26,8 @@ import { FloorPurpose, FloorState } from "./lifecycle/FloorOwner.js";
 import { PlaybackStatus } from "./lifecycle/PlaybackRegistry.js";
 import { SpeechPreparation, resolvePreparationDeadline } from "./lifecycle/SpeechPreparation.js";
 import { LocalRecoveryAudioAdapter } from "./adapters/LocalRecoveryAudioAdapter.js";
+import { StructuredPhoneDriver } from './experiments/structured-phone/StructuredPhoneDriver.js';
+import { PHONE_LIMITS } from './experiments/structured-phone/PhoneContracts.js';
 
 const STARTUP_AUDIO_MAX_FRAMES = 500;
 const STARTUP_AUDIO_MAX_BYTES = 80000;
@@ -69,13 +71,14 @@ export function initializeVoiceV2Session({
   localRecoveryAudioAdapter = new LocalRecoveryAudioAdapter(),
   speechPreparationTimeoutMs = process.env.VOICE_V2_SPEECH_PREPARATION_TIMEOUT_MS,
   speechHeadersTimeoutMs = process.env.VOICE_V2_SPEECH_HEADERS_TIMEOUT_MS,
+  structuredPhone = null,
 } = {}) {
   requireSessionInputs({ callSid, callerNumber, businessContext, buildSha, twilioSocket, openaiSocketFactory });
-  let lifecycle; let consentDiagnostics; let processing = Promise.resolve(); let effectsProcessing = Promise.resolve(); let turnSequence = 0; let responseSequence = 0; let markSequence = 0; let twilioStarted = false; let openaiSessionCreated = false; let openaiConfigured = false; let initialGreetingRequested = false; let callerTurnSeen = false; let lastAcknowledgedState = null; let transcriptionLanguage = openaiSession.input_audio_transcription?.language || null; let languageUpdatePending = false; let languageUpdateAttemptedFor = null;
+  let lifecycle; let structuredDriver = null; let structuredSpeechRequests = 0; let consentDiagnostics; let processing = Promise.resolve(); let effectsProcessing = Promise.resolve(); let turnSequence = 0; let responseSequence = 0; let markSequence = 0; let twilioStarted = false; let openaiSessionCreated = false; let openaiConfigured = false; let initialGreetingRequested = false; let callerTurnSeen = false; let lastAcknowledgedState = null; let transcriptionLanguage = openaiSession.input_audio_transcription?.language || null; let languageUpdatePending = false; let languageUpdateAttemptedFor = null;
   const providerTurns = new Set(); const requests = new Map(); const responses = new Map(); const marks = new Map(); const superseded = new Set(); const ambiguityPurposes = []; const startupAudio = []; let startupAudioBytes = 0; let callTerminationRequested = false;
-  const preparationConfiguration = resolvePreparationDeadline(speechPreparationTimeoutMs);
+  const preparationConfiguration = structuredPhone ? Object.freeze({ preparationBudgetMs: 60000, budgetSource: 'structured_experiment' }) : resolvePreparationDeadline(speechPreparationTimeoutMs);
   const preparationBudget = preparationConfiguration.preparationBudgetMs;
-  const headersBudget = Number.isInteger(Number(speechHeadersTimeoutMs)) && Number(speechHeadersTimeoutMs) >= 100 && Number(speechHeadersTimeoutMs) <= 10000
+  const headersBudget = structuredPhone ? 60000 : Number.isInteger(Number(speechHeadersTimeoutMs)) && Number(speechHeadersTimeoutMs) >= 100 && Number(speechHeadersTimeoutMs) <= 10000
     ? Number(speechHeadersTimeoutMs) : 3000;
   let callerSpeechEpoch = 0; let deliveryStopping = false;
   let localRecoveryStarted = false;
@@ -192,10 +195,11 @@ export function initializeVoiceV2Session({
   function receive(event, handler) {
     if (!lifecycle?.terminated && event.error?.code !== "response_cancel_not_active") outcomeDiagnosis.connection(event.type);
     // Receipt, rather than queue processing, revokes pending retry permission.
-    if (event.type === TransportEvent.CALLER_SPEECH_STARTED) callerSpeechEpoch++;
+    if (event.type === TransportEvent.CALLER_SPEECH_STARTED) { callerSpeechEpoch++; structuredDriver?.interrupt(); }
     if ([TransportEvent.TWILIO_STREAM_STOPPED, TransportEvent.TWILIO_CONNECTION_CLOSED, TransportEvent.TWILIO_TRANSPORT_ERROR,
       TransportEvent.OPENAI_CONNECTION_CLOSED, TransportEvent.OPENAI_TRANSPORT_ERROR].includes(event.type) && event.error?.code !== "response_cancel_not_active") {
       deliveryStopping = true;
+      structuredDriver?.close();
       disposeSpeechUndiciStages(callSid); transcriptionDiagnostics.close();
     }
     if ([TransportEvent.CALLER_AUDIO, TransportEvent.RESPONSE_AUDIO_DELTA].includes(event.type)) {
@@ -220,8 +224,8 @@ export function initializeVoiceV2Session({
     CHECK_AVAILABILITY: async (command) => { const slotKey = deriveSlotKey(session.proposal); return timedEffect(command, "AVAILABILITY_TIMEOUT", 15000, () => checkAvailability(command), () => ({ proposalVersion: command.proposalVersion, slotKey, available: false, alternatives: [], reason: "TIMEOUT" })); },
     REQUEST_AVAILABLE_TIMES_FOR_DATE: async (command) => timedEffect(command, "AVAILABILITY_TIMEOUT", 15000, () => searchAvailableTimes(command), () => schedulingTimeoutResult(command)),
     REQUEST_LATER_TIME: async (command) => timedEffect(command, "AVAILABILITY_TIMEOUT", 15000, () => searchAvailableTimes(command), () => schedulingTimeoutResult(command)),
-    CREATE_APPOINTMENT: async (command) => settleBookingEffect(command),
-    SEND_CONFIRMATION_SMS: async (command) => timedEffect(command, "EFFECT_TIMEOUT", 20000, () => smsAdapter.sendAppointmentConfirmation({
+    CREATE_APPOINTMENT: async (command) => structuredPhone ? { success: false, reason: 'EXPERIMENT_EFFECT_DISABLED' } : settleBookingEffect(command),
+    SEND_CONFIRMATION_SMS: async (command) => structuredPhone ? { success: false, submitted: false, reason: 'EXPERIMENT_EFFECT_DISABLED' } : timedEffect(command, "EFFECT_TIMEOUT", 20000, () => smsAdapter.sendAppointmentConfirmation({
       ...command, callSid, barberId: businessContext.barberId, to: callerNumber,
       timeZone: businessContext.timeZone,
     }), () => ({ success: false, submitted: false, reason: "TIMEOUT" })),
@@ -248,6 +252,22 @@ export function initializeVoiceV2Session({
   const openai = new OpenAIRealtimeAdapter({ socketFactory: openaiSocketFactory, onEvent: (event) => receive(event, onOpenAI), onTurnOrderMetadata: metadata => turnOrderDiagnostics.observe(metadata),
     onTranscriptionLifecycleMetadata: metadata => { outcomeDiagnosis.transcription(metadata); transcriptionDiagnostics.observe(metadata); }, onTranscriptionLifecycleClosed: () => transcriptionDiagnostics.close() });
   lifecycle = new SessionLifecycle({ session, transcriptAdapter, callerNumber, cleanup, onTerminating: () => { disposeSpeechUndiciStages(callSid); transcriptionDiagnostics.close(); } });
+  if (structuredPhone) {
+    if (!speechAdapter || typeof structuredPhone.createModel !== 'function' || !structuredPhone.availability) throw TypeError('STRUCTURED_PHONE_CONFIGURATION_REQUIRED');
+    structuredDriver = new StructuredPhoneDriver({ session, businessContext, ...structuredPhone, now,
+      replace: (previous, next) => { session.replaceProposal(previous, next); supersedeProposal(previous.proposalVersion); },
+      speak: plan => enqueue(async () => {
+        if (lifecycle.terminated) return;
+        if (!structuredDriver.currentPlan(plan)) return { accepted: false, reason: 'STALE_STRUCTURED_TURN' };
+        if (!await structuredDriver.applicable(plan)) {
+          if (!structuredDriver.currentPlan(plan)) return { accepted: false, reason: 'STALE_STRUCTURED_TURN' };
+          return lifecycle.terminate('STRUCTURED_STALE_EVIDENCE');
+        }
+        return requestResponse(plan);
+      }), terminate: reason => { structuredDriver.close(); return enqueue(() => lifecycle.terminate(reason)); }, emit: safeEmit });
+    session.watchdog.schedule('structured-call-deadline', PHONE_LIMITS.callMs, () => { structuredDriver.close(); void lifecycle.terminate('STRUCTURED_CALL_LIMIT'); });
+    safeEmit({ event: 'V2_STRUCTURED_PHONE_SELECTED', buildSha, mode: 'SIMULATION_ONLY', limits: PHONE_LIMITS });
+  }
   session.record("V2_SESSION_STARTED", { proposalVersion: proposal.proposalVersion });
   session.record("BUSINESS_CONTEXT_BOUND", { businessId: businessContext.businessId, barberId: businessContext.barberId });
   openai.connect({ callSid, model: openaiSession.model });
@@ -358,6 +378,7 @@ export function initializeVoiceV2Session({
     if (event.type !== TransportEvent.RESPONSE_AUDIO_DELTA) safeEmit(event);
     if (event.type === TransportEvent.STALE_RESPONSE_EVENT_QUARANTINED) callTrace.entry("STALE_RESULT_IGNORED", { ...timingDetails(event), operation: event.originalType || event.type, reason: event.reason || "STALE_RESPONSE" });
     if (lifecycle.terminated) return;
+    if (structuredPhone && event.type === TransportEvent.RESPONSE_AUDIO_DELTA) { structuredDriver.close(); return lifecycle.terminate('STRUCTURED_UNEXPECTED_MODEL_AUDIO'); }
     if (event.type === TransportEvent.OPENAI_CONNECTED) {
       return;
     }
@@ -479,6 +500,12 @@ export function initializeVoiceV2Session({
     const current = consentClaim.claimed
       ? { responseId: consentClaim.authority.responseId, markId: consentClaim.authority.markId }
       : currentLifecycle();
+    if (structuredDriver) {
+      // One decision owner. Never run the ordinary interpreter/effect planner
+      // for an experimental turn; do not hold the intake queue across model I/O.
+      void structuredDriver.turn({ turnId, transcript: event.transcript, authority: consentClaim.claimed ? consentClaim.authority : null });
+      return;
+    }
     const callerPrompt = lastAcknowledgedState?.plan?.proposalVersion === session.proposal.proposalVersion ? lastAcknowledgedState : null;
     const previousVersion = session.proposal.proposalVersion;
     const semanticTiming = timing.start("INTERPRETATION_REDUCTION", { turnId });
@@ -595,6 +622,11 @@ export function initializeVoiceV2Session({
   }
 
   async function processEffects() {
+    if (structuredPhone) {
+      // Defense in depth: even injected/errant queued effects cannot execute.
+      if (session.effectQueue.pending().length) { structuredDriver?.close(); await lifecycle.terminate('STRUCTURED_EFFECT_REFUSED'); }
+      return;
+    }
     while (session.effectQueue.pending().length) {
       const pending = session.effectQueue.pending()[0];
       const postTerminationSms = pending.type === "SEND_CONFIRMATION_SMS" && session.proposal.terminal?.outcome === "BOOKED";
@@ -718,10 +750,15 @@ export function initializeVoiceV2Session({
   }
 
   async function requestResponse(plan, attempt = 1, requestIdentity = null, timingContext = {}) {
+    if (structuredPhone && plan?.purpose === ResponsePurpose.INITIAL_GREETING) {
+      plan = Object.freeze({ ...plan, critical: true, deliveryValidationRequired: true,
+        speechContract: Object.freeze({ applicationOwnedSpeech: true, requiredMessage: plan.expectedFacts.greeting }) });
+    }
     if (lifecycle.terminated) return { accepted: false, reason: "CALL_TERMINATED" };
     if (localRecoveryStarted) return { accepted: false, reason: "CONTROLLED_RECOVERY" };
     if (speechAdapter && plan.purpose === ResponsePurpose.ERROR_RECOVERY) return startLocalRecovery();
-    const contextualPlan = bindServiceValidationContext(plan, turnContext.availableServices, {
+    if (structuredDriver && plan.structuredBinding && !await structuredDriver.applicable(plan)) return { accepted: false, reason: 'STRUCTURED_STALE_EVIDENCE' };
+    const contextualPlan = structuredDriver && plan.structuredBinding ? plan : bindServiceValidationContext(plan, turnContext.availableServices, {
       referenceDate: businessLocalReferenceDate(turnContext.referenceDate, businessContext.timeZone, now),
       timeZone: businessContext.timeZone,
     });
@@ -759,6 +796,7 @@ export function initializeVoiceV2Session({
   }
 
   function requestSynthesizedConfirmation(tracked) {
+    if (structuredPhone && ++structuredSpeechRequests > PHONE_LIMITS.speechRequests) { structuredDriver.close(); void lifecycle.terminate('STRUCTURED_SPEECH_LIMIT'); return { accepted: false, reason: 'STRUCTURED_SPEECH_LIMIT' }; }
     const responseId = `${tracked.requestId}:tts`;
     const clientRequestId = randomUUID();
     const abortController = new AbortController();
@@ -801,7 +839,7 @@ export function initializeVoiceV2Session({
 
     Promise.resolve().then(() => {
       if (deliveryStopping || lifecycle.terminated || !state.preparation.active || state.speechAttempt !== attempt || abortController.signal.aborted
-        || (attempt.number === 2 && !deliveryCurrent(state))) { observeDisposition({ deliveryObservation: observed }, "STALE", deliveryStaleReason(state)); return; }
+        || ((structuredPhone || attempt.number === 2) && !deliveryCurrent(state))) { observeDisposition({ deliveryObservation: observed }, "STALE", deliveryStaleReason(state)); return; }
       if (performance.now() >= state.preparation.identity.deadlineAt) return failPreparation(state, "SPEECH_PREPARATION_TIMEOUT", true);
       return speechAdapter.synthesize({
       input: state.preparation.identity.wording,
@@ -854,6 +892,7 @@ export function initializeVoiceV2Session({
   }
 
   function retrySpeech(state, reason) {
+    if (structuredPhone) return false;
     const diagnostics = state.lifecycleDiagnostics;
     if (state.delivery.attempts >= 2 || !state.preparation.active || state.speechAttempt.headers) return false;
     diagnostics.phase("SPEECH_RETRY_ELIGIBLE", { retryReason: reason });
@@ -1117,6 +1156,11 @@ export function initializeVoiceV2Session({
       superseded.add(responseId);
       return session.record("FLOOR_PLAN_REJECTED", { requestId: state.requestId, responseId, purpose: state.plan.purpose, proposalVersion: state.plan.proposalVersion, reason: "COMPLETION_OWNER_MISMATCH" });
     }
+    if (structuredDriver && state.plan.structuredBinding && !await structuredDriver.applicable(state.plan)) {
+      observeDisposition(state, 'STALE', 'STATE_CHANGED_DURING_SPEECH');
+      if (!structuredDriver.currentPlan(state.plan)) return supersedeResponse(state, 'CALLER_INTERRUPTION');
+      structuredDriver.close(); return lifecycle.terminate('STRUCTURED_STALE_EVIDENCE');
+    }
     state.providerCompletion = event;
     if (!state.preparation) {
       if (state.deliveryObservation) state.deliveryObservation.providerStatus = ["completed", "failed", "cancelled", "incomplete"].includes(event.providerStatus) ? event.providerStatus : null;
@@ -1162,6 +1206,12 @@ export function initializeVoiceV2Session({
       if (!preparationCurrent(state)) { observeDisposition(state, "STALE", deliveryStaleReason(state)); return; }
       session.responseRegistry.complete(responseId, { validationResult: validation });
     }
+    if (structuredDriver && state.plan.structuredBinding) {
+      if (!await structuredDriver.applicable(state.plan) || !deliveryCurrent(state)) {
+        if (!structuredDriver.currentPlan(state.plan)) return supersedeResponse(state, 'CALLER_INTERRUPTION');
+        structuredDriver.close(); return lifecycle.terminate('STRUCTURED_STALE_EVIDENCE');
+      }
+    }
     if (state.preparation || requiresBufferedDelivery(state.plan)) {
       observeDeliveryWrite(state, "MEDIA_SUBMITTED", () => twilio.submitAudio({ payload: Buffer.concat(state.audio.map((part) => Buffer.from(part, "base64"))).toString("base64") }));
       state.submittedAudioBytes = state.audioBytes;
@@ -1189,6 +1239,14 @@ export function initializeVoiceV2Session({
 
   async function acknowledgePlayback(markId) {
     const state = marks.get(markId); if (!state || lifecycle.terminated) return session.record("STALE_PLAYBACK_EVENT_QUARANTINED", { markId });
+    if (structuredDriver && state.plan.structuredBinding) {
+      const playback = session.playbackRegistry.get(markId), epoch = callerSpeechEpoch;
+      if (playback?.status !== PlaybackStatus.SUBMITTED || playback?.interrupted || playback?.invalidated
+        || !await structuredDriver.applicable(state.plan) || epoch !== callerSpeechEpoch
+        || session.playbackRegistry.get(markId)?.status !== PlaybackStatus.SUBMITTED) {
+        safeEmit({ event: 'V2_STRUCTURED_MARK_REFUSED', buildSha, reason: 'STALE_DUPLICATE_OR_INTERRUPTED' }); return;
+      }
+    }
     if (isTerminalRecovery(state)) {
       const response = session.responseRegistry.get(state.responseId);
       const playback = session.playbackRegistry.get(markId);
@@ -1376,6 +1434,7 @@ export function initializeVoiceV2Session({
   }
 
   function retryRealtimeDelivery(tracked, reason) {
+    if (structuredPhone) return false;
     const observedState = tracked?.responseId ? responses.get(tracked.responseId) || tracked : tracked;
     const ineligible = why => {
       if (observedState?.deliveryObservation) observedState.deliveryObservation.timeout = reason === "RESPONSE_GENERATION_TIMEOUT";
@@ -1460,6 +1519,7 @@ export function initializeVoiceV2Session({
 
   async function callerSilenceTimedOut() {
     if (lifecycle.terminated) return;
+    if (structuredPhone) { structuredDriver.close(); return lifecycle.terminate('STRUCTURED_CALLER_SILENCE'); }
     if (session.floorOwner.snapshot.state === FloorState.AWAIT_CONSENT) {
       const callerItemId = `${callSid}:consent-silence:${session.floorOwner.consentUnclearCount + 1}`;
       const claim = session.floorOwner.claimConsent({ callerItemId, proposalVersion: session.proposal.proposalVersion });
@@ -1528,6 +1588,21 @@ export function initializeVoiceV2Session({
     return "COMPLETED";
   }
   function clearPlayback(reason, state = null) {
+    if (structuredDriver) {
+      // A clear is cancellation, never delivery. Retire exposed asynchronous
+      // work synchronously, before Twilio can return any buffered marks.
+      if (reason === 'EXPOSED_CLEAR') structuredDriver.interrupt(reason);
+      for (const pending of responses.values()) {
+        const playback = pending.markId && session.playbackRegistry.get(pending.markId);
+        if (!pending.preparation?.active && ![PlaybackStatus.NOT_SUBMITTED, PlaybackStatus.SUBMITTED].includes(playback?.status)) continue;
+        if (playback) session.playbackRegistry.clear(pending.markId, reason);
+        session.responseRegistry.invalidate(pending.responseId, reason);
+        session.confirmationAuthority.revoke({ proposalVersion: pending.plan.proposalVersion, responseId: pending.responseId, markId: pending.markId, reason });
+        session.watchdog.cancel(`playback:${pending.markId}`);
+        supersedeResponse(pending, reason);
+        session.floorOwner.release({ reason, requestId: pending.requestId, responseId: pending.responseId, markId: pending.markId, playbackCleared: true });
+      }
+    }
     const result = twilio.clearPlayback();
     callTrace.playbackEnded();
     callTrace.entry("TWILIO_CLEAR_SUBMITTED", { ...timingDetails({ responseId: state?.responseId, markId: state?.markId }), reason });
@@ -1653,6 +1728,7 @@ export function initializeVoiceV2Session({
     if (role === "caller") callTrace.entry("CALLER_TRANSCRIPT_PERSISTED", { turnId, itemId, characterCount, persistenceOutcome: error ? "FAILED" : result?.replayed ? "REPLAYED" : result?.success === true ? "SUCCESS" : "NOT_CONFIRMED" });
   }
   async function cleanup(reason) {
+    structuredDriver?.close();
     for (const tracked of new Set(requests.values())) {
       if (!tracked.responseId && tracked.deliveryObservation && !tracked.deliveryObservation.settled) observeDisposition(tracked, "STALE", "TERMINATING");
     }
@@ -1713,7 +1789,12 @@ export function initializeVoiceV2Session({
     return openai.configureSession(openaiSession);
   }
 
-  return Object.freeze({ session, coordinator, lifecycle, twilio, openai, ready: () => Promise.all([processing, effectsProcessing]), terminate: (reason) => { deliveryStopping = true; disposeSpeechUndiciStages(callSid); transcriptionDiagnostics.close(); return enqueue(() => lifecycle.terminate(reason)); }, requestResponse: (plan) => enqueue(() => requestResponse(plan)), processEffects: kickEffects });
+  const exposedTwilio = structuredPhone ? Object.freeze({
+    get identity() { return twilio.identity; }, get metrics() { return twilio.metrics; }, get closed() { return twilio.closed; },
+    submitAudio: args => twilio.submitAudio(args), sendMark: args => twilio.sendMark(args),
+    clearPlayback: () => clearPlayback('EXPOSED_CLEAR'), close: (...args) => twilio.close(...args),
+  }) : twilio;
+  return Object.freeze({ session, coordinator, lifecycle, twilio: exposedTwilio, openai, ready: () => Promise.all([processing, effectsProcessing]), terminate: (reason) => { deliveryStopping = true; disposeSpeechUndiciStages(callSid); transcriptionDiagnostics.close(); return enqueue(() => lifecycle.terminate(reason)); }, requestResponse: (plan) => enqueue(() => requestResponse(plan)), processEffects: kickEffects });
 }
 
 function floorPurposeFor(plan) {
