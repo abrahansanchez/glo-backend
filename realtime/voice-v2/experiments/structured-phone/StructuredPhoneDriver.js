@@ -172,7 +172,7 @@ export class StructuredPhoneDriver {
         proposalVersion: this.session.proposal.proposalVersion, responseRegistry: this.session.responseRegistry, playbackRegistry: this.session.playbackRegistry });
       if (!grant?.authorized) { this.blocked = true; return rejected('CONFIRMATION_NOT_DELIVERED'); }
       if (!this.freshEvidence() || !this.evidence.result.available) return rejected('FRESH_BUNDLE_REQUIRED');
-      const fresh = await this.availability.check(this.business, this.ids(), this.session.proposal.date, this.session.proposal.time, this.preference);
+      const fresh = await this.availability.check(this.business, this.ids(), this.session.proposal.date, this.session.proposal.time, this.preference, { searchAlternatives: false });
       if (!current() || fresh.status !== 'OK' || !fresh.available || fresh.price !== this.evidence.result.price || fresh.durationMinutes !== this.evidence.result.durationMinutes) return rejected('FRESH_BUNDLE_REQUIRED');
       const latest = await this.availability.read();
       if (!current() || latest.revision !== this.business.revision || !this.availability.future(
@@ -229,12 +229,20 @@ export class StructuredPhoneDriver {
       expectedFacts: { service: display, name: p.name, date: p.date, time: p.time }, structuredBinding,
       speechContract: Object.freeze({ [purpose === 'PRE_BOOKING_CONFIRMATION' ? 'applicationOwnedConfirmation' : 'applicationOwnedSpeech']: true, requiredMessage: text }) });
   }
-  async applicable(plan) {
-    let pending;
-    const canceled = new Promise(resolve => { pending = { resolve, timer: setTimeout(() => resolve(false), 5000) }; this.applicability.add(pending); });
-    try { return await Promise.race([this.checkApplicable(plan), canceled]); }
-    catch { return false; }
-    finally { clearTimeout(pending.timer); this.applicability.delete(pending); }
+  async applicable(plan, boundary = 'UNSPECIFIED') {
+    if (!['BEFORE_SYNTHESIS', 'AFTER_SYNTHESIS', 'BEFORE_MEDIA', 'BEFORE_MARK_ACK'].includes(boundary)) boundary = 'UNSPECIFIED';
+    const started = performance.now(); let pending, accepted = false, reason = 'EVIDENCE_NOT_CURRENT';
+    this.log('FRESHNESS_STARTED', { boundary, proposalVersion: plan.proposalVersion, turnId: plan.structuredBinding?.turnId });
+    const canceled = new Promise(resolve => {
+      pending = { resolve: () => { reason = 'GENERATION_RETIRED'; resolve(false); }, timer: setTimeout(() => { reason = 'CHECK_TIMEOUT'; resolve(false); }, 5000) };
+      this.applicability.add(pending);
+    });
+    try { accepted = await Promise.race([this.checkApplicable(plan), canceled]); return accepted; }
+    catch { reason = 'CHECK_FAILED'; return false; }
+    finally {
+      clearTimeout(pending.timer); this.applicability.delete(pending);
+      this.log('FRESHNESS_COMPLETED', { boundary, proposalVersion: plan.proposalVersion, turnId: plan.structuredBinding?.turnId, accepted, reason: accepted ? 'CURRENT' : reason, elapsedMs: performance.now() - started });
+    }
   }
   currentPlan(plan) {
     const b = plan?.structuredBinding;
@@ -252,7 +260,10 @@ export class StructuredPhoneDriver {
     if (!bound() || business.revision !== b.businessRevision) return false;
     if (b.requiresAvailability) {
       if (!this.freshEvidence()) return false;
-      const fresh = await this.availability.check(business, b.serviceIds, this.session.proposal.date, this.session.proposal.time, this.preference);
+      const selected = b.alternativeIds.map(id => this.evidence.result.alternatives.find(a => a.alternativeId === id));
+      if (selected.some(a => !a)) return false;
+      const fresh = await this.availability.check(business, b.serviceIds, this.session.proposal.date, this.session.proposal.time, this.preference,
+        { searchAlternatives: false, alternativesToCheck: selected });
       if (!bound() || fresh.status !== 'OK' || b.requireAvailable && !fresh.available || fresh.price !== this.evidence.result.price
         || fresh.durationMinutes !== this.evidence.result.durationMinutes || fresh.reason !== this.evidence.result.reason) return false;
       for (const id of b.alternativeIds) {

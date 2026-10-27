@@ -789,3 +789,120 @@ test('phone catalogue: zero price remains numeric in confirmation without an inf
     assert.equal(f.executorCalls, 0);
   } finally { await f.app.terminate('TEST_DONE'); }
 });
+
+test('phone latency: confirmation freshness never regenerates alternative lists', async () => {
+  const f = await harness(); let scans = 0;
+  const list = f.availability.listSlots.bind(f.availability);
+  f.availability.listSlots = async args => { scans++; return list(args); };
+  try {
+    await f.turn(); assert.equal(f.app.lifecycle.terminated, false);
+    const mark = f.twilio.sent.filter(p => p.event === 'mark').at(-1).mark.name;
+    await f.ack(mark);
+    assert.equal(scans, 2, 'only the original tool discovery scans two dates for three alternatives');
+    assert.equal(f.checks.length, 8, 'discovery plus independent requested-slot release checks');
+    assert.equal(f.app.session.journal().filter(e => e.event === 'CONFIRMATION_AUTHORITY_GRANTED').length, 1);
+    assert.equal(f.executorCalls, 0);
+    assert.equal(f.emitted.filter(e => e.stage === 'FRESHNESS_STARTED' && e.boundary === 'BEFORE_SYNTHESIS').length, 1);
+    assert.ok(f.emitted.some(e => e.stage === 'SPEECH_HANDOFF_RESULT' && e.outcome === 'PREPARATION_ACCEPTED'));
+  } finally { await f.app.terminate('TEST_DONE'); }
+});
+
+test('phone latency: selected alternatives recheck directly and changes withhold all bytes', async () => {
+  let discoveryComplete = false, available = true, rescans = 0, directChecks = 0;
+  const f = await harness({ available: () => { if (discoveryComplete) { directChecks++; return available; } return true; },
+    script: m => {
+      if (m.round < 3) return seedScript(m);
+      discoveryComplete = true; available = false;
+      return plan(m, 'OFFER_ALTERNATIVES', { alternativeIds: [m.context.availability.alternatives[0].alternativeId] });
+    } });
+  const list = f.availability.listSlots.bind(f.availability);
+  f.availability.listSlots = async args => { if (discoveryComplete) rescans++; return list(args); };
+  await f.turn();
+  assert.equal(f.app.lifecycle.terminated, true); assert.equal(rescans, 0); assert.ok(directChecks > 0);
+  assert.equal(f.twilio.sent.some(p => p.event === 'media'), false); assert.equal(f.executorCalls, 0);
+  assert.ok(f.emitted.some(e => e.stage === 'SPEECH_HANDOFF_RESULT' && e.outcome === 'WITHHELD'));
+});
+
+test('phone latency: direct selected-slot checks preserve bundle facts without discovery', async () => {
+  const raw = business(), queries = []; let scans = 0;
+  const port = new LiveBundleAvailability({ loadBusiness: async () => raw, now: () => new Date('2026-10-25T16:00:00Z'),
+    checkSlot: async q => { queries.push(q); return q.time === '5:00 PM'; },
+    listSlots: async () => { scans++; throw Error('DISCOVERY_NOT_ALLOWED'); } });
+  const b = await port.read(), ids = raw.services.map(s => s._id);
+  const result = await port.check(b, ids, '2026-10-27', '16:00', null, {
+    searchAlternatives: false, alternativesToCheck: [{ date: '2026-10-27', time: '17:00' }],
+  });
+  assert.equal(scans, 0); assert.equal(queries.length, 2); assert.ok(queries.every(q => q.durationMinutes === 55 && q.barber === raw));
+  assert.equal(result.price, 50); assert.equal(result.durationMinutes, 55); assert.deepEqual(result.serviceIds, ids);
+  assert.equal(result.available, false); assert.equal(result.reason, 'UNAVAILABLE');
+  assert.deepEqual(result.alternatives, [{ date: '2026-10-27', time: '17:00' }]);
+});
+
+test('phone latency: interruption during preflight logs withheld handoff and cancels late checks', async () => {
+  let release;
+  const f = await harness({ script: m => {
+    if (m.round < 3) return seedScript(m);
+    const read = f.availability.read.bind(f.availability);
+    f.availability.read = () => { f.availability.read = read; return new Promise(resolve => { release = () => read().then(resolve); }); };
+    return plan(m, 'CANONICAL_CONFIRMATION');
+  } });
+  try {
+    const turn = f.turn();
+    for (let i = 0; i < 100 && !release; i++) await new Promise(resolve => setImmediate(resolve));
+    assert.equal(typeof release, 'function');
+    f.input.receive({ type: 'input_audio_buffer.speech_started', item_id: 'new-latency-turn', audio_start_ms: 0 });
+    await turn; release(); await settle(f.app);
+    assert.equal(f.speech.length, 0); assert.equal(f.twilio.sent.some(p => p.event === 'media'), false);
+    assert.ok(f.emitted.some(e => e.stage === 'FRESHNESS_COMPLETED' && e.reason === 'GENERATION_RETIRED'));
+    assert.ok(f.emitted.some(e => e.stage === 'SPEECH_HANDOFF_RESULT' && e.outcome === 'WITHHELD'));
+    assert.equal(f.executorCalls, 0);
+  } finally { release?.(); await f.app.terminate('TEST_DONE'); }
+});
+
+for (const variant of ['available', 'bundle exceeds hours', 'closed', 'blackout', 'conflict', 'buffer conflict', 'Los Angeles', 'past', 'exactly now']) test(`phone latency: actual scheduling helper direct alternative rules - ${variant}`, async () => {
+  const raw = business(), queries = []; let occupied = null;
+  if (variant === 'bundle exceeds hours') raw.availability.businessHours.tue.close = '17:50';
+  if (variant === 'closed') raw.availability.businessHours.tue.isClosed = true;
+  if (variant === 'blackout') raw.availability.blackoutDates = [{ date: '2026-10-27T12:00:00Z' }];
+  if (variant === 'conflict') occupied = [Date.parse('2026-10-27T21:40:00Z'), Date.parse('2026-10-27T22:30:00Z')];
+  if (variant === 'buffer conflict') occupied = [Date.parse('2026-10-27T21:59:00Z'), Date.parse('2026-10-27T22:30:00Z')];
+  if (variant === 'Los Angeles') raw.availability.timezone = 'America/Los_Angeles';
+  const clock = variant === 'past' ? '2026-10-27T22:00:00Z' : variant === 'exactly now' ? '2026-10-27T21:00:00Z' : '2026-10-25T16:00:00Z';
+  const original = Appointment.findOne;
+  Appointment.findOne = query => {
+    queries.push(query);
+    const start = query.$or[0].startAt.$gte.getTime(), end = query.$or[0].startAt.$lt.getTime();
+    return Promise.resolve(occupied && start < occupied[1] && end > occupied[0] ? { _id: 'synthetic-conflict' } : null);
+  };
+  try {
+    const port = new LiveBundleAvailability({ loadBusiness: async () => raw, now: () => new Date(clock),
+      listSlots: async () => { throw Error('MUST_NOT_REDISCOVER'); } });
+    const b = await port.read(), ids = raw.services.map(s => s._id);
+    const result = await port.check(b, ids, '2026-10-27', '15:00', null, {
+      searchAlternatives: false, alternativesToCheck: [{ date: '2026-10-27', time: '17:00' }],
+    });
+    assert.equal(result.status, 'OK'); assert.equal(result.durationMinutes, 55); assert.equal(result.price, 50); assert.deepEqual(result.serviceIds, ids);
+    assert.equal(result.alternatives.length, ['available', 'Los Angeles'].includes(variant) ? 1 : 0);
+    assert.ok(queries.every(q => q.barberId === ID && JSON.stringify(q.status.$in) === '["confirmed","pending"]'));
+    if (['available', 'Los Angeles'].includes(variant)) {
+      const slot = queries.at(-1);
+      assert.equal(slot.$or[0].startAt.$gte.toISOString(), variant === 'Los Angeles' ? '2026-10-27T23:55:00.000Z' : '2026-10-27T20:55:00.000Z');
+      assert.equal(slot.$or[0].startAt.$lt.toISOString(), variant === 'Los Angeles' ? '2026-10-28T01:00:00.000Z' : '2026-10-27T22:00:00.000Z');
+    }
+  } finally { Appointment.findOne = original; }
+});
+
+test('phone latency: selected alternative becomes unavailable during synthesis and releases zero bytes', async () => {
+  let selectedAvailable = true;
+  const f = await harness({ available: q => q.time === '4:00 PM' && selectedAvailable,
+    beforeSpeech: async () => { selectedAvailable = false; },
+    script: m => m.round < 3 ? seedScript(m) : plan(m, 'OFFER_ALTERNATIVES', {
+      alternativeIds: [m.context.availability.alternatives.find(a => a.time === '16:00').alternativeId],
+    }) });
+  try {
+    await f.turn(); assert.equal(f.speech.length, 1); assert.equal(f.app.lifecycle.terminated, true);
+    assert.equal(f.twilio.sent.some(p => p.event === 'media' || p.event === 'mark'), false);
+    assert.ok(f.emitted.some(e => e.stage === 'FRESHNESS_COMPLETED' && e.boundary === 'AFTER_SYNTHESIS' && e.accepted === false));
+    assert.equal(f.app.session.journal().some(e => e.event === 'CONFIRMATION_AUTHORITY_GRANTED'), false); assert.equal(f.executorCalls, 0);
+  } finally { await f.app.terminate('TEST_DONE'); }
+});

@@ -257,13 +257,20 @@ export function initializeVoiceV2Session({
     structuredDriver = new StructuredPhoneDriver({ session, businessContext, ...structuredPhone, now,
       replace: (previous, next) => { session.replaceProposal(previous, next); supersedeProposal(previous.proposalVersion); },
       speak: plan => enqueue(async () => {
-        if (lifecycle.terminated) return;
-        if (!structuredDriver.currentPlan(plan)) return { accepted: false, reason: 'STALE_STRUCTURED_TURN' };
-        if (!await structuredDriver.applicable(plan)) {
-          if (!structuredDriver.currentPlan(plan)) return { accepted: false, reason: 'STALE_STRUCTURED_TURN' };
-          return lifecycle.terminate('STRUCTURED_STALE_EVIDENCE');
+        structuredDriver.log('SPEECH_HANDOFF_STARTED', { purpose: plan.purpose, proposalVersion: plan.proposalVersion, turnId: plan.structuredBinding?.turnId });
+        if (lifecycle.terminated || !structuredDriver.currentPlan(plan)) {
+          structuredDriver.log('SPEECH_HANDOFF_RESULT', { outcome: 'WITHHELD', reason: lifecycle.terminated ? 'CALL_TERMINATED' : 'STALE_STRUCTURED_TURN' });
+          return { accepted: false, reason: 'STALE_STRUCTURED_TURN' };
         }
-        return requestResponse(plan);
+        // requestResponse owns the single pre-synthesis freshness check. No
+        // asynchronous operation separates a duplicate outer check from it.
+        const result = await requestResponse(plan);
+        const reason = ['STRUCTURED_STALE_EVIDENCE', 'STALE_STRUCTURED_TURN', 'FLOOR_OCCUPIED', 'CALL_TERMINATED', 'CONTROLLED_RECOVERY', 'STRUCTURED_SPEECH_LIMIT'].includes(result?.reason) ? result.reason : 'REFUSED';
+        structuredDriver.log('SPEECH_HANDOFF_RESULT', { purpose: plan.purpose, proposalVersion: plan.proposalVersion,
+          turnId: plan.structuredBinding?.turnId, requestId: result?.requestId || null, responseId: result?.responseId || null,
+          outcome: result?.accepted ? 'PREPARATION_ACCEPTED' : 'WITHHELD', reason: result?.accepted ? 'NONE' : reason });
+        if (result?.reason === 'STRUCTURED_STALE_EVIDENCE' && structuredDriver.currentPlan(plan)) return lifecycle.terminate('STRUCTURED_STALE_EVIDENCE');
+        return result;
       }), terminate: reason => { structuredDriver.close(); return enqueue(() => lifecycle.terminate(reason)); }, emit: event => {
         if (['STOPPED', 'MODEL_PROTOCOL_FAILED'].includes(event.stage)) session.record('STRUCTURED_DECISION_FAILED', {
           failureStage: event.failureStage, failureCode: event.failureCode,
@@ -765,7 +772,7 @@ export function initializeVoiceV2Session({
     if (lifecycle.terminated) return { accepted: false, reason: "CALL_TERMINATED" };
     if (localRecoveryStarted) return { accepted: false, reason: "CONTROLLED_RECOVERY" };
     if (speechAdapter && plan.purpose === ResponsePurpose.ERROR_RECOVERY) return startLocalRecovery();
-    if (structuredDriver && plan.structuredBinding && !await structuredDriver.applicable(plan)) return { accepted: false, reason: 'STRUCTURED_STALE_EVIDENCE' };
+    if (structuredDriver && plan.structuredBinding && !await structuredDriver.applicable(plan, 'BEFORE_SYNTHESIS')) return { accepted: false, reason: 'STRUCTURED_STALE_EVIDENCE' };
     const contextualPlan = structuredDriver && plan.structuredBinding ? plan : bindServiceValidationContext(plan, turnContext.availableServices, {
       referenceDate: businessLocalReferenceDate(turnContext.referenceDate, businessContext.timeZone, now),
       timeZone: businessContext.timeZone,
@@ -1164,7 +1171,7 @@ export function initializeVoiceV2Session({
       superseded.add(responseId);
       return session.record("FLOOR_PLAN_REJECTED", { requestId: state.requestId, responseId, purpose: state.plan.purpose, proposalVersion: state.plan.proposalVersion, reason: "COMPLETION_OWNER_MISMATCH" });
     }
-    if (structuredDriver && state.plan.structuredBinding && !await structuredDriver.applicable(state.plan)) {
+    if (structuredDriver && state.plan.structuredBinding && !await structuredDriver.applicable(state.plan, 'AFTER_SYNTHESIS')) {
       observeDisposition(state, 'STALE', 'STATE_CHANGED_DURING_SPEECH');
       if (!structuredDriver.currentPlan(state.plan)) return supersedeResponse(state, 'CALLER_INTERRUPTION');
       structuredDriver.close(); return lifecycle.terminate('STRUCTURED_STALE_EVIDENCE');
@@ -1215,7 +1222,7 @@ export function initializeVoiceV2Session({
       session.responseRegistry.complete(responseId, { validationResult: validation });
     }
     if (structuredDriver && state.plan.structuredBinding) {
-      if (!await structuredDriver.applicable(state.plan) || !deliveryCurrent(state)) {
+      if (!await structuredDriver.applicable(state.plan, 'BEFORE_MEDIA') || !deliveryCurrent(state)) {
         if (!structuredDriver.currentPlan(state.plan)) return supersedeResponse(state, 'CALLER_INTERRUPTION');
         structuredDriver.close(); return lifecycle.terminate('STRUCTURED_STALE_EVIDENCE');
       }
@@ -1251,7 +1258,7 @@ export function initializeVoiceV2Session({
     if (structuredDriver && state.plan.structuredBinding) {
       const playback = session.playbackRegistry.get(markId), epoch = callerSpeechEpoch;
       if (playback?.status !== PlaybackStatus.SUBMITTED || playback?.interrupted || playback?.invalidated
-        || !await structuredDriver.applicable(state.plan) || epoch !== callerSpeechEpoch
+        || !await structuredDriver.applicable(state.plan, 'BEFORE_MARK_ACK') || epoch !== callerSpeechEpoch
         || session.playbackRegistry.get(markId)?.status !== PlaybackStatus.SUBMITTED) {
         safeEmit({ event: 'V2_STRUCTURED_MARK_REFUSED', buildSha, reason: 'STALE_DUPLICATE_OR_INTERRUPTED' }); return;
       }

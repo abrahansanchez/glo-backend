@@ -48,7 +48,8 @@ export class LiveBundleAvailability {
     if (!current.isValid()) throw Error('INVALID_BUSINESS_CLOCK');
     return instant.isAfter(current);
   }
-  async check(business, ids, date, time, preference = null) {
+  async check(business, ids, date, time, preference = null, { searchAlternatives = true, alternativesToCheck = [] } = {}) {
+    if (!Array.isArray(alternativesToCheck) || alternativesToCheck.length > 3) throw Error('INVALID_AVAILABILITY_RESULT');
     const day = moment.tz(date, 'YYYY-MM-DD', true, business.timeZone);
     const local = time ? moment.tz(`${date} ${time}`, 'YYYY-MM-DD HH:mm', true, business.timeZone) : null;
     if (!day.isValid() || day.format('YYYY-MM-DD') !== date || date < business.window.start || date > business.window.end
@@ -67,7 +68,20 @@ export class LiveBundleAvailability {
     const closed = !business.raw.availability.businessHours?.[dayKey] || business.raw.availability.businessHours[dayKey].isClosed === true;
     if (closed && requested) return { status: 'UNSUPPORTED', reason: 'INVALID_AVAILABILITY_RESULT' };
     const alternatives = [];
-    for (let offset = 0; offset < 7 && alternatives.length < 3; offset++) {
+    if (!searchAlternatives) for (const a of alternativesToCheck) {
+      if (!a || typeof a.date !== 'string' || typeof a.time !== 'string') throw Error('INVALID_AVAILABILITY_RESULT');
+      if (preference?.kind === 'AFTERNOON' && a.time < '12:00' || preference?.kind === 'MORNING' && a.time >= '12:00') continue;
+      const parsed = moment.tz(`${a.date} ${a.time}`, 'YYYY-MM-DD HH:mm', true, business.timeZone);
+      if (!parsed.isValid() || parsed.format('YYYY-MM-DD') !== a.date || parsed.format('HH:mm') !== a.time
+        || a.date < business.window.start || a.date > business.window.end) throw Error('INVALID_AVAILABILITY_RESULT');
+      if (!this.future(parsed, business.timeZone)) continue;
+      // Same full-bundle predicate used for discovered alternatives, including
+      // existing hours, blackout, appointment and buffer rules. No new search.
+      const confirmed = await this.checkSlot({ barber: business.raw, date: a.date, time: parsed.format('h:mm A'), durationMinutes });
+      if (typeof confirmed !== 'boolean') throw Error('INVALID_AVAILABILITY_RESULT');
+      if (confirmed && this.future(parsed, business.timeZone)) alternatives.push({ date: a.date, time: a.time });
+    }
+    for (let offset = 0; searchAlternatives && offset < 7 && alternatives.length < 3; offset++) {
       const searchDate = moment.tz(date, business.timeZone).add(offset, 'days').format('YYYY-MM-DD');
       if (searchDate > business.window.end) break;
       const slots = await this.listSlots({ barber: business.raw, date: searchDate, durationMinutes, limit: null });

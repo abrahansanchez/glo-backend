@@ -232,3 +232,36 @@ confirmation. ID-less handles are deterministic; accepted catalogues always have
 unique handles, and a collision with a supplied ID or another handle rejects.
 Raw catalogue records are not mutated, and the simulation never writes handles
 as database IDs. These synthetic proofs do not identify CA0543's live guard.
+
+## Bounded latency preparation
+
+The observed 9.902 seconds from turn readiness to speech admission comprised
+5.783 seconds of model requests and 1.282 seconds of measured tools, leaving
+approximately 2.837 seconds of application/freshness work and other overhead.
+This residual is not provider compute time and is not a promised saving.
+
+The original availability tool still discovers alternatives. Subsequent freshness
+checks use the same full-duration slot predicate for the requested slot and up to
+three selected alternatives, rather than regenerating full-day alternative lists.
+They preserve ordered services, exact prices/durations, timezone, buffer, business
+revision, proposal/turn generation, future-time checks and final business reads.
+The adjacent duplicate outer pre-synthesis check is removed; requestResponse owns
+that check. Post-synthesis, pre-media and mark-boundary checks remain independent.
+Simulated authorization also rechecks its slot without discovering alternatives.
+No freshness result is cached across an asynchronous release boundary.
+
+Finite freshness start/completion and speech-handoff events record current/failed,
+timed-out or retired-generation outcomes and bounded request bindings. A handoff
+PREPARATION_ACCEPTED event means local TTS preparation was accepted, not that HTTP
+headers, speech delivery or playback occurred. Existing transport events provide
+those later boundaries. No transcripts, wording or provider payloads are added.
+
+Proposed header-wait policy, NOT implemented here: abort a still-current speech
+attempt after five seconds without headers, with zero retries; use the existing
+validated local recovery asset and controlled end only if the caller has not
+interrupted and the generation remains current. Missing local assets fail closed.
+Retire old delivery evidence before recovery and never reuse confirmation proof.
+This would bound the observed 12.055-second wait but can discard a response that
+would later succeed; it does not identify the remote cause or impose a cost cap.
+Streaming after headers cannot remove a pre-header wait. Existing header/time
+budgets, provider/model/voice settings and interruption behavior are unchanged.
