@@ -4,10 +4,14 @@ import { initializeVoiceV2Session } from '../../initializeVoiceV2Session.js';
 import { FakeSocket } from '../helpers/FakeSocket.js';
 import { LiveBundleAvailability } from '../../experiments/structured-phone/LiveBundleAvailability.js';
 import { phoneContracts, matches, selectStructuredPhone, PHONE_LIMITS } from '../../experiments/structured-phone/PhoneContracts.js';
-import { PhoneModelTransport } from '../../experiments/structured-phone/PhoneModelTransport.js';
+import { PhoneModelTransport, phoneFailure } from '../../experiments/structured-phone/PhoneModelTransport.js';
 import { createVoiceV2ProductionInitializer } from '../../production/createVoiceV2ProductionInitializer.js';
 import Appointment from '../../../../models/Appointment.js';
 import { isSlotAvailable, getAvailableSlots } from '../../../../utils/ai/availabilityHelpers.js';
+import { V1AvailabilityAdapter } from '../../adapters/V1AvailabilityAdapter.js';
+import { createIdempotentAppointment } from '../../../../services/booking/createIdempotentAppointment.js';
+import { buildServiceCatalogue } from '../../interpretation/buildServiceCatalogue.js';
+import { deriveSlotKey } from '../../domain/BookingProposal.js';
 
 const ID = '123456789012345678901234';
 function business() { return { _id: ID, services: [{ _id: 'service-cut-91', name: 'Precision Cut', price: 32, durationMinutes: 35 },
@@ -34,10 +38,11 @@ function seedScript(m) {
   if (m.round === 2) return [call('check_availability', m.binding)];
   return plan(m, 'CANONICAL_CONFIRMATION');
 }
-async function harness({ language = 'en', script = seedScript, available = true, beforeSpeech, beforeGreeting, afterAssistantPersist, raw = business(), scheduler, wire = false, wireConfigurationError = null } = {}) {
+async function harness({ language = 'en', script = seedScript, available = true, beforeSpeech, beforeGreeting, afterAssistantPersist, raw = business(), scheduler, wire = false, wireConfigurationError = null,
+  labels = { 'service-cut-91': { es: 'corte de pelo' }, 'service-beard-72': { es: 'recorte de barba' } } } = {}) {
   const requests = [], models = [], speech = [], emitted = [], checks = []; let executorCalls = 0;
   const availability = new LiveBundleAvailability({ loadBusiness: async () => raw, now: () => new Date('2026-10-25T16:00:00Z'),
-    labels: { 'service-cut-91': { es: 'corte de pelo' }, 'service-beard-72': { es: 'recorte de barba' } },
+    labels,
     checkSlot: async args => { checks.push(args); return typeof available === 'function' ? available(args) : available; },
     listSlots: async ({ date }) => [{ date, time: '4:00 PM' }, { date, time: '5:00 PM' }] });
   const twilio = new FakeSocket(), input = new FakeSocket(); input.readyState = 0;
@@ -605,4 +610,182 @@ test('phone live failure: pending greeting cannot play without prepared audio an
     const summary = f.emitted.find(e => e.traceEvent === 'CALL_SUMMARY');
     assert.equal(summary.callerTurnCount, 0); assert.equal(summary.acceptedTurnCount, 0); assert.equal(summary.deliverySuccessCount, 0);
   } finally { release?.(); await f.app.terminate('TEST_DONE'); }
+});
+
+const catalogueService = { _id: '111111111111111111111111', name: 'Haircut', price: 25, durationMinutes: 30 };
+for (const [category, services, expectedRead, expectedBundle] of [
+  ['empty list', [], 'EMPTY', null],
+  ['missing id', [{ name: 'Haircut', price: 25, durationMinutes: 30 }], null, 'OK'],
+  ['duplicate id', [catalogueService, { ...catalogueService, name: 'Beard Trim' }], 'DUPLICATE_ID', null],
+  ['missing name', [{ _id: catalogueService._id, price: 25, durationMinutes: 30 }], 'MISSING_NAME', null],
+  ['duplicate name', [catalogueService, { ...catalogueService, _id: '222222222222222222222222' }], 'DUPLICATE_NAME', null],
+  ['invalid price', [{ ...catalogueService, price: 'invalid' }], null, 'UNSUPPORTED'],
+  ['zero price', [{ ...catalogueService, price: 0 }], null, 'OK'],
+  ['missing duration', [{ _id: catalogueService._id, name: 'Haircut', price: 25 }], null, 'UNSUPPORTED'],
+  ['legacy zero price', [{ name: 'Haircut', price: 0, durationMinutes: 30 }], null, 'OK'],
+  ['oversized list', Array.from({ length: 65 }, (_, i) => ({ ...catalogueService, _id: `service-${i}`, name: `Synthetic ${i}` })), 'TOO_LARGE', null],
+  ['invalid name type', [{ ...catalogueService, name: 7 }], 'INVALID_NAME', null],
+  ['overlong name', [{ ...catalogueService, name: 'x'.repeat(129) }], 'INVALID_NAME', null],
+  ['control in name', [{ ...catalogueService, name: 'Synthetic\u0000' }], 'INVALID_NAME', null],
+]) test(`phone catalogue: ${category}`, async () => {
+  const raw = business(); raw.services = structuredClone(services);
+  const port = new LiveBundleAvailability({ loadBusiness: async () => raw, now: () => new Date('2026-10-25T16:00:00Z'), checkSlot: async () => true, listSlots: async () => [] });
+  if (expectedRead) {
+    await assert.rejects(port.read(), e => { assert.equal(e.message, 'UNSUPPORTED_CATALOGUE'); assert.equal(e.catalogueCategory, expectedRead); return true; });
+  } else {
+    const b = await port.read(); const result = await port.check(b, b.services.map(s => s.id), '2026-10-27', '17:00');
+    assert.equal(result.status, expectedBundle);
+    if (category.includes('zero price')) { assert.equal(b.services[0].price, 0); assert.equal(result.price, 0); }
+    if (expectedBundle === 'UNSUPPORTED') assert.equal(result.reason, 'UNSUPPORTED_SERVICE_BUNDLE');
+  }
+});
+
+test('phone catalogue: unchanged production fixture passes existing readers and structured driver', async () => {
+  // Exact stored service shape used by business-grounding.test.js; no invented facts.
+  const services = [{ name: 'Haircut', price: 25, durationMinutes: 30 }];
+  const raw = business(); raw.services = services;
+  const request = { barberId: ID, service: 'Haircut', date: '2026-10-27', time: '17:00', timeZone: 'America/New_York',
+    clientName: 'Synthetic Tester', callerNumber: '+15555550199', commandId: 'synthetic-command', idempotencyKey: 'synthetic-command', proposalVersion: 1, callSid: 'CA-synthetic' };
+  assert.equal(buildServiceCatalogue(services)[0].canonical, 'Haircut');
+  const adapter = new V1AvailabilityAdapter({ findBarberByIdFn: async () => raw,
+    checkAvailabilityFn: async p => { assert.equal(p.durationMinutes, 30); return true; } });
+  assert.equal((await adapter.checkAvailability({ ...request, slotKey: deriveSlotKey(request) })).available, true);
+  const booking = await createIdempotentAppointment(request, { findBarberById: async () => raw, findByIdempotencyKey: async () => null,
+    checkAvailability: async p => { assert.equal(p.durationMinutes, 30); return true; },
+    createAppointment: async values => ({ ...values, _id: 'synthetic-only-no-database-write' }) });
+  assert.equal(booking.success, true);
+  const before = structuredClone(raw.services);
+  const f = await harness({ raw, labels: {}, language: 'es', script: (m, input) => {
+    if (m.round === 1) return [call('update_appointment_draft', { ...m.binding, changes: [
+      { kind: 'SET_SERVICE', serviceId: input.context.business.services[0].id }, { kind: 'SET_DATE', date: '2026-10-27' },
+      { kind: 'SET_TIME', time: '17:00' }, { kind: 'SET_NAME', name: 'Synthetic Tester' },
+    ] })];
+    return m.round === 2 ? [call('check_availability', m.binding)] : plan(m, 'CANONICAL_CONFIRMATION');
+  } });
+  try {
+    await f.turn(); assert.equal(f.app.lifecycle.terminated, false); assert.equal(f.requests.length, 3);
+    assert.equal(f.app.session.proposal.service, 'Haircut'); assert.match(f.speech.at(-1).input, /Haircut/);
+    assert.match(f.speech.at(-1).input, /\$25/); assert.equal(f.executorCalls, 0); assert.deepEqual(raw.services, before);
+  } finally { await f.app.terminate('TEST_DONE'); }
+});
+
+test('phone catalogue: supplied malformed ids stay rejected and legacy handles are stable across order', async () => {
+  const raw = business(); raw.services = [{ name: 'Haircut', price: 25, durationMinutes: 30 }, { name: 'Beard Trim', price: 10, durationMinutes: 20 }];
+  const port = new LiveBundleAvailability({ loadBusiness: async () => raw });
+  const first = await port.read(); raw.services.reverse(); const second = await port.read();
+  assert.equal(first.services[0].id, second.services[1].id); assert.notEqual(first.services[0].id, first.services[1].id);
+  raw.services[0]._id = 'invalid supplied id';
+  await assert.rejects(port.read(), e => { assert.equal(e.catalogueCategory, 'INVALID_ID'); return true; });
+});
+
+test('phone catalogue: rejected field/category reaches sanitized event without catalogue content', async () => {
+  const raw = business(); raw.services[1]._id = raw.services[0]._id;
+  const f = await harness({ raw, labels: {} }); await f.turn();
+  const failure = f.emitted.find(e => e.stage === 'STOPPED');
+  assert.equal(failure.failureCode, 'UNSUPPORTED_CATALOGUE'); assert.equal(failure.catalogueField, 'service.id'); assert.equal(failure.catalogueCategory, 'DUPLICATE_ID');
+  assert.ok(!JSON.stringify(failure).includes('Precision Cut')); assert.ok(!JSON.stringify(failure).includes('service-cut-91'));
+  assert.equal(f.requests.length, 0); assert.equal(f.executorCalls, 0);
+});
+
+test('phone catalogue: malformed list stays rejected and diagnostic values are strictly allowlisted', async () => {
+  const raw = business(); raw.services = {};
+  await assert.rejects(new LiveBundleAvailability({ loadBusiness: async () => raw }).read(), e => {
+    assert.equal(e.catalogueField, 'services'); assert.equal(e.catalogueCategory, 'INVALID_LIST'); return true;
+  });
+  const diagnostic = phoneFailure(Object.assign(Error('UNSUPPORTED_CATALOGUE'), {
+    catalogueField: 'service.name', catalogueCategory: 'PRIVATE_SENTINEL', services: ['PRIVATE_SENTINEL'], transcript: 'PRIVATE_SENTINEL',
+  }), 'BUSINESS_CONTEXT_READ');
+  assert.equal(diagnostic.catalogueCategory, undefined); assert.ok(!JSON.stringify(diagnostic).includes('PRIVATE_SENTINEL'));
+});
+
+test('phone catalogue: exact Mongo _id is preserved alongside deterministic non-persisted handles', async () => {
+  const stored = { _id: '507f1f77bcf86cd799439011', name: 'Haircut', price: 25, durationMinutes: 30 };
+  const raw = business(); raw.services = [stored];
+  const original = structuredClone(raw);
+  const port = new LiveBundleAvailability({ loadBusiness: async () => raw });
+  const retained = (await port.read()).services[0];
+  assert.equal(retained.id, '507f1f77bcf86cd799439011'); assert.equal(retained.id.startsWith('legacy:'), false);
+  assert.deepEqual(raw, original);
+
+  const idless = { name: 'Haircut', price: 25, durationMinutes: 30 };
+  raw.services = [idless];
+  const first = await port.read(), second = await port.read();
+  const handle = first.services[0].id;
+  assert.match(handle, /^legacy:[a-f0-9]{64}$/); assert.equal(second.services[0].id, handle);
+  assert.equal(Object.hasOwn(idless, '_id'), false); assert.equal(Object.hasOwn(idless, 'id'), false);
+  raw.services.push({ name: 'Beard Trim', price: 18, durationMinutes: 20 });
+  const multiple = await port.read(); assert.equal(new Set(multiple.services.map(s => s.id)).size, 2);
+  raw.services = [stored, { name: 'Beard Trim', price: 0, durationMinutes: 20 }];
+  const mixed = await port.read(); assert.equal(mixed.services[0].id, stored._id);
+  assert.equal(new Set(mixed.services.map(s => s.id)).size, 2); assert.equal(mixed.services[1].price, 0);
+});
+
+test('phone catalogue: attempted collision with a supplied _id fails closed instead of replacing either id', async () => {
+  const raw = business(); raw.services = [{ name: 'Haircut', price: 25, durationMinutes: 30 }];
+  const port = new LiveBundleAvailability({ loadBusiness: async () => raw });
+  const handle = (await port.read()).services[0].id;
+  raw.services.push({ _id: handle, name: 'Beard Trim', price: 18, durationMinutes: 20 });
+  await assert.rejects(port.read(), e => { assert.equal(e.catalogueCategory, 'DUPLICATE_ID'); return true; });
+  assert.equal(raw.services[1]._id, handle); assert.equal(Object.hasOwn(raw.services[0], '_id'), false);
+  raw.services = [{ name: 'Haircut', price: 25, durationMinutes: 30 }, { name: 'Haircut', price: 25, durationMinutes: 30 }];
+  await assert.rejects(port.read(), e => { assert.equal(e.catalogueCategory, 'DUPLICATE_NAME'); return true; });
+  raw.services = [{ _id: '507f1f77bcf86cd799439011', price: 25, durationMinutes: 30 }];
+  await assert.rejects(port.read(), e => { assert.equal(e.catalogueCategory, 'MISSING_NAME'); return true; });
+});
+
+test('phone catalogue: retained Mongo id binds draft, bundle, alternatives and delivered confirmation', async () => {
+  const mongoId = '507f1f77bcf86cd799439011';
+  const raw = business(); raw.services = [{ _id: mongoId, name: 'Haircut', price: 25, durationMinutes: 30 },
+    { name: 'Beard Trim', price: 18, durationMinutes: 20 }];
+  const original = structuredClone(raw); let bundle;
+  const f = await harness({ raw, labels: {}, available: q => q.time !== '4:00 PM', script: (m, input) => {
+    const ids = input.context.business.services.map(s => s.id);
+    assert.equal(ids[0], mongoId); assert.match(ids[1], /^legacy:[a-f0-9]{64}$/); bundle = ids;
+    if (m.turn === 1 && m.round === 1) return [call('update_appointment_draft', { ...m.binding, changes: [
+      { kind: 'SET_SERVICE', serviceId: ids[0] }, { kind: 'ADD_SERVICE', serviceId: ids[1] },
+      { kind: 'SET_DATE', date: '2026-10-27' }, { kind: 'SET_TIME', time: '16:00' }, { kind: 'SET_NAME', name: 'Synthetic Tester' },
+    ] })];
+    assert.deepEqual(m.binding.serviceIds, ids);
+    if (m.turn === 2 && m.round === 1) {
+      const alternative = input.context.availability.alternatives.find(a => a.time === '17:00');
+      assert.ok(alternative);
+      return [call('update_appointment_draft', { ...m.binding, changes: [{ kind: 'SELECT_ALTERNATIVE', alternativeId: alternative.alternativeId }] })];
+    }
+    if (m.round === 2) return [call('check_availability', m.binding)];
+    return m.turn === 1 ? plan(m, 'OFFER_ALTERNATIVES', { alternativeIds: input.context.availability.alternatives.map(a => a.alternativeId) }) : plan(m, 'CANONICAL_CONFIRMATION');
+  } });
+  const queries = [], check = f.availability.check.bind(f.availability);
+  f.availability.check = async (b, ids, ...args) => { queries.push([...ids]); return check(b, ids, ...args); };
+  try {
+    await f.turn(); assert.equal(f.app.lifecycle.terminated, false);
+    const availability = f.models[0].results.find(r => r.status === 'OK' && Array.isArray(r.alternatives));
+    assert.deepEqual(availability.serviceIds, bundle); assert.ok(availability.alternatives.length);
+    await f.ack(f.twilio.sent.filter(p => p.event === 'mark').at(-1).mark.name);
+    await f.turn('Synthetic selected alternative'); assert.equal(f.app.lifecycle.terminated, false);
+    assert.equal(f.app.session.proposal.service, 'Haircut'); assert.deepEqual(f.app.session.proposal.additionalServices, ['Beard Trim']);
+    assert.equal(f.app.session.proposal.time, '17:00'); assert.match(f.speech.at(-1).input, /Haircut and Beard Trim/);
+    assert.match(f.speech.at(-1).input, /\$43/); assert.ok(f.checks.every(q => q.durationMinutes === 50));
+    assert.ok(queries.length > 1); assert.ok(queries.every(ids => JSON.stringify(ids) === JSON.stringify(bundle)));
+    await f.ack(f.twilio.sent.filter(p => p.event === 'mark').at(-1).mark.name);
+    assert.equal(f.app.session.journal().filter(e => e.event === 'CONFIRMATION_AUTHORITY_GRANTED').length, 1);
+    assert.equal(f.executorCalls, 0); assert.deepEqual(raw, original);
+    assert.ok(!JSON.stringify(f.app.session.proposal).includes('legacy:'));
+  } finally { await f.app.terminate('TEST_DONE'); }
+});
+
+test('phone catalogue: zero price remains numeric in confirmation without an inferred free claim', async () => {
+  const raw = business(); raw.services = [{ _id: '507f1f77bcf86cd799439011', name: 'Haircut', price: 0, durationMinutes: 30 }];
+  const f = await harness({ raw, labels: {}, script: (m, input) => {
+    if (m.round === 1) return [call('update_appointment_draft', { ...m.binding, changes: [
+      { kind: 'SET_SERVICE', serviceId: input.context.business.services[0].id }, { kind: 'SET_DATE', date: '2026-10-27' },
+      { kind: 'SET_TIME', time: '17:00' }, { kind: 'SET_NAME', name: 'Synthetic Tester' },
+    ] })];
+    return m.round === 2 ? [call('check_availability', m.binding)] : plan(m, 'CANONICAL_CONFIRMATION');
+  } });
+  try {
+    await f.turn(); assert.equal(f.app.lifecycle.terminated, false); assert.equal(raw.services[0].price, 0);
+    assert.equal(f.models[0].results.find(r => r.status === 'OK' && Object.hasOwn(r, 'price')).price, 0);
+    assert.match(f.speech.at(-1).input, /Total: \$0\./); assert.doesNotMatch(f.speech.at(-1).input, /\bfree\b/i);
+    assert.equal(f.executorCalls, 0);
+  } finally { await f.app.terminate('TEST_DONE'); }
 });

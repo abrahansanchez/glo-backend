@@ -2,6 +2,10 @@ import moment from 'moment-timezone';
 import { createHash } from 'node:crypto';
 import { isSlotAvailable, getAvailableSlots } from '../../../../utils/ai/availabilityHelpers.js';
 
+function catalogueFailure(catalogueField, catalogueCategory) {
+  throw Object.assign(Error('UNSUPPORTED_CATALOGUE'), { catalogueField, catalogueCategory });
+}
+
 export class LiveBundleAvailability {
   constructor({ loadBusiness, checkSlot = isSlotAvailable, listSlots = getAvailableSlots, labels = {}, now = () => new Date() }) {
     Object.assign(this, { loadBusiness, checkSlot, listSlots, labels, now });
@@ -9,10 +13,23 @@ export class LiveBundleAvailability {
   async read() {
     const raw = await this.loadBusiness();
     if (!raw || !moment.tz.zone(raw.availability?.timezone)) throw Error('UNSUPPORTED_BUSINESS');
-    const services = (raw.services || []).map(s => ({ id: String(s._id || s.id || ''), name: s.name, price: s.price, durationMinutes: s.durationMinutes }));
-    if (!services.length || services.length > 64 || new Set(services.map(s => s.id)).size !== services.length
-      || new Set(services.map(s => s.name)).size !== services.length
-      || services.some(s => !/^[A-Za-z0-9_.:-]{1,128}$/.test(s.id) || typeof s.name !== 'string' || !s.name.trim() || s.name.length > 128 || /[\x00-\x1f]/.test(s.name))) throw Error('UNSUPPORTED_CATALOGUE');
+    const stored = raw.services || [];
+    if (!Array.isArray(stored)) catalogueFailure('services', 'INVALID_LIST');
+    if (!stored.length) catalogueFailure('services', 'EMPTY');
+    if (stored.length > 64) catalogueFailure('services', 'TOO_LARGE');
+    const services = stored.map(s => {
+      if (s?.name == null || typeof s.name === 'string' && !s.name.trim()) catalogueFailure('service.name', 'MISSING_NAME');
+      if (typeof s.name !== 'string' || s.name.length > 128 || /[\x00-\x1f]/.test(s.name)) catalogueFailure('service.name', 'INVALID_NAME');
+      // Existing production readers select stored services by name; older
+      // accepted records need not have a subdocument ID. This is an opaque
+      // application handle, never a claimed or persisted database service ID.
+      const id = s._id == null && s.id == null
+        ? `legacy:${createHash('sha256').update(s.name).digest('hex')}` : String(s._id || s.id || '');
+      if (!/^[A-Za-z0-9_.:-]{1,128}$/.test(id)) catalogueFailure('service.id', 'INVALID_ID');
+      return { id, name: s.name, price: s.price, durationMinutes: s.durationMinutes };
+    });
+    if (new Set(services.map(s => s.name)).size !== services.length) catalogueFailure('service.name', 'DUPLICATE_NAME');
+    if (new Set(services.map(s => s.id)).size !== services.length) catalogueFailure('service.id', 'DUPLICATE_ID');
     if (!this.labels || typeof this.labels !== 'object' || Array.isArray(this.labels)
       || Object.entries(this.labels).some(([id, values]) => !services.some(s => s.id === id) || !values || typeof values !== 'object' || Array.isArray(values)
         || Object.entries(values).some(([language, label]) => !['en', 'es'].includes(language) || typeof label !== 'string' || !label.trim() || label.length > 128 || /[\x00-\x1f]/.test(label)))) throw Error('INVALID_LABEL_CONFIGURATION');

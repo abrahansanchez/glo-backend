@@ -4,6 +4,8 @@ const STAGES = new Set(['BUSINESS_CONTEXT_READ', 'BUSINESS_CONTEXT_VALIDATE', 'M
 const CODES = new Set(['UNSUPPORTED_BUSINESS', 'UNSUPPORTED_CATALOGUE', 'INVALID_LABEL_CONFIGURATION', 'INVALID_BUSINESS_CLOCK', 'CATALOGUE_CHANGED', 'BUSINESS_TIMEZONE_CHANGED', 'TURN_LIMIT', 'CONNECTION_LIMIT', 'MODEL_REQUEST_LIMIT', 'TURN_REQUEST_LIMIT', 'REPLAY', 'STRUCTURE', 'INVALID_PLAN', 'PHONE_MODEL_CLOSED', 'PHONE_MODEL_UNAVAILABLE', 'PHONE_MODEL_PROVIDER_ERROR', 'PHONE_MODEL_PROTOCOL_ERROR', 'PHONE_MODEL_CONFIGURATION_MISMATCH', 'PHONE_MODEL_CORRELATION_FAILURE', 'PHONE_MODEL_RESPONSE_FAILURE', 'PHONE_MODEL_UNEXPECTED_OUTPUT', 'PHONE_MODEL_SEND_FAILED', 'PHONE_MODEL_CONNECTION_FAILED', 'PHONE_MODEL_CONNECTION_CLOSED']);
 const PROVIDER_CODES = new Set(['invalid_function_parameters', 'invalid_request_error', 'invalid_api_key', 'unknown_parameter', 'invalid_parameter', 'invalid_value', 'rate_limit_exceeded', 'server_error', 'internal_server_error', 'insufficient_quota']);
 const PROVIDER_TYPES = new Set(['invalid_request_error', 'authentication_error', 'rate_limit_error', 'server_error']);
+const CATALOGUE_FIELDS = new Set(['services', 'service.id', 'service.name']);
+const CATALOGUE_CATEGORIES = new Set(['INVALID_LIST', 'EMPTY', 'TOO_LARGE', 'INVALID_ID', 'DUPLICATE_ID', 'MISSING_NAME', 'INVALID_NAME', 'DUPLICATE_NAME']);
 export function phoneFailure(error, stage, provider = null) {
   const saved = error?.safeDiagnostic;
   const failureStage = STAGES.has(saved?.failureStage) ? saved.failureStage : STAGES.has(stage) ? stage : 'MODEL_CONNECTION';
@@ -14,6 +16,8 @@ export function phoneFailure(error, stage, provider = null) {
     failureCode: CODES.has(code) ? code : 'UNCLASSIFIED',
     providerCode: PROVIDER_CODES.has(raw.code || raw.providerCode) ? (raw.code || raw.providerCode) : 'UNKNOWN',
     providerType: PROVIDER_TYPES.has(raw.type || raw.providerType) ? (raw.type || raw.providerType) : 'UNKNOWN',
+    ...(CATALOGUE_FIELDS.has(error?.catalogueField || saved?.catalogueField) && CATALOGUE_CATEGORIES.has(error?.catalogueCategory || saved?.catalogueCategory)
+      ? { catalogueField: error?.catalogueField || saved.catalogueField, catalogueCategory: error?.catalogueCategory || saved.catalogueCategory } : {}),
     providerParam: typeof param === 'string' && (/^session\.tools\[[0-5]\]\.parameters$/.test(param)
       || ['session', 'session.type', 'session.model', 'session.output_modalities', 'session.max_output_tokens', 'session.tools', 'session.tool_choice'].includes(param)) ? param : 'UNKNOWN' });
 }

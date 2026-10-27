@@ -207,3 +207,28 @@ and persistence before media submission. This is not an immediate or streaming
 greeting guarantee. Missing earlier phase logs or saved WAV evidence cannot prove
 the cause of provider/header delay or a subjective slow-speech report. This repair
 does not change synthesis format, speed, pacing, prompts or startup authority.
+
+## Catalogue compatibility
+
+Existing production readers accept stored name/price/durationMinutes entries
+without a subdocument ID. For those entries only, the structured adapter derives
+an opaque `legacy:` plus SHA-256 handle from the exact stored name. It is stable
+across catalogue ordering and is not a claimed/persisted database ID. Existing
+IDs are preserved; malformed supplied IDs, duplicate IDs and duplicate names stay
+rejected. Hash collisions are also rejected by the ID uniqueness check.
+No names, prices, durations or translations are filled in. Zero prices remain
+zero; missing/invalid bundle price or duration remains unsupported. Canonical
+names remain usable without Spanish localization configuration.
+
+Catalogue rejection diagnostics include only allowlisted catalogueField and
+catalogueCategory values (list/size, ID, or name failures). They contain no service
+names/IDs, account data, service lists or transcripts. The synthetic missing-ID
+compatibility defect is reproduced from an existing production test fixture;
+the supplied aggregate live error alone does not prove which live guard failed.
+
+Preservation tests use Mongo service ID `507f1f77bcf86cd799439011` unchanged through
+draft selection, ordered bundle checks, alternative selection and canonical
+confirmation. ID-less handles are deterministic; accepted catalogues always have
+unique handles, and a collision with a supplied ID or another handle rejects.
+Raw catalogue records are not mutated, and the simulation never writes handles
+as database IDs. These synthetic proofs do not identify CA0543's live guard.
