@@ -342,6 +342,38 @@ headers/body waits, the single model request wait, transcription/turn admission
 and independent freshness work remain. These offline counts are not live speed
 measurements.
 
+## Incremental accepted-sentence audio
+
+Only structured-phone plans with private current bindings opt in to early WAV
+decoding. The provider request remains WAV; headers must identify 24 kHz mono
+16-bit PCM. The existing three-sample averaging/G.711 converter is reused on
+aligned groups, retaining split sample bytes across HTTP chunks. Complete 160-byte
+PCMU frames are submitted; a final short frame is released only after successful
+body/format validation, without padding or duplicated audio. WAV headers and
+metadata never become Twilio payloads. Header parsing and retained audio are
+bounded to 64 KiB and 32 MiB respectively. Other speech consumers keep the existing
+complete-buffer behavior.
+
+The exact application sentence is validated and persisted before first media.
+The existing fresh evidence check runs before each received converted batch;
+turn/proposal/floor/cancellation ownership is also checked at each frame write.
+Mid-body failure clears partial playback through the existing failure path.
+Interruption or changed evidence prevents further frames. Post-synthesis and
+mark-acknowledgment checks remain. There is no mark, completed response or
+confirmation delivery proof for a partial body. One final mark follows successful
+EOF, conversion and submission of every frame; it still requires a genuine Twilio
+acknowledgment. Deleting/clearing queued audio cannot undo sound already consumed.
+
+Controlled fixtures: first HTTP byte 20 ms, first decodable sample group 45 ms,
+first complete-frame submission 50 ms, body completion/final mark 100 ms. The
+buffered control first submits at 100 ms. An all-at-end fixture has first byte,
+decodable audio and first media at 100 ms and gets no earlier start. These are
+virtual fixture times, not live latency measurements or audible playback times.
+The supplied CAd5c2809f5a74903fca7e0582f64af0e8 evidence does not locate decodable
+samples inside HTTP chunks, so live early-audio availability remains unverified.
+No second request, retry, voice/rate change or timeout change is introduced.
+The separate 3 PM INVALID_PLAN hangup and spoken-time/date formatting remain unfixed.
+
 EN/ES offline journeys now use one request for each of eight turns. Baseline
 comparable turns used 2 (missing date), 3 (afternoon), 3 (correction/name), 2 (early
 affirmative), 2 (repeat confirmation), and 1 (delivered affirmative). The explicit

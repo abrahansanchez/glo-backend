@@ -125,12 +125,12 @@ export class SpeechLifecycleDiagnostics {
   abort(reason) { this.phase("ABORT_OBSERVED", { abortReason: reason }); }
 }
 
-export async function bufferSpeechBody(response, signal, measurement) {
+export async function bufferSpeechBody(response, signal, measurement, onChunk = null) {
   // Compatibility for injected fetch implementations without a Web ReadableStream.
   if (!response.body?.getReader) {
     const bytes = Buffer.from(await response.arrayBuffer());
     if (signal?.aborted) throw Object.assign(new Error("speech_aborted"), { name: "AbortError", code: "TTS_ABORTED" });
-    measurement.chunk(bytes.length); return bytes;
+    measurement.chunk(bytes.length); if (onChunk) await onChunk(bytes); return bytes;
   }
   const reader = response.body.getReader(); const chunks = [];
   let cancellationRequested = false;
@@ -148,6 +148,7 @@ export async function bufferSpeechBody(response, signal, measurement) {
       if (result.done) break;
       if (!types.isUint8Array(result.value)) throw new TypeError("speech_body_chunk_not_bytes");
       const bytes = Buffer.from(result.value); chunks.push(bytes); measurement.chunk(bytes.length);
+      if (onChunk) await onChunk(bytes);
     }
     return Buffer.concat(chunks);
   } catch (error) {

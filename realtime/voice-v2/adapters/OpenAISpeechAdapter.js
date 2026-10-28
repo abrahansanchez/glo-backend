@@ -2,6 +2,7 @@ import { Agent, fetch as speechFetch } from "undici";
 import { beginSpeechUndiciStages, invokeSpeechUndiciStages } from "../diagnostics/SpeechUndiciStages.js";
 import { SpeechPreparationDiagnostics, bufferSpeechBody } from "../audio/SpeechPreparationDiagnostics.js";
 import { extractPcm24kMonoFromWav, pcm24kToPcmu8k, speechAudioFormat } from "../audio/pcm24kToPcmu8k.js";
+import { IncrementalWavPcmu } from '../audio/IncrementalWavPcmu.js';
 
 const DEFAULT_ENDPOINT = "https://api.openai.com/v1/audio/speech";
 
@@ -56,7 +57,7 @@ export class OpenAISpeechAdapter {
     finally { transport.undiciStage?.settle(); trace.settle(); measurement.settle(); request.signal?.removeEventListener("abort", onAbort); close(); }
   }
 
-  async #synthesize({ input, language = "en", signal, clientRequestId: directClientRequestId, lifecycleDiagnostics, diagnosticContext, onPhaseDiagnostic, onUndiciStageDiagnostic, onResponseHeaders } = {}, trace, measurement, transport) {
+  async #synthesize({ input, language = "en", signal, clientRequestId: directClientRequestId, lifecycleDiagnostics, diagnosticContext, onPhaseDiagnostic, onUndiciStageDiagnostic, onResponseHeaders, onPcmuFrames, onDecodableAudio } = {}, trace, measurement, transport) {
     if (typeof input !== "string" || !input.trim()) throw new TypeError("speech_input_required");
     const clientRequestId = lifecycleDiagnostics ? lifecycleDiagnostics.clientRequestId : directClientRequestId;
     const startedAt = this.monotonicNow();
@@ -121,15 +122,21 @@ export class OpenAISpeechAdapter {
       providerStatus: response?.status, providerCode: await readProviderCode(response), ...httpClassification(response?.status),
     });
     let sourceAudio;
+    let firstDecodableAt = null;
+    const incremental = typeof onPcmuFrames === 'function' ? new IncrementalWavPcmu({ onDecodable: () => { firstDecodableAt = this.monotonicNow(); try { onDecodableAudio?.(); } catch {} }, onFrames: async frames => {
+      if (signal?.aborted) throw typedError('speech_request_aborted', 'TTS_ABORTED');
+      await onPcmuFrames(frames);
+      if (signal?.aborted) throw typedError('speech_request_aborted', 'TTS_ABORTED');
+    } }) : null;
     trace.phase("AUDIO_BODY_READ_STARTED");
-    try { sourceAudio = await bufferSpeechBody(response, signal, measurement); }
+    try { sourceAudio = await bufferSpeechBody(response, signal, measurement, incremental && (bytes => incremental.push(bytes))); }
     catch (error) { throw typedError("speech_provider_audio_read_failed", error?.code, fetchDiagnostic(error, signal)); }
     trace.phase("AUDIO_BODY_READ_COMPLETED");
     measurement.phase("AUDIO_BODY_COMPLETED");
     if (!sourceAudio.length) throw typedError("speech_provider_empty_audio", "TTS_EMPTY_AUDIO", { failureClass: "EMPTY_AUDIO", transient: false });
     measurement.phase("WAV_CONVERSION_STARTED");
     let audio;
-    try { audio = pcm24kToPcmu8k(extractPcm24kMonoFromWav(sourceAudio)); }
+    try { audio = incremental ? await incremental.finish() : pcm24kToPcmu8k(extractPcm24kMonoFromWav(sourceAudio)); }
     catch (error) { throw typedError("speech_provider_invalid_audio", error?.code, { failureClass: error?.code === "TTS_INVALID_AUDIO" ? "INVALID_AUDIO" : "UNKNOWN", transient: error?.code === "TTS_INVALID_AUDIO" ? false : null }); }
     trace.phase("WAV_CONVERSION_COMPLETED");
     measurement.settle();
@@ -147,6 +154,7 @@ export class OpenAISpeechAdapter {
       inputCharacterCount: input.length,
       firstAudioLatencyMs: latencyMs,
       totalLatencyMs: latencyMs,
+      ...(incremental ? { firstDecodableAudioLatencyMs: firstDecodableAt === null ? null : Math.max(0, firstDecodableAt - startedAt) } : {}),
       durationMs: (audio.length / speechAudioFormat.targetSampleRate) * 1000,
     });
   }

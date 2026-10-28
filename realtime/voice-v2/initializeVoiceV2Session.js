@@ -870,6 +870,10 @@ export function initializeVoiceV2Session({
       onPhaseDiagnostic: event => { observeSpeechDelivery(observed, event); safeEmit(event); },
       onUndiciStageDiagnostic: event => { observeSpeechDelivery(observed, event); return emit(event); },
       preparationDiagnostics: measurement,
+      ...(structuredDriver && plan.structuredBinding ? {
+        onDecodableAudio: () => callTrace.entry('SPEECH_FIRST_DECODABLE_AUDIO', timingDetails({ requestId, responseId })),
+        onPcmuFrames: frames => submitIncrementalSpeech(state, attempt, frames),
+      } : {}),
     }); }).then(
       (result) => {
         if (state.speechAttempt !== attempt || abortController.signal.aborted || (attempt.number === 2 && !deliveryCurrent(state))) { observeDisposition({ deliveryObservation: observed }, "STALE", deliveryStaleReason(state)); return; }
@@ -906,6 +910,44 @@ export function initializeVoiceV2Session({
       && session.floorOwner.owns({ requestId: state.requestId, responseId: state.responseId || null, proposalVersion: state.plan.proposalVersion });
   }
 
+  async function submitIncrementalSpeech(state, attempt, frames) {
+    const aborted = () => Object.assign(Error('incremental_speech_retired'), { code: 'TTS_ABORTED' });
+    const current = () => state.speechAttempt === attempt && !attempt.abortController.signal.aborted
+      && preparationCurrent(state) && deliveryCurrent(state, true) && structuredDriver.currentPlan(state.plan);
+    if (!current()) {
+      if (state.streamedAudio && !attempt.abortController.signal.aborted) clearPlayback('PROPOSAL_CHANGED', state);
+      throw aborted();
+    }
+    if (!Array.isArray(frames) || frames.some(frame => !Buffer.isBuffer(frame) || !frame.length || frame.length > 160)) throw Object.assign(Error('invalid_pcmu_frame'), { code: 'TTS_INVALID_AUDIO' });
+    if (!state.earlyPersisted) {
+      state.transcript = state.plan.speechContract.requiredMessage;
+      const validation = coordinator.speechValidator(state.plan, state.transcript);
+      if (!validation.valid) throw Object.assign(Error('unaccepted_application_sentence'), { code: 'TTS_INVALID_AUDIO' });
+      let persisted;
+      try { persisted = await lifecycle.appendTurn({ turnId: `${state.responseId}:assistant`, role: 'assistant', text: state.transcript, timestamp: now() }); }
+      catch { if (current()) failPreparation(state, 'ASSISTANT_PERSISTENCE_FAILED'); throw aborted(); }
+      if (!current()) throw aborted();
+      if (persisted?.success !== true) { failPreparation(state, 'ASSISTANT_PERSISTENCE_FAILED'); throw aborted(); }
+      state.earlyPersisted = true;
+    }
+    // Await the existing evidence check before each incoming batch, then recheck
+    // ownership synchronously for every complete frame before its actual write.
+    if (!await structuredDriver.applicable(state.plan, 'BEFORE_MEDIA') || !current()) {
+      if (current()) { clearPlayback('PROPOSAL_CHANGED', state); structuredDriver.close(); void lifecycle.terminate('STRUCTURED_STALE_EVIDENCE'); }
+      throw aborted();
+    }
+    if (!state.streamedAudio && !session.floorOwner.beginSpeaking({ requestId: state.requestId, responseId: state.responseId, proposalVersion: state.plan.proposalVersion })) throw aborted();
+    for (const frame of frames) {
+      if (!current()) throw aborted();
+      state.streamedAudio = true;
+      observeDeliveryWrite(state, 'MEDIA_SUBMITTED', () => twilio.submitAudio({ payload: frame.toString('base64') }));
+      state.submittedAudioBytes += frame.length;
+      callTrace.recordAudio('assistant', frame.length, { ...timingDetails({ responseId: state.responseId }), audioBoundary: 'MEDIA_SUBMITTED', transport: 'HTTP_SPEECH' });
+      timing.once('FIRST_TWILIO_AUDIO_SUBMITTED', state.responseId, timingDetails({ responseId: state.responseId }));
+      callTrace.recordTwilioAudio(timingDetails({ responseId: state.responseId }));
+    }
+  }
+
   function retrySpeech(state, reason) {
     if (structuredPhone) return false;
     const diagnostics = state.lifecycleDiagnostics;
@@ -938,6 +980,7 @@ export function initializeVoiceV2Session({
     if (result?.format !== "audio/pcmu") return responseFailed(responseId, "TTS_INVALID_AUDIO");
     const audio = Buffer.isBuffer(result.audio) ? result.audio : Buffer.from(result.audio || []);
     if (!audio.length) return responseFailed(responseId, "TTS_EMPTY_AUDIO");
+    if (state.streamedAudio && state.submittedAudioBytes !== audio.length) return responseFailed(responseId, 'TTS_INVALID_AUDIO');
 
     state.transcript = state.plan.speechContract.requiredMessage;
     state.audio = [audio.toString("base64")];
@@ -953,6 +996,7 @@ export function initializeVoiceV2Session({
       sourceFormat: result.sourceFormat || null,
       targetFormat: result.format,
       firstAudioLatencyMs: finiteNumber(result.firstAudioLatencyMs),
+      ...(state.streamedAudio ? { firstDecodableAudioLatencyMs: finiteNumber(result.firstDecodableAudioLatencyMs) } : {}),
       totalLatencyMs: finiteNumber(result.totalLatencyMs),
       audioBytes: audio.length,
     });
@@ -999,6 +1043,7 @@ export function initializeVoiceV2Session({
 
   function failPreparation(state, reason, timedOut = false) {
     if (!invalidatePreparation(state, reason, timedOut)) return;
+    if (state.streamedAudio && state.submittedAudioBytes > 0) clearPlayback(reason, state);
     if (state.deliveryObservation) {
       state.deliveryObservation.timeout ||= timedOut;
       if (!state.deliveryObservation.settled) observeDisposition(state, state.delivery.attempts === 2 ? "RETRY_EXHAUSTED"
@@ -1173,6 +1218,7 @@ export function initializeVoiceV2Session({
     }
     if (structuredDriver && state.plan.structuredBinding && !await structuredDriver.applicable(state.plan, 'AFTER_SYNTHESIS')) {
       observeDisposition(state, 'STALE', 'STATE_CHANGED_DURING_SPEECH');
+      if (state.streamedAudio) clearPlayback('PROPOSAL_CHANGED', state);
       if (!structuredDriver.currentPlan(state.plan)) return supersedeResponse(state, 'CALLER_INTERRUPTION');
       structuredDriver.close(); return lifecycle.terminate('STRUCTURED_STALE_EVIDENCE');
     }
@@ -1194,7 +1240,7 @@ export function initializeVoiceV2Session({
     if (!current || !validation.valid || state.audioBytes <= 0) return responseFailed(responseId, !current ? "STALE_PROPOSAL" : validation.failedInvariant || "NO_AUDIO");
     if (!state.preparation) deliveryBoundary(state, "AUDIO_PREPARED");
     if (!state.preparation) session.responseRegistry.complete(responseId, { validationResult: validation });
-    if (state.transcript != null) {
+    if (state.transcript != null && !state.earlyPersisted) {
       const persistenceTiming = timing.start("TRANSCRIPT_PERSISTENCE", { ...timingDetails({ responseId }), turnId: `${responseId}:assistant`, role: "assistant" });
       state.preparationDiagnostics?.pending();
       state.preparationDiagnostics?.phase("ASSISTANT_PERSISTENCE_STARTED");
@@ -1217,20 +1263,23 @@ export function initializeVoiceV2Session({
     if (state.preparation) {
       if (performance.now() >= state.preparation.identity.deadlineAt) return failPreparation(state, "SPEECH_PREPARATION_TIMEOUT", true);
       if (!preparationCurrent(state)) { observeDisposition(state, "STALE", deliveryStaleReason(state)); return; }
-      if (!session.floorOwner.beginSpeaking({ requestId: state.requestId, responseId, proposalVersion: state.plan.proposalVersion })) return failPreparation(state, "PREPARATION_OWNER_MISMATCH");
+      if (!state.streamedAudio && !session.floorOwner.beginSpeaking({ requestId: state.requestId, responseId, proposalVersion: state.plan.proposalVersion })) return failPreparation(state, "PREPARATION_OWNER_MISMATCH");
       if (!preparationCurrent(state)) { observeDisposition(state, "STALE", deliveryStaleReason(state)); return; }
       session.responseRegistry.complete(responseId, { validationResult: validation });
     }
     if (structuredDriver && state.plan.structuredBinding) {
-      if (!await structuredDriver.applicable(state.plan, 'BEFORE_MEDIA') || !deliveryCurrent(state)) {
+      if (!await structuredDriver.applicable(state.plan, 'BEFORE_MEDIA') || !deliveryCurrent(state, Boolean(state.streamedAudio))) {
+        if (state.streamedAudio) clearPlayback('PROPOSAL_CHANGED', state);
         if (!structuredDriver.currentPlan(state.plan)) return supersedeResponse(state, 'CALLER_INTERRUPTION');
         structuredDriver.close(); return lifecycle.terminate('STRUCTURED_STALE_EVIDENCE');
       }
     }
     if (state.preparation || requiresBufferedDelivery(state.plan)) {
-      observeDeliveryWrite(state, "MEDIA_SUBMITTED", () => twilio.submitAudio({ payload: Buffer.concat(state.audio.map((part) => Buffer.from(part, "base64"))).toString("base64") }));
-      state.submittedAudioBytes = state.audioBytes;
-      if (structuredPhone && state.transport === 'application_tts') callTrace.recordAudio('assistant', state.audioBytes, { ...timingDetails({ responseId }), audioBoundary: 'MEDIA_SUBMITTED', transport: 'HTTP_SPEECH' });
+      if (!state.streamedAudio) {
+        observeDeliveryWrite(state, "MEDIA_SUBMITTED", () => twilio.submitAudio({ payload: Buffer.concat(state.audio.map((part) => Buffer.from(part, "base64"))).toString("base64") }));
+        state.submittedAudioBytes = state.audioBytes;
+      }
+      if (structuredPhone && state.transport === 'application_tts' && !state.streamedAudio) callTrace.recordAudio('assistant', state.audioBytes, { ...timingDetails({ responseId }), audioBoundary: 'MEDIA_SUBMITTED', transport: 'HTTP_SPEECH' });
       if (state.preparation) {
         state.preparation.submitted();
         session.watchdog.cancel(`preparation:${responseId}`);
