@@ -279,9 +279,13 @@ evidenceCurrent and nextAction fields. Missing draft information is not proof th
 the caller omitted it. Availability OK describes a completed check, not necessarily
 an available slot or permission to confirm.
 
-On the fourth response only, a single, structurally valid, current-bound explicit
-canonical-confirmation request hands off to the existing application renderer:
-ready evidence produces canonical readback, missing fields produce collection,
+On any response, a single, structurally valid, current-bound explicit
+canonical-confirmation request with successful eligibility hands off to the
+existing canonical renderer. A successful submit_confirmation_meaning result
+hands off to the existing simulation explanation only after caller intent,
+delivered-confirmation authority and fresh availability have been checked.
+Neither handoff acknowledges playback. Rejected consent retains model recovery.
+On the fourth response only, canonical eligibility recovery still handles missing fields with collection,
 and unavailable evidence produces its verified explanation/current alternatives.
 Unknown or stale availability cannot produce confirmation. No fifth model request,
 slot substitution, delivery acknowledgment or booking authority is introduced.
@@ -290,3 +294,13 @@ The rendered plan retains all asynchronous release and mark freshness checks.
 Ordinary offers omit service enumeration; canonical readback retains it. Generic
 unavailability describes the requested time, without inventing an hours or closure
 cause. Only a verified BUSINESS_CLOSED result supplies a closure explanation.
+
+For CA3865975fc7f03273342a90b5638cb712, confirmation-turn requests 11–14
+took 2.275, 1.974, 1.674 and 2.826 seconds (8.749 seconds total).
+Request 13 returned successful canonical eligibility; request 14 merely selected
+the corresponding plan. Consent request 15 returned WOULD_AUTHORIZE; request 16
+took another 2.020 seconds to select the simulation explanation. These successful
+single-tool results now use application-owned rendering without those subsequent
+model requests. Offline EN/ES journeys prove confirmation 4→3 requests and
+delivered consent 2→1 with the same rendered meaning. These counts do not promise
+live latency savings or change TTS, freshness, interruption or request limits.

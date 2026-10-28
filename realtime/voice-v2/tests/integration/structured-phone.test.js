@@ -101,6 +101,47 @@ test('phone selectors: explicit exact resolved business allowlist only; no email
   assert.equal(selectStructuredPhone(env, ID), true); assert.equal(selectStructuredPhone(env, 'other'), false);
 });
 
+for (const tool of ['request_canonical_confirmation', 'submit_confirmation_meaning']) for (const foreign of [false, true]) test(`phone authoritative result handoff refuses ${tool} ${foreign ? 'foreign' : 'stale'} binding`, async () => {
+  const f = await harness({ script: m => {
+    if (m.turn === 1) return seedScript(m);
+    const binding = { ...m.binding, ...(foreign ? { turnId: 'foreign-turn' } : { proposalVersion: m.binding.proposalVersion - 1 }) };
+    return [call(tool, { ...binding, ...(tool === 'submit_confirmation_meaning' ? { meaning: 'AFFIRM' } : {}) })];
+  } });
+  try {
+    await f.turn(); await f.ack(f.twilio.sent.filter(p => p.event === 'mark').at(-1).mark.name);
+    const speech = f.speech.length, requests = f.requests.length;
+    await f.turn('yes');
+    assert.equal(f.requests.length - requests, 4); assert.equal(f.speech.length, speech);
+    assert.equal(f.models[0].results.at(-1).reason, 'STALE_BINDING');
+    assert.equal(f.emitted.some(e => e.stage === 'WOULD_AUTHORIZE'), false); assert.equal(f.executorCalls, 0);
+  } finally { await f.app.terminate('TEST_DONE'); }
+});
+
+for (const language of ['en', 'es']) test(`phone authoritative result handoff: ${language} confirmation and simulated consent skip redundant plans`, async () => {
+  const f = await harness({ language, script: m => {
+    if (m.turn === 1) {
+      if (m.round < 3) return seedScript(m);
+      if (m.round === 3) return [call('request_canonical_confirmation', m.binding)];
+      return plan(m, 'CANONICAL_CONFIRMATION');
+    }
+    if (m.round === 1) return [call('submit_confirmation_meaning', { ...m.binding, meaning: 'AFFIRM' })];
+    return plan(m, 'EXPLAIN_SIMULATION');
+  } });
+  try {
+    await f.turn(); assert.equal(f.requests.length, 3);
+    assert.match(f.speech.at(-1).input, /Total: \$32/);
+    assert.match(f.speech.at(-1).input, language === 'es' ? /corte de pelo/ : /Precision Cut/);
+    assert.equal(f.emitted.some(e => e.stage === 'WOULD_AUTHORIZE'), false);
+    const mark = f.twilio.sent.filter(p => p.event === 'mark').at(-1).mark.name;
+    await f.ack(mark);
+    const before = f.requests.length; await f.turn(language === 'es' ? 'sí' : 'yes');
+    assert.equal(f.requests.length - before, 1);
+    assert.equal(f.emitted.filter(e => e.stage === 'WOULD_AUTHORIZE').length, 1);
+    assert.match(f.speech.at(-1).input, language === 'es' ? /no se ha reservado ninguna cita/ : /no appointment was booked/);
+    assert.equal(f.executorCalls, 0);
+  } finally { await f.app.terminate('TEST_DONE'); }
+});
+
 for (const selection of ['disabled', 'missing', 'mismatch', 'selected']) test(`phone production composition ${selection}: resolved identity selects experimental configuration only`, async () => {
   const socket = new FakeSocket(), events = []; let options;
   const env = { ENABLE_VOICE_V2_ROUTE: 'true', VOICE_V2_TEST_BUSINESS_ID: ID, OPENAI_API_KEY: 'SYNTHETIC_ONLY', OPENAI_MODEL: 'gpt-realtime',

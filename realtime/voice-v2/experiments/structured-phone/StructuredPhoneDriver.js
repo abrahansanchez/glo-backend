@@ -114,11 +114,13 @@ export class StructuredPhoneDriver {
               available: typeof result.available === 'boolean' ? result.available : null, evidenceCurrent: Boolean(this.freshEvidence()),
               ...(call.name === 'request_canonical_confirmation' ? { eligibilityReason: result.eligibilityReason || 'STALE_BINDING', missingFields: result.missingFields || [] } : {}),
             } : {}) });
-          // Only a valid explicit confirmation request may finish the last
-          // model response through the application-owned readiness gate.
-          if (call.name === 'request_canonical_confirmation' && calls.length === 1 && round === PHONE_LIMITS.perTurnRequests - 1
-            && result.reason !== 'STALE_BINDING') {
-            const plan = this.confirmationRecoveryPlan();
+          // Successful authority checks already select their application-owned
+          // response. Rejections retain model recovery and the final-round gate.
+          const readyConfirmation = call.name === 'request_canonical_confirmation' && result.status === 'OK' && result.eligible === true;
+          const simulatedConsent = call.name === 'submit_confirmation_meaning' && result.status === 'WOULD_AUTHORIZE' && result.simulated === true;
+          const finalRecovery = call.name === 'request_canonical_confirmation' && round === PHONE_LIMITS.perTurnRequests - 1 && result.reason !== 'STALE_BINDING';
+          if (calls.length === 1 && (readyConfirmation || simulatedConsent || finalRecovery)) {
+            const plan = simulatedConsent ? this.render({ ...this.binding(), type: 'EXPLAIN_SIMULATION' }) : this.confirmationRecoveryPlan();
             if (plan && current()) {
               this.log('PLAN_VALIDATED', { turn: this.turns, proposalVersion: this.session.proposal.proposalVersion, source: 'APPLICATION_CONFIRMATION_GATE', atMs: performance.now() });
               stage = 'SPEECH_SUBMISSION'; const delivery = await this.speak(plan);
