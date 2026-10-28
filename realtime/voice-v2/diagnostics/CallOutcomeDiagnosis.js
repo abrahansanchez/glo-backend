@@ -1,4 +1,5 @@
 // Diagnostic-only aggregation. No transcript, raw error, timers, observers or effect callbacks retained.
+import { STRUCTURED_BOUNDARIES, STRUCTURED_FAILURE_REASONS } from './StructuredPhoneFailure.js';
 const AVAILABILITY=new Set(['CHECK_AVAILABILITY','REQUEST_AVAILABLE_TIMES_FOR_DATE','REQUEST_LATER_TIME']);
 const UNRESOLVED=new Set(['UNKNOWN','NO_INFORMATION','CLARIFY']);
 const BOUNDARIES=new Set(['PLAN_ACCEPTED','REQUEST_CREATED','REQUEST_BODY_SENT','RESPONSE_HEADERS_RECEIVED','RESPONSE_BODY_COMPLETED','AUDIO_CONVERTED','AUDIO_PREPARED','ASSISTANT_PERSISTED','MEDIA_SUBMITTED','MARK_CREATED','MARK_ACKNOWLEDGED','RECOVERY_STARTED','RECOVERY_MEDIA_SUBMITTED','RECOVERY_MARK_CREATED','RECOVERY_MARK_ACKNOWLEDGED','TERMINATION_REQUESTED']);
@@ -9,6 +10,14 @@ export class CallOutcomeDiagnosis {
  #empty=0;#interpretation=0;#limitReached=false;#transcriptionFailure=0;#items=new Map();
  #currentVersion=null;#caller=false;#provider=false;#counts=Object.fromEntries(COUNT_FIELDS.map(k=>[k,0]));
  #commands=new Map();
+ #structuredFailure=null;
+ structuredFailure(record){
+  try{
+   if(this.#closed||this.#structuredFailure||record?.event!=='V2_STRUCTURED_PHONE_FAILURE')return;
+   if(!STRUCTURED_BOUNDARIES.includes(record.stage)||!STRUCTURED_BOUNDARIES.includes(record.lastCompletedBoundary)||!STRUCTURED_FAILURE_REASONS.includes(record.reasonCode))return;
+   this.#structuredFailure={failed:record.stage,last:record.lastCompletedBoundary,reasonCode:record.reasonCode};
+  }catch{/* No diagnostic callback changes aggregation or call behavior. */}
+ }
  #increment(key){this.#counts[key]=Math.min(1000000,this.#counts[key]+1);}
  // Keep identities only to a fixed ceiling; never evict and recount a command.
  #command(type,commandId){
@@ -118,6 +127,8 @@ export class CallOutcomeDiagnosis {
   const out={};
   for(const k of ['event','traceEvent','callSid','streamSid','buildSha','sequence','elapsedMs','wallTime','callerSpeechActive','assistantAudioActive','durationMs','finalProposalVersion','finalRequirement','appointmentId','finalOutcome','remainingTimerCount','remainingEffectCount','remainingResponseCount','remainingPlaybackCount','callerTurnCount','assistantResponseCount','callerAudioChunks','callerAudioBytes','firstCallerAudioElapsedMs','lastCallerAudioElapsedMs','firstCallerAudioAt','lastCallerAudioAt','assistantAudioChunks','assistantAudioBytes','firstAssistantAudioElapsedMs','lastAssistantAudioElapsedMs','firstAssistantAudioAt','lastAssistantAudioAt','availabilityEffectCount','bookingEffectCount','smsCommandCount','finalizationCount','transportCloseCount'])if(Object.hasOwn(base,k))out[k]=base[k];
   Object.assign(out,{schemaVersion:1,businessOutcome,communicationOutcome,primaryFailureCategory:root?.category||(this.#limited?'UNKNOWN':'NONE'),primaryFailureReason:root?.reason||(this.#limited?'UNKNOWN':'NONE'),primaryFailureLastSuccessfulBoundary:root?.last||'NONE',primaryFailureBoundary:root?.failed||'NONE',...this.#counts,callerDisconnected:this.#caller,providerDisconnected:this.#provider});
+  if(this.#structuredFailure){out.primaryFailureBoundary=this.#structuredFailure.failed;out.primaryFailureLastSuccessfulBoundary=this.#structuredFailure.last;}
+  out.primaryFailureReasonCode=this.#structuredFailure?.reasonCode||(root?'UNKNOWN':'NONE');
   this.#closed=true;this.#items.clear();this.#commands.clear();return Object.freeze(out);
  }
 }

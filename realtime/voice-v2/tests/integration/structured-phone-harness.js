@@ -40,7 +40,7 @@ function seedScript(m) {
     { kind: 'SET_SERVICE', serviceId: 'service-cut-91' }, { kind: 'SET_DATE', date: '2026-10-27' },
     { kind: 'SET_TIME', time: '17:00' }, { kind: 'SET_NAME', name: 'Synthetic Tester' },
   ] })];
-}async function harness({ language = 'en', script = seedScript, available = true, beforeSpeech, beforeGreeting, afterAssistantPersist, raw = business(), scheduler, wire = false, wireConfigurationError = null, injectedSpeechAdapter = null,
+}async function harness({ language = 'en', script = seedScript, available = true, beforeSpeech, beforeGreeting, afterAssistantPersist, raw = business(), scheduler, wire = false, wireConfigurationError = null, injectedSpeechAdapter = null, onCreateModel = null,
   labels = { 'service-cut-91': { es: 'corte de pelo' }, 'service-beard-72': { es: 'recorte de barba' } } } = {}) {
   const requests = [], models = [], speech = [], emitted = [], checks = []; let executorCalls = 0;
   const availability = new LiveBundleAvailability({ loadBusiness: async () => raw, now: () => new Date('2026-10-25T16:00:00Z'),
@@ -60,7 +60,8 @@ function seedScript(m) {
     speechAdapter: injectedSpeechAdapter || { async synthesize(request) { speech.push(request); if (beforeGreeting && request.input.includes('AI receptionist')) await beforeGreeting(request, app);
       if (beforeSpeech && !request.input.includes('AI receptionist')) await beforeSpeech(request, app);
       return { audio: Buffer.from([1, 2, 3]), format: 'audio/pcmu' }; } },
-    structuredPhone: { availability, createModel: (tools, onFailure) => {
+    structuredPhone: { availability, createModel: (tools, onFailure, diagnostics) => {
+      onCreateModel?.();
       if (!wire) { const model = fakeModel(script, requests, models); model.onFailure = onFailure; return model; }
       const socket = new FakeSocket(), state = { turn: 0, round: 0, results: [] }; let sequence = 0;
       const baseSend = socket.send.bind(socket);
@@ -77,7 +78,7 @@ function seedScript(m) {
           socket.receive({ type: 'response.done', response: { id, status: 'completed', output: calls.map((c, i) => ({ type: 'function_call', call_id: id + '-' + i, name: c.name, arguments: JSON.stringify(c.args) })) } });
         });
       };
-      const model = new PhoneModelTransport(socket, tools, 'gpt-realtime', onFailure); models.push({ socket, close() { model.close(); }, get closed() { return socket.closeCalls.length > 0; } });
+      const model = new PhoneModelTransport(socket, tools, 'gpt-realtime', onFailure, diagnostics); models.push({ socket, close() { model.close(); }, get closed() { return socket.closeCalls.length > 0; } });
       queueMicrotask(() => socket.open()); return model;
     } }, emit: e => emitted.push(e),
   });

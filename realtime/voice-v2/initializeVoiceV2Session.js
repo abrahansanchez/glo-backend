@@ -1,4 +1,5 @@
 import { CallOutcomeDiagnosis } from "./diagnostics/CallOutcomeDiagnosis.js";
+import { StructuredPhoneFailure } from './diagnostics/StructuredPhoneFailure.js';
 import { disposeSpeechUndiciStages } from "./diagnostics/SpeechUndiciStages.js";
 import { randomUUID } from "node:crypto";
 import { SpeechPreparationDiagnostics, SpeechLifecycleDiagnostics } from "./audio/SpeechPreparationDiagnostics.js";
@@ -84,6 +85,8 @@ export function initializeVoiceV2Session({
   let localRecoveryStarted = false;
   let recoveryObservationOrigin = null;
   const outcomeDiagnosis = new CallOutcomeDiagnosis();
+  const structuredDiagnostics = structuredPhone ? new StructuredPhoneFailure({ callSid, emit, onFirst: event => outcomeDiagnosis.structuredFailure(event) }) : null;
+  const observeStructured = (method, ...args) => { try { return structuredDiagnostics?.[method]?.(...args); } catch {} };
   const safeEmit = (event) => { try {
     if (event?.traceEvent === "CALL_SUMMARY") {
       const summary = outcomeDiagnosis.summary(event, session.proposal.terminal);
@@ -164,9 +167,12 @@ export function initializeVoiceV2Session({
     } catch { /* Diagnostic state never owns delivery. */ }
   }
   function observeDeliveryWrite(state, boundary, operation) {
+    const mark = boundary.includes('MARK');
+    observeStructured('start', mark ? 'MARK_HANDLING' : 'MEDIA_SUBMISSION', mark ? 'sendPlaybackMark' : 'submitTwilioMedia');
     const d = state.deliveryObservation; if (d && !d.settled) d.pending = boundary;
-    try { const result = operation(); deliveryBoundary(state, boundary); return result; }
+    try { const result = operation(); deliveryBoundary(state, boundary); observeStructured('done', mark ? 'MARK_HANDLING' : 'MEDIA_SUBMISSION', mark ? 'sendPlaybackMark' : 'submitTwilioMedia'); return result; }
     catch (error) {
+      observeStructured('failure', error, { reasonCode: mark ? 'MARK_SUBMISSION_FAILED' : 'MEDIA_SUBMISSION_FAILED', stage: mark ? 'MARK_HANDLING' : 'MEDIA_SUBMISSION', operation: mark ? 'sendPlaybackMark' : 'submitTwilioMedia' });
       observeDisposition(state, boundary.includes("MARK") ? "MARK_SUBMISSION_FAILED" : "MEDIA_SUBMISSION_FAILED",
         boundary.includes("MARK") ? "MARK_SUBMISSION_FAILED" : "MEDIA_SUBMISSION_FAILED");
       throw error; // Preserve the existing operational catch/recovery path exactly.
@@ -199,6 +205,7 @@ export function initializeVoiceV2Session({
     if ([TransportEvent.TWILIO_STREAM_STOPPED, TransportEvent.TWILIO_CONNECTION_CLOSED, TransportEvent.TWILIO_TRANSPORT_ERROR,
       TransportEvent.OPENAI_CONNECTION_CLOSED, TransportEvent.OPENAI_TRANSPORT_ERROR].includes(event.type) && event.error?.code !== "response_cancel_not_active") {
       deliveryStopping = true;
+      observeStructured('secondary', event.type);
       structuredDriver?.close();
       disposeSpeechUndiciStages(callSid); transcriptionDiagnostics.close();
     }
@@ -254,7 +261,7 @@ export function initializeVoiceV2Session({
   lifecycle = new SessionLifecycle({ session, transcriptAdapter, callerNumber, cleanup, onTerminating: () => { disposeSpeechUndiciStages(callSid); transcriptionDiagnostics.close(); } });
   if (structuredPhone) {
     if (!speechAdapter || typeof structuredPhone.createModel !== 'function' || !structuredPhone.availability) throw TypeError('STRUCTURED_PHONE_CONFIGURATION_REQUIRED');
-    structuredDriver = new StructuredPhoneDriver({ session, businessContext, ...structuredPhone, now,
+    structuredDriver = new StructuredPhoneDriver({ session, businessContext, ...structuredPhone, now, diagnostics: structuredDiagnostics,
       replace: (previous, next) => { session.replaceProposal(previous, next); supersedeProposal(previous.proposalVersion); },
       speak: plan => enqueue(async () => {
         structuredDriver.log('SPEECH_HANDOFF_STARTED', { purpose: plan.purpose, proposalVersion: plan.proposalVersion, turnId: plan.structuredBinding?.turnId });
@@ -271,13 +278,15 @@ export function initializeVoiceV2Session({
           outcome: result?.accepted ? 'PREPARATION_ACCEPTED' : 'WITHHELD', reason: result?.accepted ? 'NONE' : reason });
         if (result?.reason === 'STRUCTURED_STALE_EVIDENCE' && structuredDriver.currentPlan(plan)) return lifecycle.terminate('STRUCTURED_STALE_EVIDENCE');
         return result;
-      }), terminate: reason => { structuredDriver.close(); return enqueue(() => lifecycle.terminate(reason)); }, emit: event => {
+      }), terminate: reason => { observeStructured('termination', 'structuredTerminate', reason); structuredDriver.close(); return enqueue(() => lifecycle.terminate(reason)); }, emit: event => {
         if (['STOPPED', 'MODEL_PROTOCOL_FAILED'].includes(event.stage)) session.record('STRUCTURED_DECISION_FAILED', {
           failureStage: event.failureStage, failureCode: event.failureCode,
         });
         safeEmit(event);
       } });
-    session.watchdog.schedule('structured-call-deadline', PHONE_LIMITS.callMs, () => { structuredDriver.close(); void lifecycle.terminate('STRUCTURED_CALL_LIMIT'); });
+    session.watchdog.schedule('structured-call-deadline', PHONE_LIMITS.callMs, () => {
+      observeStructured('failure', null, { reasonCode: 'CALL_LIMIT', guard: 'callMs', limit: PHONE_LIMITS.callMs, stage: 'TERMINATION', operation: 'callDeadline', terminationRequestedBy: { function: 'structuredCallDeadline', reasonCode: 'STRUCTURED_CALL_LIMIT' } });
+      observeStructured('termination', 'structuredCallDeadline', 'STRUCTURED_CALL_LIMIT'); structuredDriver.close(); void lifecycle.terminate('STRUCTURED_CALL_LIMIT'); });
     safeEmit({ event: 'V2_STRUCTURED_PHONE_SELECTED', buildSha, mode: 'SIMULATION_ONLY', limits: PHONE_LIMITS });
   }
   session.record("V2_SESSION_STARTED", { proposalVersion: proposal.proposalVersion });
@@ -286,6 +295,7 @@ export function initializeVoiceV2Session({
 
   function enqueue(operation) {
     processing = processing.then(operation, operation).catch((error) => {
+      observeStructured('failure', error);
       session.record("SESSION_OPERATION_FAILED", { reason: error?.message || String(error) });
       return lifecycle.terminate("SESSION_OPERATION_FAILED");
     });
@@ -390,7 +400,9 @@ export function initializeVoiceV2Session({
     if (event.type !== TransportEvent.RESPONSE_AUDIO_DELTA) safeEmit(event);
     if (event.type === TransportEvent.STALE_RESPONSE_EVENT_QUARANTINED) callTrace.entry("STALE_RESULT_IGNORED", { ...timingDetails(event), operation: event.originalType || event.type, reason: event.reason || "STALE_RESPONSE" });
     if (lifecycle.terminated) return;
-    if (structuredPhone && event.type === TransportEvent.RESPONSE_AUDIO_DELTA) { structuredDriver.close(); return lifecycle.terminate('STRUCTURED_UNEXPECTED_MODEL_AUDIO'); }
+    if (structuredPhone && event.type === TransportEvent.RESPONSE_AUDIO_DELTA) {
+      observeStructured('failure', null, { reasonCode: 'PHONE_MODEL_UNEXPECTED_OUTPUT', guard: 'UNEXPECTED_MODEL_OUTPUT', stage: 'MODEL_RESPONSE', operation: 'validateFunctionCalls', terminationRequestedBy: { function: 'onOpenAI', reasonCode: 'STRUCTURED_UNEXPECTED_MODEL_AUDIO' } });
+      observeStructured('termination', 'onOpenAI', 'STRUCTURED_UNEXPECTED_MODEL_AUDIO'); structuredDriver.close(); return lifecycle.terminate('STRUCTURED_UNEXPECTED_MODEL_AUDIO'); }
     if (event.type === TransportEvent.OPENAI_CONNECTED) {
       return;
     }
@@ -500,6 +512,7 @@ export function initializeVoiceV2Session({
     } finally { timing.end("TRANSCRIPT_PERSISTENCE", persistenceTiming, { turnId, role: "caller", itemId: providerId }); }
     session.record("TURN_ACCEPTED", { turnId, providerId });
     if (callerSpeechOverlap) {
+      observeStructured('quarantine');
       observeConsent("admission", providerId, { status: "QUARANTINED", reason: "NEWER_CALLER_SPEECH_ACTIVE", turnId });
       session.record("SUPERSEDED_CALLER_TRANSCRIPT_IGNORED", { turnId, providerId, proposalVersion: session.proposal.proposalVersion, reason: "NEWER_CALLER_SPEECH_ACTIVE" });
       session.record("AMBIGUITY_OVERLAP_IGNORED", { turnId, proposalVersion: session.proposal.proposalVersion, reason: "NEWER_CALLER_SPEECH_ACTIVE" });
@@ -518,7 +531,8 @@ export function initializeVoiceV2Session({
       session.record('TURN_PROCESSING_STARTED', { turnId, providerId, proposalVersion: session.proposal.proposalVersion });
       callTrace.counters.callerTurns += 1;
       callTrace.entry('CALLER_TURN_FINALIZED', { turnId, itemId: providerId, proposalVersion: session.proposal.proposalVersion });
-      void structuredDriver.turn({ turnId, transcript: event.transcript, authority: consentClaim.claimed ? consentClaim.authority : null });
+      observeStructured('admitted', turnId, providerId);
+      void structuredDriver.turn({ turnId, transcript: event.transcript, authority: consentClaim.claimed ? consentClaim.authority : null, itemId: providerId });
       return;
     }
     const callerPrompt = lastAcknowledgedState?.plan?.proposalVersion === session.proposal.proposalVersion ? lastAcknowledgedState : null;
@@ -639,7 +653,9 @@ export function initializeVoiceV2Session({
   async function processEffects() {
     if (structuredPhone) {
       // Defense in depth: even injected/errant queued effects cannot execute.
-      if (session.effectQueue.pending().length) { structuredDriver?.close(); await lifecycle.terminate('STRUCTURED_EFFECT_REFUSED'); }
+      if (session.effectQueue.pending().length) {
+        observeStructured('failure', null, { reasonCode: 'STRUCTURED_EFFECT_REFUSED', guard: 'EXPERIMENTAL_EFFECT_REFUSED', stage: 'EXECUTION', operation: 'rejectExperimentalEffects', terminationRequestedBy: { function: 'processEffects', reasonCode: 'STRUCTURED_EFFECT_REFUSED' } });
+        observeStructured('termination', 'processEffects', 'STRUCTURED_EFFECT_REFUSED'); structuredDriver?.close(); await lifecycle.terminate('STRUCTURED_EFFECT_REFUSED'); }
       return;
     }
     while (session.effectQueue.pending().length) {
@@ -811,7 +827,11 @@ export function initializeVoiceV2Session({
   }
 
   function requestSynthesizedConfirmation(tracked) {
-    if (structuredPhone && ++structuredSpeechRequests > PHONE_LIMITS.speechRequests) { structuredDriver.close(); void lifecycle.terminate('STRUCTURED_SPEECH_LIMIT'); return { accepted: false, reason: 'STRUCTURED_SPEECH_LIMIT' }; }
+    if (structuredPhone && ++structuredSpeechRequests > PHONE_LIMITS.speechRequests) {
+      observeStructured('update', { speechRequests: structuredSpeechRequests });
+      observeStructured('failure', null, { reasonCode: 'SPEECH_REQUEST_LIMIT', guard: 'speechRequests', limit: PHONE_LIMITS.speechRequests, stage: 'SPEECH_HANDOFF', operation: 'speechRequestLimit', terminationRequestedBy: { function: 'requestSynthesizedConfirmation', reasonCode: 'STRUCTURED_SPEECH_LIMIT' } });
+      observeStructured('termination', 'requestSynthesizedConfirmation', 'STRUCTURED_SPEECH_LIMIT'); structuredDriver.close(); void lifecycle.terminate('STRUCTURED_SPEECH_LIMIT'); return { accepted: false, reason: 'STRUCTURED_SPEECH_LIMIT' }; }
+    observeStructured('update', { speechRequests: structuredSpeechRequests });
     const responseId = `${tracked.requestId}:tts`;
     const clientRequestId = randomUUID();
     const abortController = new AbortController();
@@ -832,6 +852,7 @@ export function initializeVoiceV2Session({
   }
 
   function startSpeechAttempt(state, clientRequestId = randomUUID(), abortController = new AbortController()) {
+    observeStructured('update', { requestId: state.requestId, proposalVersion: state.plan.proposalVersion });
     const { requestId, responseId, plan } = state;
     const attempt = { number: state.delivery.attempts, abortController, headers: false };
     state.speechAttempt = attempt;
@@ -856,6 +877,7 @@ export function initializeVoiceV2Session({
       if (deliveryStopping || lifecycle.terminated || !state.preparation.active || state.speechAttempt !== attempt || abortController.signal.aborted
         || ((structuredPhone || attempt.number === 2) && !deliveryCurrent(state))) { observeDisposition({ deliveryObservation: observed }, "STALE", deliveryStaleReason(state)); return; }
       if (performance.now() >= state.preparation.identity.deadlineAt) return failPreparation(state, "SPEECH_PREPARATION_TIMEOUT", true);
+      observeStructured('start', 'SYNTHESIS', 'synthesizeSpeech');
       return speechAdapter.synthesize({
       input: state.preparation.identity.wording,
       language: state.preparation.identity.language,
@@ -878,11 +900,15 @@ export function initializeVoiceV2Session({
       (result) => {
         if (state.speechAttempt !== attempt || abortController.signal.aborted || (attempt.number === 2 && !deliveryCurrent(state))) { observeDisposition({ deliveryObservation: observed }, "STALE", deliveryStaleReason(state)); return; }
         session.watchdog.cancel(`speech-headers:${responseId}`);
+        observeStructured('done', 'SYNTHESIS', 'synthesizeSpeech');
         return synthesizedConfirmationCompleted(responseId, result);
       },
       (error) => {
         if (state.speechAttempt !== attempt || abortController.signal.aborted || (attempt.number === 2 && !deliveryCurrent(state))) { observeDisposition({ deliveryObservation: observed }, "STALE", deliveryStaleReason(state)); return; }
         session.watchdog.cancel(`speech-headers:${responseId}`);
+        if (error?.code === 'TTS_ABORTED') observeStructured('secondary', 'CALLER_INTERRUPTION');
+        else observeStructured('failure', error, { reasonCode: ['TTS_EMPTY_AUDIO', 'TTS_INVALID_AUDIO'].includes(error?.code) ? error.code : 'TTS_ADAPTER_ERROR', stage: 'SYNTHESIS', operation: 'synthesizeSpeech',
+          provider: { code: error?.diagnostic?.providerCode, status: error?.diagnostic?.providerStatus, request_id: observed.providerRequestId } });
         if (!attempt.headers && error?.diagnostic?.transient === true && retrySpeech(state, "TRANSIENT_TRANSPORT")) return;
         observed.providerCode = DELIVERY_PROVIDER_CODES.has(error?.diagnostic?.providerCode) ? error.diagnostic.providerCode : null;
         observed.timeout = error?.diagnostic?.timeout === true;
@@ -1303,13 +1329,14 @@ export function initializeVoiceV2Session({
   }
 
   async function acknowledgePlayback(markId) {
-    const state = marks.get(markId); if (!state || lifecycle.terminated) return session.record("STALE_PLAYBACK_EVENT_QUARANTINED", { markId });
+    observeStructured('start', 'MARK_HANDLING', 'acknowledgePlayback');
+    const state = marks.get(markId); if (!state || lifecycle.terminated) { observeStructured('secondary', 'SUPERSEDED'); return session.record("STALE_PLAYBACK_EVENT_QUARANTINED", { markId }); }
     if (structuredDriver && state.plan.structuredBinding) {
       const playback = session.playbackRegistry.get(markId), epoch = callerSpeechEpoch;
       if (playback?.status !== PlaybackStatus.SUBMITTED || playback?.interrupted || playback?.invalidated
         || !await structuredDriver.applicable(state.plan, 'BEFORE_MARK_ACK') || epoch !== callerSpeechEpoch
         || session.playbackRegistry.get(markId)?.status !== PlaybackStatus.SUBMITTED) {
-        safeEmit({ event: 'V2_STRUCTURED_MARK_REFUSED', buildSha, reason: 'STALE_DUPLICATE_OR_INTERRUPTED' }); return;
+        observeStructured('secondary', 'SUPERSEDED'); safeEmit({ event: 'V2_STRUCTURED_MARK_REFUSED', buildSha, reason: 'STALE_DUPLICATE_OR_INTERRUPTED' }); return;
       }
     }
     if (isTerminalRecovery(state)) {
@@ -1325,6 +1352,7 @@ export function initializeVoiceV2Session({
       return session.record("STALE_PLAYBACK_EVENT_QUARANTINED", { markId, responseId: state.responseId, reason: "FLOOR_OWNER_MISMATCH" });
     }
     session.playbackRegistry.acknowledge(markId);
+    observeStructured('done', 'MARK_HANDLING', 'acknowledgePlayback');
     session.watchdog.cancel(`playback:${markId}`);
     timing.point("PLAYBACK_MARK_ACKNOWLEDGED", timingDetails({ responseId: state.responseId, markId }));
     callTrace.playbackEnded();
@@ -1573,6 +1601,7 @@ export function initializeVoiceV2Session({
         reason: "NOT_CURRENT_PENDING_PLAYBACK",
       });
     }
+    observeStructured('failure', null, { reasonCode: 'PLAYBACK_ACK_TIMEOUT', stage: 'MARK_HANDLING', operation: 'acknowledgePlayback' });
     if (state.deliveryObservation) state.deliveryObservation.timeout = true;
     observeDisposition(state, "PLAYBACK_TIMED_OUT", "PLAYBACK_TIMEOUT", "NOT_ELIGIBLE", "PLAYBACK_ALREADY_STARTED");
     recoveryObservationOrigin = state.deliveryObservation || null;
@@ -1793,6 +1822,7 @@ export function initializeVoiceV2Session({
     if (role === "caller") callTrace.entry("CALLER_TRANSCRIPT_PERSISTED", { turnId, itemId, characterCount, persistenceOutcome: error ? "FAILED" : result?.replayed ? "REPLAYED" : result?.success === true ? "SUCCESS" : "NOT_CONFIRMED" });
   }
   async function cleanup(reason) {
+    observeStructured('start', 'CLEANUP', 'cleanup'); observeStructured('secondary', 'CALL_TERMINATED');
     structuredDriver?.close();
     for (const tracked of new Set(requests.values())) {
       if (!tracked.responseId && tracked.deliveryObservation && !tracked.deliveryObservation.settled) observeDisposition(tracked, "STALE", "TERMINATING");
@@ -1827,6 +1857,7 @@ export function initializeVoiceV2Session({
   function requestCallLegTermination(reason) {
     if (callTerminationRequested || !callControlAdapter || [TransportEvent.TWILIO_STREAM_STOPPED, TransportEvent.TWILIO_CONNECTION_CLOSED].includes(reason)) return;
     callTerminationRequested = true;
+    observeStructured('termination', 'requestCallLegTermination', reason);
     session.record("CALL_LEG_TERMINATION_REQUESTED", { reason });
     // Provider call control must not block transcript finalization or create a
     // second timeout owner during terminal cleanup.

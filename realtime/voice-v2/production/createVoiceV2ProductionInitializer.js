@@ -24,7 +24,8 @@ export function createVoiceV2ProductionInitializer({
   smsServiceDependencies = {},
   speechAdapter,
   emit = (event) => {
-    if (event?.event !== "V2_SPEECH_LIFECYCLE" && event?.event !== "V2_TURN_ORDER_DIAGNOSTIC" && event?.event !== "V2_TRANSCRIPTION_LIFECYCLE" && event?.event !== "V2_SPEECH_UNDICI_STAGE") return console.log(event);
+    if (event?.event !== "V2_SPEECH_LIFECYCLE" && event?.event !== "V2_TURN_ORDER_DIAGNOSTIC" && event?.event !== "V2_TRANSCRIPTION_LIFECYCLE" && event?.event !== "V2_SPEECH_UNDICI_STAGE"
+      && !['V2_STRUCTURED_PHONE_FAILURE', 'V2_STRUCTURED_PHONE_SECONDARY', 'V2_STRUCTURED_PHONE_BOUNDARY', 'V2_STRUCTURED_PHONE_TERMINATION_REQUESTED'].includes(event?.event)) return console.log(event);
     try { console.log(JSON.stringify(event)); } catch { /* Diagnostic output cannot affect the call. */ }
   },
 } = {}) {
@@ -83,7 +84,7 @@ export function createVoiceV2ProductionInitializer({
                   if (!labels || typeof labels !== 'object' || Array.isArray(labels)) throw Error();
                 } catch { throw Object.assign(Error('STRUCTURED_LABEL_CONFIGURATION_INVALID'), { code: 'STRUCTURED_LABEL_CONFIGURATION_INVALID' }); }
                 structuredPhone = {
-                  createModel: (tools, onFailure) => new PhoneModelTransport(dependencies.openaiSocketFactory(), tools, env.OPENAI_MODEL, onFailure),
+                  createModel: (tools, onFailure, diagnostics) => new PhoneModelTransport(dependencies.openaiSocketFactory(), tools, env.OPENAI_MODEL, onFailure, diagnostics),
                   availability: new LiveBundleAvailability({ loadBusiness: () => findBarberById(businessContext.barberId), labels }),
                 };
               }

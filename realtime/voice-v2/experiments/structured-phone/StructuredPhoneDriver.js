@@ -9,8 +9,8 @@ import { phoneFailure } from './PhoneModelTransport.js';
 
 const rejected = reason => ({ status: 'REJECTED', reason });
 export class StructuredPhoneDriver {
-  constructor({ session, businessContext, availability, createModel, replace, speak, terminate, emit, now = () => new Date() }) {
-    Object.assign(this, { session, businessContext, availability, createModel, replace, speak, terminate, emit, now });
+  constructor({ session, businessContext, availability, createModel, replace, speak, terminate, emit, diagnostics = null, now = () => new Date() }) {
+    Object.assign(this, { session, businessContext, availability, createModel, replace, speak, terminate, emit, diagnostics, now });
     this.generation = 0; this.turns = 0; this.requests = 0; this.connections = 0; this.model = null; this.active = false;
     this.evidence = null; this.preference = null; this.bindings = new WeakSet(); this.seenCalls = new Set(); this.closed = false;
     this.applicability = new Set(); this.decisionTimer = null;
@@ -19,7 +19,11 @@ export class StructuredPhoneDriver {
     this.datePreference = null;
   }
   log(stage, details = {}) { this.emit({ event: 'V2_STRUCTURED_PHONE', callSid: this.session.callSid, buildSha: this.session.buildSha, stage, ...details }); }
+  diagnostic(method, ...args) { try { return this.diagnostics?.[method]?.(...args); } catch {} }
+  diagnosticCounters() { try { this.diagnostic('update', { turns: this.turns, modelRequests: this.requests, decisionConnections: this.connections,
+    generation: this.generation, turnId: this.turnId, proposalVersion: this.session.proposal.proposalVersion }); } catch {} }
   interrupt(reason = 'CALLER_SPEECH') {
+    this.diagnostic('cancel', reason);
     this.generation++;
     clearTimeout(this.decisionTimer); this.decisionTimer = null;
     for (const pending of this.applicability) { clearTimeout(pending.timer); pending.resolve(false); }
@@ -37,72 +41,126 @@ export class StructuredPhoneDriver {
   binding() { return { turnId: this.turnId, proposalVersion: this.session.proposal.proposalVersion,
     businessRevision: this.business.revision, serviceIds: this.ids(), language: this.businessContext.preferredLanguage === 'es' ? 'es' : 'en' }; }
   context() {
-    return { binding: this.binding(), draft: { serviceIds: this.ids(), date: this.session.proposal.date, time: this.session.proposal.time, name: this.session.proposal.name },
+    this.executionDiagnostic = { stage: 'CONTEXT_CONSTRUCTION', operation: 'buildDecisionContext' };
+    this.diagnostic('start', 'CONTEXT_CONSTRUCTION', 'buildDecisionContext');
+    try {
+    const context = { binding: this.binding(), draft: { serviceIds: this.ids(), date: this.session.proposal.date, time: this.session.proposal.time, name: this.session.proposal.name },
       business: { timeZone: this.business.timeZone, now: this.business.now, bookingWindow: this.business.window,
         services: this.business.services.map(s => ({ ...s, label: this.availability.label(s, this.binding().language) })),
         hours: this.business.raw.availability.businessHours }, availability: this.freshEvidence() ? this.evidence.result : null,
       pendingQuestions: [...this.pendingQuestions], datePreference: this.datePreference };
+    this.diagnostic('done', 'CONTEXT_CONSTRUCTION', 'buildDecisionContext'); return context;
+    } catch (error) { if (this.active && !this.closed) this.diagnostic('failure', error, { stage: 'CONTEXT_CONSTRUCTION', operation: 'buildDecisionContext', terminationRequestedBy: { function: 'StructuredPhoneDriver.turn', reasonCode: 'STRUCTURED_PHONE_FAILED' } }); throw error; }
   }
-  async turn({ turnId, transcript, authority }) {
+  async turn({ turnId, transcript, authority, itemId }) {
     this.interrupt('NEW_TURN'); const generation = this.generation; this.turnId = turnId; this.callerText = transcript; this.consent = authority;
     this.blocked = false; this.simulated = false; this.unsupported = false; this.changed = false; this.active = true;
     const current = () => !this.closed && generation === this.generation;
-    const timer = setTimeout(() => { if (current()) { this.interrupt('DECISION_TIMEOUT'); this.terminate('STRUCTURED_DECISION_TIMEOUT'); } }, PHONE_LIMITS.decisionMs);
+    this.diagnosticCounters(); this.diagnostic('update', { modelRequestStartedForTurn: false }); this.diagnostic('decisionStarted'); this.rejectionGuard = null; this.rejectionLocalStage = null;
+    this.executionDiagnostic = { stage: 'TURN_ADMISSION', operation: 'driverTurn' };
+    const timer = setTimeout(() => { if (current()) {
+      this.diagnosticCounters(); this.diagnostic('deadline', 'FIRED');
+      this.diagnostic('failure', null, { reasonCode: 'DECISION_DEADLINE_EXPIRED', guard: 'decisionMs', limit: PHONE_LIMITS.decisionMs,
+        stage: this.executionDiagnostic?.stage, operation: this.executionDiagnostic?.operation,
+        terminationRequestedBy: { function: 'decisionDeadline', reasonCode: 'STRUCTURED_DECISION_TIMEOUT' } });
+      this.diagnostic('termination', 'decisionDeadline', 'STRUCTURED_DECISION_TIMEOUT');
+      this.interrupt('DECISION_TIMEOUT'); this.terminate('STRUCTURED_DECISION_TIMEOUT'); } }, PHONE_LIMITS.decisionMs);
     this.decisionTimer = timer;
     let stage = 'BUSINESS_CONTEXT_READ';
     try {
       if (++this.turns > PHONE_LIMITS.turns) throw Error('TURN_LIMIT');
+      this.diagnosticCounters(); this.diagnostic('start', 'BUSINESS_READ', 'readBusiness');
+      this.executionDiagnostic = { stage: 'BUSINESS_READ', operation: 'readBusiness' };
       this.log('BUSINESS_CONTEXT_READ');
       const business = await this.availability.read(); if (!current()) return;
+      this.diagnostic('done', 'BUSINESS_READ', 'readBusiness'); this.diagnostic('start', 'CATALOGUE_VALIDATION', 'validateCatalogue');
       stage = 'BUSINESS_CONTEXT_VALIDATE';
       if (business.timeZone !== this.businessContext.timeZone) throw Error('BUSINESS_TIMEZONE_CHANGED');
       if (this.model && this.business?.revision !== business.revision) { this.modelOwner = null; this.model.close(); this.model = null; }
       this.business = business; this.contracts = phoneContracts(business.services.map(s => s.id));
+      this.diagnostic('done', 'CATALOGUE_VALIDATION', 'validateCatalogue');
       if (this.evidence && this.evidence.revision !== business.revision) this.evidence = null;
       if (!this.model) {
         stage = 'MODEL_CONNECTION';
         if (this.connections >= PHONE_LIMITS.decisionConnections) throw Error('CONNECTION_LIMIT'); this.connections++;
         const owner = {}; this.modelOwner = owner;
+        this.executionDiagnostic = { stage: 'DECISION_CONNECTION', operation: 'constructDecisionConnection' };
+        this.diagnosticCounters(); this.diagnostic('connectionStarted'); this.diagnostic('start', 'DECISION_CONNECTION', 'constructDecisionConnection');
         this.log('MODEL_CONNECTION', { connection: this.connections });
         const model = this.createModel(this.contracts.tools, error => {
           // Intentional close/cancellation can finish after a replacement turn.
           // Ownership follows the connection, including intentional reuse.
-          if (this.closed || this.modelOwner !== owner) return;
+          if (this.closed || this.modelOwner !== owner) { this.diagnostic('secondary', 'RETIRED_OWNER'); return; }
+          this.diagnostic('failure', error, { terminationRequestedBy: { function: 'phoneFailureCallback', reasonCode: 'STRUCTURED_MODEL_PROTOCOL_FAILED' } });
+          this.diagnostic('termination', 'phoneFailureCallback', 'STRUCTURED_MODEL_PROTOCOL_FAILED');
           this.log('MODEL_PROTOCOL_FAILED', phoneFailure(error, 'MODEL_CONNECTION'));
           this.interrupt('MODEL_PROTOCOL_FAILURE'); this.terminate('STRUCTURED_MODEL_PROTOCOL_FAILED');
-        });
+        }, this.diagnostic('owned', () => !this.closed && this.modelOwner === owner));
+        this.diagnostic('done', 'DECISION_CONNECTION', 'constructDecisionConnection');
         if (!current()) { model.close(); return; }
         this.model = model; stage = 'MODEL_CONFIGURATION';
+        this.executionDiagnostic = { stage: 'DECISION_CONFIGURATION', operation: 'awaitDecisionConfiguration' };
+        this.diagnostic('start', 'DECISION_CONFIGURATION', 'awaitDecisionConfiguration');
         this.log('MODEL_CONFIGURATION'); await model.ready;
         if (current()) this.log('MODEL_READY');
+        if (current()) this.diagnostic('done', 'DECISION_CONFIGURATION', 'awaitDecisionConfiguration');
       }
       if (!current()) return;
       stage = 'MODEL_REQUEST';
       if (++this.requests > PHONE_LIMITS.modelRequests) throw Error('MODEL_REQUEST_LIMIT');
+      this.diagnosticCounters();
       this.log('MODEL_REQUEST', { turn: this.turns, request: this.requests });
       const modelStartedMs = performance.now();
-      const response = await this.model.request({ callerText: transcript, context: this.context() });
+      const context = this.context();
+      this.executionDiagnostic = { stage: 'MODEL_REQUEST', operation: 'createDecisionRequest' };
+      this.diagnostic('start', 'MODEL_REQUEST', 'createDecisionRequest');
+      this.diagnostic('update', { modelRequestStartedForTurn: true });
+      const response = await this.model.request({ callerText: transcript, context });
       if (!current()) return;
+      this.diagnostic('done', 'MODEL_RESPONSE', 'receiveDecisionResponse');
       this.log('MODEL_COMPLETED', { turn: this.turns, request: this.requests, elapsedMs: performance.now() - modelStartedMs });
       stage = 'TOOL_ARGUMENT_VALIDATION';
+      this.diagnostic('start', 'DECISION_VALIDATION', 'validateDecisionSchema');
       if (!Array.isArray(response.calls) || response.calls.length !== 1) { this.rejectDecision('ONE_DECISION_REQUIRED'); throw Error('STRUCTURE'); }
       const call = response.calls[0];
       if (this.seenCalls.has(call.callId)) { this.rejectDecision('REPLAY'); throw Error('REPLAY'); }
       let decision;
+      this.diagnostic('start', 'DECISION_VALIDATION', 'parseDecisionJson');
       try { decision = JSON.parse(call.argumentsJson); } catch { this.rejectDecision('INVALID_JSON'); throw Error('STRUCTURE'); }
+      this.diagnostic('start', 'DECISION_VALIDATION', 'validateDecisionSchema');
       if (call.name !== 'submit_turn_decision' || !matches(decision, this.contracts.decision)) { this.rejectDecision('INVALID_SHAPE'); throw Error('STRUCTURE'); }
+      this.diagnostic('done', 'DECISION_VALIDATION', 'validateDecisionSchema');
       this.seenCalls.add(call.callId);
       stage = 'TOOL_DISPATCH';
       const plan = await this.executeDecision(decision, current);
       if (!current()) return;
       if (!plan) { if (this.rejectionTurn !== this.turns) this.rejectDecision('PLAN_NOT_RENDERABLE', 'RENDER'); throw Error('INVALID_PLAN'); }
       this.log('PLAN_VALIDATED', { turn: this.turns, proposalVersion: this.session.proposal.proposalVersion, source: 'APPLICATION_DECISION', atMs: performance.now() });
-      stage = 'SPEECH_SUBMISSION'; const delivery = await this.speak(plan);
+      stage = 'SPEECH_SUBMISSION'; this.executionDiagnostic = { stage: 'SPEECH_HANDOFF', operation: 'submitSpeechPlan' }; this.diagnostic('start', 'SPEECH_HANDOFF', 'submitSpeechPlan'); const delivery = await this.speak(plan);
+      this.diagnostic('done', 'SPEECH_HANDOFF', 'submitSpeechPlan');
       stage = 'TOOL_RESULT_SUBMISSION';
+      this.diagnostic('start', 'MODEL_REQUEST', 'submitDecisionResult');
       if (current()) this.model.toolResult(call.callId, { status: delivery?.accepted ? 'SPEECH_PREPARING' : 'WITHHELD', operations: this.localResults, playbackAcknowledged: false }, this.context());
+      if (current()) this.diagnostic('done', 'MODEL_REQUEST', 'submitDecisionResult');
     } catch (error) {
+      if (current()) {
+        this.diagnosticCounters();
+        const limits = { TURN_LIMIT: ['turns', 'TURN_ADMISSION', 'turnLimit'], MODEL_REQUEST_LIMIT: ['modelRequests', 'MODEL_REQUEST', 'modelRequestLimit'], CONNECTION_LIMIT: ['decisionConnections', 'DECISION_CONNECTION', 'decisionConnectionLimit'] };
+        const limit = limits[phoneFailure(error, stage).failureCode];
+        const locations = { BUSINESS_CONTEXT_READ: ['BUSINESS_READ', 'readBusiness'], BUSINESS_CONTEXT_VALIDATE: ['CATALOGUE_VALIDATION', 'validateCatalogue'],
+          MODEL_CONNECTION: ['DECISION_CONNECTION', 'constructDecisionConnection'], MODEL_CONFIGURATION: ['DECISION_CONFIGURATION', 'awaitDecisionConfiguration'],
+          MODEL_REQUEST: ['MODEL_REQUEST', 'createDecisionRequest'], TOOL_ARGUMENT_VALIDATION: ['DECISION_VALIDATION', this.rejectionGuard === 'INVALID_JSON' ? 'parseDecisionJson' : 'validateDecisionSchema'],
+          SPEECH_SUBMISSION: ['SPEECH_HANDOFF', 'submitSpeechPlan'], TOOL_RESULT_SUBMISSION: ['MODEL_REQUEST', 'submitDecisionResult'] };
+        const rejectionLocations = { DECISION_VALIDATE: ['DECISION_VALIDATION', 'validateDecisionBinding'], DRAFT_UPDATE: ['DRAFT_MUTATION', 'applyDraftChanges'],
+          CONFIRMATION_MEANING: ['DECISION_VALIDATION', 'validateDecisionBinding'], RENDER: ['RENDERING', 'renderApplicationResponse'], QUESTION_RENDER: ['RENDERING', 'renderApplicationResponse'] };
+        const alternative = stage === 'TOOL_DISPATCH' && this.executionDiagnostic.stage === 'ALTERNATIVE_RESOLUTION';
+        const location = stage === 'TOOL_DISPATCH' ? alternative ? ['ALTERNATIVE_RESOLUTION', 'resolveAlternative'] : rejectionLocations[this.rejectionLocalStage] || [this.executionDiagnostic.stage, this.executionDiagnostic.operation] : locations[stage];
+        this.diagnostic('failure', error, { guard: limit?.[0] || (alternative && this.rejectionGuard ? 'STALE_OR_FOREIGN_ALTERNATIVE' : this.rejectionGuard), limit: limit ? PHONE_LIMITS[limit[0]] : this.rejectionGuard === 'ONE_DECISION_REQUIRED' ? 1 : null,
+          stage: limit?.[1] || location?.[0], operation: limit?.[2] || location?.[1], terminationRequestedBy: { function: 'StructuredPhoneDriver.turn', reasonCode: 'STRUCTURED_PHONE_FAILED' } });
+        this.diagnostic('termination', 'StructuredPhoneDriver.turn', 'STRUCTURED_PHONE_FAILED');
+      } else this.diagnostic('secondary', 'RETIRED_OWNER');
       if (current()) { this.log('STOPPED', { reason: 'DECISION_FAILED_OR_LIMIT', ...phoneFailure(error, stage), turn: this.turns, requests: this.requests, connections: this.connections }); this.close(); this.terminate('STRUCTURED_PHONE_FAILED'); }
-    } finally { clearTimeout(timer); if (this.decisionTimer === timer) this.decisionTimer = null; if (current()) this.active = false; }
+    } finally { clearTimeout(timer); if (this.decisionTimer === timer) this.decisionTimer = null; if (generation === this.generation) this.diagnostic('deadline', 'CLEARED'); if (current()) this.active = false; }
   }
   same(args) { const b = this.binding(); return Object.keys(b).every(key => JSON.stringify(args[key]) === JSON.stringify(b[key])) && Object.keys(args).length === Object.keys(b).length; }
   rejectDecision(guard, localStage = 'DECISION_VALIDATE') {
@@ -112,15 +170,20 @@ export class StructuredPhoneDriver {
       'DRAFT_UNCHANGED', 'NO_VERIFIED_EXPLANATION', 'NO_CURRENT_ALTERNATIVES', 'FOREIGN_ALTERNATIVE', 'CONFIRMATION_NOT_READY', 'NO_BLOCKED_AFFIRMATIVE',
       'NO_UNSUPPORTED_RESULT', 'NO_SIMULATION_RESULT', 'UNKNOWN_PURPOSE', 'PLAN_NOT_RENDERABLE'];
     this.rejectionTurn = this.turns;
+    this.rejectionGuard = guards.includes(guard) ? guard : 'PLAN_NOT_RENDERABLE';
+    this.rejectionLocalStage = localStage;
     this.log('DECISION_REJECTED', { turn: this.turns, guard: guards.includes(guard) ? guard : 'PLAN_NOT_RENDERABLE',
       localStage: ['DECISION_VALIDATE', 'DRAFT_UPDATE', 'CONFIRMATION_MEANING', 'RENDER', 'QUESTION_RENDER'].includes(localStage) ? localStage : 'DECISION_VALIDATE' });
     return null;
   }
   async executeDecision(decision, current) {
+    this.executionDiagnostic = { stage: 'DECISION_VALIDATION', operation: 'validateDecisionBinding' };
+    this.diagnostic('start', 'DECISION_VALIDATION', 'validateDecisionBinding');
     const { changes, intent, meaning, questions: submittedQuestions, missingField, ...binding } = decision;
     const questions = [...new Set([...this.pendingQuestions, ...submittedQuestions])];
     if (!this.same(binding)) { this.rejectDecision('BINDING_MISMATCH'); throw Error('STALE_BINDING'); }
     if (new Set(submittedQuestions).size !== submittedQuestions.length) return this.rejectDecision('DUPLICATE_QUESTION');
+    this.diagnostic('done', 'DECISION_VALIDATION', 'validateDecisionBinding');
     this.localResults = [];
     // Validate the complete intent before any mutation. Unrepresentable meaning
     // is not reduced to the subset that happens to be supported.
@@ -228,11 +291,18 @@ export class StructuredPhoneDriver {
     const { changes, meaning, ...binding } = args;
     if (!this.same(binding)) return rejected('STALE_BINDING');
     if (name === 'update_appointment_draft') {
+      this.executionDiagnostic = { stage: 'DRAFT_MUTATION', operation: 'applyDraftChanges' };
+      this.diagnostic('start', 'DRAFT_MUTATION', 'applyDraftChanges');
       const original = this.session.proposal, selected = new Map();
       for (const change of changes) if (change.kind === 'SELECT_ALTERNATIVE') {
+        this.executionDiagnostic = { stage: 'ALTERNATIVE_RESOLUTION', operation: 'resolveAlternative' };
+        this.diagnostic('start', 'ALTERNATIVE_RESOLUTION', 'resolveAlternative');
         const alternative = this.freshEvidence() && this.evidence.result.alternatives.find(a => a.alternativeId === change.alternativeId);
         if (!alternative) return rejected('STALE_OR_FOREIGN_ALTERNATIVE'); selected.set(change, alternative);
+        this.diagnostic('done', 'ALTERNATIVE_RESOLUTION', 'resolveAlternative');
       }
+      this.executionDiagnostic = { stage: 'DRAFT_MUTATION', operation: 'applyDraftChanges' };
+      this.diagnostic('start', 'DRAFT_MUTATION', 'applyDraftChanges');
       const ids = [...this.ids()]; let date = original.date, time = original.time, name = original.name, preference = this.preference, datePreference = this.datePreference;
       for (const change of changes) {
         if (change.kind === 'SET_SERVICE') ids.splice(0, ids.length, change.serviceId);
@@ -259,13 +329,17 @@ export class StructuredPhoneDriver {
         service: services[0]?.name || null, additionalServices: services.slice(1).map(s => s.name), date, time, name });
       if (!current()) return rejected('STALE_BINDING');
       this.replace(original, next); this.preference = preference; this.datePreference = datePreference; this.evidence = null; this.changed = true; this.blocked = false; this.simulated = false; this.unsupported = false; this.consent = null;
+      this.diagnosticCounters(); this.diagnostic('done', 'DRAFT_MUTATION', 'applyDraftChanges');
       return { status: 'OK', draft: this.context().draft };
     }
     if (name === 'check_availability') {
+      this.executionDiagnostic = { stage: 'AVAILABILITY', operation: 'checkBundleAvailability' };
+      this.diagnostic('start', 'AVAILABILITY', 'checkBundleAvailability');
       if ((!this.session.proposal.date && !this.datePreference) || !this.ids().length) return rejected('FRESH_BUNDLE_REQUIRED');
       const result = await this.availability.check(this.business, this.ids(), this.session.proposal.date || this.datePreference.startDate,
         this.session.proposal.date ? this.session.proposal.time : null, this.preference, { dateRange: this.datePreference && { ...this.datePreference, time: this.session.proposal.time } });
       if (!current()) return rejected('STALE_BINDING');
+      this.diagnostic('done', 'AVAILABILITY', 'checkBundleAvailability');
       if (result.status !== 'OK') { this.evidence = null; this.unsupported = result.status === 'UNSUPPORTED'; return result; }
       this.unsupported = false;
       const alternatives = result.alternatives.map(a => ({ ...a, alternativeId: randomUUID() }));
@@ -293,6 +367,8 @@ export class StructuredPhoneDriver {
     return rejected('INVALID_CHANGE');
   }
   render(args) {
+    this.executionDiagnostic = { stage: 'RENDERING', operation: 'renderApplicationResponse' };
+    this.diagnostic('start', 'RENDERING', 'renderApplicationResponse');
     const { type, field, alternativeIds, ...binding } = args;
     if (!this.same(binding)) return this.rejectDecision('BINDING_MISMATCH', 'RENDER');
     const p = this.session.proposal, es = binding.language === 'es', evidence = this.freshEvidence() ? this.evidence.result : null;
@@ -336,13 +412,15 @@ export class StructuredPhoneDriver {
       requireAvailable: ['CANONICAL_CONFIRMATION', 'EXPLAIN_SIMULATION'].includes(type), alternativeIds: Object.freeze([...(alternativeIds || [])]),
       ...(['ACK_DRAFT', 'OFFER_ALTERNATIVES', 'CANONICAL_CONFIRMATION'].includes(type) ? { spokenReferenceDate: businessDate(this.business.now, this.business.timeZone) } : {}) });
     this.bindings.add(structuredBinding);
-    return Object.freeze({ purpose, proposalVersion: p.proposalVersion, language: binding.language, expectsCallerInput: true, critical: true, deliveryValidationRequired: true,
+    const plan = Object.freeze({ purpose, proposalVersion: p.proposalVersion, language: binding.language, expectsCallerInput: true, critical: true, deliveryValidationRequired: true,
       expectedFacts: { service: display, name: p.name, date: p.date, time: p.time }, structuredBinding,
       speechContract: Object.freeze({ [purpose === 'PRE_BOOKING_CONFIRMATION' ? 'applicationOwnedConfirmation' : 'applicationOwnedSpeech']: true, requiredMessage: text }) });
+    this.diagnostic('done', 'RENDERING', 'renderApplicationResponse'); return plan;
   }
   async applicable(plan, boundary = 'UNSPECIFIED') {
     if (!['BEFORE_SYNTHESIS', 'AFTER_SYNTHESIS', 'BEFORE_MEDIA', 'BEFORE_MARK_ACK'].includes(boundary)) boundary = 'UNSPECIFIED';
     const started = performance.now(); let pending, accepted = false, reason = 'EVIDENCE_NOT_CURRENT';
+    this.diagnostic('start', 'FRESHNESS', 'checkSpeechFreshness');
     this.log('FRESHNESS_STARTED', { boundary, proposalVersion: plan.proposalVersion, turnId: plan.structuredBinding?.turnId });
     const canceled = new Promise(resolve => {
       pending = { resolve: () => { reason = 'GENERATION_RETIRED'; resolve(false); }, timer: setTimeout(() => { reason = 'CHECK_TIMEOUT'; resolve(false); }, 5000) };
@@ -352,6 +430,7 @@ export class StructuredPhoneDriver {
     catch { reason = 'CHECK_FAILED'; return false; }
     finally {
       clearTimeout(pending.timer); this.applicability.delete(pending);
+      if (accepted) this.diagnostic('done', 'FRESHNESS', 'checkSpeechFreshness'); else this.diagnostic('secondary', 'STRUCTURED_STALE_EVIDENCE');
       this.log('FRESHNESS_COMPLETED', { boundary, proposalVersion: plan.proposalVersion, turnId: plan.structuredBinding?.turnId, accepted, reason: accepted ? 'CURRENT' : reason, elapsedMs: performance.now() - started });
     }
   }
