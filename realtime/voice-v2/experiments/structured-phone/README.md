@@ -372,7 +372,44 @@ virtual fixture times, not live latency measurements or audible playback times.
 The supplied CAd5c2809f5a74903fca7e0582f64af0e8 evidence does not locate decodable
 samples inside HTTP chunks, so live early-audio availability remains unverified.
 No second request, retry, voice/rate change or timeout change is introduced.
-The separate 3 PM INVALID_PLAN hangup and spoken-time/date formatting remain unfixed.
+At the streaming commit, the separate 3 PM INVALID_PLAN hangup and spoken-time/date formatting were outside that patch; the bounded follow-up is documented below.
+
+## Offered-time corrections and spoken slots
+
+The streaming change above was committed independently. A later offline repair
+proves a schema/execution mismatch: CONFIRMATION/CORRECTION with explicit ordered
+changes was schema-valid but rejected before applying a valid current alternative
+or exact time. Such decisions now execute only their validated changes, fresh
+bundle check and application rendering; they never submit consent. AFFIRM with
+changes remains rejected. CLARIFY with no missing field and current alternatives
+re-renders those verified alternatives without selecting or mutating a slot.
+Without current alternatives it still stops. Explicit availability questions may
+offer actual current slots without requiring an invented exact requested time.
+
+The exact live decision for CAd5c2809f5a74903fca7e0582f64af0e8 was not saved.
+These synthetic reproductions do not establish its initiating INVALID_PLAN guard.
+TRANSCRIPTION_UNRESOLVED in the summary does not identify that initiating cause.
+DECISION_REJECTED now records only an allowlisted guard, local stage, turn and
+existing call/build correlation. Structural, foreign, stale, unsafe and unsupported
+decisions do not receive generic successful recovery. No raw decision, rejected
+string, transcript, catalogue or provider payload is added to these diagnostics.
+
+Phone-only spoken slots group consecutive same-day alternatives and use business
+clock/timezone-relative today/tomorrow or an explicit weekday/month/day (year when
+needed). English uses 12-hour AM/PM, noon and midnight. Spanish uses natural hour
+phrases, mediodía and medianoche. Canonical phone readback retains service order,
+name, price and its booking question; only its date/time presentation changes.
+Internal ISO dates, 24-hour times, opaque alternative IDs and authority remain
+unchanged. The shared production confirmation renderer is not modified.
+Date-bearing speech is also bound to its business-local reference day so a
+midnight crossing cannot release stale relative wording or acknowledge it.
+
+Example alternatives: "I can offer tomorrow at 2 PM or 2:30 PM or 3 PM. Which
+would you prefer?" / "Puedo ofrecer mañana a las dos de la tarde o a las dos y
+media de la tarde o a las tres de la tarde. ¿Cuál prefieres?"
+The whole-conversation latency issue remains open. This repair changes no model,
+speech transport, timeout, speaking rate, scheduling policy, request ceiling or
+booking/SMS execution boundary. Part 2 remains unstaged for independent review.
 
 EN/ES offline journeys now use one request for each of eight turns. Baseline
 comparable turns used 2 (missing date), 3 (afternoon), 3 (correction/name), 2 (early

@@ -1,7 +1,7 @@
 import moment from 'moment-timezone';
 import { randomUUID } from 'node:crypto';
 import { createBookingProposal } from '../../domain/BookingProposal.js';
-import { renderPreBookingConfirmation } from '../../planning/renderPreBookingConfirmation.js';
+import { businessDate, formatSpokenSlots } from './SpokenSlots.js';
 import { normalizeTurn } from '../../interpretation/TurnNormalizer.js';
 import { extractConfirmation } from '../../interpretation/extractors/ConfirmationExtractor.js';
 import { phoneContracts, matches, PHONE_LIMITS } from './PhoneContracts.js';
@@ -85,16 +85,17 @@ export class StructuredPhoneDriver {
       if (!current()) return;
       this.log('MODEL_COMPLETED', { turn: this.turns, request: this.requests, elapsedMs: performance.now() - modelStartedMs });
       stage = 'TOOL_ARGUMENT_VALIDATION';
-      if (!Array.isArray(response.calls) || response.calls.length !== 1) throw Error('STRUCTURE');
+      if (!Array.isArray(response.calls) || response.calls.length !== 1) { this.rejectDecision('ONE_DECISION_REQUIRED'); throw Error('STRUCTURE'); }
       const call = response.calls[0];
-      if (this.seenCalls.has(call.callId)) throw Error('REPLAY');
-      const decision = JSON.parse(call.argumentsJson);
-      if (call.name !== 'submit_turn_decision' || !matches(decision, this.contracts.decision)) throw Error('STRUCTURE');
+      if (this.seenCalls.has(call.callId)) { this.rejectDecision('REPLAY'); throw Error('REPLAY'); }
+      let decision;
+      try { decision = JSON.parse(call.argumentsJson); } catch { this.rejectDecision('INVALID_JSON'); throw Error('STRUCTURE'); }
+      if (call.name !== 'submit_turn_decision' || !matches(decision, this.contracts.decision)) { this.rejectDecision('INVALID_SHAPE'); throw Error('STRUCTURE'); }
       this.seenCalls.add(call.callId);
       stage = 'TOOL_DISPATCH';
       const plan = await this.executeDecision(decision, current);
       if (!current()) return;
-      if (!plan) throw Error('INVALID_PLAN');
+      if (!plan) { if (this.rejectionTurn !== this.turns) this.rejectDecision('PLAN_NOT_RENDERABLE', 'RENDER'); throw Error('INVALID_PLAN'); }
       this.log('PLAN_VALIDATED', { turn: this.turns, proposalVersion: this.session.proposal.proposalVersion, source: 'APPLICATION_DECISION', atMs: performance.now() });
       stage = 'SPEECH_SUBMISSION'; const delivery = await this.speak(plan);
       stage = 'TOOL_RESULT_SUBMISSION';
@@ -104,18 +105,31 @@ export class StructuredPhoneDriver {
     } finally { clearTimeout(timer); if (this.decisionTimer === timer) this.decisionTimer = null; if (current()) this.active = false; }
   }
   same(args) { const b = this.binding(); return Object.keys(b).every(key => JSON.stringify(args[key]) === JSON.stringify(b[key])) && Object.keys(args).length === Object.keys(b).length; }
+  rejectDecision(guard, localStage = 'DECISION_VALIDATE') {
+    const guards = ['ONE_DECISION_REQUIRED', 'REPLAY', 'INVALID_JSON', 'INVALID_SHAPE', 'BINDING_MISMATCH', 'DUPLICATE_QUESTION', 'UNSUPPORTED_INTENT',
+      'CLARIFICATION_WITH_CHANGES', 'CONFIRMATION_WITH_CHANGES', 'NON_CONFIRMATION_MEANING', 'QUESTION_WITHOUT_QUESTION', 'NO_CURRENT_SELECTION',
+      'DRAFT_CHANGE_REJECTED', 'CONFIRMATION_MEANING_NOT_ACTIONABLE', 'QUESTION_FACTS_UNSUPPORTED', 'AVAILABILITY_REQUIRED', 'FIELD_ALREADY_KNOWN',
+      'DRAFT_UNCHANGED', 'NO_VERIFIED_EXPLANATION', 'NO_CURRENT_ALTERNATIVES', 'FOREIGN_ALTERNATIVE', 'CONFIRMATION_NOT_READY', 'NO_BLOCKED_AFFIRMATIVE',
+      'NO_UNSUPPORTED_RESULT', 'NO_SIMULATION_RESULT', 'UNKNOWN_PURPOSE', 'PLAN_NOT_RENDERABLE'];
+    this.rejectionTurn = this.turns;
+    this.log('DECISION_REJECTED', { turn: this.turns, guard: guards.includes(guard) ? guard : 'PLAN_NOT_RENDERABLE',
+      localStage: ['DECISION_VALIDATE', 'DRAFT_UPDATE', 'CONFIRMATION_MEANING', 'RENDER', 'QUESTION_RENDER'].includes(localStage) ? localStage : 'DECISION_VALIDATE' });
+    return null;
+  }
   async executeDecision(decision, current) {
     const { changes, intent, meaning, questions: submittedQuestions, missingField, ...binding } = decision;
     const questions = [...new Set([...this.pendingQuestions, ...submittedQuestions])];
-    if (!this.same(binding)) throw Error('STALE_BINDING');
-    if (new Set(submittedQuestions).size !== submittedQuestions.length) return null;
+    if (!this.same(binding)) { this.rejectDecision('BINDING_MISMATCH'); throw Error('STALE_BINDING'); }
+    if (new Set(submittedQuestions).size !== submittedQuestions.length) return this.rejectDecision('DUPLICATE_QUESTION');
     this.localResults = [];
     // Validate the complete intent before any mutation. Unrepresentable meaning
     // is not reduced to the subset that happens to be supported.
-    if (intent === 'UNSUPPORTED' || intent === 'CLARIFY' && (changes.length || submittedQuestions.length || missingField === 'NONE')
-      || intent === 'CONFIRMATION' && (changes.length || questions.length || missingField !== 'NONE')
-      || intent !== 'CONFIRMATION' && meaning !== 'UNKNOWN'
-      || intent === 'QUESTION' && !questions.length) return null;
+    const correction = ['REQUEST', 'CONFIRMATION'].includes(intent) && meaning === 'CORRECTION' && changes.length > 0;
+    if (intent === 'UNSUPPORTED') return this.rejectDecision('UNSUPPORTED_INTENT');
+    if (intent === 'CLARIFY' && (changes.length || submittedQuestions.length)) return this.rejectDecision('CLARIFICATION_WITH_CHANGES');
+    if (intent === 'CONFIRMATION' && !correction && (changes.length || questions.length || missingField !== 'NONE')) return this.rejectDecision('CONFIRMATION_WITH_CHANGES');
+    if (intent !== 'CONFIRMATION' && meaning !== 'UNKNOWN' && !correction) return this.rejectDecision('NON_CONFIRMATION_MEANING');
+    if (intent === 'QUESTION' && !questions.length) return this.rejectDecision('QUESTION_WITHOUT_QUESTION');
     const run = async (name, fields = {}) => {
       const started = performance.now(), result = await this.invoke(name, { ...this.binding(), ...fields }, current);
       if (current()) this.localResults.push({ tool: name, result });
@@ -124,15 +138,19 @@ export class StructuredPhoneDriver {
         ...(typeof result.available === 'boolean' ? { available: result.available } : {}), elapsedMs: performance.now() - started });
       return result;
     };
-    if (intent === 'CLARIFY') return this.render({ ...this.binding(), type: 'ASK_MISSING', field: missingField });
-    if (intent === 'CONFIRMATION') {
+    if (intent === 'CLARIFY') {
+      if (missingField !== 'NONE') return this.render({ ...this.binding(), type: 'ASK_MISSING', field: missingField });
+      if (!this.freshEvidence() || !this.evidence.result.alternatives.length) return this.rejectDecision('NO_CURRENT_SELECTION');
+      return this.render({ ...this.binding(), type: 'OFFER_ALTERNATIVES', alternativeIds: this.evidence.result.alternatives.slice(0, 3).map(a => a.alternativeId) });
+    }
+    if (intent === 'CONFIRMATION' && !correction) {
       const result = await run('submit_confirmation_meaning', { meaning });
       if (!current()) return null;
       if (result.status === 'WOULD_AUTHORIZE') return this.render({ ...this.binding(), type: 'EXPLAIN_SIMULATION' });
       if (result.reason === 'CONFIRMATION_NOT_DELIVERED') return this.render({ ...this.binding(), type: 'EXPLAIN_DELIVERY_GATE' });
-      return null;
+      return this.rejectDecision('CONFIRMATION_MEANING_NOT_ACTIONABLE', 'CONFIRMATION_MEANING');
     }
-    if (changes.length && (await run('update_appointment_draft', { changes })).status !== 'OK') return null;
+    if (changes.length && (await run('update_appointment_draft', { changes })).status !== 'OK') return this.rejectDecision('DRAFT_CHANGE_REJECTED', 'DRAFT_UPDATE');
     if (!current()) return null;
     this.pendingQuestions = questions;
     // A proposed missing-field question must not discard otherwise supplied facts.
@@ -151,7 +169,7 @@ export class StructuredPhoneDriver {
       if (result.status !== 'OK') return this.render({ ...this.binding(), type: 'EXPLAIN_UNSUPPORTED' });
       // A preference searches current alternatives without treating a requested
       // lower bound as a selected or verified time.
-      if ((!this.session.proposal.time && this.preference || !this.session.proposal.date && this.datePreference) && result.alternatives.length) {
+      if ((!this.session.proposal.time && (this.preference || questions.includes('AVAILABILITY')) || !this.session.proposal.date && this.datePreference) && result.alternatives.length) {
         plan = this.render({ ...this.binding(), type: 'OFFER_ALTERNATIVES', alternativeIds: result.alternatives.slice(0, 3).map(a => a.alternativeId) });
       } else plan = this.confirmationRecoveryPlan();
     }
@@ -162,7 +180,7 @@ export class StructuredPhoneDriver {
     const es = plan.language === 'es', services = this.ids().map(id => this.business.services.find(s => s.id === id));
     if (!services.length) return plan; // Collect service first; retain the question in application context.
     if (services.some(s => !Number.isFinite(s.price) || s.price < 0 || !Number.isSafeInteger(Math.round(s.price * 100))
-      || Math.abs(s.price * 100 - Math.round(s.price * 100)) > 0.000001 || !Number.isInteger(s.durationMinutes) || s.durationMinutes <= 0)) return null;
+      || Math.abs(s.price * 100 - Math.round(s.price * 100)) > 0.000001 || !Number.isInteger(s.durationMinutes) || s.durationMinutes <= 0)) return this.rejectDecision('QUESTION_FACTS_UNSUPPORTED', 'QUESTION_RENDER');
     const answers = [];
     const deferred = [];
     for (const question of questions) {
@@ -200,7 +218,7 @@ export class StructuredPhoneDriver {
   }
   confirmationRecoveryPlan() {
     const eligibility = this.confirmationEligibility(), args = { ...this.binding(), type: eligibility.nextAction };
-    if (args.type === 'CHECK_AVAILABILITY') return null;
+    if (args.type === 'CHECK_AVAILABILITY') return this.rejectDecision('AVAILABILITY_REQUIRED', 'RENDER');
     if (args.type === 'ASK_MISSING') args.field = eligibility.missingFields[0];
     if (args.type === 'OFFER_ALTERNATIVES') args.alternativeIds = this.evidence.result.alternatives.slice(0, 3).map(a => a.alternativeId);
     return this.render(args);
@@ -276,45 +294,47 @@ export class StructuredPhoneDriver {
   }
   render(args) {
     const { type, field, alternativeIds, ...binding } = args;
-    if (!this.same(binding)) return null;
+    if (!this.same(binding)) return this.rejectDecision('BINDING_MISMATCH', 'RENDER');
     const p = this.session.proposal, es = binding.language === 'es', evidence = this.freshEvidence() ? this.evidence.result : null;
     const labels = this.ids().map(id => this.availability.label(this.business.services.find(s => s.id === id), binding.language));
-    const display = labels.join(es ? ' y ' : ' and '), locale = es ? 'es' : 'en';
-    const slot = value => new Intl.DateTimeFormat(locale, { weekday: 'long', month: 'long', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZone: 'UTC' }).format(new Date(value.date + 'T' + value.time + ':00Z'));
+    const display = labels.join(es ? ' y ' : ' and ');
+    const spoken = values => formatSpokenSlots(values, { language: binding.language, timeZone: this.business.timeZone, now: this.business.now });
+    const slot = value => spoken([value]);
     const explanation = evidence?.reason === 'BUSINESS_CLOSED' ? (es ? 'El negocio está cerrado para el día solicitado.' : 'The business is closed on the requested day.')
       : evidence?.reason === 'UNAVAILABLE' ? (es ? 'El horario solicitado no está disponible.' : 'The requested time is unavailable.') : null;
     let text, purpose = 'CLARIFICATION';
     if (type === 'ASK_MISSING') {
-      if (field === 'service' ? this.ids().length : p[field]) return null;
+      if (field === 'service' ? this.ids().length : p[field]) return this.rejectDecision('FIELD_ALREADY_KNOWN', 'RENDER');
       text = ({ service: ['Which service would you like?', '¿Qué servicio te gustaría?'], date: ['What date would you like?', '¿Qué fecha prefieres?'], time: ['What time would you prefer?', '¿Qué hora prefieres?'], name: ['What name should I use?', '¿A qué nombre pongo la solicitud?'] })[field][es ? 1 : 0];
     } else if (type === 'ACK_DRAFT') {
-      if (!this.changed) return null;
+      if (!this.changed) return this.rejectDecision('DRAFT_UNCHANGED', 'RENDER');
       text = es ? `He actualizado tu solicitud para ${display}${p.date && p.time ? ': ' + slot(p) : ''}. No se ha reservado ninguna cita.` : `I updated your request for ${display}${p.date && p.time ? ': ' + slot(p) : ''}. No appointment has been booked.`;
-    } else if (type === 'EXPLAIN_RESULT') { if (!explanation) return null; text = explanation;
+    } else if (type === 'EXPLAIN_RESULT') { if (!explanation) return this.rejectDecision('NO_VERIFIED_EXPLANATION', 'RENDER'); text = explanation;
     } else if (type === 'OFFER_ALTERNATIVES') {
-      if (!evidence || !alternativeIds.length || new Set(alternativeIds).size !== alternativeIds.length) return null;
+      if (!evidence || !alternativeIds.length || new Set(alternativeIds).size !== alternativeIds.length) return this.rejectDecision('NO_CURRENT_ALTERNATIVES', 'RENDER');
       const alternatives = alternativeIds.map(id => evidence.alternatives.find(a => a.alternativeId === id));
-      if (alternatives.some(a => !a)) return null;
-      text = (explanation ? explanation + ' ' : '') + (es ? `Puedo ofrecer ${alternatives.map(slot).join(' o ')}. ¿Cuál prefieres?` : `I can offer ${alternatives.map(slot).join(' or ')}. Which would you prefer?`);
+      if (alternatives.some(a => !a)) return this.rejectDecision('FOREIGN_ALTERNATIVE', 'RENDER');
+      text = (explanation ? explanation + ' ' : '') + (es ? `Puedo ofrecer ${spoken(alternatives)}. ¿Cuál prefieres?` : `I can offer ${spoken(alternatives)}. Which would you prefer?`);
       purpose = 'OFFER_ALTERNATIVES';
     } else if (type === 'CANONICAL_CONFIRMATION') {
-      if (!evidence?.available || !p.name || !p.date || !p.time) return null;
-      text = renderPreBookingConfirmation({ service: display, name: p.name, date: p.date, time: p.time }, binding.language);
-      const question = es ? '¿Quieres' : 'Would you'; text = text.replace(question, `Total: $${evidence.price}. ${question}`);
+      if (!evidence?.available || !p.name || !p.date || !p.time) return this.rejectDecision('CONFIRMATION_NOT_READY', 'RENDER');
+      text = es ? `Tengo la cita a nombre de ${p.name} para ${display}, ${slot(p)}. Total: $${evidence.price}. ¿Quieres que reserve esta cita?`
+        : `I have ${p.name} for ${display} ${slot(p)}. Total: $${evidence.price}. Would you like me to book this appointment?`;
       purpose = 'PRE_BOOKING_CONFIRMATION';
     } else if (type === 'EXPLAIN_DELIVERY_GATE') {
-      if (!this.blocked) return null;
+      if (!this.blocked) return this.rejectDecision('NO_BLOCKED_AFFIRMATIVE', 'RENDER');
       text = es ? 'La confirmación no se ha reproducido completamente. No se ha reservado ninguna cita.' : 'The confirmation has not been played completely. No appointment has been booked.';
     } else if (type === 'EXPLAIN_UNSUPPORTED') {
-      if (!this.unsupported) return null;
+      if (!this.unsupported) return this.rejectDecision('NO_UNSUPPORTED_RESULT', 'RENDER');
       text = es ? 'No puedo verificar esta combinación de servicios en esta prueba. No se ha reservado ninguna cita.' : 'I cannot verify this service bundle in this test. No appointment has been booked.';
     } else if (type === 'EXPLAIN_SIMULATION') {
-      if (!this.simulated) return null;
+      if (!this.simulated) return this.rejectDecision('NO_SIMULATION_RESULT', 'RENDER');
       text = es ? 'Esta es una prueba. La autorización sería válida, pero no se ha reservado ninguna cita ni enviado mensajes.' : 'This is a test. Authorization would be valid, but no appointment was booked and no messages were sent.';
-    } else return null;
+    } else return this.rejectDecision('UNKNOWN_PURPOSE', 'RENDER');
     const structuredBinding = Object.freeze({ ...binding, serviceIds: Object.freeze([...binding.serviceIds]), generation: this.generation,
       requiresAvailability: ['CANONICAL_CONFIRMATION', 'OFFER_ALTERNATIVES', 'EXPLAIN_RESULT', 'EXPLAIN_SIMULATION'].includes(type),
-      requireAvailable: ['CANONICAL_CONFIRMATION', 'EXPLAIN_SIMULATION'].includes(type), alternativeIds: Object.freeze([...(alternativeIds || [])]) });
+      requireAvailable: ['CANONICAL_CONFIRMATION', 'EXPLAIN_SIMULATION'].includes(type), alternativeIds: Object.freeze([...(alternativeIds || [])]),
+      ...(['ACK_DRAFT', 'OFFER_ALTERNATIVES', 'CANONICAL_CONFIRMATION'].includes(type) ? { spokenReferenceDate: businessDate(this.business.now, this.business.timeZone) } : {}) });
     this.bindings.add(structuredBinding);
     return Object.freeze({ purpose, proposalVersion: p.proposalVersion, language: binding.language, expectsCallerInput: true, critical: true, deliveryValidationRequired: true,
       expectedFacts: { service: display, name: p.name, date: p.date, time: p.time }, structuredBinding,
@@ -345,7 +365,8 @@ export class StructuredPhoneDriver {
     if (!b) return true;
     // Recheck after every asynchronous business/availability operation.
     const bound = () => !this.closed && this.bindings.has(b) && b.generation === this.generation && b.turnId === this.turnId
-      && b.proposalVersion === this.session.proposal.proposalVersion && JSON.stringify(b.serviceIds) === JSON.stringify(this.ids());
+      && b.proposalVersion === this.session.proposal.proposalVersion && JSON.stringify(b.serviceIds) === JSON.stringify(this.ids())
+      && (!b.spokenReferenceDate || b.spokenReferenceDate === businessDate(this.availability.now(), this.business.timeZone));
     if (!bound()) return false;
     const business = await this.availability.read();
     if (!bound() || business.revision !== b.businessRevision) return false;

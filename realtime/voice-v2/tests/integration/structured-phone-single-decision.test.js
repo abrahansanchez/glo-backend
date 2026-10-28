@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { harness, call, business } from './structured-phone-harness.js';
-import { renderPreBookingConfirmation } from '../../planning/renderPreBookingConfirmation.js';
+
 import { phoneContracts, PHONE_LIMITS } from '../../experiments/structured-phone/PhoneContracts.js';
 
 const decision = (m, fields = {}) => [call('submit_turn_decision', { ...m.binding, changes: [], intent: 'REQUEST', meaning: 'UNKNOWN', questions: [], missingField: 'NONE', ...fields })];
@@ -31,7 +31,7 @@ for (const language of ['en', 'es']) test(`single decision complete ${language} 
   const scripts = [
     { text: language === 'es' ? 'Quiero un corte.' : 'I want a haircut.', fields: { changes: [service] }, expected: /date|fecha/, before: 2 },
     { text: language === 'es' ? 'El martes por la tarde.' : 'Tuesday afternoon.', fields: { changes: [date, { kind: 'SET_PREFERENCE', preference: { kind: 'AFTERNOON' } }] }, expected: /offer|ofrecer/, before: 3 },
-    { text: language === 'es' ? 'Más tarde de las cuatro.' : 'Later than four.', fields: { changes: [{ kind: 'SET_PREFERENCE', preference: { kind: 'AFTER', time: '16:00' } }] }, expected: /5:00|17:00/, before: null },
+    { text: language === 'es' ? 'Más tarde de las cuatro.' : 'Later than four.', fields: { changes: [{ kind: 'SET_PREFERENCE', preference: { kind: 'AFTER', time: '16:00' } }] }, expected: /5 PM|cinco de la tarde/, before: null },
     { text: language === 'es' ? 'Las cinco, y añade barba. ¿Cuánto cuesta y cuánto dura?' : 'Five, and add beard trim. What does it cost and how long does it take?', fields: { changes: [time, { kind: 'ADD_SERVICE', serviceId: 'service-beard-72' }], questions: ['PRICE', 'DURATION'] }, expected: /50/, before: null },
     { text: language === 'es' ? 'Mi nombre es Synthetic Tester. Perdón, a las cuatro.' : 'My name is Synthetic Tester. Sorry, make it four.', fields: { changes: [name, { kind: 'SET_TIME', time: '16:00' }] }, expected: /Total: \$50/, before: 3 },
     { text: language === 'es' ? 'Sí.' : 'Yes.', fields: { intent: 'CONFIRMATION', meaning: 'AFFIRM' }, expected: /not been played|no se ha reproducido/, before: 2 },
@@ -49,10 +49,10 @@ for (const language of ['en', 'es']) test(`single decision complete ${language} 
       assert.match(f.speech.at(-1).input, row.expected);
       if (row === scripts[3]) { assert.match(f.speech.at(-1).input, /55/); assert.match(f.speech.at(-1).input, /name|nombre/); }
       if (row === scripts[4]) {
-        const baseline = renderPreBookingConfirmation({ service: language === 'es' ? 'corte de pelo y recorte de barba' : 'Precision Cut and Beard Detail',
-          name: 'Synthetic Tester', date: '2026-10-27', time: '16:00' }, language);
-        const question = language === 'es' ? '¿Quieres' : 'Would you';
-        assert.equal(f.speech.at(-1).input, baseline.replace(question, `Total: $50. ${question}`));
+        const expected = language === 'es'
+          ? 'Tengo la cita a nombre de Synthetic Tester para corte de pelo y recorte de barba, martes, 27 de octubre a las cuatro de la tarde. Total: $50. ¿Quieres que reserve esta cita?'
+          : 'I have Synthetic Tester for Precision Cut and Beard Detail Tuesday, October 27 at 4 PM. Total: $50. Would you like me to book this appointment?';
+        assert.equal(f.speech.at(-1).input, expected);
       }
       rows.push({ caller: row.text, before: row.before, after: 1, speech: f.speech.at(-1).input });
       if (row.ack) await f.ack(f.twilio.sent.filter(p => p.event === 'mark').at(-1).mark.name);
