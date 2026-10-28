@@ -153,8 +153,8 @@ policies remain in force.
 
 ## Limits and testing
 
-Per call: 12 admitted decision turns, four decision requests/turn and 48 total,
-512 output tokens/request, eight calls/completed response, four decision transport
+Per call: 12 admitted decision turns, one decision request/turn and 12 total,
+512 output tokens/request, one decision call/completed response, four decision transport
 constructions maximum (plus one unchanged intake connection), 16 TTS requests
 including greeting/recovery, zero retries, 20-second decision deadline,
 60-second TTS preparation deadline and 180-second call deadline. Existing 30-second
@@ -279,18 +279,14 @@ evidenceCurrent and nextAction fields. Missing draft information is not proof th
 the caller omitted it. Availability OK describes a completed check, not necessarily
 an available slot or permission to confirm.
 
-On any response, a single, structurally valid, current-bound explicit
-canonical-confirmation request with successful eligibility hands off to the
-existing canonical renderer. A successful submit_confirmation_meaning result
-hands off to the existing simulation explanation only after caller intent,
-delivered-confirmation authority and fresh availability have been checked.
-Neither handoff acknowledges playback. Rejected consent retains model recovery.
-On the fourth response only, canonical eligibility recovery still handles missing fields with collection,
-and unavailable evidence produces its verified explanation/current alternatives.
-Unknown or stale availability cannot produce confirmation. No fifth model request,
-slot substitution, delivery acknowledgment or booking authority is introduced.
-The rendered plan retains all asynchronous release and mark freshness checks.
-
+The current single-decision path interprets the whole caller turn once, then
+uses application-owned tools and rendering. The earlier fourth-response recovery
+loop and follow-up response-plan requests are no longer used. Ready evidence
+produces canonical readback, missing draft fields produce the existing collection
+question, and unavailable results produce verified explanation/current alternatives.
+Unknown/stale evidence cannot produce confirmation. All asynchronous release and
+mark freshness checks remain independent; neither rendering nor submission grants
+consent, delivery acknowledgment or booking authority.
 Ordinary offers omit service enumeration; canonical readback retains it. Generic
 unavailability describes the requested time, without inventing an hours or closure
 cause. Only a verified BUSINESS_CLOSED result supplies a closure explanation.
@@ -304,3 +300,52 @@ single-tool results now use application-owned rendering without those subsequent
 model requests. Offline EN/ES journeys prove confirmation 4→3 requests and
 delivered consent 2→1 with the same rendered meaning. These counts do not promise
 live latency savings or change TTS, freshness, interruption or request limits.
+
+## One decision per accepted caller turn
+
+The old tool/response-plan schema required model continuations and could not
+express an explicit later-than bound or a question answer in the renderer.
+Only submit_turn_decision is now sent to the decision model. It contains current
+turn/version/business/ordered-service/language bindings; up to eight ordered
+changes; REQUEST, QUESTION, CONFIRMATION, CLARIFY or UNSUPPORTED intent; proposed
+confirmation meaning; typed PRICE, DURATION or AVAILABILITY questions; and an
+optional supported missing-field request. No predicted outcome or arbitrary speech
+field exists. Unsupported questions/intent must be explicit UNSUPPORTED and stop,
+not be reduced to a supported subset. Model interpretation remains fallible.
+
+Changes support existing catalogue operations, exact ISO calendar dates, explicit
+bounded ISO date ranges, exact times, names, current alternative references,
+MORNING/AFTERNOON and an explicit AFTER HH:mm bound. A date range is held separately
+from the proposal date: it never silently selects its first day. Range alternatives
+retain an explicitly requested time and are filtered at discovery and release.
+The existing seven-day bounded alternative search remains; it does not prove
+unavailability throughout a longer range. Exact date/alternative selection ends a
+date preference; a later exact time correction replaces an older time preference.
+
+The driver validates the whole decision and current bindings before dispatch.
+Atomic ordered changes run first, then actual full-bundle availability, then
+application eligibility/rendering. No model request follows a local result. Genuine
+current affirmative meaning still goes through existing caller-evidence veto,
+message-bound completed playback authority, fresh availability and simulation-only
+checks. Blocked affirmative renders the existing delivery gate. Unsafe, foreign,
+ambiguous, unsupported or rejected decisions with no supported clarification stop
+with bounded diagnostics; they do not get another model attempt. Tool results and
+pending questions are returned in one function output and next-turn context.
+
+PRICE and DURATION answers use validated catalogue money/duration; AVAILABILITY
+answers use current bundle evidence and retain independent release checks. A
+question needing a missing service/date stays pending while the application asks
+for that information. Existing canonical text, localized ordered services and
+confirmation authority are retained. No caller phrase lists or scenario answers
+are supplied. Greeting uses zero decision requests. Speech synthesis and its
+headers/body waits, the single model request wait, transcription/turn admission
+and independent freshness work remain. These offline counts are not live speed
+measurements.
+
+EN/ES offline journeys now use one request for each of eight turns. Baseline
+comparable turns used 2 (missing date), 3 (afternoon), 3 (correction/name), 2 (early
+affirmative), 2 (repeat confirmation), and 1 (delivered affirmative). The explicit
+later-than and combined price/duration question turns are new contract coverage;
+there is no equivalent complete baseline meaning/count to claim. Legacy compound
+changes alone used three requests but did not answer those questions. Canonical
+wording is checked byte-for-byte against the unchanged canonical renderer.

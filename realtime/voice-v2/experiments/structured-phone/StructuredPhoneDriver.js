@@ -15,6 +15,8 @@ export class StructuredPhoneDriver {
     this.evidence = null; this.preference = null; this.bindings = new WeakSet(); this.seenCalls = new Set(); this.closed = false;
     this.applicability = new Set(); this.decisionTimer = null;
     this.modelOwner = null;
+    this.pendingQuestions = [];
+    this.datePreference = null;
   }
   log(stage, details = {}) { this.emit({ event: 'V2_STRUCTURED_PHONE', callSid: this.session.callSid, buildSha: this.session.buildSha, stage, ...details }); }
   interrupt(reason = 'CALLER_SPEECH') {
@@ -38,7 +40,8 @@ export class StructuredPhoneDriver {
     return { binding: this.binding(), draft: { serviceIds: this.ids(), date: this.session.proposal.date, time: this.session.proposal.time, name: this.session.proposal.name },
       business: { timeZone: this.business.timeZone, now: this.business.now, bookingWindow: this.business.window,
         services: this.business.services.map(s => ({ ...s, label: this.availability.label(s, this.binding().language) })),
-        hours: this.business.raw.availability.businessHours }, availability: this.freshEvidence() ? this.evidence.result : null };
+        hours: this.business.raw.availability.businessHours }, availability: this.freshEvidence() ? this.evidence.result : null,
+      pendingQuestions: [...this.pendingQuestions], datePreference: this.datePreference };
   }
   async turn({ turnId, transcript, authority }) {
     this.interrupt('NEW_TURN'); const generation = this.generation; this.turnId = turnId; this.callerText = transcript; this.consent = authority;
@@ -74,70 +77,111 @@ export class StructuredPhoneDriver {
         if (current()) this.log('MODEL_READY');
       }
       if (!current()) return;
-      for (let round = 0; round < PHONE_LIMITS.perTurnRequests; round++) {
-        stage = 'MODEL_REQUEST';
-        if (++this.requests > PHONE_LIMITS.modelRequests) throw Error('MODEL_REQUEST_LIMIT');
-        this.log('MODEL_REQUEST', { turn: this.turns, request: this.requests });
-        const modelStartedMs = performance.now();
-        const response = await this.model.request({ callerText: round === 0 ? transcript : null, context: this.context() });
-        if (!current()) return;
-        this.log('MODEL_COMPLETED', { turn: this.turns, request: this.requests, elapsedMs: performance.now() - modelStartedMs });
-        // Whole-batch structural validation before any dispatch or mutation.
-        stage = 'TOOL_ARGUMENT_VALIDATION';
-        const calls = response.calls.map(call => {
-          if (this.seenCalls.has(call.callId)) throw Error('REPLAY');
-          const tool = this.contracts.tools.find(t => t.name === call.name), args = JSON.parse(call.argumentsJson);
-          if (!tool || !matches(args, call.name === 'propose_response_plan' ? this.contracts.plan : tool.parameters)) throw Error('STRUCTURE');
-          return { ...call, args };
-        });
-        if (!calls.length || calls.length > 8 || new Set(calls.map(c => c.callId)).size !== calls.length) throw Error('STRUCTURE');
-        if (calls.some(c => c.name === 'propose_response_plan') && calls.length !== 1) throw Error('STRUCTURE');
-        for (const call of calls) {
-          this.seenCalls.add(call.callId);
-          if (call.name === 'propose_response_plan') {
-            stage = 'PLAN_VALIDATION';
-            const plan = this.render(call.args);
-            if (!plan || !current()) throw Error('INVALID_PLAN');
-            this.log('PLAN_VALIDATED', { turn: this.turns, proposalVersion: this.session.proposal.proposalVersion, atMs: performance.now() });
-            stage = 'SPEECH_SUBMISSION'; const delivery = await this.speak(plan);
-            stage = 'TOOL_RESULT_SUBMISSION';
-            if (current()) this.model.toolResult(call.callId, { status: delivery?.accepted ? 'SPEECH_PREPARING' : 'WITHHELD', playbackAcknowledged: false }, this.context());
-            return;
-          }
-          const toolStartedMs = performance.now();
-          stage = 'TOOL_DISPATCH';
-          const result = await this.invoke(call.name, call.args, current);
-          if (!current()) return;
-          this.log('TOOL_RESULT', { turn: this.turns, tool: call.name, status: result.status, elapsedMs: performance.now() - toolStartedMs,
-            reason: ['STALE_BINDING', 'INVALID_CHANGE', 'STALE_OR_FOREIGN_ALTERNATIVE', 'UNSUPPORTED_SERVICE_BUNDLE', 'FRESH_BUNDLE_REQUIRED', 'CONFIRMATION_NOT_DELIVERED', 'NOT_AFFIRMATIVE', 'UNAVAILABLE', 'BUSINESS_CLOSED'].includes(result.reason) ? result.reason : result.reason ? 'REJECTED' : null,
-            ...(['check_availability', 'request_canonical_confirmation'].includes(call.name) ? {
-              available: typeof result.available === 'boolean' ? result.available : null, evidenceCurrent: Boolean(this.freshEvidence()),
-              ...(call.name === 'request_canonical_confirmation' ? { eligibilityReason: result.eligibilityReason || 'STALE_BINDING', missingFields: result.missingFields || [] } : {}),
-            } : {}) });
-          // Successful authority checks already select their application-owned
-          // response. Rejections retain model recovery and the final-round gate.
-          const readyConfirmation = call.name === 'request_canonical_confirmation' && result.status === 'OK' && result.eligible === true;
-          const simulatedConsent = call.name === 'submit_confirmation_meaning' && result.status === 'WOULD_AUTHORIZE' && result.simulated === true;
-          const finalRecovery = call.name === 'request_canonical_confirmation' && round === PHONE_LIMITS.perTurnRequests - 1 && result.reason !== 'STALE_BINDING';
-          if (calls.length === 1 && (readyConfirmation || simulatedConsent || finalRecovery)) {
-            const plan = simulatedConsent ? this.render({ ...this.binding(), type: 'EXPLAIN_SIMULATION' }) : this.confirmationRecoveryPlan();
-            if (plan && current()) {
-              this.log('PLAN_VALIDATED', { turn: this.turns, proposalVersion: this.session.proposal.proposalVersion, source: 'APPLICATION_CONFIRMATION_GATE', atMs: performance.now() });
-              stage = 'SPEECH_SUBMISSION'; const delivery = await this.speak(plan);
-              stage = 'TOOL_RESULT_SUBMISSION';
-              if (current()) this.model.toolResult(call.callId, { ...result, delivery: { status: delivery?.accepted ? 'SPEECH_PREPARING' : 'WITHHELD', playbackAcknowledged: false } }, this.context());
-              return;
-            }
-          }
-          stage = 'TOOL_RESULT_SUBMISSION'; this.model.toolResult(call.callId, result, this.context());
-        }
-      }
-      throw Error('TURN_REQUEST_LIMIT');
+      stage = 'MODEL_REQUEST';
+      if (++this.requests > PHONE_LIMITS.modelRequests) throw Error('MODEL_REQUEST_LIMIT');
+      this.log('MODEL_REQUEST', { turn: this.turns, request: this.requests });
+      const modelStartedMs = performance.now();
+      const response = await this.model.request({ callerText: transcript, context: this.context() });
+      if (!current()) return;
+      this.log('MODEL_COMPLETED', { turn: this.turns, request: this.requests, elapsedMs: performance.now() - modelStartedMs });
+      stage = 'TOOL_ARGUMENT_VALIDATION';
+      if (!Array.isArray(response.calls) || response.calls.length !== 1) throw Error('STRUCTURE');
+      const call = response.calls[0];
+      if (this.seenCalls.has(call.callId)) throw Error('REPLAY');
+      const decision = JSON.parse(call.argumentsJson);
+      if (call.name !== 'submit_turn_decision' || !matches(decision, this.contracts.decision)) throw Error('STRUCTURE');
+      this.seenCalls.add(call.callId);
+      stage = 'TOOL_DISPATCH';
+      const plan = await this.executeDecision(decision, current);
+      if (!current()) return;
+      if (!plan) throw Error('INVALID_PLAN');
+      this.log('PLAN_VALIDATED', { turn: this.turns, proposalVersion: this.session.proposal.proposalVersion, source: 'APPLICATION_DECISION', atMs: performance.now() });
+      stage = 'SPEECH_SUBMISSION'; const delivery = await this.speak(plan);
+      stage = 'TOOL_RESULT_SUBMISSION';
+      if (current()) this.model.toolResult(call.callId, { status: delivery?.accepted ? 'SPEECH_PREPARING' : 'WITHHELD', operations: this.localResults, playbackAcknowledged: false }, this.context());
     } catch (error) {
       if (current()) { this.log('STOPPED', { reason: 'DECISION_FAILED_OR_LIMIT', ...phoneFailure(error, stage), turn: this.turns, requests: this.requests, connections: this.connections }); this.close(); this.terminate('STRUCTURED_PHONE_FAILED'); }
     } finally { clearTimeout(timer); if (this.decisionTimer === timer) this.decisionTimer = null; if (current()) this.active = false; }
   }
   same(args) { const b = this.binding(); return Object.keys(b).every(key => JSON.stringify(args[key]) === JSON.stringify(b[key])) && Object.keys(args).length === Object.keys(b).length; }
+  async executeDecision(decision, current) {
+    const { changes, intent, meaning, questions: submittedQuestions, missingField, ...binding } = decision;
+    const questions = [...new Set([...this.pendingQuestions, ...submittedQuestions])];
+    if (!this.same(binding)) throw Error('STALE_BINDING');
+    if (new Set(submittedQuestions).size !== submittedQuestions.length) return null;
+    this.localResults = [];
+    // Validate the complete intent before any mutation. Unrepresentable meaning
+    // is not reduced to the subset that happens to be supported.
+    if (intent === 'UNSUPPORTED' || intent === 'CLARIFY' && (changes.length || submittedQuestions.length || missingField === 'NONE')
+      || intent === 'CONFIRMATION' && (changes.length || questions.length || missingField !== 'NONE')
+      || intent !== 'CONFIRMATION' && meaning !== 'UNKNOWN'
+      || intent === 'QUESTION' && !questions.length) return null;
+    const run = async (name, fields = {}) => {
+      const started = performance.now(), result = await this.invoke(name, { ...this.binding(), ...fields }, current);
+      if (current()) this.localResults.push({ tool: name, result });
+      if (current()) this.log('TOOL_RESULT', { turn: this.turns, tool: name, status: result.status,
+        reason: ['STALE_BINDING', 'INVALID_CHANGE', 'STALE_OR_FOREIGN_ALTERNATIVE', 'FRESH_BUNDLE_REQUIRED', 'CONFIRMATION_NOT_DELIVERED', 'NOT_AFFIRMATIVE', 'UNAVAILABLE', 'BUSINESS_CLOSED'].includes(result.reason) ? result.reason : result.reason ? 'REJECTED' : null,
+        ...(typeof result.available === 'boolean' ? { available: result.available } : {}), elapsedMs: performance.now() - started });
+      return result;
+    };
+    if (intent === 'CLARIFY') return this.render({ ...this.binding(), type: 'ASK_MISSING', field: missingField });
+    if (intent === 'CONFIRMATION') {
+      const result = await run('submit_confirmation_meaning', { meaning });
+      if (!current()) return null;
+      if (result.status === 'WOULD_AUTHORIZE') return this.render({ ...this.binding(), type: 'EXPLAIN_SIMULATION' });
+      if (result.reason === 'CONFIRMATION_NOT_DELIVERED') return this.render({ ...this.binding(), type: 'EXPLAIN_DELIVERY_GATE' });
+      return null;
+    }
+    if (changes.length && (await run('update_appointment_draft', { changes })).status !== 'OK') return null;
+    if (!current()) return null;
+    this.pendingQuestions = questions;
+    // A proposed missing-field question must not discard otherwise supplied facts.
+    if (missingField !== 'NONE') {
+      const plan = this.render({ ...this.binding(), type: 'ASK_MISSING', field: missingField });
+      if (!plan) return null;
+      if (questions.length) return this.answerQuestions(plan, questions);
+      return plan;
+    }
+    let plan;
+    if (!this.ids().length || !this.session.proposal.date && !this.datePreference) {
+      plan = this.render({ ...this.binding(), type: 'ASK_MISSING', field: !this.ids().length ? 'service' : 'date' });
+    } else {
+      const result = await run('check_availability');
+      if (!current()) return null;
+      if (result.status !== 'OK') return this.render({ ...this.binding(), type: 'EXPLAIN_UNSUPPORTED' });
+      // A preference searches current alternatives without treating a requested
+      // lower bound as a selected or verified time.
+      if ((!this.session.proposal.time && this.preference || !this.session.proposal.date && this.datePreference) && result.alternatives.length) {
+        plan = this.render({ ...this.binding(), type: 'OFFER_ALTERNATIVES', alternativeIds: result.alternatives.slice(0, 3).map(a => a.alternativeId) });
+      } else plan = this.confirmationRecoveryPlan();
+    }
+    if (!plan || !questions.length) return plan;
+    return this.answerQuestions(plan, questions);
+  }
+  answerQuestions(plan, questions) {
+    const es = plan.language === 'es', services = this.ids().map(id => this.business.services.find(s => s.id === id));
+    if (!services.length) return plan; // Collect service first; retain the question in application context.
+    if (services.some(s => !Number.isFinite(s.price) || s.price < 0 || !Number.isSafeInteger(Math.round(s.price * 100))
+      || Math.abs(s.price * 100 - Math.round(s.price * 100)) > 0.000001 || !Number.isInteger(s.durationMinutes) || s.durationMinutes <= 0)) return null;
+    const answers = [];
+    const deferred = [];
+    for (const question of questions) {
+      if (question === 'PRICE') answers.push(`Total: $${services.reduce((sum, s) => sum + Math.round(s.price * 100), 0) / 100}.`);
+      if (question === 'DURATION') answers.push(es ? `La duración total es ${services.reduce((sum, s) => sum + s.durationMinutes, 0)} minutos.` : `The total duration is ${services.reduce((sum, s) => sum + s.durationMinutes, 0)} minutes.`);
+      if (question === 'AVAILABILITY' && !this.freshEvidence()) deferred.push(question);
+      if (question === 'AVAILABILITY' && this.freshEvidence() && this.evidence.result.available)
+        answers.push(es ? 'El horario solicitado está disponible.' : 'The requested time is available.');
+    }
+    this.pendingQuestions = deferred;
+    const key = plan.purpose === 'PRE_BOOKING_CONFIRMATION' ? 'applicationOwnedConfirmation' : 'applicationOwnedSpeech';
+    let structuredBinding = plan.structuredBinding;
+    if (questions.includes('AVAILABILITY') && this.freshEvidence()) {
+      structuredBinding = Object.freeze({ ...structuredBinding, requiresAvailability: true,
+        requireAvailable: structuredBinding.requireAvailable || this.evidence.result.available });
+      this.bindings.add(structuredBinding);
+    }
+    return Object.freeze({ ...plan, structuredBinding, speechContract: Object.freeze({ [key]: true, requiredMessage: [...answers, plan.speechContract.requiredMessage].join(' ') }) });
+  }
   freshEvidence() { return this.evidence?.version === this.session.proposal.proposalVersion && performance.now() - this.evidence.checkedAt <= 60000 && this.evidence.revision === this.business.revision
     && JSON.stringify(this.evidence.ids) === JSON.stringify(this.ids()); }
   confirmationEligibility() {
@@ -171,31 +215,38 @@ export class StructuredPhoneDriver {
         const alternative = this.freshEvidence() && this.evidence.result.alternatives.find(a => a.alternativeId === change.alternativeId);
         if (!alternative) return rejected('STALE_OR_FOREIGN_ALTERNATIVE'); selected.set(change, alternative);
       }
-      const ids = [...this.ids()]; let date = original.date, time = original.time, name = original.name, preference = this.preference;
+      const ids = [...this.ids()]; let date = original.date, time = original.time, name = original.name, preference = this.preference, datePreference = this.datePreference;
       for (const change of changes) {
         if (change.kind === 'SET_SERVICE') ids.splice(0, ids.length, change.serviceId);
         else if (change.kind === 'ADD_SERVICE' && !ids.includes(change.serviceId)) ids.push(change.serviceId);
         else if (change.kind === 'REMOVE_SERVICE') { const index = ids.indexOf(change.serviceId); if (index >= 0) ids.splice(index, 1); }
-        else if (change.kind === 'SET_DATE') date = change.date;
-        else if (change.kind === 'SET_TIME') time = change.time;
+        else if (change.kind === 'SET_DATE') { date = change.date; datePreference = null; }
+        else if (change.kind === 'SET_DATE_RANGE') { datePreference = { startDate: change.startDate, endDate: change.endDate }; date = null; }
+        else if (change.kind === 'SET_TIME') { time = change.time; preference = null; }
         else if (change.kind === 'SET_NAME') name = change.name;
-        else if (change.kind === 'SELECT_ALTERNATIVE') { date = selected.get(change).date; time = selected.get(change).time; }
+        else if (change.kind === 'SELECT_ALTERNATIVE') { date = selected.get(change).date; time = selected.get(change).time; datePreference = null; }
         else if (change.kind === 'SET_PREFERENCE') { preference = change.preference; time = null; }
       }
       const parsed = date && moment.tz(date, 'YYYY-MM-DD', true, this.business.timeZone);
-      if (!ids.length || ids.length > 8 || date && (!parsed.isValid() || parsed.format('YYYY-MM-DD') !== date || date < this.business.window.start || date > this.business.window.end)
-        || time && !/^([01]\d|2[0-3]):[0-5]\d$/.test(time)) return rejected('INVALID_CHANGE');
+      if (datePreference && (datePreference.startDate > datePreference.endDate || [datePreference.startDate, datePreference.endDate].some(value => {
+        const d = moment.tz(value, 'YYYY-MM-DD', true, this.business.timeZone);
+        return !d.isValid() || d.format('YYYY-MM-DD') !== value || value < this.business.window.start || value > this.business.window.end;
+      }))) return rejected('INVALID_CHANGE');
+      if (ids.length > 8 || date && (!parsed.isValid() || parsed.format('YYYY-MM-DD') !== date || date < this.business.window.start || date > this.business.window.end)
+        || time && !/^([01]\d|2[0-3]):[0-5]\d$/.test(time)
+        || preference?.kind === 'AFTER' && !/^([01]\d|2[0-3]):[0-5]\d$/.test(preference.time)) return rejected('INVALID_CHANGE');
       const services = ids.map(id => this.business.services.find(s => s.id === id));
       if (services.some(s => !s)) return rejected('INVALID_CHANGE');
       const next = createBookingProposal({ proposalId: original.proposalId, proposalVersion: original.proposalVersion + 1,
-        service: services[0].name, additionalServices: services.slice(1).map(s => s.name), date, time, name });
+        service: services[0]?.name || null, additionalServices: services.slice(1).map(s => s.name), date, time, name });
       if (!current()) return rejected('STALE_BINDING');
-      this.replace(original, next); this.preference = preference; this.evidence = null; this.changed = true; this.blocked = false; this.simulated = false; this.unsupported = false; this.consent = null;
+      this.replace(original, next); this.preference = preference; this.datePreference = datePreference; this.evidence = null; this.changed = true; this.blocked = false; this.simulated = false; this.unsupported = false; this.consent = null;
       return { status: 'OK', draft: this.context().draft };
     }
     if (name === 'check_availability') {
-      if (!this.session.proposal.date || !this.ids().length) return rejected('FRESH_BUNDLE_REQUIRED');
-      const result = await this.availability.check(this.business, this.ids(), this.session.proposal.date, this.session.proposal.time, this.preference);
+      if ((!this.session.proposal.date && !this.datePreference) || !this.ids().length) return rejected('FRESH_BUNDLE_REQUIRED');
+      const result = await this.availability.check(this.business, this.ids(), this.session.proposal.date || this.datePreference.startDate,
+        this.session.proposal.date ? this.session.proposal.time : null, this.preference, { dateRange: this.datePreference && { ...this.datePreference, time: this.session.proposal.time } });
       if (!current()) return rejected('STALE_BINDING');
       if (result.status !== 'OK') { this.evidence = null; this.unsupported = result.status === 'UNSUPPORTED'; return result; }
       this.unsupported = false;
@@ -302,8 +353,9 @@ export class StructuredPhoneDriver {
       if (!this.freshEvidence()) return false;
       const selected = b.alternativeIds.map(id => this.evidence.result.alternatives.find(a => a.alternativeId === id));
       if (selected.some(a => !a)) return false;
-      const fresh = await this.availability.check(business, b.serviceIds, this.session.proposal.date, this.session.proposal.time, this.preference,
-        { searchAlternatives: false, alternativesToCheck: selected });
+      const fresh = await this.availability.check(business, b.serviceIds, this.session.proposal.date || this.datePreference?.startDate,
+        this.session.proposal.date ? this.session.proposal.time : null, this.preference,
+        { searchAlternatives: false, alternativesToCheck: selected, dateRange: this.datePreference && { ...this.datePreference, time: this.session.proposal.time } });
       if (!bound() || fresh.status !== 'OK' || b.requireAvailable && !fresh.available || fresh.price !== this.evidence.result.price
         || fresh.durationMinutes !== this.evidence.result.durationMinutes || fresh.reason !== this.evidence.result.reason) return false;
       for (const id of b.alternativeIds) {

@@ -48,7 +48,7 @@ export class LiveBundleAvailability {
     if (!current.isValid()) throw Error('INVALID_BUSINESS_CLOCK');
     return instant.isAfter(current);
   }
-  async check(business, ids, date, time, preference = null, { searchAlternatives = true, alternativesToCheck = [] } = {}) {
+  async check(business, ids, date, time, preference = null, { searchAlternatives = true, alternativesToCheck = [], dateRange = null } = {}) {
     if (!Array.isArray(alternativesToCheck) || alternativesToCheck.length > 3) throw Error('INVALID_AVAILABILITY_RESULT');
     const day = moment.tz(date, 'YYYY-MM-DD', true, business.timeZone);
     const local = time ? moment.tz(`${date} ${time}`, 'YYYY-MM-DD HH:mm', true, business.timeZone) : null;
@@ -70,7 +70,9 @@ export class LiveBundleAvailability {
     const alternatives = [];
     if (!searchAlternatives) for (const a of alternativesToCheck) {
       if (!a || typeof a.date !== 'string' || typeof a.time !== 'string') throw Error('INVALID_AVAILABILITY_RESULT');
-      if (preference?.kind === 'AFTERNOON' && a.time < '12:00' || preference?.kind === 'MORNING' && a.time >= '12:00') continue;
+      if (dateRange && (a.date < dateRange.startDate || a.date > dateRange.endDate)) continue;
+      if (dateRange?.time && a.time !== dateRange.time) continue;
+      if (preference?.kind === 'AFTERNOON' && a.time < '12:00' || preference?.kind === 'MORNING' && a.time >= '12:00' || preference?.kind === 'AFTER' && a.time <= preference.time) continue;
       const parsed = moment.tz(`${a.date} ${a.time}`, 'YYYY-MM-DD HH:mm', true, business.timeZone);
       if (!parsed.isValid() || parsed.format('YYYY-MM-DD') !== a.date || parsed.format('HH:mm') !== a.time
         || a.date < business.window.start || a.date > business.window.end) throw Error('INVALID_AVAILABILITY_RESULT');
@@ -84,6 +86,7 @@ export class LiveBundleAvailability {
     for (let offset = 0; searchAlternatives && offset < 7 && alternatives.length < 3; offset++) {
       const searchDate = moment.tz(date, business.timeZone).add(offset, 'days').format('YYYY-MM-DD');
       if (searchDate > business.window.end) break;
+      if (dateRange && searchDate > dateRange.endDate) break;
       const slots = await this.listSlots({ barber: business.raw, date: searchDate, durationMinutes, limit: null });
       if (!Array.isArray(slots)) throw Error('INVALID_AVAILABILITY_RESULT');
       for (const slot of slots) {
@@ -91,7 +94,8 @@ export class LiveBundleAvailability {
         if (!parsed.isValid() || slot.date !== searchDate) throw Error('INVALID_AVAILABILITY_RESULT');
         if (!this.future(parsed, business.timeZone)) continue;
         const t = parsed.format('HH:mm');
-        if (preference?.kind === 'AFTERNOON' && t < '12:00' || preference?.kind === 'MORNING' && t >= '12:00') continue;
+        if (dateRange?.time && t !== dateRange.time) continue;
+        if (preference?.kind === 'AFTERNOON' && t < '12:00' || preference?.kind === 'MORNING' && t >= '12:00' || preference?.kind === 'AFTER' && t <= preference.time) continue;
         const confirmed = await this.checkSlot({ barber: business.raw, date: searchDate, time: parsed.format('h:mm A'), durationMinutes });
         if (typeof confirmed !== 'boolean') throw Error('INVALID_AVAILABILITY_RESULT');
         if (!confirmed || !this.future(parsed, business.timeZone)) continue;

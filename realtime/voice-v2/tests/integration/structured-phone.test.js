@@ -13,86 +13,7 @@ import { createIdempotentAppointment } from '../../../../services/booking/create
 import { buildServiceCatalogue } from '../../interpretation/buildServiceCatalogue.js';
 import { deriveSlotKey } from '../../domain/BookingProposal.js';
 
-const ID = '123456789012345678901234';
-function business() { return { _id: ID, services: [{ _id: 'service-cut-91', name: 'Precision Cut', price: 32, durationMinutes: 35 },
-  { _id: 'service-beard-72', name: 'Beard Detail', price: 18, durationMinutes: 20 }],
-  availability: { timezone: 'America/New_York', bufferMinutes: 5, businessHours: { mon: { open: '09:00', close: '18:00', isClosed: false }, tue: { open: '09:00', close: '18:00', isClosed: false } } } }; }
-function fakeModel(script, requests, models) {
-  const model = { ready: Promise.resolve(), closed: false, results: [], binding: null,
-    async request(request) {
-      requests.push(request); this.binding = request.context.binding;
-      if (request.callerText !== null) { this.turn = (this.turn || 0) + 1; this.round = 0; }
-      this.round++; const calls = await script(this, request);
-      return { calls: calls.map((c, i) => ({ callId: 'call-' + requests.length + '-' + i, name: c.name, argumentsJson: c.raw || JSON.stringify(c.args) })) };
-    }, toolResult(_id, result, context) { this.results.push(result); this.binding = context.binding; this.context = context; },
-    close() { this.closed = true; } };
-  models.push(model); return model;
-}
-const call = (name, args) => ({ name, args });
-const plan = (m, type, fields = {}) => [call('propose_response_plan', { ...m.binding, type, ...fields })];
-function seedScript(m) {
-  if (m.round === 1) return [call('update_appointment_draft', { ...m.binding, changes: [
-    { kind: 'SET_SERVICE', serviceId: 'service-cut-91' }, { kind: 'SET_DATE', date: '2026-10-27' },
-    { kind: 'SET_TIME', time: '17:00' }, { kind: 'SET_NAME', name: 'Synthetic Tester' },
-  ] })];
-  if (m.round === 2) return [call('check_availability', m.binding)];
-  return plan(m, 'CANONICAL_CONFIRMATION');
-}
-async function harness({ language = 'en', script = seedScript, available = true, beforeSpeech, beforeGreeting, afterAssistantPersist, raw = business(), scheduler, wire = false, wireConfigurationError = null,
-  labels = { 'service-cut-91': { es: 'corte de pelo' }, 'service-beard-72': { es: 'recorte de barba' } } } = {}) {
-  const requests = [], models = [], speech = [], emitted = [], checks = []; let executorCalls = 0;
-  const availability = new LiveBundleAvailability({ loadBusiness: async () => raw, now: () => new Date('2026-10-25T16:00:00Z'),
-    labels,
-    checkSlot: async args => { checks.push(args); return typeof available === 'function' ? available(args) : available; },
-    listSlots: async ({ date }) => [{ date, time: '4:00 PM' }, { date, time: '5:00 PM' }] });
-  const twilio = new FakeSocket(), input = new FakeSocket(); input.readyState = 0;
-  const app = initializeVoiceV2Session({ callSid: 'CA-phone', callerNumber: '+15555550199', buildSha: 'offline-phone-test', twilioSocket: twilio,
-    businessContext: { businessId: ID, barberId: ID, businessName: 'Synthetic Real-Port Test', timeZone: 'America/New_York', services: raw.services, preferredLanguage: language },
-    openaiSocketFactory: () => input, openaiSession: { model: 'gpt-realtime', voice: 'alloy', input_audio_transcription: { model: 'gpt-4o-mini-transcribe', language } },
-    turnContext: { language, availableServices: raw.services.map(s => ({ canonical: s.name, aliases: [] })) },
-    coordinator: undefined, scheduler, now: () => new Date('2026-10-25T16:00:00Z'),
-    bookingAdapter: { createAppointment() { executorCalls++; throw Error('FORBIDDEN'); }, reconcileAppointment() { executorCalls++; throw Error('FORBIDDEN'); } },
-    smsAdapter: { sendAppointmentConfirmation() { executorCalls++; throw Error('FORBIDDEN'); } },
-    transcriptAdapter: { appendTurn: async request => { if (request.role === 'assistant') afterAssistantPersist?.(request); return { success: true }; }, finalizeCall: async () => ({ success: true }) },
-    applicationOwnedCollectSpeech: true, applicationOwnedAvailabilitySpeech: true,
-    speechAdapter: { async synthesize(request) { speech.push(request); if (beforeGreeting && request.input.includes('AI receptionist')) await beforeGreeting(request, app);
-      if (beforeSpeech && !request.input.includes('AI receptionist')) await beforeSpeech(request, app);
-      return { audio: Buffer.from([1, 2, 3]), format: 'audio/pcmu' }; } },
-    structuredPhone: { availability, createModel: (tools, onFailure) => {
-      if (!wire) { const model = fakeModel(script, requests, models); model.onFailure = onFailure; return model; }
-      const socket = new FakeSocket(), state = { turn: 0, round: 0, results: [] }; let sequence = 0;
-      const baseSend = socket.send.bind(socket);
-      socket.send = raw => {
-        baseSend(raw); const p = JSON.parse(raw);
-        if (p.type === 'session.update') queueMicrotask(() => socket.receive(wireConfigurationError
-          ? { type: 'error', error: wireConfigurationError } : { type: 'session.updated', session: p.session }));
-        if (p.item?.type === 'message') { const data = JSON.parse(p.item.content[0].text); state.binding = data.applicationContext.binding; state.context = data.applicationContext; state.turn++; state.round = 0; }
-        if (p.item?.type === 'function_call_output') { const data = JSON.parse(p.item.output); state.results.push(data.result); state.context = data.applicationContext; state.binding = state.context.binding; }
-        if (p.type === 'response.create') queueMicrotask(async () => {
-          requests.push(p); state.round++;
-          const id = 'wire-' + (++sequence), calls = await script(state);
-          socket.receive({ type: 'response.created', response: { id, metadata: p.response.metadata } });
-          socket.receive({ type: 'response.done', response: { id, status: 'completed', output: calls.map((c, i) => ({ type: 'function_call', call_id: id + '-' + i, name: c.name, arguments: JSON.stringify(c.args) })) } });
-        });
-      };
-      const model = new PhoneModelTransport(socket, tools, 'gpt-realtime', onFailure); models.push({ socket, close() { model.close(); }, get closed() { return socket.closeCalls.length > 0; } });
-      queueMicrotask(() => socket.open()); return model;
-    } }, emit: e => emitted.push(e),
-  });
-  input.open(); twilio.receive({ event: 'start', start: { callSid: 'CA-phone', streamSid: 'MZ-phone' } });
-  input.receive({ type: 'session.created' }); await settle(app);
-  input.receive({ type: 'session.updated' }); await settle(app);
-  // A real Twilio mark, not synthesis completion, finishes the application greeting.
-  const greeting = twilio.sent.find(p => p.event === 'mark');
-  if (greeting) twilio.receive({ event: 'mark', streamSid: 'MZ-phone', mark: greeting.mark });
-  await settle(app); twilio.sent.length = 0; speech.length = 0;
-  return { app, input, twilio, speech, emitted, checks, requests, models, raw, availability,
-    get executorCalls() { return executorCalls; },
-    async turn(text = 'Synthetic request') { input.receive({ type: 'conversation.item.input_audio_transcription.completed', item_id: 'item-' + Math.random(), transcript: text }); await settle(app); },
-    async ack(mark) { twilio.receive({ event: 'mark', streamSid: 'MZ-phone', mark: { name: mark } }); await settle(app); },
-  };
-}
-async function settle(app) { for (let i = 0; i < 30; i++) { await new Promise(resolve => setImmediate(resolve)); await app.ready(); } }
+import { ID, harness, business, call, decide, plan, seedScript, settle } from './structured-phone-harness.js';
 
 test('phone selectors: explicit exact resolved business allowlist only; no email/partial selection', () => {
   for (const env of [{}, { ENABLE_VOICE_V2_STRUCTURED_PHONE: 'true' }, { ENABLE_VOICE_V2_STRUCTURED_PHONE: 'TRUE', VOICE_V2_STRUCTURED_PHONE_BUSINESS_IDS: ID },
@@ -105,14 +26,14 @@ for (const tool of ['request_canonical_confirmation', 'submit_confirmation_meani
   const f = await harness({ script: m => {
     if (m.turn === 1) return seedScript(m);
     const binding = { ...m.binding, ...(foreign ? { turnId: 'foreign-turn' } : { proposalVersion: m.binding.proposalVersion - 1 }) };
-    return [call(tool, { ...binding, ...(tool === 'submit_confirmation_meaning' ? { meaning: 'AFFIRM' } : {}) })];
+    return [decide({ ...binding, ...(tool === 'submit_confirmation_meaning' ? { intent: 'CONFIRMATION', meaning: 'AFFIRM' } : {}) })];
   } });
   try {
     await f.turn(); await f.ack(f.twilio.sent.filter(p => p.event === 'mark').at(-1).mark.name);
     const speech = f.speech.length, requests = f.requests.length;
     await f.turn('yes');
-    assert.equal(f.requests.length - requests, 4); assert.equal(f.speech.length, speech);
-    assert.equal(f.models[0].results.at(-1).reason, 'STALE_BINDING');
+    assert.equal(f.requests.length - requests, 1); assert.equal(f.speech.length, speech);
+    assert.equal(f.emitted.find(e => e.stage === 'STOPPED').failureCode, 'STALE_BINDING');
     assert.equal(f.emitted.some(e => e.stage === 'WOULD_AUTHORIZE'), false); assert.equal(f.executorCalls, 0);
   } finally { await f.app.terminate('TEST_DONE'); }
 });
@@ -121,14 +42,14 @@ for (const language of ['en', 'es']) test(`phone authoritative result handoff: $
   const f = await harness({ language, script: m => {
     if (m.turn === 1) {
       if (m.round < 3) return seedScript(m);
-      if (m.round === 3) return [call('request_canonical_confirmation', m.binding)];
+      if (m.round === 3) return [decide(m.binding)];
       return plan(m, 'CANONICAL_CONFIRMATION');
     }
-    if (m.round === 1) return [call('submit_confirmation_meaning', { ...m.binding, meaning: 'AFFIRM' })];
+    if (m.round === 1) return [decide({ intent: 'CONFIRMATION', ...m.binding, meaning: 'AFFIRM' })];
     return plan(m, 'EXPLAIN_SIMULATION');
   } });
   try {
-    await f.turn(); assert.equal(f.requests.length, 3);
+    await f.turn(); assert.equal(f.requests.length, 1);
     assert.match(f.speech.at(-1).input, /Total: \$32/);
     assert.match(f.speech.at(-1).input, language === 'es' ? /corte de pelo/ : /Precision Cut/);
     assert.equal(f.emitted.some(e => e.stage === 'WOULD_AUTHORIZE'), false);
@@ -160,7 +81,7 @@ for (const selection of ['disabled', 'missing', 'mismatch', 'selected']) test(`p
 
 test('phone actual wire protocol: fake sockets exercise text/function batches, live ports, TTS and Twilio mark', async () => {
   const f = await harness({ wire: true });
-  try { await f.turn(); assert.equal(f.app.lifecycle.terminated, false); assert.equal(f.requests.length, 3);
+  try { await f.turn(); assert.equal(f.app.lifecycle.terminated, false); assert.equal(f.requests.length, 1);
     assert.match(f.speech.at(-1).input, /Total: \$32/); assert.ok(f.twilio.sent.some(p => p.event === 'mark')); assert.equal(f.executorCalls, 0);
   } finally { await f.app.terminate('TEST_DONE'); }
 });
@@ -171,7 +92,7 @@ for (const language of ['en', 'es']) test(`phone integrated ${language}: real V2
     f.twilio.receive({ event: 'media', streamSid: 'MZ-phone', media: { payload: 'AQID', track: 'inbound' } }); await settle(f.app);
     assert.ok(f.input.sent.some(p => p.type === 'input_audio_buffer.append'));
     await f.turn();
-    assert.equal(f.app.lifecycle.terminated, false); assert.equal(f.requests.length, 3);
+    assert.equal(f.app.lifecycle.terminated, false); assert.equal(f.requests.length, 1);
     assert.equal(f.input.sent.filter(p => p.type === 'response.create').length, 0);
     assert.equal(f.app.session.proposal.service, 'Precision Cut');
     assert.match(f.speech.at(-1).input, language === 'es' ? /corte de pelo/ : /Precision Cut/);
@@ -192,9 +113,9 @@ for (const order of ['add-first', 'select-first']) for (const available of [true
     if (m.round === 1) {
       const alt = m.context.availability.alternatives.find(a => a.time === '17:00');
       const changes = [{ kind: 'ADD_SERVICE', serviceId: 'service-beard-72' }, { kind: 'SELECT_ALTERNATIVE', alternativeId: alt.alternativeId }];
-      return [call('update_appointment_draft', { ...m.binding, changes: order === 'add-first' ? changes : changes.reverse() })];
+      return [decide({ ...m.binding, changes: order === 'add-first' ? changes : changes.reverse() })];
     }
-    if (m.round === 2) return [call('check_availability', m.binding)];
+    if (m.round === 2) return [decide(m.binding)];
     return available ? plan(m, 'CANONICAL_CONFIRMATION') : plan(m, 'OFFER_ALTERNATIVES', { alternativeIds: m.context.availability.alternatives.map(a => a.alternativeId) });
   };
   const f = await harness({ script, available: args => args.durationMinutes === 55 && args.time === '5:00 PM' ? available : true });
@@ -213,8 +134,8 @@ for (const order of ['add-first', 'select-first']) for (const available of [true
 test('phone consent: early affirmative blocked; delivered current confirmation permits simulation only', async () => {
   const script = m => {
     if (m.turn === 1) return seedScript(m);
-    if (m.turn === 3) { if (m.round === 1) return [call('check_availability', m.binding)]; return plan(m, 'CANONICAL_CONFIRMATION'); }
-    if (m.round === 1) return [call('submit_confirmation_meaning', { ...m.binding, meaning: 'AFFIRM' })];
+    if (m.turn === 3) { if (m.round === 1) return [decide(m.binding)]; return plan(m, 'CANONICAL_CONFIRMATION'); }
+    if (m.round === 1) return [decide({ intent: 'CONFIRMATION', ...m.binding, meaning: 'AFFIRM' })];
     return plan(m, m.turn === 2 ? 'EXPLAIN_DELIVERY_GATE' : 'EXPLAIN_SIMULATION');
   };
   const f = await harness({ script });
@@ -240,10 +161,10 @@ test('phone malformed whole batch rejects before mutation and no booking/SMS pat
 
 test('phone stale/foreign alternative rejects atomically without adding another service', async () => {
   const f = await harness({ script: m => {
-    if (m.round === 1) return [call('update_appointment_draft', { ...m.binding, changes: [{ kind: 'SET_SERVICE', serviceId: 'service-cut-91' }, { kind: 'SELECT_ALTERNATIVE', alternativeId: 'foreign' }] })];
+    if (m.round === 1) return [decide({ ...m.binding, changes: [{ kind: 'SET_SERVICE', serviceId: 'service-cut-91' }, { kind: 'SELECT_ALTERNATIVE', alternativeId: 'foreign' }] })];
     return plan(m, 'ASK_MISSING', { field: 'date' });
   } });
-  try { await f.turn(); assert.equal(f.app.session.proposal.service, null); assert.ok(f.models[0].results.some(r => r.reason === 'STALE_OR_FOREIGN_ALTERNATIVE')); assert.equal(f.executorCalls, 0); }
+  try { await f.turn(); assert.equal(f.app.session.proposal.service, null); assert.ok(f.emitted.some(e => e.reason === 'STALE_OR_FOREIGN_ALTERNATIVE')); assert.equal(f.executorCalls, 0); }
   finally { await f.app.terminate('TEST_DONE'); }
 });
 
@@ -298,7 +219,7 @@ test('phone unsupported live bundle has an explicit application-owned explanatio
   } finally { await f.app.terminate('TEST_DONE'); }
 });
 
-test('phone decision request limit stops at four attempts with no retries or synthesized fallback plans', async () => {
+test('phone decision request limit stops after one decision with no retries or synthesized fallback plans', async () => {
   const f = await harness({ script: () => [call('read_business_context', {})] });
   await f.turn(); assert.equal(f.requests.length, PHONE_LIMITS.perTurnRequests); assert.equal(f.speech.length, 0);
   assert.equal(f.app.lifecycle.terminated, true); assert.equal(f.executorCalls, 0);
@@ -307,7 +228,7 @@ test('phone decision request limit stops at four attempts with no retries or syn
 test('phone an earlier blocked affirmative cannot authorize delivery-gate wording on a later negative turn', async () => {
   const f = await harness({ script: m => {
     if (m.turn === 1) return seedScript(m);
-    if (m.turn === 2 && m.round === 1) return [call('submit_confirmation_meaning', { ...m.binding, meaning: 'AFFIRM' })];
+    if (m.turn === 2 && m.round === 1) return [decide({ intent: 'CONFIRMATION', ...m.binding, meaning: 'AFFIRM' })];
     return plan(m, 'EXPLAIN_DELIVERY_GATE');
   } });
   await f.turn(); await f.turn('yes');
@@ -330,7 +251,7 @@ for (const tool of ['create_appointment', 'modify_appointment', 'cancel_appointm
 for (const reply of ['no', 'could you clarify?', 'not sure', 'no, sí']) test(`phone consent: model AFFIRM cannot override actual caller evidence (${reply})`, async () => {
   const f = await harness({ script: m => {
     if (m.turn === 1) return seedScript(m);
-    if (m.round === 1) return [call('submit_confirmation_meaning', { ...m.binding, meaning: 'AFFIRM' })];
+    if (m.round === 1) return [decide({ intent: 'CONFIRMATION', ...m.binding, meaning: 'AFFIRM' })];
     return plan(m, 'EXPLAIN_SIMULATION');
   } });
   await f.turn(); await f.ack(f.twilio.sent.filter(p => p.event === 'mark').at(-1).mark.name);
@@ -432,7 +353,8 @@ test('phone repair: actual availability helper and driver withhold 17:00 at busi
     const result = await f.availability.check(b, ['service-cut-91'], '2026-10-27', '17:00');
     await f.turn();
     assert.equal(result.available, false);
-    assert.equal(f.speech.length, 0); assert.equal(f.twilio.sent.filter(p => p.event === 'media').length, 0);
+    assert.equal(f.speech.length, 1); assert.doesNotMatch(f.speech[0].input, /Total:|Would you like to confirm/);
+    assert.equal(f.app.session.journal().some(e => e.event === 'CONFIRMATION_AUTHORITY_GRANTED'), false);
     assert.equal(f.executorCalls, 0);
   } finally { Appointment.findOne = original; await f?.app.terminate('TEST_DONE'); }
 });
@@ -527,9 +449,7 @@ test('phone repair: slot expires during final business read before a confirmatio
 
 test('phone repair: offered alternative expires during the final read before media submission', async () => {
   let clock = new Date('2026-10-27T19:59:00Z'), persisted = false, expire = false;
-  const f = await harness({ script: m => m.round < 3 ? seedScript(m) : plan(m, 'OFFER_ALTERNATIVES', {
-    alternativeIds: [m.context.availability.alternatives[0].alternativeId],
-  }), afterAssistantPersist: () => { persisted = true; } });
+  const f = await harness({ script: m => { const c = seedScript(m)[0]; c.args.changes.push({ kind: 'SET_PREFERENCE', preference: { kind: 'AFTERNOON' } }); return [c]; }, afterAssistantPersist: () => { persisted = true; } });
   try {
     persisted = false; // The harness already persisted its initial greeting.
     const check = f.availability.check.bind(f.availability), read = f.availability.read.bind(f.availability);
@@ -697,14 +617,14 @@ test('phone catalogue: unchanged production fixture passes existing readers and 
   assert.equal(booking.success, true);
   const before = structuredClone(raw.services);
   const f = await harness({ raw, labels: {}, language: 'es', script: (m, input) => {
-    if (m.round === 1) return [call('update_appointment_draft', { ...m.binding, changes: [
+    if (m.round === 1) return [decide({ ...m.binding, changes: [
       { kind: 'SET_SERVICE', serviceId: input.context.business.services[0].id }, { kind: 'SET_DATE', date: '2026-10-27' },
       { kind: 'SET_TIME', time: '17:00' }, { kind: 'SET_NAME', name: 'Synthetic Tester' },
     ] })];
-    return m.round === 2 ? [call('check_availability', m.binding)] : plan(m, 'CANONICAL_CONFIRMATION');
+    return m.round === 2 ? [decide(m.binding)] : plan(m, 'CANONICAL_CONFIRMATION');
   } });
   try {
-    await f.turn(); assert.equal(f.app.lifecycle.terminated, false); assert.equal(f.requests.length, 3);
+    await f.turn(); assert.equal(f.app.lifecycle.terminated, false); assert.equal(f.requests.length, 1);
     assert.equal(f.app.session.proposal.service, 'Haircut'); assert.match(f.speech.at(-1).input, /Haircut/);
     assert.match(f.speech.at(-1).input, /\$25/); assert.equal(f.executorCalls, 0); assert.deepEqual(raw.services, before);
   } finally { await f.app.terminate('TEST_DONE'); }
@@ -782,7 +702,7 @@ test('phone catalogue: retained Mongo id binds draft, bundle, alternatives and d
   const f = await harness({ raw, labels: {}, available: q => q.time !== '4:00 PM', script: (m, input) => {
     const ids = input.context.business.services.map(s => s.id);
     assert.equal(ids[0], mongoId); assert.match(ids[1], /^legacy:[a-f0-9]{64}$/); bundle = ids;
-    if (m.turn === 1 && m.round === 1) return [call('update_appointment_draft', { ...m.binding, changes: [
+    if (m.turn === 1 && m.round === 1) return [decide({ ...m.binding, changes: [
       { kind: 'SET_SERVICE', serviceId: ids[0] }, { kind: 'ADD_SERVICE', serviceId: ids[1] },
       { kind: 'SET_DATE', date: '2026-10-27' }, { kind: 'SET_TIME', time: '16:00' }, { kind: 'SET_NAME', name: 'Synthetic Tester' },
     ] })];
@@ -790,9 +710,9 @@ test('phone catalogue: retained Mongo id binds draft, bundle, alternatives and d
     if (m.turn === 2 && m.round === 1) {
       const alternative = input.context.availability.alternatives.find(a => a.time === '17:00');
       assert.ok(alternative);
-      return [call('update_appointment_draft', { ...m.binding, changes: [{ kind: 'SELECT_ALTERNATIVE', alternativeId: alternative.alternativeId }] })];
+      return [decide({ ...m.binding, changes: [{ kind: 'SELECT_ALTERNATIVE', alternativeId: alternative.alternativeId }] })];
     }
-    if (m.round === 2) return [call('check_availability', m.binding)];
+    if (m.round === 2) return [decide(m.binding)];
     return m.turn === 1 ? plan(m, 'OFFER_ALTERNATIVES', { alternativeIds: input.context.availability.alternatives.map(a => a.alternativeId) }) : plan(m, 'CANONICAL_CONFIRMATION');
   } });
   const queries = [], check = f.availability.check.bind(f.availability);
@@ -817,11 +737,11 @@ test('phone catalogue: retained Mongo id binds draft, bundle, alternatives and d
 test('phone catalogue: zero price remains numeric in confirmation without an inferred free claim', async () => {
   const raw = business(); raw.services = [{ _id: '507f1f77bcf86cd799439011', name: 'Haircut', price: 0, durationMinutes: 30 }];
   const f = await harness({ raw, labels: {}, script: (m, input) => {
-    if (m.round === 1) return [call('update_appointment_draft', { ...m.binding, changes: [
+    if (m.round === 1) return [decide({ ...m.binding, changes: [
       { kind: 'SET_SERVICE', serviceId: input.context.business.services[0].id }, { kind: 'SET_DATE', date: '2026-10-27' },
       { kind: 'SET_TIME', time: '17:00' }, { kind: 'SET_NAME', name: 'Synthetic Tester' },
     ] })];
-    return m.round === 2 ? [call('check_availability', m.binding)] : plan(m, 'CANONICAL_CONFIRMATION');
+    return m.round === 2 ? [decide(m.binding)] : plan(m, 'CANONICAL_CONFIRMATION');
   } });
   try {
     await f.turn(); assert.equal(f.app.lifecycle.terminated, false); assert.equal(raw.services[0].price, 0);
@@ -851,12 +771,9 @@ test('phone latency: confirmation freshness never regenerates alternative lists'
 test('phone latency: selected alternatives recheck directly and changes withhold all bytes', async () => {
   let discoveryComplete = false, available = true, rescans = 0, directChecks = 0;
   const f = await harness({ available: () => { if (discoveryComplete) { directChecks++; return available; } return true; },
-    script: m => {
-      if (m.round < 3) return seedScript(m);
-      discoveryComplete = true; available = false;
-      return plan(m, 'OFFER_ALTERNATIVES', { alternativeIds: [m.context.availability.alternatives[0].alternativeId] });
-    } });
-  const list = f.availability.listSlots.bind(f.availability);
+    script: m => { const c = seedScript(m)[0]; c.args.changes.push({ kind: 'SET_PREFERENCE', preference: { kind: 'AFTERNOON' } }); return [c]; } });
+  const check = f.availability.check.bind(f.availability);
+  f.availability.check = async (...args) => { const result = await check(...args); if (!discoveryComplete) { discoveryComplete = true; available = false; } return result; };  const list = f.availability.listSlots.bind(f.availability);
   f.availability.listSlots = async args => { if (discoveryComplete) rescans++; return list(args); };
   await f.turn();
   assert.equal(f.app.lifecycle.terminated, true); assert.equal(rescans, 0); assert.ok(directChecks > 0);
@@ -881,13 +798,17 @@ test('phone latency: direct selected-slot checks preserve bundle facts without d
 
 test('phone latency: interruption during preflight logs withheld handoff and cancels late checks', async () => {
   let release;
-  const f = await harness({ script: m => {
-    if (m.round < 3) return seedScript(m);
-    const read = f.availability.read.bind(f.availability);
-    f.availability.read = () => { f.availability.read = read; return new Promise(resolve => { release = () => read().then(resolve); }); };
-    return plan(m, 'CANONICAL_CONFIRMATION');
-  } });
-  try {
+  const f = await harness();
+  const check = f.availability.check.bind(f.availability);
+  let discovery = false;
+  f.availability.check = async (...args) => {
+    const result = await check(...args);
+    if (!discovery) {
+      discovery = true; const read = f.availability.read.bind(f.availability);
+      f.availability.read = () => { f.availability.read = read; return new Promise(resolve => { release = () => read().then(resolve); }); };
+    }
+    return result;
+  };  try {
     const turn = f.turn();
     for (let i = 0; i < 100 && !release; i++) await new Promise(resolve => setImmediate(resolve));
     assert.equal(typeof release, 'function');
@@ -948,7 +869,7 @@ test('phone latency: selected alternative becomes unavailable during synthesis a
   } finally { await f.app.terminate('TEST_DONE'); }
 });
 
-for (const mode of ['missing name', 'available', 'unavailable', 'missing date', 'missing time']) test(`phone confirmation recovery: recorded four-request sequence - ${mode}`, async () => {
+for (const mode of ['missing name', 'available', 'unavailable', 'missing date', 'missing time']) test(`phone confirmation recovery: single-decision recovery - ${mode}`, async () => {
   const raw = business(); raw.services = [{ _id: '507f1f77bcf86cd799439011', name: 'Haircut', price: 25, durationMinutes: 30 }];
   raw.availability.bufferMinutes = 10;
   raw.availability.businessHours.wed = { open: '09:00', close: '09:30', isClosed: false };
@@ -962,25 +883,25 @@ for (const mode of ['missing name', 'available', 'unavailable', 'missing date', 
         if (mode !== 'missing date') changes.push({ kind: 'SET_DATE', date: '2026-10-28' });
         if (mode !== 'missing time') changes.push({ kind: 'SET_TIME', time: mode === 'unavailable' ? '10:00' : '09:00' });
         if (mode !== 'missing name') changes.push({ kind: 'SET_NAME', name: 'Synthetic Tester' });
-        return [call('update_appointment_draft', { ...m.binding, changes })];
+        return [decide({ ...m.binding, changes })];
       }
       return [call(m.round === 3 ? 'check_availability' : 'request_canonical_confirmation', m.binding)];
     } });
     f.availability.checkSlot = isSlotAvailable; f.availability.listSlots = getAvailableSlots;
     await f.turn('Miércoles veintiocho de octubre a las nueve a.m.');
-    assert.equal(f.requests.length, 4); assert.equal(f.app.lifecycle.terminated, false); assert.equal(f.speech.length, 1);
-    assert.deepEqual(f.models[0].results.map(r => r.status), ['OK', 'REJECTED', mode === 'missing date' ? 'REJECTED' : 'OK', mode === 'available' ? 'OK' : 'REJECTED']);
-    assert.equal(f.models[0].results[3].delivery.status, 'SPEECH_PREPARING');
+    assert.equal(f.requests.length, 1); assert.equal(f.app.lifecycle.terminated, false); assert.equal(f.speech.length, 1);
+    assert.equal(f.models[0].results.at(-1).status, 'SPEECH_PREPARING');
+    assert.equal(f.models[0].results.at(-1).playbackAcknowledged, false);
     const text = f.speech[0].input;
     if (mode === 'available') { assert.match(text, /Haircut/); assert.match(text, /\$25/); }
     if (mode === 'missing name') {
-      assert.match(text, /nombre/); assert.equal(f.models[0].results[2].available, true);
-      assert.equal(f.models[0].results[3].eligibilityReason, 'MISSING_INFORMATION'); assert.deepEqual(f.models[0].results[3].missingFields, ['name']);
+      assert.match(text, /nombre/); assert.equal(f.models[0].results.find(r => Object.hasOwn(r, 'available')).available, true);
+      assert.equal(f.app.session.proposal.name, null);
     }
     if (mode === 'missing date') assert.match(text, /fecha/);
     if (mode === 'missing time') assert.match(text, /hora/);
     if (mode === 'unavailable') {
-      assert.equal(f.models[0].results[2].available, false); assert.match(text, /horario solicitado no está disponible/);
+      assert.equal(f.models[0].results.find(r => Object.hasOwn(r, 'available')).available, false); assert.match(text, /horario solicitado no está disponible/);
       assert.doesNotMatch(text, /Haircut|servicios|cerrado|fuera del horario/i); assert.equal(f.app.session.proposal.time, '10:00');
     }
     assert.equal(f.app.session.journal().some(e => e.event === 'CONFIRMATION_AUTHORITY_GRANTED'), false);
@@ -995,18 +916,18 @@ for (const mode of ['stale binding', 'foreign binding', 'interrupted synthesis',
       if (mode === 'stale synthesis') f.raw.services[0].price++;
     },
     script: m => {
-      if (m.round === 1) return seedScript(m);
-      if (m.round === 3) return [call('check_availability', m.binding)];
+      if (m.round === 1 && !mode.endsWith('binding')) return seedScript(m);
+      if (m.round === 3) return [decide(m.binding)];
       const binding = { ...m.binding };
-      if (m.round === 4 && mode === 'stale binding') binding.proposalVersion--;
-      if (m.round === 4 && mode === 'foreign binding') binding.turnId = 'foreign-turn';
-      return [call('request_canonical_confirmation', binding)];
+      if (m.round === 1 && mode === 'stale binding') binding.proposalVersion++;
+      if (m.round === 1 && mode === 'foreign binding') binding.turnId = 'foreign-turn';
+      return [decide(binding)];
     },
   });
   try {
-    await f.turn(); assert.equal(f.requests.length, 4); assert.equal(f.executorCalls, 0);
+    await f.turn(); assert.equal(f.requests.length, 1); assert.equal(f.executorCalls, 0);
     if (mode.endsWith('binding')) {
-      assert.equal(f.models[0].results.at(-1).reason, 'STALE_BINDING');
+      assert.equal(f.emitted.find(e => e.stage === 'STOPPED').failureCode, 'STALE_BINDING');
       assert.equal(f.speech.length, 0); assert.equal(f.app.lifecycle.terminated, true);
     } else if (mode === 'interrupted playback') {
       const mark = f.twilio.sent.find(p => p.event === 'mark').mark.name;

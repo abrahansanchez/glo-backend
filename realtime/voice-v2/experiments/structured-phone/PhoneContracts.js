@@ -14,25 +14,26 @@ export function phoneContracts(ids) {
   const id = { enum: ids }, array = items => ({ type: 'array', minItems: 1, maxItems: 8, items });
   const binding = { turnId: str, proposalVersion: integer, businessRevision: str, serviceIds: { ...array(id), minItems: 0 }, language: { enum: ['en', 'es'] } };
   const changes = { oneOf: [object({ kind: { enum: ['SET_SERVICE', 'ADD_SERVICE', 'REMOVE_SERVICE'] }, serviceId: id }),
-    object({ kind: { enum: ['SET_DATE'] }, date: { ...str, maxLength: 10 } }), object({ kind: { enum: ['SET_TIME'] }, time: { ...str, maxLength: 5 } }),
+    object({ kind: { enum: ['SET_DATE'] }, date: { ...str, maxLength: 10 } }),
+    object({ kind: { enum: ['SET_DATE_RANGE'] }, startDate: { ...str, maxLength: 10 }, endDate: { ...str, maxLength: 10 } }),
+    object({ kind: { enum: ['SET_TIME'] }, time: { ...str, maxLength: 5 } }),
     object({ kind: { enum: ['SET_NAME'] }, name: str }), object({ kind: { enum: ['SELECT_ALTERNATIVE'] }, alternativeId: str }),
-    object({ kind: { enum: ['SET_PREFERENCE'] }, preference: object({ kind: { enum: ['MORNING', 'AFTERNOON'] } }) })] };
+    object({ kind: { enum: ['SET_PREFERENCE'] }, preference: { oneOf: [object({ kind: { enum: ['MORNING', 'AFTERNOON'] } }), object({ kind: { enum: ['AFTER'] }, time: { ...str, maxLength: 5 } })] } })] };
+  const decision = object({ ...binding,
+    changes: { ...array(changes), minItems: 0 },
+    intent: { enum: ['REQUEST', 'QUESTION', 'CONFIRMATION', 'CLARIFY', 'UNSUPPORTED'] },
+    meaning: { enum: ['AFFIRM', 'DENY', 'UNKNOWN', 'CORRECTION'] },
+    questions: { type: 'array', minItems: 0, maxItems: 3, items: { enum: ['PRICE', 'DURATION', 'AVAILABILITY'] } },
+    missingField: { enum: ['NONE', 'service', 'date', 'time', 'name'] },
+  });
   const plans = ['ASK_MISSING', 'EXPLAIN_RESULT', 'OFFER_ALTERNATIVES', 'ACK_DRAFT', 'CANONICAL_CONFIRMATION', 'EXPLAIN_DELIVERY_GATE', 'EXPLAIN_SIMULATION', 'EXPLAIN_UNSUPPORTED'];
   const plan = { oneOf: plans.map(type => object({ ...binding, type: { enum: [type] },
     ...(type === 'ASK_MISSING' ? { field: { enum: ['service', 'date', 'time', 'name'] } } : {}),
     ...(type === 'OFFER_ALTERNATIVES' ? { alternativeIds: { ...array(str), maxItems: 3 } } : {}) })) };
-  const wire = object({ ...binding, type: { enum: plans }, field: { enum: ['service', 'date', 'time', 'name'] }, alternativeIds: { ...array(str), maxItems: 3 } }, [...Object.keys(binding), 'type']);
-  const tools = [
-    ['read_business_context', 'Read current application-owned business facts, clock, catalogue and draft.', object({})],
-    ['update_appointment_draft', 'Apply ordered changes atomically. SET_DATE is a real YYYY-MM-DD date within the supplied booking window. Resolve alternative IDs against the current originating bundle before any changes. Never book.', object({ ...binding, changes: array(changes) })],
-    ['check_availability', 'Check the complete ordered service bundle with its summed duration. No reservation.', object(binding)],
-    ['request_canonical_confirmation', 'Check confirmation eligibility. Read eligibilityReason, missingFields and nextAction: missing draft fields require collection, unknown/stale evidence requires check_availability, and unavailable results require explanation/current alternatives. A successful eligible result immediately hands off to application-owned canonical confirmation. On the last allowed model response a rejected current-bound request may hand off to supported recovery. Never grants delivery or booking authority.', object(binding)],
-    ['submit_confirmation_meaning', 'Propose consent meaning; existing delivered-confirmation authority and caller evidence decide. A successful WOULD_AUTHORIZE result hands off to application-owned simulation explanation. Simulation only.', object({ ...binding, meaning: { enum: ['AFFIRM', 'DENY', 'UNKNOWN', 'CORRECTION'] } })],
-    ['propose_response_plan', 'End the turn with a communication purpose and current bindings. No arbitrary wording or facts.', wire],
-  ].map(([name, description, parameters]) => ({ type: 'function', name, description, parameters }));
-  return { tools, plan };
+  const decisionTool = { type: 'function', name: 'submit_turn_decision', description: 'Interpret the complete caller turn once. Include every ordered change and question. Dates are YYYY-MM-DD within the business window. Preserve service order; alternative IDs refer to current originating evidence. AFTER is an explicit lower time bound, not an available slot. Questions are typed requests, not answers. Unsupported questions/intent require UNSUPPORTED; uncertainty requires CLARIFY. CONFIRMATION proposes meaning only, never consent authority. Do not predict availability or choose speech.', parameters: decision };
+  return { tools: [decisionTool], decision, plan };
 }
-export const PHONE_LIMITS = Object.freeze({ turns: 12, perTurnRequests: 4, modelRequests: 48, speechRequests: 16,
+export const PHONE_LIMITS = Object.freeze({ turns: 12, perTurnRequests: 1, modelRequests: 12, speechRequests: 16,
   callMs: 180000, decisionMs: 20000, decisionConnections: 4, retries: 0 });
 export function selectStructuredPhone(env, businessId) {
   const ids = String(env.VOICE_V2_STRUCTURED_PHONE_BUSINESS_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
