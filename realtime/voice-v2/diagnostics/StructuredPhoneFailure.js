@@ -37,6 +37,7 @@ const counter = value => Number.isSafeInteger(value) && value >= 0 ? Math.min(1e
 
 // Pure observation: no timers, decisions, lifecycle calls, provider objects or text.
 export class StructuredPhoneFailure {
+  #bindingLines = 0;
   #emit; #clock; #onFirst; #start; #accepted = null; #decision = null; #first = null; #trail = []; #sequence = 0; #lines = 0; #secondaryLines = 0;
   #state = { stage: 'CALL_START', operation: 'initialize', lastCompletedBoundary: 'CALL_START', generationState: 'CURRENT', deadlineState: 'NOT_ARMED',
     generation: 0, turns: 0, modelRequests: 0, speechRequests: 0, decisionConnections: 0, modelRequestStartedForTurn: false };
@@ -68,6 +69,21 @@ export class StructuredPhoneFailure {
   contextSubmitted(tool = false) { this.#safe(() => {
     if (tool) this.#context.submittedToolResultCount++;
     else { this.#context.submittedCallerItemCount++; this.#context.sourceItemIds.push(this.#context.currentTranscriptItemId); this.#context.sourceItemIds = this.#context.sourceItemIds.filter(Boolean).slice(-8); }
+  }); }
+  bindingComparison(value = {}) { this.#safe(() => {
+    if (this.#bindingLines++ >= 128) return;
+    const fields = ['turnId', 'proposalVersion', 'businessRevision', 'serviceIds', 'language'].map(field => {
+      const input = value.fields?.find(f => f?.field === field);
+      return { field, equalsCurrent: input?.equalsCurrent === true, equalsRequest: input?.equalsRequest === true, requestEqualsCurrent: input?.requestEqualsCurrent === true };
+    });
+    const mismatchedFields = fields.filter(f => !f.equalsCurrent || !f.equalsRequest || !f.requestEqualsCurrent).map(f => f.field);
+    const generationCurrent = value.generationCurrent === true;
+    this.#write({ event: 'V2_STRUCTURED_PHONE_BINDING', callSid: this.callSid, turnId: this.#state.turnId || null, requestId: this.#state.requestId || null,
+      generation: this.#state.generation, generationState: this.#state.generationState, deadlineState: this.#state.deadlineState,
+      boundary: ['DECISION', 'TOOL', 'RENDER', 'LOCAL'].includes(value.boundary) ? value.boundary : 'LOCAL',
+      fields, mismatchedFields, requestContextCurrent: fields.every(f => f.requestEqualsCurrent), generationCurrent,
+      responseCorrelated: typeof value.responseCorrelated === 'boolean' ? value.responseCorrelated : null,
+      disposition: !generationCurrent ? 'STALE_GENERATION' : mismatchedFields.length ? 'CURRENT_REQUEST_REJECTED' : 'MATCH' });
   }); }
   start(stage, operation) { this.#note(stage, operation, false); }
   done(stage, operation) { this.#note(stage, operation, true); }

@@ -159,6 +159,7 @@ export class StructuredPhoneDriver {
       this.log('MODEL_REQUEST', { turn: this.turns, request: this.requests });
       const modelStartedMs = performance.now();
       const context = this.context();
+      const requestBinding = structuredClone(context.binding);
       this.executionDiagnostic = { stage: 'MODEL_REQUEST', operation: 'createDecisionRequest' };
       this.diagnostic('start', 'MODEL_REQUEST', 'createDecisionRequest');
       this.diagnostic('update', { modelRequestStartedForTurn: true });
@@ -179,7 +180,7 @@ export class StructuredPhoneDriver {
       this.diagnostic('done', 'DECISION_VALIDATION', 'validateDecisionSchema');
       this.seenCalls.add(call.callId);
       stage = 'TOOL_DISPATCH';
-      const result = await this.executeDecision(decision, current);
+      const result = await this.executeDecision(decision, current, { binding: requestBinding, responseCorrelated: response.request?.correlationVerified ?? null });
       if (!current()) return;
       if (!result || result.outcome === 'TERMINAL') { if (this.rejectionTurn !== this.turns) this.rejectDecision('PLAN_NOT_RENDERABLE', 'RENDER'); throw Error('INVALID_PLAN'); }
       this.log('DECISION_OUTCOME', { turn: this.turns, turnId, generation, outcome: result.outcome, interpretationStatus: result.interpretationStatus, reasonCode: result.reasonCode });
@@ -220,7 +221,14 @@ export class StructuredPhoneDriver {
       if (current()) { this.log('STOPPED', { reason: 'DECISION_FAILED_OR_LIMIT', ...phoneFailure(error, stage), turn: this.turns, requests: this.requests, connections: this.connections }); this.close(); this.terminate('STRUCTURED_PHONE_FAILED'); }
     } finally { clearTimeout(timer); if (this.decisionTimer === timer) this.decisionTimer = null; if (generation === this.generation) this.diagnostic('deadline', 'CLEARED'); if (current()) this.active = false; }
   }
-  same(args) { const b = this.binding(); return Object.keys(b).every(key => JSON.stringify(args[key]) === JSON.stringify(b[key])) && Object.keys(args).length === Object.keys(b).length; }
+  same(args, { reference = this.binding(), boundary = 'LOCAL', generationCurrent = true, responseCorrelated = null } = {}) {
+    const b = this.binding(), fields = Object.keys(b).map(field => ({ field,
+      equalsCurrent: JSON.stringify(args[field]) === JSON.stringify(b[field]),
+      equalsRequest: JSON.stringify(args[field]) === JSON.stringify(reference[field]),
+      requestEqualsCurrent: JSON.stringify(reference[field]) === JSON.stringify(b[field]) }));
+    this.diagnostic('bindingComparison', { fields, boundary, generationCurrent, responseCorrelated });
+    return fields.every(f => f.equalsCurrent && (boundary !== 'DECISION' || f.requestEqualsCurrent)) && Object.keys(args).length === Object.keys(b).length;
+  }
   rejectDecision(guard, localStage = 'DECISION_VALIDATE') {
     const guards = ['ONE_DECISION_REQUIRED', 'REPLAY', 'INVALID_JSON', 'INVALID_SHAPE', 'BINDING_MISMATCH', 'DUPLICATE_QUESTION', 'UNSUPPORTED_INTENT',
       'CLARIFICATION_WITH_CHANGES', 'CONFIRMATION_WITH_CHANGES', 'NON_CONFIRMATION_MEANING', 'QUESTION_WITHOUT_QUESTION', 'NO_CURRENT_SELECTION',
@@ -245,15 +253,19 @@ export class StructuredPhoneDriver {
     for (const a of this.evidence?.result?.alternatives || []) this.retiredAlternativeIds.add(a.alternativeId);
     while (this.retiredAlternativeIds.size > 48) this.retiredAlternativeIds.delete(this.retiredAlternativeIds.values().next().value);
   }
-  async executeDecision(decision, current) {
+  async executeDecision(decision, current, request = null) {
+    if (!current()) return this.decisionOutcome('WITHHOLD', null, 'RETIRED_GENERATION');
     this.executionDiagnostic = { stage: 'DECISION_VALIDATION', operation: 'validateDecisionBinding' };
     this.diagnostic('start', 'DECISION_VALIDATION', 'validateDecisionBinding');
     const { changes, intent, meaning, questions: submittedQuestions, missingField, changeCertainty, scope, ...binding } = decision;
     this.localResults = [];
     const questions = [...new Set([...this.pendingQuestions, ...submittedQuestions])];
-    if (!this.same(binding)) {
+    if (!this.same(binding, { reference: request?.binding || this.binding(), boundary: 'DECISION', generationCurrent: current(), responseCorrelated: request?.responseCorrelated ?? null })) {
       this.rejectDecision('BINDING_MISMATCH'); this.consent = null;
-      return this.decisionOutcome('WITHHOLD', null, 'STALE_OR_FOREIGN_BINDING');
+      // This response belongs to the current request, but none of its proposed
+      // actions are usable. Render only a current application-owned recovery;
+      // never rewrite/accept its echoed binding or retry the model.
+      return this.clarification('CURRENT_BINDING_REJECTED');
     }
     if (new Set(submittedQuestions).size !== submittedQuestions.length) {
       this.rejectDecision('DUPLICATE_QUESTION'); return this.clarification('QUESTION_TARGET_AMBIGUOUS');
@@ -424,7 +436,7 @@ export class StructuredPhoneDriver {
   async invoke(name, args, current) {
     if (name === 'read_business_context') return { status: 'OK', ...this.context() };
     const { changes, meaning, ...binding } = args;
-    if (!this.same(binding)) return rejected('STALE_BINDING');
+    if (!this.same(binding, { boundary: 'TOOL' })) return rejected('STALE_BINDING');
     if (name === 'update_appointment_draft') {
       this.executionDiagnostic = { stage: 'DRAFT_MUTATION', operation: 'applyDraftChanges' };
       this.diagnostic('start', 'DRAFT_MUTATION', 'applyDraftChanges');
@@ -523,7 +535,7 @@ export class StructuredPhoneDriver {
     this.executionDiagnostic = { stage: 'RENDERING', operation: 'renderApplicationResponse' };
     this.diagnostic('start', 'RENDERING', 'renderApplicationResponse');
     const { type, field, alternativeIds, ...binding } = args;
-    if (!this.same(binding)) return this.rejectDecision('BINDING_MISMATCH', 'RENDER');
+    if (!this.same(binding, { boundary: 'RENDER' })) return this.rejectDecision('BINDING_MISMATCH', 'RENDER');
     const p = this.session.proposal, es = binding.language === 'es', evidence = this.freshEvidence() ? this.evidence.result : null;
     const labels = this.ids().map(id => this.availability.label(this.business.services.find(s => s.id === id), binding.language));
     const display = labels.join(es ? ' y ' : ' and ');
@@ -534,6 +546,7 @@ export class StructuredPhoneDriver {
     let text, purpose = 'CLARIFICATION';
     if (type === 'CLARIFY_REQUEST') {
       const messages = {
+        CURRENT_BINDING_REJECTED: ['I could not safely apply that response to your current request. Could you repeat or clarify what you would like?', 'No he podido aplicar esa respuesta de forma segura a tu solicitud actual. ¿Puedes repetir o aclarar lo que deseas?'],
         UNCERTAIN_CHANGES_HELD: ['I have not changed the proposed request. Could you clarify the service, date or time you want?', 'No he cambiado la solicitud propuesta. ¿Puedes aclarar el servicio, la fecha o la hora que deseas?'],
         CONSENT_WITH_CHANGES_HELD: ['I have not applied those proposed changes or treated that as confirmation. Could you clarify the changes you want?', 'No he aplicado esos cambios propuestos ni lo he tomado como confirmación. ¿Puedes aclarar los cambios que deseas?'],
         UNSUPPORTED_CAPABILITY: ['This test cannot carry out that action. What would you like to check about a proposed appointment?', 'Esta prueba no puede realizar esa acción. ¿Qué quieres consultar sobre una solicitud de cita?'],

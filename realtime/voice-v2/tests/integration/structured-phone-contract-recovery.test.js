@@ -35,12 +35,13 @@ for (const mode of ['malformed', 'infrastructure']) test(`actual wire ${mode} re
   } finally { await f.app.terminate('TEST_DONE'); }
 });
 
-test('actual wire stale binding stays silent and permits a fresh next turn', async () => {
+test('actual wire current response with stale echoed binding recovers and permits a fresh next turn', async () => {
   const inputs = [], f = await harness({ wire: true, injectedSpeechAdapter: streamingSpeech(inputs), script: m => [decide({ ...m.binding,
     ...(m.turn === 1 ? { proposalVersion: m.binding.proposalVersion + 1 } : { changes: [{ kind: 'SET_SERVICE', serviceId: 'service-cut-91' }] }) })] });
   try {
     const before = structuredClone(f.app.session.proposal), speechBefore = inputs.length; await f.turn('Synthetic stale decision');
-    assert.deepEqual(f.app.session.proposal, before); assert.equal(outputs(f).at(-1).decisionOutcome, 'WITHHOLD'); assert.equal(inputs.length, speechBefore);
+    assert.deepEqual(f.app.session.proposal, before); assert.equal(outputs(f).at(-1).decisionOutcome, 'CLARIFY'); assert.equal(inputs.length, speechBefore + 1);
+    assert.equal(outputs(f).at(-1).interpretationStatus, 'REJECTED'); assert.match(inputs.at(-1), /repeat or clarify/);
     assert.equal(f.app.lifecycle.terminated, false); await f.turn('A haircut.');
     assert.equal(outputs(f).at(-1).decisionOutcome, 'COLLECT'); assert.match(inputs.at(-1), /date|day/); assert.equal(f.requests.length, 2);
     assert.equal(f.executorCalls, 0); noFailure(f);

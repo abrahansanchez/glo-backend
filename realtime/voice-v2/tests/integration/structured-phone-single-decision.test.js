@@ -111,10 +111,11 @@ for (const mode of ['stale', 'foreign', 'ambiguous', 'extra speech', 'multiple',
   } });
   try {
     await f.turn(); assert.equal(f.requests.length, 1); assert.equal(f.executorCalls, 0);
-    const terminal = ['extra speech', 'multiple'].includes(mode), held = ['stale', 'foreign', 'foreign alternative'].includes(mode);
+    const terminal = ['extra speech', 'multiple'].includes(mode), held = mode === 'foreign alternative';
     assert.equal(f.app.lifecycle.terminated, terminal); assert.equal(f.speech.length, terminal || held ? 0 : 1);
     assert.equal(f.app.session.proposal.service, mode === 'consent plus mutation' ? 'Precision Cut' : null);
     if (!terminal) assert.equal(f.emitted.filter(e => e.stage === 'DECISION_OUTCOME').at(-1).outcome, held ? 'WITHHOLD' : mode === 'consent plus mutation' ? 'CONTINUE' : 'CLARIFY');
+    if (['stale', 'foreign'].includes(mode)) assert.match(f.speech.at(-1).input, /repeat or clarify/);
     assert.equal(f.emitted.some(e => e.stage === 'WOULD_AUTHORIZE'), false);
   } finally { await f.app.terminate('TEST_DONE'); }
 });

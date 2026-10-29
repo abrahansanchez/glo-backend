@@ -32,8 +32,9 @@ for (const tool of ['request_canonical_confirmation', 'submit_confirmation_meani
     await f.turn(); await f.ack(f.twilio.sent.filter(p => p.event === 'mark').at(-1).mark.name);
     const speech = f.speech.length, requests = f.requests.length;
     await f.turn('yes');
-    assert.equal(f.requests.length - requests, 1); assert.equal(f.speech.length, speech);
-    assert.equal(f.emitted.filter(e => e.stage === 'DECISION_OUTCOME').at(-1).outcome, 'WITHHOLD');
+    assert.equal(f.requests.length - requests, 1); assert.equal(f.speech.length, speech + 1);
+    assert.equal(f.emitted.filter(e => e.stage === 'DECISION_OUTCOME').at(-1).outcome, 'CLARIFY');
+    assert.match(f.speech.at(-1).input, /repeat or clarify/);
     assert.equal(f.emitted.some(e => e.stage === 'WOULD_AUTHORIZE'), false); assert.equal(f.executorCalls, 0);
   } finally { await f.app.terminate('TEST_DONE'); }
 });
@@ -927,8 +928,8 @@ for (const mode of ['stale binding', 'foreign binding', 'interrupted synthesis',
   try {
     await f.turn(); assert.equal(f.requests.length, 1); assert.equal(f.executorCalls, 0);
     if (mode.endsWith('binding')) {
-      assert.equal(f.emitted.filter(e => e.stage === 'DECISION_OUTCOME').at(-1).outcome, 'WITHHOLD');
-      assert.equal(f.speech.length, 0); assert.equal(f.app.lifecycle.terminated, false);
+      assert.equal(f.emitted.filter(e => e.stage === 'DECISION_OUTCOME').at(-1).outcome, 'CLARIFY');
+      assert.equal(f.speech.length, 1); assert.match(f.speech.at(-1).input, /repeat or clarify/); assert.equal(f.app.lifecycle.terminated, false);
     } else if (mode === 'interrupted playback') {
       const mark = f.twilio.sent.find(p => p.event === 'mark').mark.name;
       f.app.twilio.clearPlayback(); await f.ack(mark); await f.ack(mark);

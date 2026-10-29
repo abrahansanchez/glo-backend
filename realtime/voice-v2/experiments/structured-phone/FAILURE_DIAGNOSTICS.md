@@ -127,3 +127,19 @@ random alternative IDs). Historical summary compatibility remains separately
 tested. Diagnostic observer failures are swallowed. Recoverable semantic
 outcomes and STALE_WORK withholding follow [DECISION_CONTRACT.md](DECISION_CONTRACT.md);
 they do not create an initiating system failure.
+
+V2_STRUCTURED_PHONE_BINDING is a separate bounded comparison record (128 per
+call, under the existing 4,000-byte record limit). It allowlists only the five
+binding FIELD NAMES and boolean equality/currentness flags. It records whether
+the returned echo equals the dispatch snapshot/current state, whether the
+snapshot remains current, and whether transport correlation was verified.
+Standard current call/turn/request correlation remains; no returned binding
+values, service IDs, revisions, language values, transcripts or argument payloads
+are emitted by this record. Unrecognized observer inputs cannot add fields/text.
+
+CURRENT_REQUEST_REJECTED is distinct from expected cancellation. A recoverable
+current binding rejection is CLARIFY with interpretationStatus REJECTED, not
+successful interpretation or STALE_WORK. Retired generations stay silent. A
+primary system failure is still reserved for actual terminal protocol,
+infrastructure or limit failures. Production serializes the comparison as one
+JSON line. See DECISION_CONTRACT.md for comparison and retained-history ordering.

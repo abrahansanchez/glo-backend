@@ -71,7 +71,7 @@ export class PhoneModelTransport {
           });
           if (new Set(calls.map(c => c.callId)).size !== calls.length) throw Error();
           this.#observedGuard = null;
-          this.#active = null; a.resolve({ calls });
+          this.#active = null; a.resolve({ calls, request: Object.freeze({ id: a.id, responseId: a.responseId, correlationVerified: true }) });
         }
       } catch { this.#fail(); }
     });
@@ -88,7 +88,10 @@ export class PhoneModelTransport {
         this.#observedOperation = 'submitDecisionContext';
         if (callerText !== null) { this.#send({ type: 'conversation.item.create', item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: JSON.stringify({ callerText, applicationContext: context }) }] } }); this.#observe('contextSubmitted'); }
         this.#observedOperation = 'createDecisionRequest';
-        this.#send({ type: 'response.create', response: { output_modalities: ['text'], max_output_tokens: 512, tool_choice: 'required', metadata: { phoneRequestId: id } } });
+        this.#send({ type: 'response.create', response: { output_modalities: ['text'], max_output_tokens: 512, tool_choice: 'required',
+          instructions: JSON.stringify({ contract: PHONE_DECISION_INSTRUCTIONS, currentBinding: context?.binding || null,
+            contextRule: 'Use the latest caller message and its applicationContext. Earlier messages and function outputs are historical. Echo currentBinding exactly; proposed changes do not change this input binding. Unchanged proposalVersion never means unchanged turnId.' }),
+          metadata: { phoneRequestId: id } } });
       } catch { this.#fail('PHONE_MODEL_SEND_FAILED'); }
     });
   }
