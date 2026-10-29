@@ -383,8 +383,18 @@ or exact time. Such decisions now execute only their validated changes, fresh
 bundle check and application rendering; they never submit consent. AFFIRM with
 changes remains rejected. CLARIFY with no missing field and current alternatives
 re-renders those verified alternatives without selecting or mutating a slot.
-Without current alternatives it still stops. Explicit availability questions may
+Without current alternatives it now uses owned clarification. The current
+[decision/recovery contract](DECISION_CONTRACT.md) supersedes historical fatal
+semantic-rejection descriptions here. AFFIRM with changes is held atomically
+for clarification; KNOWN details and typed questions may accompany CLARIFY.
+Explicit availability questions may
 offer actual current slots without requiring an invented exact requested time.
+
+QUESTION and existing-appointment inquiries now use the isolated exploration
+copy described in DECISION_CONTRACT.md. They cannot replace the active proposal
+or invalidate its delivered confirmation merely by asking. Explicit adoption of
+an exploratory option requires a DRAFT request/correction and fresh active bundle
+availability. Exploratory speech and marks cannot grant confirmation authority.
 
 The exact live decision for CAd5c2809f5a74903fca7e0582f64af0e8 was not saved.
 These synthetic reproductions do not establish its initiating INVALID_PLAN guard.

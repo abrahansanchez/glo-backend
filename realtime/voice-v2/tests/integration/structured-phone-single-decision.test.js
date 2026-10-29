@@ -4,7 +4,7 @@ import { harness, call, business } from './structured-phone-harness.js';
 
 import { phoneContracts, PHONE_LIMITS } from '../../experiments/structured-phone/PhoneContracts.js';
 
-const decision = (m, fields = {}) => [call('submit_turn_decision', { ...m.binding, changes: [], intent: 'REQUEST', meaning: 'UNKNOWN', questions: [], missingField: 'NONE', ...fields })];
+const decision = (m, fields = {}) => [call('submit_turn_decision', { ...m.binding, changeCertainty: 'KNOWN', scope: 'DRAFT', changes: [], intent: 'REQUEST', meaning: 'UNKNOWN', questions: [], missingField: 'NONE', ...fields })];
 const service = { kind: 'SET_SERVICE', serviceId: 'service-cut-91' };
 const date = { kind: 'SET_DATE', date: '2026-10-27' };
 const time = { kind: 'SET_TIME', time: '17:00' };
@@ -85,18 +85,19 @@ test('single decision date range retains requested time, offers only current ran
 });
 
 test('single decision retains a deferred availability question while collecting a missing service', async () => {
-  const f = await harness({ script: m => decision(m, m.turn === 1 ? { intent: 'QUESTION', questions: ['AVAILABILITY'], changes: [date, time] } : { changes: [service] }) });
+  const f = await harness({ script: m => decision(m, { intent: 'QUESTION', questions: ['AVAILABILITY'], changes: m.turn === 1 ? [date, time] : [service] }) });
   try {
     await f.turn('Is Tuesday at five available?'); assert.match(f.speech.at(-1).input, /service/);
-    assert.deepEqual(f.models[0].context.pendingQuestions, ['AVAILABILITY']);
+    assert.deepEqual(f.models[0].context.exploration.pendingQuestions, ['AVAILABILITY']);
     await f.ack(f.twilio.sent.filter(p => p.event === 'mark').at(-1).mark.name);
-    await f.turn('Haircut.'); assert.match(f.speech.at(-1).input, /name/);
-    assert.equal(f.models[0].context.availability.available, true);
-    assert.deepEqual(f.models[0].context.pendingQuestions, []); assert.equal(f.requests.length, 2); assert.equal(f.executorCalls, 0);
+    await f.turn('Haircut.'); assert.match(f.speech.at(-1).input, /available/);
+    assert.equal(f.models[0].context.exploration.availability.available, true);
+    assert.equal(f.app.session.proposal.service, null); assert.equal(f.app.session.proposal.date, null);
+    assert.deepEqual(f.models[0].context.exploration.pendingQuestions, []); assert.equal(f.requests.length, 2); assert.equal(f.executorCalls, 0);
   } finally { await f.app.terminate('TEST_DONE'); }
 });
 
-for (const mode of ['stale', 'foreign', 'ambiguous', 'extra speech', 'multiple', 'invalid date', 'foreign alternative', 'consent plus mutation']) test(`single decision rejects ${mode} without a second model request or mutation`, async () => {
+for (const mode of ['stale', 'foreign', 'ambiguous', 'extra speech', 'multiple', 'invalid date', 'foreign alternative', 'consent plus mutation']) test(`single decision explicit outcome for ${mode} without a second model request`, async () => {
   const f = await harness({ script: m => {
     let fields = { changes: [service, date, time, name] };
     if (mode === 'stale') fields.proposalVersion = m.binding.proposalVersion + 1;
@@ -109,9 +110,12 @@ for (const mode of ['stale', 'foreign', 'ambiguous', 'extra speech', 'multiple',
     const calls = decision(m, fields); return mode === 'multiple' ? [...calls, ...calls] : calls;
   } });
   try {
-    await f.turn(); assert.equal(f.requests.length, 1); assert.equal(f.speech.length, 0);
-    assert.equal(f.app.session.proposal.service, null); assert.equal(f.executorCalls, 0);
-    assert.equal(f.app.lifecycle.terminated, true);
+    await f.turn(); assert.equal(f.requests.length, 1); assert.equal(f.executorCalls, 0);
+    const terminal = ['extra speech', 'multiple'].includes(mode), held = ['stale', 'foreign', 'foreign alternative'].includes(mode);
+    assert.equal(f.app.lifecycle.terminated, terminal); assert.equal(f.speech.length, terminal || held ? 0 : 1);
+    assert.equal(f.app.session.proposal.service, mode === 'consent plus mutation' ? 'Precision Cut' : null);
+    if (!terminal) assert.equal(f.emitted.filter(e => e.stage === 'DECISION_OUTCOME').at(-1).outcome, held ? 'WITHHOLD' : mode === 'consent plus mutation' ? 'CONTINUE' : 'CLARIFY');
+    assert.equal(f.emitted.some(e => e.stage === 'WOULD_AUTHORIZE'), false);
   } finally { await f.app.terminate('TEST_DONE'); }
 });
 

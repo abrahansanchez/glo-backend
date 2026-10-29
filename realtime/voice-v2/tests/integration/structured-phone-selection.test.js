@@ -15,7 +15,7 @@ for (const language of ['en', 'es']) for (const mode of ['id', 'time', 'correcti
   let firstAlternative;
   const f = await harness({ raw, language, labels: { [serviceId]: { es: 'corte de pelo' } }, script: (m, input) => {
     if (m.turn === 1) return [decide({ ...m.binding, changes: [{ kind: 'SET_SERVICE', serviceId }, { kind: 'SET_DATE', date: '2026-10-29' },
-      ...(mode === 'missing name' ? [] : [{ kind: 'SET_NAME', name: 'Synthetic Tester' }])], intent: 'QUESTION', questions: ['AVAILABILITY'] })];
+      ...(mode === 'missing name' ? [] : [{ kind: 'SET_NAME', name: 'Synthetic Tester' }])], intent: 'REQUEST', questions: ['AVAILABILITY'] })];
     const alternatives = input.context.availability.alternatives;
     if (m.turn === 2) { firstAlternative = alternatives.find(a => a.time === '15:00').alternativeId;
       return [decide({ ...m.binding, changes: [{ kind: 'SET_PREFERENCE', preference: { kind: 'AFTERNOON' } }] })]; }
@@ -36,7 +36,7 @@ for (const language of ['en', 'es']) for (const mode of ['id', 'time', 'correcti
   f.availability.checkSlot = isSlotAvailable; f.availability.listSlots = getAvailableSlots;
   try {
     const turn = async text => { const count = f.requests.length; await f.turn(text); assert.equal(f.requests.length - count, 1); };
-    await turn(language === 'es' ? '¿Qué horas hay el jueves?' : 'What times are available Thursday?');
+    await turn(language === 'es' ? 'Quiero un corte el jueves. ¿Qué horas hay?' : 'I want a haircut Thursday. What times are available?');
     assert.equal(f.app.lifecycle.terminated, false); await f.ack(f.twilio.sent.filter(p => p.event === 'mark').at(-1).mark.name);
     await turn(language === 'es' ? 'Por la tarde.' : 'In the afternoon.');
     assert.equal(f.app.lifecycle.terminated, false);
@@ -45,11 +45,14 @@ for (const language of ['en', 'es']) for (const mode of ['id', 'time', 'correcti
     if (mode === 'after correction') { await turn('Friday instead.'); await f.ack(f.twilio.sent.filter(p => p.event === 'mark').at(-1).mark.name); }
     const before = structuredClone(f.app.session.proposal), spoken = f.speech.length;
     await turn(mode === 'ambiguous' ? 'Which one?' : language === 'es' ? 'Las tres de la tarde.' : 'Three PM.');
-    if (['stale', 'foreign', 'unsafe affirmative'].includes(mode)) {
+    if (mode === 'foreign') {
       assert.equal(f.app.lifecycle.terminated, true); assert.equal(f.speech.length, spoken); assert.deepEqual(f.app.session.proposal, before);
       const rejected = f.emitted.filter(e => e.stage === 'DECISION_REJECTED').at(-1);
-      assert.equal(rejected.guard, mode === 'unsafe affirmative' ? 'CONFIRMATION_WITH_CHANGES' : 'DRAFT_CHANGE_REJECTED');
-      assert.ok(['DECISION_VALIDATE', 'DRAFT_UPDATE'].includes(rejected.localStage));
+      assert.equal(rejected.guard, 'FOREIGN_ALTERNATIVE');
+    } else if (mode === 'stale' || mode === 'unsafe affirmative') {
+      assert.equal(f.app.lifecycle.terminated, false); assert.deepEqual(f.app.session.proposal, before);
+      assert.equal(f.speech.length, spoken + (mode === 'stale' ? 0 : 1));
+      assert.equal(f.emitted.filter(e => e.stage === 'DECISION_OUTCOME').at(-1).outcome, mode === 'stale' ? 'WITHHOLD' : 'CLARIFY');
     } else if (mode === 'ambiguous') {
       assert.equal(f.app.lifecycle.terminated, false); assert.deepEqual(f.app.session.proposal, before);
       assert.match(f.speech.at(-1).input, /prefier|Which/);

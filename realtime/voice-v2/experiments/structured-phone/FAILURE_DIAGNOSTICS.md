@@ -121,6 +121,9 @@ the call-leg action. It is not a new termination path.
 Fault tests cover all major boundaries and ceilings, pre-model and in-request
 deadlines, deadline clearing, expected cancellations, context/quarantine metadata,
 first-cause preservation, bounded privacy and summary compatibility. A committed
-baseline driver is also compared against the instrumented driver for ordered
-actions, outbound model data and unchanged termination reasons (normalizing only
-fresh random alternative IDs). Diagnostic observer failures are swallowed.
+current-contract driver is compared with its observer disabled for ordered
+actions, outbound model data and termination reasons (normalizing only fresh
+random alternative IDs). Historical summary compatibility remains separately
+tested. Diagnostic observer failures are swallowed. Recoverable semantic
+outcomes and STALE_WORK withholding follow [DECISION_CONTRACT.md](DECISION_CONTRACT.md);
+they do not create an initiating system failure.

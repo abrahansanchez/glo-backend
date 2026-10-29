@@ -33,7 +33,7 @@ for (const tool of ['request_canonical_confirmation', 'submit_confirmation_meani
     const speech = f.speech.length, requests = f.requests.length;
     await f.turn('yes');
     assert.equal(f.requests.length - requests, 1); assert.equal(f.speech.length, speech);
-    assert.equal(f.emitted.find(e => e.stage === 'STOPPED').failureCode, 'STALE_BINDING');
+    assert.equal(f.emitted.filter(e => e.stage === 'DECISION_OUTCOME').at(-1).outcome, 'WITHHOLD');
     assert.equal(f.emitted.some(e => e.stage === 'WOULD_AUTHORIZE'), false); assert.equal(f.executorCalls, 0);
   } finally { await f.app.terminate('TEST_DONE'); }
 });
@@ -164,13 +164,13 @@ test('phone stale/foreign alternative rejects atomically without adding another 
     if (m.round === 1) return [decide({ ...m.binding, changes: [{ kind: 'SET_SERVICE', serviceId: 'service-cut-91' }, { kind: 'SELECT_ALTERNATIVE', alternativeId: 'foreign' }] })];
     return plan(m, 'ASK_MISSING', { field: 'date' });
   } });
-  try { await f.turn(); assert.equal(f.app.session.proposal.service, null); assert.ok(f.emitted.some(e => e.reason === 'STALE_OR_FOREIGN_ALTERNATIVE')); assert.equal(f.executorCalls, 0); }
+  try { await f.turn(); assert.equal(f.app.session.proposal.service, null); assert.ok(f.emitted.some(e => e.stage === 'DECISION_OUTCOME' && e.outcome === 'WITHHOLD')); assert.equal(f.executorCalls, 0); }
   finally { await f.app.terminate('TEST_DONE'); }
 });
 
 test('phone business state changes during synthesis withhold all confirmation bytes', async () => {
   const raw = business(); const f = await harness({ raw, beforeSpeech: async request => { if (request.input.includes('Synthetic Tester')) raw.services[0].price++; } });
-  await f.turn(); assert.equal(f.app.lifecycle.terminated, true); assert.equal(f.twilio.sent.filter(p => p.event === 'media').length, 0); assert.equal(f.executorCalls, 0);
+  await f.turn(); assert.equal(f.app.lifecycle.terminated, false); assert.equal(f.twilio.sent.filter(p => p.event === 'media').length, 0); assert.equal(f.executorCalls, 0);
 });
 
 test('phone new caller speech aborts pending synthesis and late audio cannot submit or acknowledge', async () => {
@@ -207,7 +207,7 @@ test('phone freshness is checked after assistant persistence, immediately before
   const raw = business(); const f = await harness({ raw, afterAssistantPersist: request => {
     if (request.text.includes('Synthetic Tester')) raw.services[0].durationMinutes++;
   } });
-  await f.turn(); assert.equal(f.app.lifecycle.terminated, true);
+  await f.turn(); assert.equal(f.app.lifecycle.terminated, false);
   assert.equal(f.twilio.sent.filter(p => p.event === 'media').length, 0); assert.equal(f.executorCalls, 0);
 });
 
@@ -215,7 +215,7 @@ test('phone unsupported live bundle has an explicit application-owned explanatio
   const raw = business(); raw.services[0].durationMinutes = null;
   const f = await harness({ raw, script: m => m.round < 3 ? seedScript(m) : plan(m, 'EXPLAIN_UNSUPPORTED') });
   try { await f.turn(); assert.equal(f.app.lifecycle.terminated, false); assert.equal(f.checks.length, 0);
-    assert.match(f.speech.at(-1).input, /cannot verify this service bundle/); assert.equal(f.executorCalls, 0);
+    assert.match(f.speech.at(-1).input, /cannot verify the required catalogue facts/); assert.equal(f.executorCalls, 0);
   } finally { await f.app.terminate('TEST_DONE'); }
 });
 
@@ -234,7 +234,7 @@ test('phone an earlier blocked affirmative cannot authorize delivery-gate wordin
   await f.turn(); await f.turn('yes');
   const speech = f.speech.length;
   await f.turn('no');
-  assert.equal(f.app.lifecycle.terminated, true); assert.equal(f.speech.length, speech); assert.equal(f.executorCalls, 0);
+  assert.equal(f.app.lifecycle.terminated, false); assert.equal(f.speech.length, speech + 1); assert.equal(f.executorCalls, 0); assert.equal(f.emitted.filter(e => e.stage === 'DECISION_OUTCOME').at(-1).outcome, 'CLARIFY');
 });
 
 test('phone turn limit prevents a thirteenth decision and cleans resources', async () => {
@@ -256,8 +256,8 @@ for (const reply of ['no', 'could you clarify?', 'not sure', 'no, sí']) test(`p
   } });
   await f.turn(); await f.ack(f.twilio.sent.filter(p => p.event === 'mark').at(-1).mark.name);
   await f.turn(reply);
-  assert.equal(f.emitted.some(e => e.stage === 'WOULD_AUTHORIZE'), false); assert.equal(f.executorCalls, 0);
-  assert.equal(f.app.lifecycle.terminated, true);
+  assert.equal(f.emitted.some(e => e.stage === 'WOULD_AUTHORIZE'), false); assert.equal(f.executorCalls, 0); assert.equal(f.emitted.filter(e => e.stage === 'DECISION_OUTCOME').at(-1).outcome, 'CLARIFY');
+  assert.equal(f.app.lifecycle.terminated, false);
 });
 
 test('phone transport stop closes active owners and no later model or speech work can be accepted', async () => {
@@ -393,7 +393,7 @@ test('phone repair: slot reaching the current instant during synthesis cannot re
   try {
     f.availability.now = () => clock; await f.turn();
     assert.equal(f.speech.length, 1); assert.equal(f.twilio.sent.filter(p => p.event === 'media').length, 0);
-    assert.equal(f.app.lifecycle.terminated, true); assert.equal(f.executorCalls, 0);
+    assert.equal(f.app.lifecycle.terminated, false); assert.equal(f.executorCalls, 0);
   } finally { await f.app.terminate('TEST_DONE'); }
 });
 
@@ -458,7 +458,7 @@ test('phone repair: offered alternative expires during the final read before med
     f.availability.read = async () => { if (expire) clock = new Date('2026-10-27T20:00:00Z'); return read(); };
     await f.turn();
     assert.equal(f.speech.length, 1); assert.equal(f.twilio.sent.filter(p => p.event === 'media').length, 0);
-    assert.equal(f.app.lifecycle.terminated, true); assert.equal(f.executorCalls, 0);
+    assert.equal(f.app.lifecycle.terminated, false); assert.equal(f.executorCalls, 0);
   } finally { await f.app.terminate('TEST_DONE'); }
 });
 
@@ -776,7 +776,7 @@ test('phone latency: selected alternatives recheck directly and changes withhold
   f.availability.check = async (...args) => { const result = await check(...args); if (!discoveryComplete) { discoveryComplete = true; available = false; } return result; };  const list = f.availability.listSlots.bind(f.availability);
   f.availability.listSlots = async args => { if (discoveryComplete) rescans++; return list(args); };
   await f.turn();
-  assert.equal(f.app.lifecycle.terminated, true); assert.equal(rescans, 0); assert.ok(directChecks > 0);
+  assert.equal(f.app.lifecycle.terminated, false); assert.equal(rescans, 0); assert.ok(directChecks > 0);
   assert.equal(f.twilio.sent.some(p => p.event === 'media'), false); assert.equal(f.executorCalls, 0);
   assert.ok(f.emitted.some(e => e.stage === 'SPEECH_HANDOFF_RESULT' && e.outcome === 'WITHHELD'));
 });
@@ -862,7 +862,7 @@ test('phone latency: selected alternative becomes unavailable during synthesis a
       alternativeIds: [m.context.availability.alternatives.find(a => a.time === '16:00').alternativeId],
     }) });
   try {
-    await f.turn(); assert.equal(f.speech.length, 1); assert.equal(f.app.lifecycle.terminated, true);
+    await f.turn(); assert.equal(f.speech.length, 1); assert.equal(f.app.lifecycle.terminated, false);
     assert.equal(f.twilio.sent.some(p => p.event === 'media' || p.event === 'mark'), false);
     assert.ok(f.emitted.some(e => e.stage === 'FRESHNESS_COMPLETED' && e.boundary === 'AFTER_SYNTHESIS' && e.accepted === false));
     assert.equal(f.app.session.journal().some(e => e.event === 'CONFIRMATION_AUTHORITY_GRANTED'), false); assert.equal(f.executorCalls, 0);
@@ -927,8 +927,8 @@ for (const mode of ['stale binding', 'foreign binding', 'interrupted synthesis',
   try {
     await f.turn(); assert.equal(f.requests.length, 1); assert.equal(f.executorCalls, 0);
     if (mode.endsWith('binding')) {
-      assert.equal(f.emitted.find(e => e.stage === 'STOPPED').failureCode, 'STALE_BINDING');
-      assert.equal(f.speech.length, 0); assert.equal(f.app.lifecycle.terminated, true);
+      assert.equal(f.emitted.filter(e => e.stage === 'DECISION_OUTCOME').at(-1).outcome, 'WITHHOLD');
+      assert.equal(f.speech.length, 0); assert.equal(f.app.lifecycle.terminated, false);
     } else if (mode === 'interrupted playback') {
       const mark = f.twilio.sent.find(p => p.event === 'mark').mark.name;
       f.app.twilio.clearPlayback(); await f.ack(mark); await f.ack(mark);

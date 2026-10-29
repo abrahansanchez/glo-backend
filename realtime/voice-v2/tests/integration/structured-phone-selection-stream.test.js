@@ -17,7 +17,7 @@ for (const language of ['en', 'es']) for (const mode of ['complete', 'interrupte
     return new Response(new ReadableStream({ start(c) { controller = c; }, cancel() { cancelled = true; } }), { status: 200 });
   } });
   const f = await harness({ raw, language, injectedSpeechAdapter: adapter, script: (m, input) => {
-    if (m.turn === 1) return [decide({ ...m.binding, intent: 'QUESTION', questions: ['AVAILABILITY'], changes: [
+    if (m.turn === 1) return [decide({ ...m.binding, intent: 'REQUEST', questions: ['AVAILABILITY'], changes: [
       { kind: 'SET_SERVICE', serviceId: 'service-cut-91' }, { kind: 'SET_DATE', date: '2026-10-27' }, { kind: 'SET_NAME', name: 'Synthetic Tester' },
     ] })];
     if (m.turn === 2) return [decide({ ...m.binding, changes: [{ kind: 'SET_PREFERENCE', preference: { kind: 'AFTERNOON' } }] })];
@@ -26,7 +26,7 @@ for (const language of ['en', 'es']) for (const mode of ['complete', 'interrupte
   } });
   f.availability.listSlots = async ({ date }) => ['14:00', '15:00', '16:00'].map(time => ({ date, time }));
   try {
-    for (const text of ['Tuesday availability', 'Afternoon']) {
+    for (const text of ['I want a haircut Tuesday; what is available?', 'Afternoon']) {
       const before = f.requests.length; await f.turn(text); assert.equal(f.requests.length - before, 1);
       await f.ack(f.twilio.sent.filter(p => p.event === 'mark').at(-1).mark.name);
     }

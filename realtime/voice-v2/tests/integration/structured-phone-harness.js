@@ -30,7 +30,7 @@ function fakeModel(script, requests, models) {
 }
 const call = (name, args) => ({ name, args });
 // Single-turn synthetic model fixtures describe intent, never tool outcomes.
-const decide = args => call('submit_turn_decision', { changes: [], intent: 'REQUEST', meaning: 'UNKNOWN', questions: [], missingField: 'NONE', ...args });
+const decide = args => call('submit_turn_decision', { changeCertainty: 'KNOWN', scope: 'DRAFT', changes: [], intent: 'REQUEST', meaning: 'UNKNOWN', questions: [], missingField: 'NONE', ...args });
 const plan = (m, type, fields = {}) => [decide({ ...m.binding,
   ...(type === 'ASK_MISSING' ? { intent: 'CLARIFY', missingField: fields.field } : {}),
   ...(['EXPLAIN_SIMULATION', 'EXPLAIN_DELIVERY_GATE'].includes(type) ? { intent: 'CONFIRMATION', meaning: 'AFFIRM' } : {}),
@@ -42,7 +42,7 @@ function seedScript(m) {
   ] })];
 }async function harness({ language = 'en', script = seedScript, available = true, beforeSpeech, beforeGreeting, afterAssistantPersist, raw = business(), scheduler, wire = false, wireConfigurationError = null, injectedSpeechAdapter = null, onCreateModel = null,
   labels = { 'service-cut-91': { es: 'corte de pelo' }, 'service-beard-72': { es: 'recorte de barba' } } } = {}) {
-  const requests = [], models = [], speech = [], emitted = [], checks = []; let executorCalls = 0;
+  const requests = [], models = [], speech = [], emitted = [], checks = []; let executorCalls = 0, wireSequence = 0;
   const availability = new LiveBundleAvailability({ loadBusiness: async () => raw, now: () => new Date('2026-10-25T16:00:00Z'),
     labels,
     checkSlot: async args => { checks.push(args); return typeof available === 'function' ? available(args) : available; },
@@ -63,7 +63,7 @@ function seedScript(m) {
     structuredPhone: { availability, createModel: (tools, onFailure, diagnostics) => {
       onCreateModel?.();
       if (!wire) { const model = fakeModel(script, requests, models); model.onFailure = onFailure; return model; }
-      const socket = new FakeSocket(), state = { turn: 0, round: 0, results: [] }; let sequence = 0;
+      const socket = new FakeSocket(), state = { turn: 0, round: 0, results: [] };
       const baseSend = socket.send.bind(socket);
       socket.send = raw => {
         baseSend(raw); const p = JSON.parse(raw);
@@ -73,9 +73,9 @@ function seedScript(m) {
         if (p.item?.type === 'function_call_output') { const data = JSON.parse(p.item.output); state.results.push(data.result); state.context = data.applicationContext; state.binding = state.context.binding; }
         if (p.type === 'response.create') queueMicrotask(async () => {
           requests.push(p); state.round++;
-          const id = 'wire-' + (++sequence), calls = await script(state);
+          const id = 'wire-' + (++wireSequence), calls = await script(state);
           socket.receive({ type: 'response.created', response: { id, metadata: p.response.metadata } });
-          socket.receive({ type: 'response.done', response: { id, status: 'completed', output: calls.map((c, i) => ({ type: 'function_call', call_id: id + '-' + i, name: c.name, arguments: JSON.stringify(c.args) })) } });
+          socket.receive({ type: 'response.done', response: { id, status: 'completed', output: calls.map((c, i) => ({ type: 'function_call', call_id: id + '-' + i, name: c.name, arguments: c.raw ?? JSON.stringify(c.args) })) } });
         });
       };
       const model = new PhoneModelTransport(socket, tools, 'gpt-realtime', onFailure, diagnostics); models.push({ socket, close() { model.close(); }, get closed() { return socket.closeCalls.length > 0; } });

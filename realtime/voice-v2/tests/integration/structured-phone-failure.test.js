@@ -16,8 +16,8 @@ const cases = [
   ['context', 'CONTEXT_CONSTRUCTION', 'buildDecisionContext'], ['connection', 'DECISION_CONNECTION', 'constructDecisionConnection'],
   ['configuration', 'DECISION_CONFIGURATION', 'receiveProviderError'], ['model', 'MODEL_REQUEST', 'createDecisionRequest'],
   ['json', 'DECISION_VALIDATION', 'parseDecisionJson'], ['schema', 'DECISION_VALIDATION', 'validateDecisionSchema'],
-  ['multiple', 'DECISION_VALIDATION', 'validateDecisionSchema'], ['binding', 'DECISION_VALIDATION', 'validateDecisionBinding'],
-  ['eligibility', 'DECISION_VALIDATION', 'validateDecisionBinding'], ['mutation', 'DRAFT_MUTATION', 'applyDraftChanges'],
+  ['multiple', 'DECISION_VALIDATION', 'validateDecisionSchema'],
+  ['mutation', 'DRAFT_MUTATION', 'applyDraftChanges'],
   ['alternative', 'ALTERNATIVE_RESOLUTION', 'resolveAlternative'], ['availability', 'AVAILABILITY', 'checkBundleAvailability'], ['render', 'RENDERING', 'renderApplicationResponse'],
   ['synthesis', 'SYNTHESIS', 'synthesizeSpeech'], ['media', 'MEDIA_SUBMISSION', 'submitTwilioMedia'], ['mark', 'MARK_HANDLING', 'sendPlaybackMark'],
 ];
@@ -33,7 +33,7 @@ for (const [kind, stage, operation] of cases) test(`first structured cause: ${ki
       if (kind === 'multiple') return [...seedScript(m), ...seedScript(m)];
       if (kind === 'binding') return [decide({ ...m.binding, turnId: 'CA-foreign:turn:1' })];
       if (kind === 'eligibility') return [decide({ ...m.binding, intent: 'UNSUPPORTED' })];
-      if (kind === 'alternative') return [decide({ ...m.binding, changes: [{ kind: 'SELECT_ALTERNATIVE', alternativeId: 'foreign' }] })];
+      if (kind === 'alternative' && m.turn === 2) return [decide({ ...m.binding, changes: [{ kind: 'SELECT_ALTERNATIVE', alternativeId: 'foreign' }] })];
       return seedScript(m);
     } });
   try {
@@ -50,7 +50,8 @@ for (const [kind, stage, operation] of cases) test(`first structured cause: ${ki
       const send = f.twilio.send.bind(f.twilio);
       f.twilio.send = raw => { if (JSON.parse(raw).event === kind) throw Error(secret); return send(raw); };
     }
-    await f.turn('PRIVATE_TRANSCRIPT'); await settle(f.app);
+    if (kind === 'alternative') { await f.turn('Prime current alternatives'); await f.ack(f.twilio.sent.filter(p => p.event === 'mark').at(-1).mark.name); }
+    const previousRequests = f.requests.length; await f.turn('PRIVATE_TRANSCRIPT'); await settle(f.app);
     assert.equal(failure(f).length, 1);
     const first = structuredClone(failure(f)[0]);
     if (kind === 'business' || kind === 'eligibility') console.log(JSON.stringify({ sample: kind === 'business' ? 'thrown_error' : 'guard_rejection', record: first }));
@@ -58,7 +59,7 @@ for (const [kind, stage, operation] of cases) test(`first structured cause: ${ki
     if (kind === 'multiple') { assert.equal(first.guard, 'ONE_DECISION_REQUIRED'); assert.equal(first.configuredLimit, 1); }
     assert.ok(first.trail.length); assert.ok(first.terminationRequestedBy || ['synthesis', 'media', 'mark'].includes(kind));
     assert.equal(first.counters.modelRequestStartedForTurn, !['business', 'catalogue', 'context', 'connection', 'configuration'].includes(kind));
-    assert.ok(f.requests.length <= 1); assert.equal(f.executorCalls, 0);
+    assert.ok(f.requests.length - previousRequests <= 1); assert.equal(f.executorCalls, 0);
     await f.app.terminate('TEST_DONE'); f.twilio.emit('error', Error(secret)); await settle(f.app);
     assert.equal(failure(f).length, 1); assert.deepEqual(failure(f)[0], first);
     for (const e of f.emitted.filter(e => e.event?.startsWith('V2_STRUCTURED_PHONE_') && ['FAILURE', 'SECONDARY', 'BOUNDARY', 'TERMINATION_REQUESTED'].some(suffix => e.event.endsWith(suffix)))) {
@@ -275,11 +276,9 @@ test('quarantined source items do not enter separate decision context; context i
   } finally { await f.app.terminate('TEST_DONE'); }
 });
 
-test('observer faults and instrumentation leave baseline decision actions, payloads and hangup reasons unchanged', async () => {
-  const moduleUrl = new URL('../../experiments/structured-phone/StructuredPhoneDriver.js', import.meta.url);
-  let source = execFileSync('git', ['show', '970cad63cda8edb776b5ba5fab35ab66eab6850f:realtime/voice-v2/experiments/structured-phone/StructuredPhoneDriver.js'], { encoding: 'utf8' });
-  source = source.replace(/from '([^']+)'/g, (all, path) => `from '${path.startsWith('.') ? new URL(path, moduleUrl).href : path.startsWith('node:') ? path : import.meta.resolve(path)}'`);
-  const Baseline = (await import('data:text/javascript;base64,' + Buffer.from(source).toString('base64'))).StructuredPhoneDriver;
+test('observer faults leave current-contract actions, payloads and hangup reasons unchanged', async () => {
+  // Contract semantics intentionally changed; compare observer enabled/disabled against the same current contract.
+  const Baseline = StructuredPhoneDriver;
   for (const mode of ['success', 'read failure', 'model failure', 'availability failure', 'invalid JSON', 'handoff failure', 'observer throws']) {
     const run = async (Driver, observe) => {
       const f = await harness(), actions = [];

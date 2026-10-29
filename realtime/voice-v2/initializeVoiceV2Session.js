@@ -276,7 +276,7 @@ export function initializeVoiceV2Session({
         structuredDriver.log('SPEECH_HANDOFF_RESULT', { purpose: plan.purpose, proposalVersion: plan.proposalVersion,
           turnId: plan.structuredBinding?.turnId, requestId: result?.requestId || null, responseId: result?.responseId || null,
           outcome: result?.accepted ? 'PREPARATION_ACCEPTED' : 'WITHHELD', reason: result?.accepted ? 'NONE' : reason });
-        if (result?.reason === 'STRUCTURED_STALE_EVIDENCE' && structuredDriver.currentPlan(plan)) return lifecycle.terminate('STRUCTURED_STALE_EVIDENCE');
+        if (result?.reason === 'STRUCTURED_STALE_EVIDENCE' && structuredDriver.currentPlan(plan)) structuredDriver.interrupt('STALE_WORK');
         return result;
       }), terminate: reason => { observeStructured('termination', 'structuredTerminate', reason); structuredDriver.close(); return enqueue(() => lifecycle.terminate(reason)); }, emit: event => {
         if (['STOPPED', 'MODEL_PROTOCOL_FAILED'].includes(event.stage)) session.record('STRUCTURED_DECISION_FAILED', {
@@ -959,7 +959,7 @@ export function initializeVoiceV2Session({
     // Await the existing evidence check before each incoming batch, then recheck
     // ownership synchronously for every complete frame before its actual write.
     if (!await structuredDriver.applicable(state.plan, 'BEFORE_MEDIA') || !current()) {
-      if (current()) { clearPlayback('PROPOSAL_CHANGED', state); structuredDriver.close(); void lifecycle.terminate('STRUCTURED_STALE_EVIDENCE'); }
+      if (current()) withholdStructuredOutput(state);
       throw aborted();
     }
     if (!state.streamedAudio && !session.floorOwner.beginSpeaking({ requestId: state.requestId, responseId: state.responseId, proposalVersion: state.plan.proposalVersion })) throw aborted();
@@ -972,6 +972,13 @@ export function initializeVoiceV2Session({
       timing.once('FIRST_TWILIO_AUDIO_SUBMITTED', state.responseId, timingDetails({ responseId: state.responseId }));
       callTrace.recordTwilioAudio(timingDetails({ responseId: state.responseId }));
     }
+  }
+
+  function withholdStructuredOutput(state) {
+    // Retired output must never clear or cancel a replacement generation.
+    if (!structuredDriver.currentPlan(state.plan)) return supersedeResponse(state, 'CALLER_INTERRUPTION');
+    clearPlayback('PROPOSAL_CHANGED', state);
+    structuredDriver.interrupt('STALE_WORK');
   }
 
   function retrySpeech(state, reason) {
@@ -1244,9 +1251,7 @@ export function initializeVoiceV2Session({
     }
     if (structuredDriver && state.plan.structuredBinding && !await structuredDriver.applicable(state.plan, 'AFTER_SYNTHESIS')) {
       observeDisposition(state, 'STALE', 'STATE_CHANGED_DURING_SPEECH');
-      if (state.streamedAudio) clearPlayback('PROPOSAL_CHANGED', state);
-      if (!structuredDriver.currentPlan(state.plan)) return supersedeResponse(state, 'CALLER_INTERRUPTION');
-      structuredDriver.close(); return lifecycle.terminate('STRUCTURED_STALE_EVIDENCE');
+      return withholdStructuredOutput(state);
     }
     state.providerCompletion = event;
     if (!state.preparation) {
@@ -1295,9 +1300,7 @@ export function initializeVoiceV2Session({
     }
     if (structuredDriver && state.plan.structuredBinding) {
       if (!await structuredDriver.applicable(state.plan, 'BEFORE_MEDIA') || !deliveryCurrent(state, Boolean(state.streamedAudio))) {
-        if (state.streamedAudio) clearPlayback('PROPOSAL_CHANGED', state);
-        if (!structuredDriver.currentPlan(state.plan)) return supersedeResponse(state, 'CALLER_INTERRUPTION');
-        structuredDriver.close(); return lifecycle.terminate('STRUCTURED_STALE_EVIDENCE');
+        return withholdStructuredOutput(state);
       }
     }
     if (state.preparation || requiresBufferedDelivery(state.plan)) {
