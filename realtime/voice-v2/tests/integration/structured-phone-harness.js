@@ -41,7 +41,8 @@ function seedScript(m) {
     { kind: 'SET_TIME', time: '17:00' }, { kind: 'SET_NAME', name: 'Synthetic Tester' },
   ] })];
 }async function harness({ language = 'en', script = seedScript, available = true, beforeSpeech, beforeGreeting, afterAssistantPersist, raw = business(), scheduler, wire = false, wireConfigurationError = null, injectedSpeechAdapter = null, onCreateModel = null,
-  labels = { 'service-cut-91': { es: 'corte de pelo' }, 'service-beard-72': { es: 'recorte de barba' } } } = {}) {
+  labels = { 'service-cut-91': { es: 'corte de pelo' }, 'service-beard-72': { es: 'recorte de barba' } },
+  structuredGreetingAudio = null, configureIntake = true, persistAssistant = null } = {}) {
   const requests = [], models = [], speech = [], emitted = [], checks = []; let executorCalls = 0, wireSequence = 0;
   const availability = new LiveBundleAvailability({ loadBusiness: async () => raw, now: () => new Date('2026-10-25T16:00:00Z'),
     labels,
@@ -55,8 +56,8 @@ function seedScript(m) {
     coordinator: undefined, scheduler, now: () => new Date('2026-10-25T16:00:00Z'),
     bookingAdapter: { createAppointment() { executorCalls++; throw Error('FORBIDDEN'); }, reconcileAppointment() { executorCalls++; throw Error('FORBIDDEN'); } },
     smsAdapter: { sendAppointmentConfirmation() { executorCalls++; throw Error('FORBIDDEN'); } },
-    transcriptAdapter: { appendTurn: async request => { if (request.role === 'assistant') afterAssistantPersist?.(request); return { success: true }; }, finalizeCall: async () => ({ success: true }) },
-    applicationOwnedCollectSpeech: true, applicationOwnedAvailabilitySpeech: true,
+    transcriptAdapter: { appendTurn: async request => { if (request.role === 'assistant') { afterAssistantPersist?.(request); if (persistAssistant) return persistAssistant(request); } return { success: true }; }, finalizeCall: async () => ({ success: true }) },
+    applicationOwnedCollectSpeech: true, applicationOwnedAvailabilitySpeech: true, structuredGreetingAudio,
     speechAdapter: injectedSpeechAdapter || { async synthesize(request) { speech.push(request); if (beforeGreeting && request.input.includes('AI receptionist')) await beforeGreeting(request, app);
       if (beforeSpeech && !request.input.includes('AI receptionist')) await beforeSpeech(request, app);
       return { audio: Buffer.from([1, 2, 3]), format: 'audio/pcmu' }; } },
@@ -84,7 +85,7 @@ function seedScript(m) {
   });
   input.open(); twilio.receive({ event: 'start', start: { callSid: 'CA-phone', streamSid: 'MZ-phone' } });
   input.receive({ type: 'session.created' }); await settle(app);
-  input.receive({ type: 'session.updated' }); await settle(app);
+  if (configureIntake) { input.receive({ type: 'session.updated' }); await settle(app); }
   // A real Twilio mark, not synthesis completion, finishes the application greeting.
   const greeting = twilio.sent.find(p => p.event === 'mark');
   if (greeting) twilio.receive({ event: 'mark', streamSid: 'MZ-phone', mark: greeting.mark });

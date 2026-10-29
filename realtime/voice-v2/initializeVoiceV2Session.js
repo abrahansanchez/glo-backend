@@ -29,6 +29,8 @@ import { SpeechPreparation, resolvePreparationDeadline } from "./lifecycle/Speec
 import { LocalRecoveryAudioAdapter } from "./adapters/LocalRecoveryAudioAdapter.js";
 import { StructuredPhoneDriver } from './experiments/structured-phone/StructuredPhoneDriver.js';
 import { PHONE_LIMITS } from './experiments/structured-phone/PhoneContracts.js';
+import { planResponse } from './planning/ResponsePlanner.js';
+import { greetingSynthesisConfiguration } from './experiments/structured-phone/GreetingAudioCache.js';
 
 const STARTUP_AUDIO_MAX_FRAMES = 500;
 const STARTUP_AUDIO_MAX_BYTES = 80000;
@@ -73,8 +75,10 @@ export function initializeVoiceV2Session({
   speechPreparationTimeoutMs = process.env.VOICE_V2_SPEECH_PREPARATION_TIMEOUT_MS,
   speechHeadersTimeoutMs = process.env.VOICE_V2_SPEECH_HEADERS_TIMEOUT_MS,
   structuredPhone = null,
+  structuredGreetingAudio = null,
 } = {}) {
   requireSessionInputs({ callSid, callerNumber, businessContext, buildSha, twilioSocket, openaiSocketFactory });
+  let greetingPreparation = null;
   let lifecycle; let structuredDriver = null; let structuredSpeechRequests = 0; let consentDiagnostics; let processing = Promise.resolve(); let effectsProcessing = Promise.resolve(); let turnSequence = 0; let responseSequence = 0; let markSequence = 0; let twilioStarted = false; let openaiSessionCreated = false; let openaiConfigured = false; let initialGreetingRequested = false; let callerTurnSeen = false; let lastAcknowledgedState = null; let transcriptionLanguage = openaiSession.input_audio_transcription?.language || null; let languageUpdatePending = false; let languageUpdateAttemptedFor = null;
   const providerTurns = new Set(); const requests = new Map(); const responses = new Map(); const marks = new Map(); const superseded = new Set(); const ambiguityPurposes = []; const startupAudio = []; let startupAudioBytes = 0; let callTerminationRequested = false;
   const preparationConfiguration = structuredPhone ? Object.freeze({ preparationBudgetMs: 60000, budgetSource: 'structured_experiment' }) : resolvePreparationDeadline(speechPreparationTimeoutMs);
@@ -201,10 +205,11 @@ export function initializeVoiceV2Session({
   function receive(event, handler) {
     if (!lifecycle?.terminated && event.error?.code !== "response_cancel_not_active") outcomeDiagnosis.connection(event.type);
     // Receipt, rather than queue processing, revokes pending retry permission.
-    if (event.type === TransportEvent.CALLER_SPEECH_STARTED) { callerSpeechEpoch++; structuredDriver?.interrupt(); }
+    if (event.type === TransportEvent.CALLER_SPEECH_STARTED) { callerSpeechEpoch++; structuredDriver?.interrupt(); greetingPreparation?.controller.abort(); }
     if ([TransportEvent.TWILIO_STREAM_STOPPED, TransportEvent.TWILIO_CONNECTION_CLOSED, TransportEvent.TWILIO_TRANSPORT_ERROR,
       TransportEvent.OPENAI_CONNECTION_CLOSED, TransportEvent.OPENAI_TRANSPORT_ERROR].includes(event.type) && event.error?.code !== "response_cancel_not_active") {
       deliveryStopping = true;
+      greetingPreparation?.controller.abort();
       observeStructured('secondary', event.type);
       structuredDriver?.close();
       disposeSpeechUndiciStages(callSid); transcriptionDiagnostics.close();
@@ -379,6 +384,7 @@ export function initializeVoiceV2Session({
       callTrace.setStreamSid(event.streamSid);
       if (event.callSid !== callSid) return lifecycle.terminate("TRANSPORT_IDENTITY_MISMATCH");
       twilioStarted = true;
+      prepareReusableGreeting();
       if (!openaiConfigured) session.watchdog.schedule("openai-startup", 10000, () => enqueue(() => lifecycle.terminate("OPENAI_STARTUP_TIMEOUT")));
       if (openai.connected && openaiSessionCreated && !openai.configurationRequested) configureSession();
       await maybeRequestInitialGreeting();
@@ -827,7 +833,10 @@ export function initializeVoiceV2Session({
   }
 
   function requestSynthesizedConfirmation(tracked) {
-    if (structuredPhone && ++structuredSpeechRequests > PHONE_LIMITS.speechRequests) {
+    const reservedGreeting = tracked.plan.purpose === ResponsePurpose.INITIAL_GREETING && greetingPreparation?.reserved
+      && !greetingPreparation.claimed && tracked.requestId === `${callSid}:startup:initial-greeting`;
+    if (reservedGreeting) greetingPreparation.claimed = true;
+    if (structuredPhone && !reservedGreeting && ++structuredSpeechRequests > PHONE_LIMITS.speechRequests) {
       observeStructured('update', { speechRequests: structuredSpeechRequests });
       observeStructured('failure', null, { reasonCode: 'SPEECH_REQUEST_LIMIT', guard: 'speechRequests', limit: PHONE_LIMITS.speechRequests, stage: 'SPEECH_HANDOFF', operation: 'speechRequestLimit', terminationRequestedBy: { function: 'requestSynthesizedConfirmation', reasonCode: 'STRUCTURED_SPEECH_LIMIT' } });
       observeStructured('termination', 'requestSynthesizedConfirmation', 'STRUCTURED_SPEECH_LIMIT'); structuredDriver.close(); void lifecycle.terminate('STRUCTURED_SPEECH_LIMIT'); return { accepted: false, reason: 'STRUCTURED_SPEECH_LIMIT' }; }
@@ -878,6 +887,16 @@ export function initializeVoiceV2Session({
         || ((structuredPhone || attempt.number === 2) && !deliveryCurrent(state))) { observeDisposition({ deliveryObservation: observed }, "STALE", deliveryStaleReason(state)); return; }
       if (performance.now() >= state.preparation.identity.deadlineAt) return failPreparation(state, "SPEECH_PREPARATION_TIMEOUT", true);
       observeStructured('start', 'SYNTHESIS', 'synthesizeSpeech');
+      if (plan.purpose === ResponsePurpose.INITIAL_GREETING && greetingPreparation) {
+        if (greetingPreparation.text !== state.preparation.identity.wording || greetingPreparation.language !== state.preparation.identity.language
+          || greetingPreparation.configuration !== JSON.stringify(greetingSynthesisConfiguration(speechAdapter))) {
+          greetingPreparation.controller.abort(); throw Object.assign(Error('greeting_identity_changed'), { code: 'TTS_ABORTED' });
+        }
+        const cancel = () => greetingPreparation.controller.abort();
+        abortController.signal.addEventListener('abort', cancel, { once: true });
+        if (abortController.signal.aborted) cancel();
+        return greetingPreparation.promise.finally(() => abortController.signal.removeEventListener('abort', cancel));
+      }
       return speechAdapter.synthesize({
       input: state.preparation.identity.wording,
       language: state.preparation.identity.language,
@@ -1053,6 +1072,7 @@ export function initializeVoiceV2Session({
 
   function preparationCurrent(state) {
     return state.preparation?.active && !lifecycle.terminated && !localRecoveryStarted
+      && !(state.plan.purpose === ResponsePurpose.INITIAL_GREETING && greetingPreparation && (deliveryStopping || greetingPreparation.controller.signal.aborted))
       && (state.delivery.attempts !== 2 || deliveryCurrent(state))
       && !session.responseRegistry.get(state.responseId)?.invalidated && !superseded.has(state.responseId)
       && state.plan.proposalVersion === session.proposal.proposalVersion
@@ -1148,9 +1168,39 @@ export function initializeVoiceV2Session({
     }
   }
 
+  function prepareReusableGreeting() {
+    if (!structuredPhone || !structuredGreetingAudio || greetingPreparation || deliveryStopping || lifecycle.terminated || callerTurnSeen) return;
+    const configuration = JSON.stringify(structuredGreetingAudio.configuration);
+    if (configuration !== JSON.stringify(greetingSynthesisConfiguration(speechAdapter))) return;
+    const language = session.conversationLanguage.currentLanguage;
+    // Cache only the canonical business-only introduction. No proposal/caller
+    // details, arbitrary coordinator wording or conversational sentences enter.
+    const args = { proposal: session.proposal, purpose: ResponsePurpose.INITIAL_GREETING, language, businessName: businessContext.businessName };
+    const text = planResponse(args).expectedFacts.greeting;
+    if (coordinator.responsePlanner(args).expectedFacts.greeting !== text) return;
+    const controller = new AbortController();
+    greetingPreparation = { controller, text, language, configuration, reserved: true };
+    structuredSpeechRequests++;
+    observeStructured('update', { speechRequests: structuredSpeechRequests });
+    greetingPreparation.promise = structuredGreetingAudio.cache.acquire({ businessId: String(businessContext.businessId), language, text,
+      configuration: structuredGreetingAudio.configuration, signal: controller.signal,
+      prepare: async signal => {
+        if (configuration !== JSON.stringify(greetingSynthesisConfiguration(speechAdapter))) throw Object.assign(Error('greeting_configuration_changed'), { code: 'TTS_ABORTED' });
+        const audio = await speechAdapter.synthesize({ input: text, language, signal });
+        if (configuration !== JSON.stringify(greetingSynthesisConfiguration(speechAdapter))) throw Object.assign(Error('greeting_configuration_changed'), { code: 'TTS_ABORTED' });
+        return audio;
+      },
+      observe: disposition => safeEmit({ event: 'V2_STRUCTURED_GREETING_AUDIO', callSid, buildSha, disposition }),
+    });
+    // Observe early failure now, but preserve it for the ordinary per-call
+    // speech failure path after intake readiness. Never silently retry it.
+    greetingPreparation.promise.catch(() => {});
+  }
+
   async function maybeRequestInitialGreeting() {
     if (!twilioStarted || !openaiConfigured || lifecycle.terminated || initialGreetingRequested) return { accepted: false, reason: "STARTUP_NOT_ELIGIBLE" };
-    if (callerTurnSeen) { initialGreetingRequested = true; return { accepted: false, reason: "CALLER_TURN_ALREADY_RECEIVED" }; }
+    if (greetingPreparation?.controller.signal.aborted) { initialGreetingRequested = true; return { accepted: false, reason: 'GREETING_CANCELED' }; }
+    if (callerTurnSeen) { greetingPreparation?.controller.abort(); initialGreetingRequested = true; return { accepted: false, reason: "CALLER_TURN_ALREADY_RECEIVED" }; }
     initialGreetingRequested = true;
     session.watchdog.cancel("openai-startup");
     const requestIdentity = `${callSid}:startup:initial-greeting`;
@@ -1825,6 +1875,7 @@ export function initializeVoiceV2Session({
     if (role === "caller") callTrace.entry("CALLER_TRANSCRIPT_PERSISTED", { turnId, itemId, characterCount, persistenceOutcome: error ? "FAILED" : result?.replayed ? "REPLAYED" : result?.success === true ? "SUCCESS" : "NOT_CONFIRMED" });
   }
   async function cleanup(reason) {
+    greetingPreparation?.controller.abort();
     observeStructured('start', 'CLEANUP', 'cleanup'); observeStructured('secondary', 'CALL_TERMINATED');
     structuredDriver?.close();
     for (const tracked of new Set(requests.values())) {

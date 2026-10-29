@@ -13,6 +13,7 @@ import { buildBusinessSessionInstructions } from "../planning/businessGrounding.
 import { selectStructuredPhone } from '../experiments/structured-phone/PhoneContracts.js';
 import { PhoneModelTransport } from '../experiments/structured-phone/PhoneModelTransport.js';
 import { LiveBundleAvailability } from '../experiments/structured-phone/LiveBundleAvailability.js';
+import { GreetingAudioCache, greetingSynthesisConfiguration } from '../experiments/structured-phone/GreetingAudioCache.js';
 
 export function createVoiceV2ProductionInitializer({
   env = process.env,
@@ -30,6 +31,7 @@ export function createVoiceV2ProductionInitializer({
   },
 } = {}) {
   const approvedBusinessId = String(env.VOICE_V2_TEST_BUSINESS_ID || "").trim();
+  const greetingAudioCache = new GreetingAudioCache();
 
   return function initializeV2Connection({ socket, buildSha }) {
     return new Promise((resolve, reject) => {
@@ -95,7 +97,9 @@ export function createVoiceV2ProductionInitializer({
                 speechAdapter: dependencies.speechAdapter,
                 applicationOwnedCollectSpeech: true,
                 applicationOwnedAvailabilitySpeech: true,
-                ...(structuredPhone ? { structuredPhone, speechPreparationTimeoutMs: 60000, speechHeadersTimeoutMs: 60000 } : {}),
+                ...(structuredPhone ? { structuredPhone, speechPreparationTimeoutMs: 60000, speechHeadersTimeoutMs: 60000,
+                  structuredGreetingAudio: dependencies.speechAdapter instanceof OpenAISpeechAdapter && greetingSynthesisConfiguration(dependencies.speechAdapter)
+                    ? { cache: greetingAudioCache, configuration: greetingSynthesisConfiguration(dependencies.speechAdapter) } : null } : {}),
                 callControlAdapter: dependencies.callControlAdapter,
                 openaiSession: {
                   ...dependencies.openaiSession,
