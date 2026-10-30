@@ -23,6 +23,7 @@ import { attachMediaWebSocketServer } from "./realtime/mediaStreamServer.js";
 import { attachIsolatedVoiceRoutes } from "./realtime/voice-v2/routing/attachIsolatedVoiceRoutes.js";
 import { createVoiceV2ProductionInitializer } from "./realtime/voice-v2/production/createVoiceV2ProductionInitializer.js";
 import { startAppointmentReminderJob } from "./jobs/appointmentReminders.js";
+import { mountRetellReadOnlyTools } from "./services/voice/retell/mountReadOnlyTools.js";
 
 // ---------------------------------------------------------
 // ROUTES
@@ -104,6 +105,10 @@ app.use(
 
 // Mount Stripe webhook router
 app.use("/api/stripe", stripeWebhookRoutes);
+// Reserved, default-disabled read-only tools. No credentials/config are loaded here.
+// Keep raw-body authentication before the general JSON parser. Activation requires
+// a separately reviewed trusted registration/binding composition; no test bypass.
+mountRetellReadOnlyTools(app);
 // ---------------------------------------------------------
 // JSON + FORM parsing (AFTER Stripe raw body)
 // ---------------------------------------------------------

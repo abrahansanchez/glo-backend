@@ -21,7 +21,8 @@ export function getServiceDurationMinutes(barber, serviceName) {
  * Check if a specific date/time slot is available.
  * Enforces: business hours, closed days, blackout dates, overlap, buffer.
  */
-export async function isSlotAvailable({ barber, date, time, durationMinutes, excludeAppointmentId, session }) {
+export async function isSlotAvailable({ barber, date, time, durationMinutes, excludeAppointmentId, session,
+  findConflict = (query) => Appointment.findOne(query), observe = console.log }) {
   const tz = barber.availability?.timezone || "America/New_York";
   const duration = durationMinutes || barber.availability?.defaultServiceDurationMinutes || 30;
   const buffer = barber.availability?.bufferMinutes || 0;
@@ -34,7 +35,7 @@ export async function isSlotAvailable({ barber, date, time, durationMinutes, exc
   // 1. Check closed day
   const dayKey = DAY_MAP[start.day()];
   const dayHours = barber.availability?.businessHours?.[dayKey];
-  console.log("[AVAILABILITY_DAY_RESOLVE]", {
+  observe("[AVAILABILITY_DAY_RESOLVE]", {
     date,
     time,
     tz,
@@ -64,7 +65,7 @@ export async function isSlotAvailable({ barber, date, time, durationMinutes, exc
   // 4. Check appointment overlap with buffer
   const bufferedStart = start.clone().subtract(buffer, "minutes").toDate();
   const bufferedEnd = end.clone().add(buffer, "minutes").toDate();
-  console.log("[AVAILABILITY_SLOT_PARSE]", {
+  observe("[AVAILABILITY_SLOT_PARSE]", {
     bufferedStart: moment(bufferedStart).tz(tz).format("YYYY-MM-DD HH:mm z"),
     bufferedEnd: moment(bufferedEnd).tz(tz).format("YYYY-MM-DD HH:mm z"),
     openTime: openTime.format("YYYY-MM-DD HH:mm z"),
@@ -87,10 +88,10 @@ export async function isSlotAvailable({ barber, date, time, durationMinutes, exc
     query._id = { $ne: excludeAppointmentId };
   }
 
-  let finder = Appointment.findOne(query);
+  let finder = findConflict(query);
   if (session && typeof finder.session === "function") finder = finder.session(session);
   const conflict = await finder;
-  console.log("[AVAILABILITY_RESULT]", {
+  observe("[AVAILABILITY_RESULT]", {
     date,
     time,
     service: durationMinutes + "min",
