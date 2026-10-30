@@ -275,3 +275,30 @@ docs/voice/RETELL_SANDBOX_CHECKPOINT.md
 ```
 
 Proposed title: `feat(voice): add disabled read-only Retell registration and tools`. This follow-up touches nine of those files (three lifecycle/repository/test edits, transport plus two tests, and three documents). Everything remains unstaged/uncommitted. The registration transport is now available to inject, but no real phone handoff or provider-enabled composition exists in server.js. The minimum remaining connected checkpoint needs the specifically documented sandbox SIP handoff/termination seam, provisioned read-only agent, verified business mapping and explicit execution permission; a dashboard/web call cannot prove phone registration.
+
+## Disabled sandbox SIP handoff round — 2026-10-30
+
+Foundation committed at `8ffa9130d492ab68a9a87cfd37d250cd40351dcf`; this round remains unstaged. The [sandbox checkpoint](RETELL_SANDBOX_CHECKPOINT.md#disabled-sip-handoff-implemented-offline--2026-10-30) now documents an implemented but uninstalled composition, durable global experiment budget, bind-before-bridge and signed pre-connect screening, telephony duration control, failure hangup and disabled takeover. Its latest section supersedes earlier statements that handoff code is missing. Production still never calls the installer and no environment settings were added.
+
+Exact 14-file round overlay on that clean starting HEAD:
+
+```text
+controllers/callController.js
+routes/voiceWebhook.js
+models/RetellCallRegistration.js
+models/RetellSandboxBudget.js
+services/voice/retell/CallRegistration.js
+services/voice/retell/RegistrationRepository.js
+services/voice/retell/SandboxBudgetRepository.js
+services/voice/retell/SandboxHandoff.js
+services/voice/retell/SandboxPhoneHooks.js
+services/voice/retell/installSandbox.js
+tests/services/retellSandboxHandoff.test.js
+docs/voice/RETELL_SANDBOX_CHECKPOINT.md
+docs/voice/RETELL_READ_ONLY_SLICE.md
+docs/voice/RETELL_IMPLEMENTATION_TRACKER.md
+```
+
+Affected tests: **324/324 pass each in worktree and clean overlay**, no fail/skip/cancel. This is 24 new handoff checks plus the existing 300 affected checks; no full repository discovery is claimed. New checks use the actual Mongoose schemas/repositories against an already cached isolated Mongo 8.0.32 child plus fake provider and real loopback HTTP shared hooks. No production server boot/credential reads. Existing scheduling, structured-phone and routing regressions remain included. Eleven changed/new JavaScript syntax checks, tracked/staged diff checks and new-file whitespace checks pass. Reports, exact inventory and byte-matched overlay hashes are in `C:\Users\sanch\AppData\Local\Temp\retell-sip-4a1df0ac074643d4b0b76eb0928f7fed`.
+
+Exact affected command adds `tests/services/retellSandboxHandoff.test.js` to the previous 300-test command. Unrelated adapter/test modifications, standalone lab/evaluation files and untracked engineering/assessment documentation are excluded. Normal booking/StructuredPhoneDriver are unchanged. Initial sandbox has no appointment/SMS executor, no custom-AI fallback after selection, and no automatic retry. Only signed, nonselected calls/default configuration retain normal route behavior; the selected account's explicit takeover is blocked until separately implemented.

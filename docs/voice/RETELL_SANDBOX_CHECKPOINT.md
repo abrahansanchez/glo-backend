@@ -78,3 +78,76 @@ Success requires accepted registration, durable identity, authentic signed lifec
 Rollback: leave/revert both explicit enabled properties and read-only mount to false/absent, retire any active sandbox owner via `supersede`, stop the isolated handoff and end its test call. Do not delete registration rows to re-enable retries. Existing production routing requires no rollback because it has not been changed or enabled. No number/webhook/mobile configuration changes are authorized by this document.
 
 Proposed accumulated commit title: `feat(voice): add disabled read-only Retell registration and tools`.
+
+## Disabled SIP handoff implemented offline — 2026-10-30
+
+Starting HEAD `8ffa9130d492ab68a9a87cfd37d250cd40351dcf` now contains the foundation above. This section supersedes the earlier **missing handoff code** blocker; provisioning, deployment review and real provider/telephony acceptance remain unverified. No call or provider request has been made.
+
+### Composition and existing phone routing
+
+`installRetellSandbox(app, options)` is **not called by server.js**. Both `enabled === true` and `executionEnabled === true`, one explicit server-resolved `businessId`, a stable `budgetId`, exactly one pinned `agentsByBusiness` entry and injected configuration/dependencies are required. No environment-variable parser or credential lookup was added. Call the installer only in a separately reviewed sandbox boot, before general JSON parsing, because it composes the existing raw-body read/callback mount. It installs `app.locals.retellSandbox` only after configuration succeeds. The normal production boot has no such object.
+
+Existing `handleIncomingCall` still performs forwarding verification and business resolution, then observes the selected call and returns the same mobile Client dial. Failed observation does not prevent a human answering; it prevents later sandbox registration. Normal nonselected calls and default-disabled routes retain existing behavior. A completed human dial retires the observation and hangs up without consuming the experiment budget or registering Retell.
+
+Only signed `/api/voice/dial-fallback` for the selected business may register. The handler checks the trusted called-number resolver again, the previously persisted incoming identity/epoch and the allowed dial outcomes (no-answer/busy/failed/canceled). Unsigned selected requests reject; legacy URL aliases cannot bypass this canonical-URL verification. The selected branch returns before custom AI or the normal missed-call push and clears the existing active-call map. Selected registration, persistence or bridge failures use existing application-owned failure wording plus Hangup; they **never** fall through into the custom voice engine. Normal nonselected missed-call notifications remain unchanged. Selected account takeover returns `RETELL_SANDBOX_TAKEOVER_DISABLED`; no owner transition to custom AI is enabled.
+
+### Durable budget and bridge boundary
+
+`RetellSandboxBudget` has one unique `_id = budgetId` per explicitly approved experiment, shared across calls/processes, no TTL deletion. A create-only CLAIMED row pins the business, parent CallSid and owner epoch **before registration**. Duplicates/concurrent losers never retry or return another SIP dial. A second parent and a new process using the same budget cannot acquire it. Never change/delete the budget ID to retry an uncertain run; a new ID requires a separately authorized experiment.
+
+At actual provider dispatch, a second atomic predicate consumes `registrationAttemptId` only once and checks the exact registration attempt/agent/version/current owner against the budget. Even calling the internal lifecycle directly cannot bypass that fence. Bridge reservation requires this consumed registration field. A blocked direct call grants no provider execution or tools.
+
+After provider identity is validated and persisted, two conditional writes reserve the sole bridge and bind its deadline to the current registration. Final async reads recheck registration status, business, epoch, identity and expiry immediately before returning TwiML. The SIP URI is built only from the persisted validated call ID, with a restricted URI-safe ID shape. An ambiguous failure consumes the budget and safely withholds the bridge.
+
+Returned TwiML contains:
+
+```xml
+<Dial timeLimit="120" timeout="20" answerOnBridge="true"
+      action="https://APP_ORIGIN/api/voice/retell-sandbox/complete" method="POST">
+  <Sip url="https://APP_ORIGIN/api/voice/retell-sandbox/screen" method="POST"
+       statusCallback="https://APP_ORIGIN/api/voice/retell-sandbox/status"
+       statusCallbackMethod="POST" statusCallbackEvent="answered completed">sip:PERSISTED_CALL_ID@sip.retellai.com</Sip>
+</Dial>
+```
+
+The signed called-leg screening callback rechecks current ownership and durably pins the **first child CallSid** to this budget; another child rejects, including one caused by replayed TwiML. It requires the documented child `ParentCallSid` to match the saved parent. Missing/foreign fields fail closed. Empty screening TwiML allows the bridge; Hangup rejects it. Tools require bridge reservation **and successful persisted screening**, in addition to the existing authenticated Retell ACTIVE binding. No model or submission completion grants that state.
+
+The final check cannot atomically control Twilio after an HTTP response is exposed. Screening is the remote-boundary recheck; ownership loss after screening still revokes tools immediately on subsequent repository reads but cannot retract a bridge already consumed remotely. Real delivery/order, actual SIP compatibility and carrier behavior remain live-test requirements. No instantaneous remote disconnect on arbitrary later ownership loss is claimed: the Twilio duration limit remains the independent maximum, and takeover remains disabled.
+
+### Enforced limits versus setup timing
+
+- **One application registration attempt and one bridge reservation** per persisted budget. Atomic Mongo ownership survives duplicate webhooks and restarts. Screening permits only one child leg. Failed/uncertain attempts are not restored.
+- **120 seconds connected:** Twilio `<Dial timeLimit="120">` is the documented telephony control, not a Node timer. The Dial action always returns Hangup after revocation. Twilio's action response controls the original parent leg; the extra Hangup following Dial is not relied on because an action URL takes over TwiML execution.
+- **Setup:** budget admission/screening must complete within 30 seconds of claim. SIP Dial timeout is 20 seconds; Twilio documents an additional five-second timeout buffer. Registration retains its bounded three-second request deadline. Retell separately requires connecting the registered ID within five minutes. These setup bounds are distinct from the connected duration and do not promise exact wall-clock termination under provider/network failure.
+- **Tool access:** a stricter deadline starts at bridge reservation and ends 120 seconds later, so setup time reduces the usable tool window. It never extends on a delayed answered/start callback. Expiry is checked from time directly, with rows retained; this is conservative and may deny tools before the full connected limit.
+- Signed child completion, Dial completion, existing Retell end events, supersession or direct expiry remove read authorization. Late callbacks cannot restore it. If callbacks are unavailable, direct time checks still deny after the conservative deadline. No call-duration callback or process timer is trusted to extend authority.
+
+No booking, modify/cancel appointment, SMS, calendar or custom structured-driver execution capability was added. Existing booking rules and StructuredPhoneDriver are unchanged. No new number/mobile onboarding, audio path or transcription implementation was added.
+
+### Exact added configuration and activation prerequisites
+
+Existing constructor properties above remain injectable. The installer adds these exact properties (not environment-variable names):
+
+| Property | Value/default |
+| --- | --- |
+| `enabled`, `executionEnabled` | both false by default; both must be explicit true in the separately authorized sandbox boot |
+| `businessId` | one verified lowercase 24-hex server-resolved business ID; never an email/model argument |
+| `budgetId` | stable approved experiment identifier, 8–80 characters `[A-Za-z0-9_-]`; reuse unchanged across restarts, never automatically rotate |
+| `agentsByBusiness` | exactly one entry keyed by that business ID, with pinned agent/version/language |
+| `provider` | explicitly injected registration transport; no provider construction in this installer |
+| `twilioAuth` | injected `authToken`, authoritative HTTPS `appBaseUrl`; canonical routes must match signed URLs |
+| `signingKey` | designated Retell webhook-verification key, injected without logging |
+| `models`, `RegistrationModel`, `BudgetModel` | existing read-only models plus shared durable registration/budget models; isolated models used in tests |
+| `resolveBusiness`, `now` | existing application resolver/clock by default; synthetic resolver/clock for offline tests |
+
+Before the first connected test: review/commit this exact patch separately; verify shared deployment Mongo indexes/write concern and approved single business/number mapping; provision the read-only EN/ES agent and pinned version with existing two tool schemas and public URLs; verify the Retell webhook key/config; explicitly compose the sandbox before JSON parsing in a separately authorized boot. Existing `/api/voice/incoming` and `/api/voice/dial-fallback` stay on the existing number. Ensure the public signed screening/status/complete endpoints are reachable. No provider/account/webhook configuration or deployment was changed here. The initial two-read/one-denial checklist above remains the target; no per-call total read quota or hard dollar cap is claimed.
+
+Rollback: remove/disable the explicit installer (both flags false/absent), retire the current registration, end the test call through the existing approved telephony workflow, and leave the consumed budget row intact. Do not re-enable the custom owner for that in-flight call. Normal routes remain the default for future calls; no new number or service rollback is needed.
+
+### Offline evidence and inventory
+
+Affected worktree and exact clean-starting-HEAD overlay: **324/324 pass each**, no failures/skips/cancellations. This includes 24 new handoff checks using fake provider requests, real loopback HTTP hooks and isolated Mongo concurrency/restart tests, plus 300 existing affected tests. Original controller/router code is source-checked against the actual shared hooks; tests do not boot the production server or import its dotenv/provider/database startup. Eleven changed/new JavaScript syntax checks and both diff/whitespace checks pass. No provider acceptance, live call duration or real phone routing is claimed.
+
+Current official Twilio sources: [Dial timeLimit, timeout and action](https://www.twilio.com/docs/voice/twiml/dial), [Sip screening and progress callbacks](https://www.twilio.com/docs/voice/twiml/sip), and [child ParentCallSid request field](https://www.twilio.com/docs/voice/twiml). These contracts justify emitted controls; offline TwiML assertions cannot prove carrier execution or live callback timing.
+
+Evidence directory: `C:\Users\sanch\AppData\Local\Temp\retell-sip-4a1df0ac074643d4b0b76eb0928f7fed` (worktree/clean-overlay TAP, exact inventory, SHA-256 hashes and status). The exact 14-file round overlay is listed in the slice document; it excludes unrelated adapter/test edits, engineering documentation and standalone evaluation/lab directories.

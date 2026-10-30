@@ -22,6 +22,12 @@ export function createRetellRegistrationRepository({ Model = RetellCallRegistrat
       catch (error) { if (error?.code !== 11000) throw error; return find({ _id: row._id }); }
     },
     findByParentCallId: id => find({ _id: id }),
+    reserveBridge: (row, at) => update({ _id: row._id, ownerEpoch: row.ownerEpoch, providerCallId: row.providerCallId,
+      bridgeRequired: true, bridgeReservedAt: { $exists: false }, status: { $in: ['REGISTERED', 'ACTIVE'] },
+      expiresAt: { $gt: at } }, { bridgeReservedAt: at, bridgeExpiresAt: new Date(+at + 120000) }),
+    screenBridge: (row, at) => update({ _id: row._id, ownerEpoch: row.ownerEpoch, providerCallId: row.providerCallId,
+      bridgeRequired: true, bridgeReservedAt: { $exists: true }, bridgeExpiresAt: { $gt: at },
+      status: { $in: ['REGISTERED', 'ACTIVE'] }, expiresAt: { $gt: at } }, { bridgeScreenedAt: at }),
     claim: (id, epoch, now) => update({ _id: id, ownerEpoch: epoch, status: 'OBSERVED', expiresAt: { $gt: now } }, { status: 'REGISTERING' }),
     async bind(row, callId, now) {
       // A callback may race the registration response. Only this exact attempt
@@ -54,6 +60,9 @@ export function createRetellRegistrationRepository({ Model = RetellCallRegistrat
     async findByProviderCallId(callId) {
       const row = await find({ providerCallId: callId, status: 'ACTIVE', expiresAt: { $gt: now() } });
       if (!row) return null;
+      // Sandbox-only conservative window starts at bridge reservation, not at a
+      // potentially delayed callback. No timer/TTL/callback can extend it.
+      if (row.bridgeRequired && (!row.bridgeReservedAt || !row.bridgeScreenedAt || !(+new Date(row.bridgeExpiresAt) > +now()))) return null;
       return { provider: 'retell', mode: 'READ_ONLY', status: 'ACTIVE', callId: row.providerCallId,
         parentCallSid: row._id, businessId: row.businessId, agentId: row.agentId, agentVersion: row.agentVersion,
         language: row.language, revision: row.revision, expiresAt: row.expiresAt };

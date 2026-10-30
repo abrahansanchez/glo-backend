@@ -9,7 +9,7 @@ const result = reasonCode => Object.freeze({ registered: false, reasonCode, tele
 // lookup, network implementation, TwiML handoff or fallback/takeover modification.
 export function createRetellCallRegistration({ enabled = false, repository, provider,
   agentsByBusiness = {}, twilio = {}, resolveBusiness = resolveBusinessByCalledNumber,
-  now = () => new Date(), deadlineMs = 3000, lifetimeMs = 600000 } = {}) {
+  now = () => new Date(), deadlineMs = 3000, lifetimeMs = 600000, requireBridge = false } = {}) {
   if (enabled !== true) return Object.freeze({ observeIncoming: async () => result('NOT_ENABLED'),
     register: async () => result('NOT_ENABLED'), handleEvent: async () => false,
     supersede: async () => false });
@@ -31,7 +31,8 @@ export function createRetellCallRegistration({ enabled = false, repository, prov
         const agent = business && agents[business.businessId];
         if (!agent) return result('BUSINESS_NOT_ALLOWED');
         const row = await repository.observe({ _id: params.CallSid, businessId: business.businessId, ...agent,
-          ownerEpoch: 1, revision: 1, attemptId: randomUUID(), status: 'OBSERVED', expiresAt: new Date(+now() + lifetimeMs) });
+          ownerEpoch: 1, revision: 1, attemptId: randomUUID(), status: 'OBSERVED', expiresAt: new Date(+now() + lifetimeMs),
+          ...(requireBridge ? { bridgeRequired: true } : {}) });
         if (row.businessId !== business.businessId || row.agentId !== agent.agentId || row.agentVersion !== agent.agentVersion
           || row.language !== agent.language || row.status !== 'OBSERVED' || +new Date(row.expiresAt) <= +now()) return result('CALL_ALREADY_OWNED');
         return Object.freeze({ observed: true, parentCallSid: row._id, ownerEpoch: row.ownerEpoch });

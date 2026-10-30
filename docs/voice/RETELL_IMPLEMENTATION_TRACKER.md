@@ -30,6 +30,16 @@ Worktree and clean-starting-HEAD overlay: **248/248 pass each**, zero failure/sk
 
 ## Research evidence completed
 
+### Disabled sandbox SIP handoff (2026-10-30, starting 8ffa913)
+
+The foundation is now committed; this new 14-file round is unstaged. Latest [sandbox procedure](RETELL_SANDBOX_CHECKPOINT.md) supersedes the missing-handoff blocker: explicit installer, shared existing phone hooks, durable per-experiment budget, guarded registration dispatch, unique-child screening, Twilio Dial timeLimit=120 and signed end revocation are implemented offline. `server.js` never installs/enables it. Human/mobile behavior remains; selected takeover is blocked. Failure never silently starts custom AI.
+
+| ID | Deliverable | Dependencies | Evidence/source | Acceptance criteria | Status | Owner role | Effort range/confidence | Blocker |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| RET-RO13 | Disabled read-only sandbox SIP composition/budget | RET-RO08–11 | installSandbox.js; SandboxHandoff.js; SandboxPhoneHooks.js; SandboxBudgetRepository.js; RetellSandboxBudget.js; retellSandboxHandoff.test.js | 24 new checks: bind before SIP, signed screening pins one child, global budget/dispatch fences survive duplicates and restarts, human answer bypass, errors/end/expiry/ownership revoke, no custom fallback or mutation execution | VERIFIED | Backend + QA | Implemented offline / high | Provisioned agent/verified mapping, reviewed sandbox boot and live Twilio/Retell acceptance remain unverified |
+
+**324/324 affected tests pass in worktree and exact clean-HEAD overlay each**, zero fail/skip/cancel, including actual isolated Mongo concurrency and real loopback HTTP hook tests with fake providers. Eleven JavaScript syntax checks and both diff/whitespace checks pass. Exact files/hashes/evidence are in the slice document. Source hook ordering/default routing are checked without booting production or reading credentials. Telephony timeLimit is emitted, not live-measured; tool authority has a stricter fixed 120-second reservation window. SIP timeout=20 seconds plus Twilio's documented five-second buffer and 30-second screening admission are setup controls, separate from connected duration. No hard dollar cap/total read quota is claimed. Earlier RET-RO12 handoff blocker is addressed offline, but connected execution remains BLOCKED on configuration/provisioning/deployment review and explicit authorization. No provider, call, number, environment or deployment action occurred.
+
 ### Sandbox preparation follow-up (2026-10-30)
 
 The missing registration transport and standalone local-Mongo evidence are now completed offline. [RETELL_SANDBOX_CHECKPOINT.md](RETELL_SANDBOX_CHECKPOINT.md) distinguishes actual database tests from mocks and specifies the smallest connected SIP checkpoint, exact constructor configuration, missing sandbox handoff, budget and rollback. Production defaults and telephony remain disabled. **300/300 affected tests pass in the worktree and exact 21-file clean-HEAD overlay each**: 36 lifecycle, 15 fake-HTTP transport, one actual isolated Mongo test and 248 prior affected checks. Eighteen JavaScript syntax checks and diff/whitespace checks pass; no live provider acceptance is claimed.

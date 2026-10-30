@@ -1,4 +1,5 @@
 import twilio from "twilio";
+import { observeSandboxIncoming, handleSandboxFallback } from "../services/voice/retell/SandboxPhoneHooks.js";
 import Barber from "../models/Barber.js";
 import { findBarberByInboundNumber } from "../services/business/resolveBusinessByCalledNumber.js";
 import { selectVoiceMediaPath } from "../realtime/voice-v2/routing/selectVoiceMediaPath.js";
@@ -240,6 +241,8 @@ export const handleIncomingCall = async (req, res) => {
 
     const barberId = barber._id.toString();
     console.log("[ROUTING_DEBUG] assigned barberId:", barberId);
+    // Absent by default. Trusted observation never replaces mobile ringing.
+    await observeSandboxIncoming(req, barberId);
     const callSid = req.body.CallSid || "";
     const from = req.body.From || "";
     const to = req.body.To || req.body.Called || "";
@@ -309,6 +312,10 @@ export const handleForwardingVerificationDigits = async (req, res) => {
 
 export const handleDialFallback = async (req, res) => {
   try {
+    if (await handleSandboxFallback(req, res)) {
+      clearActiveCallBySid(req.body.CallSid || "");
+      return;
+    }
     const dialStatusRaw = req.body.DialCallStatus || "";
     const dialStatus = String(dialStatusRaw).toLowerCase();
     const callSid = req.body.CallSid || "";
@@ -411,6 +418,8 @@ export const handleAiTakeover = async (req, res) => {
     if (!barberId) {
       return res.status(401).json({ error: "UNAUTHORIZED" });
     }
+    if (req.app?.locals?.retellSandbox?.selected(barberId))
+      return res.status(409).json({ error: "RETELL_SANDBOX_TAKEOVER_DISABLED" });
 
     const activeCall = getActiveCall(barberId);
     if (!activeCall) {

@@ -13,6 +13,10 @@ const schema = new mongoose.Schema({
   attemptId: { type: String, required: true },
   providerCallId: { type: String },
   observedCallId: { type: String },
+  bridgeRequired: Boolean,
+  bridgeReservedAt: Date,
+  bridgeExpiresAt: Date,
+  bridgeScreenedAt: Date,
   status: { type: String, required: true, enum: [
     'OBSERVED', 'REGISTERING', 'START_OBSERVED', 'REGISTERED', 'ACTIVE',
     'UNKNOWN', 'FAILED', 'ENDED', 'SUPERSEDED',
