@@ -222,8 +222,8 @@ test('disabled-by-default adapter has no dependency access; existing phone route
   assert.equal((await f.post('context')).status, 404); assert.equal(f.counters.bindings, 0);
   assert.equal((await f.send('/api/voice/incoming', '{}')).body.existingRoute, true);
   const serverSource = await readFile(new URL('../../server.js', import.meta.url), 'utf8');
-  assert.match(serverSource, /mountRetellReadOnlyTools\(app\)/);
-  assert.ok(serverSource.indexOf('mountRetellReadOnlyTools(app)') < serverSource.indexOf('app.use(express.json'));
+  assert.match(serverSource, /await mountRetellStartup\(app\)/);
+  assert.ok(serverSource.indexOf('await mountRetellStartup(app)') < serverSource.indexOf('app.use(express.json'));
   for (const path of ['../../routes/retellReadOnlyRoutes.js', '../../services/voice/retell/ReadOnlyBusinessTools.js']) {
     const source = await readFile(new URL(path, import.meta.url), 'utf8');
     assert.doesNotMatch(source, /StructuredPhoneDriver|PhoneModelTransport|FixtureBusiness|sendAppointment|createAppointment|process\.env/);

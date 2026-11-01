@@ -103,7 +103,7 @@ test('no binding/registration/mutation HTTP bypass is exposed', async t => {
   const f = await fixture(t);
   for (const tool of ['register', 'bindings', 'booking', 'cancel', 'sms']) assert.equal((await f.post(tool)).status, 404);
   const server = await readFile(new URL('../../server.js', import.meta.url), 'utf8');
-  assert.match(server, /mountRetellReadOnlyTools\(app\);/);
-  assert.ok(server.indexOf('mountRetellReadOnlyTools(app);') < server.indexOf('app.use(express.json'));
-  assert.ok(server.indexOf('app.use("/api/stripe", stripeWebhookRoutes)') < server.indexOf('mountRetellReadOnlyTools(app);'));
+  assert.match(server, /await mountRetellStartup\(app\);/);
+  assert.ok(server.indexOf('await mountRetellStartup(app);') < server.indexOf('app.use(express.json'));
+  assert.ok(server.indexOf('app.use("/api/stripe", stripeWebhookRoutes)') < server.indexOf('await mountRetellStartup(app);'));
 });

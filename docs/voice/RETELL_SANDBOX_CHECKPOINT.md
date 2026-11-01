@@ -151,3 +151,75 @@ Affected worktree and exact clean-starting-HEAD overlay: **324/324 pass each**, 
 Current official Twilio sources: [Dial timeLimit, timeout and action](https://www.twilio.com/docs/voice/twiml/dial), [Sip screening and progress callbacks](https://www.twilio.com/docs/voice/twiml/sip), and [child ParentCallSid request field](https://www.twilio.com/docs/voice/twiml). These contracts justify emitted controls; offline TwiML assertions cannot prove carrier execution or live callback timing.
 
 Evidence directory: `C:\Users\sanch\AppData\Local\Temp\retell-sip-4a1df0ac074643d4b0b76eb0928f7fed` (worktree/clean-overlay TAP, exact inventory, SHA-256 hashes and status). The exact 14-file round overlay is listed in the slice document; it excludes unrelated adapter/test edits, engineering documentation and standalone evaluation/lab directories.
+
+## Actual export and startup completion — 2026-10-30
+
+Starting HEAD: `4245db4dd3bee2763c93383265c410fd53991efb`. This uncommitted round supersedes earlier statements that the boot composition/environment parser is missing. `server.js` now awaits `mountRetellStartup(app)` at the existing pre-JSON location, after Stripe's raw webhook mount. It chooses exactly one disabled-prefix or enabled-sandbox composition. Production remains **disabled by default**; nothing was deployed or enabled during preparation.
+
+### Actual local agent export
+
+Read `C:\Users\sanch\Downloads\Retell Glō — Read-Only Test v0.json` without modifying/copying it into the repository. SHA-256: `64e91a5ba61ecd00dfd680de1194c992f063150ea02caf2fce360feb9400d7e6`. Its empty `agent_id` remains empty. The intended separately dashboard-supplied ID is `agent_1da974cf19d41a0b0e64b012d5`; neither export nor local configuration verifies ownership at Retell.
+
+Both custom tools match: exact names, POST, the two intended Render URLs, JSON schemas, required availability arguments, `args_at_root: false`, empty custom headers, 3500 ms timeout and zero retries. The context schema omits `required: []`, which is semantically equivalent to the template. A leading tab in its description has no protocol effect. Built-in `end_call` is also present and does not grant appointment/SMS authority. The webhook URL matches `/api/voice/retell/events`; **webhook_events is absent**, so actual selections cannot be inferred. Select/verify call_started and call_ended separately.
+
+Preserved export settings: cascading model `gpt-6.1-terra` standard tier; voice `retell-Claudia`; languages `en-US` and `es-419`; agent-first Spanish greeting `Hola, soy Glō, tu asistente virtual. ¿En qué puedo ayudarte?`; data storage `everything`, retention 30 days; caller DTMF enabled with empty options; timezone America/Los_Angeles; maximum agent duration 3600000 ms. No backend code overrides these, the prompt or response-engine configuration. The independent Twilio limit remains 120 seconds. Agent timezone is not the authoritative booking timezone: the tools supply business clock/timezone. Backend label-language configuration does not disable Retell's bilingual conversation.
+
+The export prompt differs from the initial simple templates (including natural translation of familiar service labels); it is user-selected and unchanged. The connected tool set is read-only even though its prompt describes future action capabilities conditionally. No model/voice/provider compatibility, actual behavior or publication state beyond the saved export is inferred.
+
+### Publication/version findings
+
+The export's agent V0 and referenced Retell LLM V0 both say `is_published: false`. Current official [version documentation](https://docs.retellai.com/agent/version) permits draft versions for testing/phone-number use and states publishing preserves the number; [publish API](https://docs.retellai.com/api-references/publish-agent) publishes a chosen draft in place. The [phone registration contract](https://docs.retellai.com/api-references/register-phone-call) supports explicit version selection; it does not establish a published-only restriction. Therefore unpublished V0 is not a demonstrated protocol rejection. Registered SIP acceptance of this actual draft has not been tested.
+
+For the repeatable checkpoint, use the dashboard's version panel to open the reviewed V0, verify tool/event settings, click Publish and confirm **V0**. Publishing V0 does not imply V1. Pin `RETELL_SANDBOX_AGENT_VERSION=0` only after confirming this is the reviewed version; if a different draft is chosen, configure that verified number explicitly. No publication action was taken. Publication is an immutable-configuration checkpoint recommendation, not a newly invented backend/API restriction; the parser accepts explicitly configured numeric zero.
+
+`response_engine.version` selects the referenced LLM revision; `agent.version` selects the containing voice-agent revision. The [agent response contract](https://docs.retellai.com/api-references/get-agent) exposes both independently. Both happen to be zero here. Do not substitute the LLM version for the agent pin or assume future numbers match. Verify the published agent references the reviewed LLM/tools revision in the dashboard. The backend sends agent_id/agent_version only; it does not override the response engine.
+
+The [custom-function contract](https://docs.retellai.com/build/single-multi-prompt/custom-function) documents name/args/call including call_id, agent_id, agent_version and ongoing status, matching our tool handler. [Lifecycle documentation](https://docs.retellai.com/features/webhook-overview) has an event/call wrapper; callback agent_version is optional here and known calls can omit metadata after binding. Registration supplies the attempt metadata for early-event correlation. Raw signature verification follows the [designated webhook key/raw-body contract](https://docs.retellai.com/features/secure-webhook). No missing provider field is synthesized or authentication weakened; actual signed deliveries remain unverified.
+
+### Implemented boot configuration
+
+`services/voice/retell/startup.js` reads only the two flags initially. Unless both are exactly lowercase `true`, it mounts the disabled prefix without reading secret properties or importing registration models. Missing/malformed required configuration also mounts that single disabled prefix; no provider request or phone ownership change occurs. Enabled setup creates `RegistrationTransport`, stages the installer on a private router, and attaches that one router/current phone hooks only after successful setup. This prevents the previous disabled-prefix shadowing problem and partial installation. It never imports the export file at startup.
+
+Non-secret settings (no values were set in this task):
+
+| Name | Required value shape/default |
+| --- | --- |
+| `RETELL_SANDBOX_ENABLED` | exact `true` to opt in; otherwise disabled |
+| `RETELL_SANDBOX_EXECUTION_ENABLED` | independent exact `true`; otherwise disabled |
+| `RETELL_SANDBOX_BUSINESS_ID` | required verified lowercase 24-hex business ID from trusted routing; no guessed value supplied |
+| `RETELL_SANDBOX_BUDGET_ID` | required stable 8–80 character `[A-Za-z0-9_-]` approved experiment ID; never rotate/reset automatically |
+| `RETELL_SANDBOX_AGENT_ID` | intended dashboard ID above by default; explicit override must match `agent_[A-Za-z0-9_-]{1,100}`; never read from the blank export ID |
+| `RETELL_SANDBOX_AGENT_VERSION` | required canonical nonnegative safe-integer string, including `0`; no latest/tag/default version |
+| `RETELL_SANDBOX_LANGUAGE` | `en` or `es`, default `es`; catalogue label projection only, not an agent language override |
+| `APP_BASE_URL` | existing authoritative HTTPS origin, no credentials/path/query/fragment; intended `https://glo-backend-yaho.onrender.com` |
+
+Secret **names only**, supplied through the backend service's secure runtime configuration:
+
+- `RETELL_API_KEY`: registration API credential for the intended Retell workspace. A suitable existing workspace key may be reused; none was inspected.
+- `RETELL_WEBHOOK_SIGNING_KEY`: key designated by Retell for webhook verification. It may be the same key only if that existing key has the webhook-verification designation for this workspace; no silent fallback to the registration key.
+- `TWILIO_AUTH_TOKEN`: reuse the existing token for the Twilio account signing this number's requests. The sandbox enforces verification independently of legacy off/observe mode.
+- Existing `MONGO_URI`: unchanged database startup configuration. Registration/budget repositories use that shared connection; deployment unique indexes/write concern and permissions still need verification. No new database secret or external store is added.
+
+Keys are neither logged nor included in returned startup state. No key/provider/model/voice settings from the export are copied into environment configuration automatically. The registration request remains the same four-field identity/metadata body and zero-retry transport; no agent_override or speech request is added.
+
+### Verification and future deployment/rollback
+
+Worktree and exact seven-file clean-HEAD overlay: **341/341 affected tests pass each**, zero fail/skip/cancel (17 new startup checks plus 324 existing affected checks). Five changed/new JavaScript syntax checks, both diff checks, new-file whitespace and overlay SHA-256 checks pass. The enabled startup test uses the actual private-router installer, fake registration HTTP, real loopback signed raw JSON/form requests and an isolated cached Mongo child: configured V0/agent pass to registration, bind precedes SIP, screening/start activate tools, both read tools succeed, duplicates cannot dispatch again and completion denies further reads. Disabled/missing/invalid settings preserve normal HTTP routes and issue zero provider requests. No production server/dotenv/live database boot is run by these tests.
+
+Exact round inventory:
+
+```text
+server.js
+services/voice/retell/startup.js
+tests/services/retellStartup.test.js
+tests/services/retellReadOnlyTools.test.js
+tests/services/retellReadOnlyComposition.test.js
+docs/voice/RETELL_SANDBOX_CHECKPOINT.md
+docs/voice/RETELL_IMPLEMENTATION_TRACKER.md
+```
+
+Evidence directory: `C:\Users\sanch\AppData\Local\Temp\retell-startup-8e631745e42b495bbcbe48e93443aad1` (export comparison, test TAP, inventory, overlay hashes/status). Unrelated adapters, engineering documents, evaluation/lab directories and the downloaded export are excluded from the overlay.
+
+Remaining code: no additional boot/SIP handoff implementation is currently identified for this read-only checkpoint. Remaining operational steps: review/commit this patch separately, verify the authoritative business/number/account mapping and shared deployment database, publish/freeze the reviewed agent version and inspect lifecycle selections, deploy the approved build with both flags absent/false first, then separately authorize configuring one stable budget/agent/business plus secure keys and both true flags. Existing number/mobile routes remain; verify their canonical signed URLs and public tool/lifecycle/SIP callbacks. Do not execute a dashboard/web test as proof of phone registration. Retell model/voice acceptance, authentic signatures, early-event metadata, SIP connection, carrier timing and the real 120-second cutoff remain connected-test requirements.
+
+Rollback: set `RETELL_SANDBOX_ENABLED=false` (or remove either opt-in flag) and restart the backend through the approved deployment workflow. Retire/end any active sandbox call using the existing authorized workflow; disabling startup does not itself hang up an already connected remote leg. Keep budget rows and the stable consumed ID; do not reactivate custom AI on that in-flight call. Default future calls use normal routing. No deployment, configuration, agent publication, provider request or call was performed in this task.

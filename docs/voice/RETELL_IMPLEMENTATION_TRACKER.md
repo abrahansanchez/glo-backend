@@ -30,6 +30,17 @@ Worktree and clean-starting-HEAD overlay: **248/248 pass each**, zero failure/sk
 
 ## Research evidence completed
 
+### Actual export + default-disabled boot completion (2026-10-30, starting 4245db4)
+
+Latest [sandbox checkpoint](RETELL_SANDBOX_CHECKPOINT.md#actual-export-and-startup-completion--2026-10-30) records the supplied local agent export, exact environment configuration and remaining operational requirements. The export is unchanged (empty agent_id retained); intended identity comes separately from the dashboard URL. Both custom tools/URLs/schemas/full envelopes/timeouts/retries match; lifecycle event selections are omitted and remain unverified. Greeting/retention/keypad/timezone/model/voice/languages and agent maximum duration were preserved, with the backend's independent 120-second limit unchanged.
+
+| ID | Deliverable | Dependencies | Evidence/source | Acceptance criteria | Status | Owner role | Effort range/confidence | Blocker |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| RET-RO14 | Single default-disabled startup composition | RET-RO10, RET-RO13 | startup.js; server.js; retellStartup.test.js | Both explicit opt-ins plus validated business/budget/agent/version/origin/keys; private route staging prevents shadowing; disabled does not read secrets/request providers; fake HTTP + real isolated Mongo exercise both authorized reads via phone handoff | VERIFIED | Backend + QA | Implemented offline / high | Deployment/account mapping, secure configuration and real provider/SIP acceptance remain unverified |
+| RET-RO15 | Actual agent export/protocol comparison | RET-RO04, RET-R04 | Local export hash/comparison report; checkpoint official references | Two tools match and empty ID left unchanged; numeric V0/draft/publication/LLM-reference distinctions documented; no inferred event selections or live acceptance | VERIFIED | Backend + QA | Source/fixture review / high | Dashboard event selections and actual published snapshot must be confirmed by user; no provider query performed |
+
+**341/341 affected tests pass in worktree and exact seven-file clean-HEAD overlay each**, no fail/skip/cancel (17 startup plus 324 prior affected). Five changed/new JavaScript syntax checks, both diff checks, new-file whitespace and overlay byte comparisons pass. No unrelated broad suite repeated. Earlier missing boot composition/environment parser statements are historical: this round completes them, with false/missing flags preserving the normal route and no production activation performed. V0 is not rejected merely for being a draft; publication in place freezes the reviewed configuration and keeps V0. The parser requires an explicit numeric pin and does not claim to verify Retell publication state. All work remains unstaged/uncommitted; no provider/account/env/deployment action occurred.
+
 ### Disabled sandbox SIP handoff (2026-10-30, starting 8ffa913)
 
 The foundation is now committed; this new 14-file round is unstaged. Latest [sandbox procedure](RETELL_SANDBOX_CHECKPOINT.md) supersedes the missing-handoff blocker: explicit installer, shared existing phone hooks, durable per-experiment budget, guarded registration dispatch, unique-child screening, Twilio Dial timeLimit=120 and signed end revocation are implemented offline. `server.js` never installs/enables it. Human/mobile behavior remains; selected takeover is blocked. Failure never silently starts custom AI.
