@@ -38,6 +38,7 @@ const appointmentSchema = new mongoose.Schema(
       default: "confirmed",
       set: normalizeStatus,
     },
+    notificationsSuppressed: { type: Boolean, default: false },
     reminderSent: {
       type: Boolean,
       default: false,

@@ -172,7 +172,9 @@ export function mapVoiceCallRecordToDashboard(doc, { detail = false } = {}) {
     transcriptLines: [],
   });
   const callEndedAt = item?.finalizedAt || null;
-  const durationSeconds = durationSecondsBetween(item?.createdAt, callEndedAt);
+  const retellStart = item.metadata?.provider === "retell" ? toIsoDateValue(item.metadata.callStartedAt) : null;
+  const callStartedAt = retellStart || item?.createdAt || null;
+  const durationSeconds = durationSecondsBetween(callStartedAt, callEndedAt);
   const mapped = {
     id: String(item?._id || ""),
     _id: item?._id,
@@ -193,7 +195,7 @@ export function mapVoiceCallRecordToDashboard(doc, { detail = false } = {}) {
     hasTranscript,
     lineCount: callerLines.length,
     createdAt: item?.createdAt || null,
-    callStartedAt: item?.createdAt || null,
+    callStartedAt,
     callEndedAt,
     durationSeconds,
     finalized: item?.finalized === true,

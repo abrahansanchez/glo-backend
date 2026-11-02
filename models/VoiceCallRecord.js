@@ -21,11 +21,14 @@ const VoiceCallRecordSchema = new mongoose.Schema(
     appointmentId: { type: mongoose.Schema.Types.ObjectId, ref: "Appointment", default: null },
     metadata: { type: mongoose.Schema.Types.Mixed, default: {} },
     finalizedAt: { type: Date, default: null },
+    // Only explicitly opted-in Retell ingestion sets this retention deadline.
+    retellExpiresAt: { type: Date },
   },
   { timestamps: true }
 );
 
 VoiceCallRecordSchema.index({ callSid: 1 }, { unique: true });
+VoiceCallRecordSchema.index({ retellExpiresAt: 1 }, { expireAfterSeconds: 0 });
 
 const VoiceCallRecord = mongoose.models.VoiceCallRecord
   || mongoose.model("VoiceCallRecord", VoiceCallRecordSchema);

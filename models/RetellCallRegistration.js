@@ -17,6 +17,11 @@ const schema = new mongoose.Schema({
   bridgeReservedAt: Date,
   bridgeExpiresAt: Date,
   bridgeScreenedAt: Date,
+  trustedCallerNumber: String,
+  bookingAllowed: Boolean,
+  bookingLock: String,
+  bookingProposalId: String,
+  bookingFence: { type: Number, default: 0 },
   status: { type: String, required: true, enum: [
     'OBSERVED', 'REGISTERING', 'START_OBSERVED', 'REGISTERED', 'ACTIVE',
     'UNKNOWN', 'FAILED', 'ENDED', 'SUPERSEDED',

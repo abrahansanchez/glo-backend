@@ -1,6 +1,7 @@
 import { createRetellReadOnlyRouter } from '../../../routes/retellReadOnlyRoutes.js';
 import { createRetellReadOnlyRepositories } from './ReadOnlyRepositories.js';
 import { createRetellLifecycleRouter } from '../../../routes/retellLifecycleRoutes.js';
+import { createRetellBookingRouter } from '../../../routes/retellBookingRoutes.js';
 
 export const RETELL_READ_ONLY_PATH = '/api/voice/retell';
 
@@ -8,7 +9,7 @@ export const RETELL_READ_ONLY_PATH = '/api/voice/retell';
 // disabled, no model access, no binding creation and no provider connection.
 // A future reviewed registration/lifecycle composition must inject callBindings.
 export function mountRetellReadOnlyTools(app, { config = {}, callBindings, registration, models,
-  now, audit, deadlineMs } = {}) {
+  now, audit, deadlineMs, booking, transcripts } = {}) {
   if (!config || config.enabled !== true) {
     app.use(RETELL_READ_ONLY_PATH, createRetellReadOnlyRouter());
     return Object.freeze({ enabled: false, reasonCode: 'NOT_ENABLED' });
@@ -33,7 +34,10 @@ export function mountRetellReadOnlyTools(app, { config = {}, callBindings, regis
       allowedBusinessIds: config.allowedBusinessIds, callBindings,
       ...createRetellReadOnlyRepositories(models), now, audit, deadlineMs });
     if (registration) app.use(RETELL_READ_ONLY_PATH, createRetellLifecycleRouter({
-      lifecycle: registration.lifecycle, signingKey: config.signingKey, now }));
+      lifecycle: registration.lifecycle, signingKey: config.signingKey, now, transcripts }));
+    if (registration) app.use(RETELL_READ_ONLY_PATH, createRetellBookingRouter({ enabled: booking?.enabled === true,
+      signingKey: config.signingKey, allowedBusinessIds: config.allowedBusinessIds, repository: registration.repository,
+      dependencies: booking?.dependencies, now }));
     app.use(RETELL_READ_ONLY_PATH, router);
     return Object.freeze({ enabled: true, reasonCode: null });
   } catch {

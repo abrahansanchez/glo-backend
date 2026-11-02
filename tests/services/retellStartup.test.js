@@ -102,6 +102,7 @@ test('actual boot composition with fake HTTP and isolated Mongo preserves raw au
     const call={call_id:'call_startup',agent_id:INTENDED_RETELL_AGENT_ID,agent_version:0,call_status:'ongoing',metadata:requests[0].body.metadata};
     assert.equal((await post('/api/voice/retell/events',{event:'call_started',call},true)).status,204);
     const contextBody={name:'read_business_context',call,args:{}};
+    assert.equal((await post('/api/voice/retell/tools/prepare-booking',{name:'prepare_booking',call,args:{}},true)).status,404);
     assert.equal((await post('/api/voice/retell/tools/context',contextBody,true,true)).status,401);
     const context=await post('/api/voice/retell/tools/context',contextBody,true);assert.equal(context.status,200);
     const availability=await post('/api/voice/retell/tools/availability',{name:'check_bundle_availability',call,args:{serviceIds:['synthetic_cut'],date:'2026-11-03',time:'15:00',businessRevision:JSON.parse(context.text).businessRevision}},true);
@@ -110,3 +111,9 @@ test('actual boot composition with fake HTTP and isolated Mongo preserves raw au
     await post('/api/voice/retell-sandbox/complete',{CallSid:parent,DialCallStatus:'completed'});
     assert.equal((await post('/api/voice/retell/tools/context',contextBody,true)).status,403);assert.deepEqual(effects,[]);
   });
+
+for(const retention of [undefined,'0','31','7.5']) test(`enabled transcript storage requires bounded explicit retention: ${retention}`,async()=>{
+  let requests=0;const app={locals:{},use:()=>{}};
+  const state=await mountRetellStartup(app,{env:{...config(),RETELL_TRANSCRIPTS_ENABLED:'true',RETELL_TRANSCRIPT_RETENTION_DAYS:retention},http:()=>{requests++;}});
+  assert.equal(state.enabled,false);assert.equal(requests,0);assert.equal(app.locals.retellSandbox,undefined);
+});

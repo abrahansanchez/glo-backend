@@ -16,6 +16,7 @@ export function createRetellRegistrationRepository({ Model = RetellCallRegistrat
   };
   const find = async filter => { await ensureReady(); return Model.findOne(filter).lean(); };
   return Object.freeze({
+    Model,
     async observe(row) {
       await ensureReady();
       try { return (await Model.create(row)).toObject(); }
@@ -65,7 +66,8 @@ export function createRetellRegistrationRepository({ Model = RetellCallRegistrat
       if (row.bridgeRequired && (!row.bridgeReservedAt || !row.bridgeScreenedAt || !(+new Date(row.bridgeExpiresAt) > +now()))) return null;
       return { provider: 'retell', mode: 'READ_ONLY', status: 'ACTIVE', callId: row.providerCallId,
         parentCallSid: row._id, businessId: row.businessId, agentId: row.agentId, agentVersion: row.agentVersion,
-        language: row.language, revision: row.revision, expiresAt: row.expiresAt };
+        language: row.language, revision: row.revision, expiresAt: row.expiresAt,
+        bookingAllowed: row.bookingAllowed === true, trustedCallerNumber: row.trustedCallerNumber };
     },
   });
 }

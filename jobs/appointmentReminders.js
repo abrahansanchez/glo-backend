@@ -13,6 +13,7 @@ export const startAppointmentReminderJob = () => {
       const upcoming = await Appointment.find({
         startAt: { $gte: in23hours, $lte: in24hours },
         reminderSent: { $ne: true },
+        notificationsSuppressed: { $ne: true },
         status: { $ne: "canceled" },
       });
 

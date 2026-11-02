@@ -139,7 +139,8 @@ test('verified incoming -> single durable registration -> signed start -> author
   assert.equal((await restarted.findByProviderCallId('retell_1')).businessId, businessId);
   assert.equal(f.requests.length, 1);
   assert.deepEqual(Object.keys(f.requests[0]).sort(), ['agent_id','agent_version','direction','metadata']);
-  assert.ok(!JSON.stringify([...f.db.rows.values()]).includes('+1555'));
+  const stored = [...f.db.rows.values()].map(row => { const copy = { ...row }; assert.equal(copy.trustedCallerNumber, '+15550000003'); delete copy.trustedCallerNumber; return copy; });
+  assert.ok(!JSON.stringify(stored).includes('+1555')); // only the approved signed caller field is retained
 });
 
 test('two businesses stay isolated; forged business args reject and metadata cannot change scope', async t => {

@@ -178,6 +178,9 @@ export async function createAppointmentAtomically(values, options = {}) {
       if (conflict) throw new ScheduleConflictError();
     }
 
+    // Optional application-owned authorization fence. Existing callers retain
+    // their exact path; Retell uses this inside the transaction before persistence.
+    if (typeof options.beforeCreate === "function") await options.beforeCreate(ctx);
     const created = await createWithSession(ctx.AppointmentModel, prepared.values, ctx.session);
     return { appointment: created, replayed: false, requestHashMatches: true };
   }, options);

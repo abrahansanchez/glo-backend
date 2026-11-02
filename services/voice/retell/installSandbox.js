@@ -8,7 +8,7 @@ import { mountRetellReadOnlyTools } from './mountReadOnlyTools.js';
 // provider and server-owned mapping. No production/environment activation switch.
 export function installRetellSandbox(app, { enabled = false, executionEnabled = false, businessId, budgetId,
   provider, agentsByBusiness, twilioAuth, signingKey, models, RegistrationModel, BudgetModel,
-  resolveBusiness, now = () => new Date() } = {}) {
+  resolveBusiness, now = () => new Date(), bookingEnabled = false, bookingDependencies, transcriptPolicy, transcriptDependencies } = {}) {
   if (enabled !== true || executionEnabled !== true) return Object.freeze({ enabled: false });
   if (Object.keys(agentsByBusiness || {}).length !== 1 || !agentsByBusiness[businessId]) throw Error('SANDBOX_MAPPING_INVALID');
   if (typeof provider?.registerPhoneCall !== 'function') throw Error('SANDBOX_PROVIDER_REQUIRED');
@@ -28,11 +28,19 @@ export function installRetellSandbox(app, { enabled = false, executionEnabled = 
     return provider.registerPhoneCall(payload, controls);
   } };
   const lifecycle = createRetellCallRegistration({ enabled: true, repository, provider: guardedProvider, agentsByBusiness,
-    twilio: twilioAuth, resolveBusiness, now, requireBridge: true });
+    twilio: twilioAuth, resolveBusiness, now, requireBridge: true, bookingAllowed: bookingEnabled === true });
   const handoff = createRetellSandboxHandoff({ enabled: true, executionEnabled: true, businessId, budgetId,
     repository, budgets, lifecycle, twilioAuth, resolveBusiness, now });
+  let ingester;
+  const transcripts = transcriptPolicy?.enabled === true ? { async ingest(event) {
+    if (!['call_ended','call_analyzed'].includes(event?.event)) return;
+    ingester ??= import('./TranscriptIngestion.js').then(({ RetellTranscriptIngestion }) => new RetellTranscriptIngestion({
+      ...transcriptDependencies, repository, retentionDays: transcriptPolicy.retentionDays, now }));
+    return (await ingester).ingest(event);
+  } } : undefined;
   const mounted = mountRetellReadOnlyTools(app, { config: { enabled: true, signingKey, allowedBusinessIds: [businessId] },
-    registration: { repository, lifecycle }, models, now });
+    registration: { repository, lifecycle }, models, now, booking: { enabled: bookingEnabled === true,
+      dependencies: { BarberModel: models?.BarberModel, AppointmentModel: models?.AppointmentModel, ...bookingDependencies } }, transcripts });
   if (!mounted.enabled) throw Error('SANDBOX_READ_CONFIGURATION_INVALID');
   app.locals.retellSandbox = handoff;
   return Object.freeze({ enabled: true, repository, budgets, lifecycle, handoff });
