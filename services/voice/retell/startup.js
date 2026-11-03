@@ -22,11 +22,16 @@ function configuration(env) {
   if ([apiKey, signingKey, authToken].some(value => typeof value !== 'string' || !value.trim() || /[\r\n]/.test(value)))
     throw Error('MISSING_CONFIGURATION');
   const bookingEnabled = env.RETELL_BOOKING_ENABLED === 'true';
+  const developmentEnabled = env.RETELL_SANDBOX_DEVELOPMENT_ENABLED === 'true';
+  const developmentRunId = env.RETELL_SANDBOX_TEST_RUN_ID;
+  if (developmentEnabled && (!/^[A-Za-z0-9_-]{8,80}$/.test(developmentRunId || '')
+    || /^glo_retell_checkpoint_00[12]$/.test(developmentRunId))) throw Error('INVALID_DEVELOPMENT_RUN');
   const transcriptsEnabled = env.RETELL_TRANSCRIPTS_ENABLED === 'true';
   const retention = env.RETELL_TRANSCRIPT_RETENTION_DAYS;
   if (transcriptsEnabled && (!/^(?:[1-9]|[12]\d|30)$/.test(retention || ''))) throw Error('INVALID_TRANSCRIPT_POLICY');
   return { businessId, budgetId, agentId, agentVersion: Number(version), language, apiKey, signingKey, authToken, origin: origin.origin,
-    bookingEnabled, transcriptPolicy: { enabled: transcriptsEnabled, retentionDays: transcriptsEnabled ? Number(retention) : undefined } };
+    bookingEnabled, developmentEnabled, developmentRunId,
+    transcriptPolicy: { enabled: transcriptsEnabled, retentionDays: transcriptsEnabled ? Number(retention) : undefined } };
 }
 
 // Single pre-JSON boot seam. Never boot server.js in offline tests (it connects
@@ -51,7 +56,8 @@ export async function mountRetellStartup(app, { env = process.env, http, depende
       businessId: config.businessId, budgetId: config.budgetId, provider,
       agentsByBusiness: { [config.businessId]: { agentId: config.agentId, agentVersion: config.agentVersion, language: config.language } },
       twilioAuth: { authToken: config.authToken, appBaseUrl: config.origin }, signingKey: config.signingKey,
-      bookingEnabled: config.bookingEnabled, transcriptPolicy: config.transcriptPolicy });
+      bookingEnabled: config.bookingEnabled, transcriptPolicy: config.transcriptPolicy,
+      developmentEnabled: config.developmentEnabled, developmentRunId: config.developmentRunId });
     app.use(router);
     app.locals.retellSandbox = pending.locals.retellSandbox;
     return Object.freeze({ enabled: true, reasonCode: null, agentId: config.agentId, agentVersion: config.agentVersion });

@@ -28,7 +28,7 @@ export function createRetellSandboxHandoff({ enabled = false, executionEnabled =
     await budgets.end(budgetId, parent, now());
   };
   const current = async parent => {
-    const [row, budget] = await Promise.all([repository.findByParentCallId(parent), budgets.find(budgetId)]);
+    const [row, budget] = await Promise.all([repository.findByParentCallId(parent), budgets.find(budgetId, parent)]);
     return row && budget && row.businessId === businessId && budget.businessId === businessId
       && budget.parentCallSid === parent && budget.ownerEpoch === row.ownerEpoch && budget.status === 'BRIDGE_RESERVED'
       && ['REGISTERED', 'ACTIVE'].includes(row.status) && row.providerCallId && row.bridgeRequired === true
@@ -58,7 +58,7 @@ export function createRetellSandboxHandoff({ enabled = false, executionEnabled =
         if (!row || row.businessId !== businessId || row.status !== 'OBSERVED' || !row.bridgeRequired || +new Date(row.expiresAt) <= +now())
           return { status: 200, twiml: xml(true) };
         const budget = await budgets.claim({ _id: budgetId, businessId, parentCallSid: parent, ownerEpoch: row.ownerEpoch,
-          status: 'CLAIMED', setupExpiresAt: new Date(+now() + 30000) });
+          status: 'CLAIMED', setupExpiresAt: new Date(+now() + 30000) }, { attemptId: row.attemptId });
         // Duplicate requests never return the SIP TwiML again. No registration retry.
         if (!budget) return { status: 200, twiml: xml() };
         const registered = await lifecycle.register({ parentCallSid: parent, ownerEpoch: row.ownerEpoch });
@@ -87,8 +87,8 @@ export function createRetellSandboxHandoff({ enabled = false, executionEnabled =
       if (!['screen', 'status', 'complete'].includes(kind) || !auth(req, kind)) return { status: 403, twiml: xml() };
       let parent;
       try {
-        const budget = await budgets.find(budgetId);
         parent = kind === 'complete' ? req.body.CallSid : req.body.ParentCallSid;
+        const budget = await budgets.find(budgetId, parent);
         if (!callId(parent) || budget?.parentCallSid !== parent) return { status: 403, twiml: xml() };
         if (kind === 'complete') { await retire(parent); return { status: 200, twiml: xml() }; }
         if (!callId(req.body.CallSid)) return { status: 403, twiml: xml() };

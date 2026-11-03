@@ -3,21 +3,29 @@ import { createRetellSandboxBudgetRepository } from './SandboxBudgetRepository.j
 import { createRetellCallRegistration } from './CallRegistration.js';
 import { createRetellSandboxHandoff } from './SandboxHandoff.js';
 import { mountRetellReadOnlyTools } from './mountReadOnlyTools.js';
+import { createRetellDevelopmentBudgetRepository } from './DevelopmentBudgetRepository.js';
 
 // Not invoked by server.js. Future sandbox boot must explicitly inject secrets,
 // provider and server-owned mapping. No production/environment activation switch.
 export function installRetellSandbox(app, { enabled = false, executionEnabled = false, businessId, budgetId,
   provider, agentsByBusiness, twilioAuth, signingKey, models, RegistrationModel, BudgetModel,
-  resolveBusiness, now = () => new Date(), bookingEnabled = false, bookingDependencies, transcriptPolicy, transcriptDependencies } = {}) {
+  resolveBusiness, now = () => new Date(), bookingEnabled = false, bookingDependencies, transcriptPolicy, transcriptDependencies,
+  developmentEnabled = false, developmentRunId, DevelopmentRunModel, allowanceAudit } = {}) {
   if (enabled !== true || executionEnabled !== true) return Object.freeze({ enabled: false });
   if (Object.keys(agentsByBusiness || {}).length !== 1 || !agentsByBusiness[businessId]) throw Error('SANDBOX_MAPPING_INVALID');
   if (typeof provider?.registerPhoneCall !== 'function') throw Error('SANDBOX_PROVIDER_REQUIRED');
   const repository = createRetellRegistrationRepository({ Model: RegistrationModel, now });
-  const budgets = createRetellSandboxBudgetRepository({ Model: BudgetModel });
+  const singleBudgets = createRetellSandboxBudgetRepository({ Model: BudgetModel });
+  const agent = agentsByBusiness[businessId];
+  const budgets = developmentEnabled === true ? createRetellDevelopmentBudgetRepository({ budgets: singleBudgets,
+    Model: DevelopmentRunModel, runId: developmentRunId, businessId, agentId: agent.agentId, agentVersion: agent.agentVersion,
+    now, audit: allowanceAudit }) : singleBudgets;
   // Fence the actual injectable provider boundary too, not just the HTTP loop.
   // A direct lifecycle call without this durable budget cannot dispatch.
   const guardedProvider = { async registerPhoneCall(payload, controls) {
-    const budget = await budgets.find(budgetId);
+    const candidate = developmentEnabled === true ? await repository.Model.findOne({ attemptId: payload.metadata?.glo_registration_attempt,
+      businessId, agentId: agent.agentId, agentVersion: agent.agentVersion }).lean() : null;
+    const budget = await budgets.find(budgetId, candidate?._id);
     const row = budget && await repository.findByParentCallId(budget.parentCallSid);
     if (!row || row.businessId !== businessId || row.ownerEpoch !== budget.ownerEpoch || row.status !== 'REGISTERING'
       || row.attemptId !== payload.metadata?.glo_registration_attempt || row.agentId !== payload.agent_id || row.agentVersion !== payload.agent_version

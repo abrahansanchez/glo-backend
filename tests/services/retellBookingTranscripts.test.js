@@ -194,3 +194,31 @@ test('proposal persistence failure cannot authorize or create, and releases its 
   await assert.rejects(book(f),/SYNTHETIC_STORAGE_FAILURE/);assert.equal(await count(f),0);
   const row=await f.models.Registration.findById(f.parent).lean();assert.equal(row.bookingLock,undefined);assert.equal(row.bookingProposalId,undefined);
 });
+
+test('prepare followed by a history-expanded signed commit stays within a bounded booking envelope',db,async t=>{
+  const f=await fixture(harness),post=await endpoint(t,f);
+  const p=await post('/api/voice/retell/tools/prepare-booking',{name:'prepare_booking',call:f.call,args:f.args});
+  assert.equal(p.body.status,'PREPARED');
+  const transcript=Array.from({length:32},(_,i)=>({role:i%2?'user':'agent',content:'Synthetic conversation. '.repeat(70)}));
+  const call={...f.call,transcript_object:transcript,transcript_with_tool_calls:[{role:'tool_call_invocation',name:'prepare_booking',arguments:JSON.stringify(f.args)},{role:'tool_call_result',content:JSON.stringify(p.body)}]};
+  const body={name:'commit_booking',call,args:{confirmation:'AFFIRMATIVE',proposalId:p.body.proposalId}};
+  assert.ok(Buffer.byteLength(JSON.stringify(body))>32768);
+  t.diagnostic(JSON.stringify({prepareBytes:Buffer.byteLength(JSON.stringify({name:'prepare_booking',call:f.call,args:f.args},null,2)),
+    commitBytes:Buffer.byteLength(JSON.stringify(body,null,2)),argsBytes:Buffer.byteLength(JSON.stringify(body.args))}));
+  const r=await post('/api/voice/retell/tools/commit-booking',body);
+  assert.equal(r.status,200);assert.equal(r.body.status,'BOOKED');assert.equal(await count(f),1);
+});
+
+test('large booking envelopes retain signature, identity and argument checks and reject over-bound bodies',db,async t=>{
+  const f=await fixture(harness),post=await endpoint(t,f);
+  const call={...f.call,transcript:'Synthetic history. '.repeat(3000)};
+  const body={name:'prepare_booking',call,args:f.args};
+  assert.equal((await post('/api/voice/retell/tools/prepare-booking',body,false)).status,401);
+  assert.equal((await post('/api/voice/retell/tools/prepare-booking',{...body,args:{...f.args,clientName:''}})).status,400);
+  assert.equal((await post('/api/voice/retell/tools/prepare-booking',{...body,call:{...call,agent_version:999}})).status,403);
+  const huge={...body,call:{...call,transcript:'x'.repeat(256*1024)}};
+  const r=await post('/api/voice/retell/tools/prepare-booking',huge);assert.equal(r.status,413);assert.equal(r.body.reasonCode,'PAYLOAD_TOO_LARGE');
+  assert.equal((await post('/api/voice/retell/tools/context',{name:'read_business_context',call:{...f.call,transcript:'x'.repeat(129*1024)},args:{}})).status,413);
+  assert.equal((await post('/api/voice/retell/events',{event:'call_ended',call:{...f.call,transcript:'x'.repeat(129*1024)}})).status,413);
+  assert.equal(await count(f),0);
+});

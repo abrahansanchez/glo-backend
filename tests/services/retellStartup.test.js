@@ -117,3 +117,9 @@ for(const retention of [undefined,'0','31','7.5']) test(`enabled transcript stor
   const state=await mountRetellStartup(app,{env:{...config(),RETELL_TRANSCRIPTS_ENABLED:'true',RETELL_TRANSCRIPT_RETENTION_DAYS:retention},http:()=>{requests++;}});
   assert.equal(state.enabled,false);assert.equal(requests,0);assert.equal(app.locals.retellSandbox,undefined);
 });
+
+for(const runId of [undefined,'short','glo_retell_checkpoint_001','glo_retell_checkpoint_002']) test(`development allowance rejects invalid/reserved run identity: ${runId}`,async()=>{
+  let requests=0;const app={locals:{},use:()=>{}};
+  const state=await mountRetellStartup(app,{env:{...config(),RETELL_SANDBOX_DEVELOPMENT_ENABLED:'true',RETELL_SANDBOX_TEST_RUN_ID:runId},http:()=>{requests++;}});
+  assert.equal(state.enabled,false);assert.equal(requests,0);assert.equal(app.locals.retellSandbox,undefined);
+});

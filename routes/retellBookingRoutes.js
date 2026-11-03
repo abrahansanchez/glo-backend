@@ -4,13 +4,15 @@ import { verifyRetellSignature } from './retellReadOnlyRoutes.js';
 const keys = (value, expected) => value && typeof value === 'object' && !Array.isArray(value)
   && Object.keys(value).length === expected.length && expected.every(k => Object.hasOwn(value, k));
 const handle = v => typeof v === 'string' && /^[A-Za-z0-9_.:-]{1,128}$/.test(v);
+// Full Retell call envelopes include conversation/tool history, not just args.
+export const RETELL_BOOKING_BODY_LIMIT = 256 * 1024;
 const reasons = new Set(['BUSINESS_CHANGED','UNKNOWN_SERVICE','INVALID_CATALOGUE','INVALID_SCHEDULE','BUSINESS_UNAVAILABLE',
   'UNAVAILABLE','INVALID_SLOT','CALL_NOT_AUTHORIZED','IDEMPOTENCY_CONFLICT','BOOKING_BUSY','PROPOSAL_EXPIRED','MISSING_CATALOGUE_FACTS']);
 export function createRetellBookingRouter({ enabled = false, signingKey, allowedBusinessIds, repository, dependencies = {}, now = () => new Date() }) {
   const router = express.Router();
   let serviceClass;
   for (const [path, name] of [['prepare-booking','prepare_booking'], ['commit-booking','commit_booking']]) router.post(`/tools/${path}`,
-    express.raw({ type: 'application/json', limit: '32kb', inflate: false }), async (req, res) => {
+    express.raw({ type: 'application/json', limit: RETELL_BOOKING_BODY_LIMIT, inflate: false }), async (req, res) => {
       if (!enabled) return res.status(404).json({ status: 'REJECTED', reasonCode: 'BOOKING_NOT_ENABLED' });
       if (!verifyRetellSignature(req.body, req.get('x-retell-signature'), signingKey, +now())) return res.status(401).json({ status: 'REJECTED', reasonCode: 'AUTHENTICATION_FAILED' });
       let request;
@@ -48,6 +50,6 @@ export function createRetellBookingRouter({ enabled = false, signingKey, allowed
       }
     });
   router.use((error, _req, res, next) => error ? res.status(error.type === 'entity.too.large' ? 413 : 400)
-    .json({ status: 'REJECTED', reasonCode: 'INVALID_REQUEST' }) : next());
+    .json({ status: 'REJECTED', reasonCode: error.type === 'entity.too.large' ? 'PAYLOAD_TOO_LARGE' : 'INVALID_REQUEST' }) : next());
   return router;
 }
