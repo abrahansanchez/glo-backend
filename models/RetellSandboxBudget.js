@@ -9,6 +9,7 @@ const schema = new mongoose.Schema({
   ownerEpoch: { type: Number, required: true },
   status: { type: String, enum: ['CLAIMED', 'BRIDGE_RESERVED', 'ENDED'], required: true },
   setupExpiresAt: { type: Date, required: true },
+  bridgeDurationSeconds: { type: Number, enum: [120, 300] },
   bridgeExpiresAt: Date,
   registrationAttemptId: String,
   childCallSid: String,

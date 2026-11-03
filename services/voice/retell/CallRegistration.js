@@ -9,14 +9,15 @@ const result = reasonCode => Object.freeze({ registered: false, reasonCode, tele
 // lookup, network implementation, TwiML handoff or fallback/takeover modification.
 export function createRetellCallRegistration({ enabled = false, repository, provider,
   agentsByBusiness = {}, twilio = {}, resolveBusiness = resolveBusinessByCalledNumber,
-  now = () => new Date(), deadlineMs = 3000, lifetimeMs = 600000, requireBridge = false, bookingAllowed = false } = {}) {
+  now = () => new Date(), deadlineMs = 3000, lifetimeMs = 600000, requireBridge = false, bookingAllowed = false,
+  bridgeDurationSeconds = 120 } = {}) {
   if (enabled !== true) return Object.freeze({ observeIncoming: async () => result('NOT_ENABLED'),
     register: async () => result('NOT_ENABLED'), handleEvent: async () => false,
     supersede: async () => false });
   const agents = structuredClone(agentsByBusiness);
   if (!repository || typeof provider?.registerPhoneCall !== 'function'
     || !Number.isInteger(deadlineMs) || deadlineMs < 10 || deadlineMs > 10000
-    || !Number.isInteger(lifetimeMs) || lifetimeMs < 1000 || lifetimeMs > 1800000
+    || !Number.isInteger(lifetimeMs) || lifetimeMs < 1000 || lifetimeMs > 1800000 || ![120, 300].includes(bridgeDurationSeconds)
     || !Object.keys(agents).length || Object.entries(agents).some(([business, a]) => !/^[a-f\d]{24}$/.test(business)
       || !id(a?.agentId) || !Number.isSafeInteger(a.agentVersion) || a.agentVersion < 0
       || !['en', 'es'].includes(a.language))) throw Error('REGISTRATION_CONFIGURATION_INVALID');
@@ -34,7 +35,7 @@ export function createRetellCallRegistration({ enabled = false, repository, prov
           ownerEpoch: 1, revision: 1, attemptId: randomUUID(), status: 'OBSERVED', expiresAt: new Date(+now() + lifetimeMs),
           ...(typeof params.From === 'string' && /^\+[1-9]\d{7,14}$/.test(params.From) ? { trustedCallerNumber: params.From } : {}),
           ...(bookingAllowed === true ? { bookingAllowed: true } : {}),
-          ...(requireBridge ? { bridgeRequired: true } : {}) });
+          ...(requireBridge ? { bridgeRequired: true, bridgeDurationSeconds } : {}) });
         if (row.businessId !== business.businessId || row.agentId !== agent.agentId || row.agentVersion !== agent.agentVersion
           || row.language !== agent.language || row.status !== 'OBSERVED' || +new Date(row.expiresAt) <= +now()) return result('CALL_ALREADY_OWNED');
         return Object.freeze({ observed: true, parentCallSid: row._id, ownerEpoch: row.ownerEpoch });

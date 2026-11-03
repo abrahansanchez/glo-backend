@@ -124,3 +124,10 @@ tests/services/retellStartup.test.js
 ```
 
 External evidence: C:/Users/sanch/AppData/Local/Temp/retell-payload-development-20261102 (payload-before.tap, affected-final.tap, overlay.tap, inventory.json, hashes.json, checks.json). SHA256 before values are starting-HEAD Git blob bytes, after values are final working-tree bytes. Code overlay was tested without excluded adapter/lab files. Docs were updated with final results afterward; no runtime/test content changed afterward.
+
+
+## 2026-11-03 development duration snapshot
+
+The latest offline patch selects300sec only for newly admitted explicit development calls, with120sec retained for single-call and historical unsnapshotted calls. Registration and per-call budget persist the selected duration and share one immutable bridge deadline. Proposal freshness remains60sec capped by remaining authorization; setup30sec, answer20sec, pinned identity, ten-attempt quota and SMS suppression remain unchanged. No new flag/index/provisioning, reset or activation. Preserve glo_retell_booking_dev_001 and consumed checkpoints. This dated policy supersedes earlier120sec statements only for new development admissions. See [RETELL_DEVELOPMENT_DURATION.md](RETELL_DEVELOPMENT_DURATION.md) for evidence limits, complete deadline trace, read-only call/proposal/outcome inspection, exact reviewed inventory, deployment and controlled-test/rollback procedure.
+
+Duration-slice validation:429/429 affected checks pass in worktree and combined clean db5ab5b overlay, zero fail/skip/cancel; ten new duration cases pass. Exact16-file round versus19-file combined diagnostic overlay inventory and hashes are documented in RETELL_DEVELOPMENT_DURATION.md. Syntax/diff checks pass. All changes remain unstaged/uncommitted; no activation, production records, allowance/run ID, Retell dashboard or mobile settings changed.

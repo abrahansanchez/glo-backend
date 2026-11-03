@@ -54,7 +54,7 @@ export function createRetellDevelopmentBudgetRepository({ budgets, Model = Run, 
         && (!row.registrationAttemptId || row.registrationAttemptId === attempt.attemptId) ? row : null;
     },
     consumeRegistration: (_id, parent, epoch, attemptId, time) => budgets.consumeRegistration(budgetId(parent), parent, epoch, attemptId, time),
-    reserve: (_id, parent, epoch, time) => budgets.reserve(budgetId(parent), parent, epoch, time),
+    reserve: (_id, parent, epoch, time, authorizationExpiresAt) => budgets.reserve(budgetId(parent), parent, epoch, time, authorizationExpiresAt),
     screen: (_id, parent, epoch, child, time) => budgets.screen(budgetId(parent), parent, epoch, child, time),
     end: (_id, parent, time) => budgets.end(budgetId(parent), parent, time),
     async usage() {

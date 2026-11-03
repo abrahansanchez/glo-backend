@@ -1,4 +1,5 @@
 import RetellCallRegistration from '../../../models/RetellCallRegistration.js';
+import { bridgeDurationSeconds, bridgeDeadline } from './SandboxCallDuration.js';
 
 // Atomic database predicates, not a process-local ownership lock. Model injection
 // permits offline tests; the production default performs no I/O until invoked.
@@ -23,9 +24,11 @@ export function createRetellRegistrationRepository({ Model = RetellCallRegistrat
       catch (error) { if (error?.code !== 11000) throw error; return find({ _id: row._id }); }
     },
     findByParentCallId: id => find({ _id: id }),
-    reserveBridge: (row, at) => update({ _id: row._id, ownerEpoch: row.ownerEpoch, providerCallId: row.providerCallId,
+    reserveBridge: (row, at, deadline) => update({ _id: row._id, ownerEpoch: row.ownerEpoch, providerCallId: row.providerCallId,
       bridgeRequired: true, bridgeReservedAt: { $exists: false }, status: { $in: ['REGISTERED', 'ACTIVE'] },
-      expiresAt: { $gt: at } }, { bridgeReservedAt: at, bridgeExpiresAt: new Date(+at + 120000) }),
+      bridgeDurationSeconds: row.bridgeDurationSeconds === undefined ? { $exists: false } : bridgeDurationSeconds(row),
+      expiresAt: { $gt: at } }, { bridgeReservedAt: at,
+        bridgeExpiresAt: bridgeDeadline(row, at, deadline === undefined ? row.expiresAt : new Date(Math.min(+new Date(deadline), +new Date(row.expiresAt)))) }),
     screenBridge: (row, at) => update({ _id: row._id, ownerEpoch: row.ownerEpoch, providerCallId: row.providerCallId,
       bridgeRequired: true, bridgeReservedAt: { $exists: true }, bridgeExpiresAt: { $gt: at },
       status: { $in: ['REGISTERED', 'ACTIVE'] }, expiresAt: { $gt: at } }, { bridgeScreenedAt: at }),
@@ -66,7 +69,8 @@ export function createRetellRegistrationRepository({ Model = RetellCallRegistrat
       if (row.bridgeRequired && (!row.bridgeReservedAt || !row.bridgeScreenedAt || !(+new Date(row.bridgeExpiresAt) > +now()))) return null;
       return { provider: 'retell', mode: 'READ_ONLY', status: 'ACTIVE', callId: row.providerCallId,
         parentCallSid: row._id, businessId: row.businessId, agentId: row.agentId, agentVersion: row.agentVersion,
-        language: row.language, revision: row.revision, expiresAt: row.expiresAt,
+        language: row.language, revision: row.revision,
+        expiresAt: row.bridgeRequired ? new Date(Math.min(+new Date(row.expiresAt), +new Date(row.bridgeExpiresAt))) : row.expiresAt,
         bookingAllowed: row.bookingAllowed === true, trustedCallerNumber: row.trustedCallerNumber };
     },
   });

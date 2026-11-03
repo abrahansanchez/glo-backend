@@ -14,6 +14,7 @@ const schema = new mongoose.Schema({
   providerCallId: { type: String },
   observedCallId: { type: String },
   bridgeRequired: Boolean,
+  bridgeDurationSeconds: { type: Number, enum: [120, 300] },
   bridgeReservedAt: Date,
   bridgeExpiresAt: Date,
   bridgeScreenedAt: Date,

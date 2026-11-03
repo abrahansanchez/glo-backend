@@ -48,7 +48,7 @@ test('ten concurrent calls reserve exactly ten durable attempts; restarts and ex
 test('duplicate concurrent fallback and lifecycle callbacks consume one attempt and bridge once',db,async()=>{
   const f=call({runId:'synthetic_duplicates_001'});await f.incoming();const rs=await Promise.all(Array.from({length:8},()=>f.fallback()));
   assert.equal(rs.filter(r=>r.twiml.includes('<Sip')).length,1);assert.equal(f.requests.length,1);assert.equal((await f.budgets.usage()).used,1);
-  assert.match(rs.find(r=>r.twiml.includes('<Sip')).twiml,/timeLimit="120"/);
+  assert.match(rs.find(r=>r.twiml.includes('<Sip')).twiml,/timeLimit="300"/);
   await f.webhook('screen');await f.webhook('screen');await f.webhook('status');await f.webhook('status');await f.webhook('complete');await f.fallback();
   assert.equal((await f.budgets.usage()).used,1);assert.equal(f.requests.length,1);assert.equal(await f.repository.findByProviderCallId(`call_${f.requests[0].metadata.glo_registration_attempt}`),null);
 });
@@ -109,7 +109,8 @@ test('development call retains expiry denial and late callbacks cannot regain to
   const providerId=`call_${f.requests[0].metadata.glo_registration_attempt}`;
   const started={event:'call_started',call:{call_id:providerId,agent_id:'agent_development',agent_version:0,call_status:'ongoing',metadata:f.requests[0].metadata}};
   await f.lifecycle.handleEvent(started);assert.ok(await f.repository.findByProviderCallId(providerId));
-  f.advance(120001);assert.equal(await f.repository.findByProviderCallId(providerId),null);
+  f.advance(121000);assert.ok(await f.repository.findByProviderCallId(providerId));
+  f.advance(179000);assert.equal(await f.repository.findByProviderCallId(providerId),null);
   await f.lifecycle.handleEvent(started);assert.ok((await f.webhook('screen')).twiml.includes('Hangup'));
   assert.equal(await f.repository.findByProviderCallId(providerId),null);assert.equal((await f.budgets.usage()).used,1);assert.equal(f.requests.length,1);
 });

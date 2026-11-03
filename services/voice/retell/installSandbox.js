@@ -36,7 +36,8 @@ export function installRetellSandbox(app, { enabled = false, executionEnabled = 
     return provider.registerPhoneCall(payload, controls);
   } };
   const lifecycle = createRetellCallRegistration({ enabled: true, repository, provider: guardedProvider, agentsByBusiness,
-    twilio: twilioAuth, resolveBusiness, now, requireBridge: true, bookingAllowed: bookingEnabled === true });
+    twilio: twilioAuth, resolveBusiness, now, requireBridge: true, bookingAllowed: bookingEnabled === true,
+    bridgeDurationSeconds: developmentEnabled === true ? 300 : 120 });
   const handoff = createRetellSandboxHandoff({ enabled: true, executionEnabled: true, businessId, budgetId,
     repository, budgets, lifecycle, twilioAuth, resolveBusiness, now });
   let ingester;

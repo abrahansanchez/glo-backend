@@ -62,6 +62,7 @@ export async function fixture(harness, options = {}) {
     provider:{registerPhoneCall:async p=>({call_id:callId,agent_id:p.agent_id,agent_version:p.agent_version,call_status:'registered'})},
     models:{BarberModel:models.Barber,AppointmentModel:models.Appointment},RegistrationModel:models.Registration,BudgetModel:models.Budget,
     resolveBusiness:async()=>({businessId}),now,bookingEnabled:options.bookingEnabled !== false,bookingDependencies,
+    developmentEnabled:options.developmentEnabled === true,developmentRunId:options.developmentRunId,DevelopmentRunModel:models.Run,
     transcriptPolicy:{enabled:options.transcriptsEnabled === true,retentionDays:30},
     transcriptDependencies:{VoiceCallRecordModel:models.VoiceRecord,ReceiptModel:models.Receipt} });
   const req = (path, body) => ({ originalUrl:path,body,headers:{'x-twilio-signature':twilio.getExpectedTwilioSignature(secret,`${origin}${path}`,body)} });
@@ -76,5 +77,5 @@ export async function fixture(harness, options = {}) {
   const service = new RetellBookingService({...bookingDependencies,repository:installed.repository,authorize,now});
   const context = await service.reads().context({businessId,language:options.language || 'en'});
   const args = {serviceIds:[context.data.services[0].id],date:'2026-11-03',time:'15:00',businessRevision:context.businessRevision,clientName:'Alex Synthetic',contactNumber:'+15550000004'};
-  return {...installed, app,service,models,parent,callId,call,businessId,args,authorize,now,advance:ms=>{time+=ms;},req,context};
+  return {...installed, app,service,models,parent,callId,call,businessId,args,authorize,now,advance:ms=>{time+=ms;},req,context,bridged};
 }
