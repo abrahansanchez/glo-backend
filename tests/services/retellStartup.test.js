@@ -123,3 +123,14 @@ for(const runId of [undefined,'short','glo_retell_checkpoint_001','glo_retell_ch
   const state=await mountRetellStartup(app,{env:{...config(),RETELL_SANDBOX_DEVELOPMENT_ENABLED:'true',RETELL_SANDBOX_TEST_RUN_ID:runId},http:()=>{requests++;}});
   assert.equal(state.enabled,false);assert.equal(requests,0);assert.equal(app.locals.retellSandbox,undefined);
 });
+
+for(const country of ['ZZ','us','USA','']) test(`booking default country must be explicit supported ISO2: ${country}`,async()=>{
+  let requests=0;const app={locals:{},use:()=>{}};
+  const state=await mountRetellStartup(app,{env:{...config(),RETELL_BOOKING_ENABLED:'true',RETELL_BOOKING_DEFAULT_COUNTRY:country},http:()=>{requests++;}});
+  assert.equal(state.enabled,false);assert.equal(requests,0);
+});
+
+test('unused default-country setting cannot disable read-only mode; absent country remains unset',async()=>{
+  const app={locals:{},use:()=>{}};
+  assert.equal((await mountRetellStartup(app,{env:{...config(),RETELL_BOOKING_ENABLED:'false',RETELL_BOOKING_DEFAULT_COUNTRY:'INVALID'},http:()=>{throw Error('NO_REQUEST');}})).enabled,true);
+});

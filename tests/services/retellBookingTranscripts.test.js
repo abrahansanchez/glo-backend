@@ -33,7 +33,7 @@ for(const language of ['en','es']) test(`${language}: signed caller identity, pr
   const f=await fixture(harness,{language});const b=await f.authorize();assert.equal(b.trustedCallerNumber,'+15550000003');
   const p=await book(f);assert.equal(p.status,'PREPARED');assert.equal(p.summary.durationMinutes,30);assert.equal(await count(f),0);
   const r=await commit(f,p);assert.equal(r.status,'BOOKED');const again=await commit(f,p);assert.equal(again.appointmentId,r.appointmentId);assert.equal(again.replayed,true);assert.equal(await count(f),1);
-  const appointment=await f.models.Appointment.findById(r.appointmentId).lean();assert.equal(appointment.clientPhone,'+15550000004');assert.equal(appointment.service,'Haircut');
+  const appointment=await f.models.Appointment.findById(r.appointmentId).lean();assert.equal(appointment.clientPhone,'+12025550123');assert.equal(appointment.service,'Haircut');
   assert.equal(appointment.notificationsSuppressed,true);
   assert.equal(await sendAppointmentConfirmationSms(appointment),false);
   assert.equal(await sendAppointmentReminderSms(appointment),false);
@@ -169,9 +169,9 @@ test('missing final snapshot waits for supported analyzed event, and disabled in
   const g=await fixture(harness),post=await endpoint(t,g);assert.equal((await post('/api/voice/retell/events',finalEvent(g))).status,204);assert.equal(await g.models.VoiceRecord.countDocuments({callSid:g.parent}),0);
 });
 
-test('contact data cannot replace a missing trusted signed caller identity',db,async()=>{
+test('withheld caller ID can collect explicit contact without turning contact into customer identity',db,async()=>{
   const f=await fixture(harness);await f.models.Registration.updateOne({_id:f.parent},{$unset:{trustedCallerNumber:1}});
-  assert.equal((await book(f)).reasonCode,'TRUSTED_CALLER_NUMBER_REQUIRED');assert.equal(await count(f),0);
+  const prepared=await book(f);assert.equal(prepared.status,'PREPARED');assert.equal(prepared.summary.contactNumber,'+12025550123');assert.equal(await count(f),0);
 });
 test('new SMS suppression is opt-in; existing appointment defaults remain unchanged',()=>{
   const a=new Appointment();

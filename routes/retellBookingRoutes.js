@@ -1,6 +1,7 @@
 import express from 'express';
 import { TextDecoder } from 'node:util';
 import { verifyRetellSignature } from './retellReadOnlyRoutes.js';
+import { validContactSelection } from '../services/voice/retell/BookingContact.js';
 const keys = (value, expected) => value && typeof value === 'object' && !Array.isArray(value)
   && Object.keys(value).length === expected.length && expected.every(k => Object.hasOwn(value, k));
 const handle = v => typeof v === 'string' && /^[A-Za-z0-9_.:-]{1,128}$/.test(v);
@@ -21,12 +22,11 @@ export function createRetellBookingRouter({ enabled = false, signingKey, allowed
         || !Number.isSafeInteger(request.call.agent_version) || request.call.agent_version < 0 || request.call.call_status !== 'ongoing')
         return res.status(400).json({ status: 'REJECTED', reasonCode: 'INVALID_REQUEST' });
       const a = request.args;
-      const valid = name === 'prepare_booking' ? keys(a,['serviceIds','date','time','businessRevision','clientName','contactNumber'])
+      const valid = name === 'prepare_booking' ? validContactSelection(a)
         && Array.isArray(a.serviceIds) && a.serviceIds.length >= 1 && a.serviceIds.length <= 8 && a.serviceIds.every(handle)
         && new Set(a.serviceIds).size === a.serviceIds.length && typeof a.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(a.date)
         && typeof a.time === 'string' && /^\d{2}:\d{2}$/.test(a.time) && typeof a.businessRevision === 'string' && /^[a-f\d]{64}$/.test(a.businessRevision)
         && typeof a.clientName === 'string' && a.clientName.trim().length > 0 && a.clientName.length <= 128 && !/[\x00-\x1f]/.test(a.clientName)
-        && typeof a.contactNumber === 'string' && /^\+[1-9]\d{7,14}$/.test(a.contactNumber)
         : keys(a,['proposalId','confirmation']) && typeof a.proposalId === 'string' && /^[a-f\d-]{36}$/.test(a.proposalId) && a.confirmation === 'AFFIRMATIVE';
       if (!valid) return res.status(400).json({ status: 'REJECTED', reasonCode: 'INVALID_ARGUMENTS' });
       const authorize = async () => {

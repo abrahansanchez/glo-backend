@@ -5,14 +5,16 @@ import Appointment from '../../../models/Appointment.js';
 import { ReadOnlyBusinessTools } from './ReadOnlyBusinessTools.js';
 import { createIdempotentAppointment, reconcileIdempotentAppointment } from '../../booking/createIdempotentAppointment.js';
 import { createAppointmentAtomically, ScheduleConflictError } from '../../booking/atomicScheduleMutation.js';
+import { validContactSelection, resolveBookingContact, validateDefaultCountry } from './BookingContact.js';
 
 const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const fail = reasonCode => Object.assign(Error(reasonCode), { reasonCode });
 const result = (status, reasonCode, extra = {}) => ({ status, reasonCode, ...extra });
 export class RetellBookingService {
   constructor({ repository, authorize, ProposalModel = Proposal, BarberModel = Barber, AppointmentModel = Appointment,
-    atomicOptions = {}, create = createIdempotentAppointment, reconcile = reconcileIdempotentAppointment, now = () => new Date() }) {
+    atomicOptions = {}, create = createIdempotentAppointment, reconcile = reconcileIdempotentAppointment, now = () => new Date(), defaultCountry }) {
     Object.assign(this, { repository, authorize, ProposalModel, BarberModel, AppointmentModel, atomicOptions, create, reconcile, now });
+    this.defaultCountry = validateDefaultCountry(defaultCountry);
     this.ready = Promise.resolve().then(async () => { await ProposalModel.init(); await ProposalModel.createIndexes(); });
   }
   scope(binding) { return { callId: binding.callId, businessId: binding.businessId, parentCallSid: binding.parentCallSid }; }
@@ -54,7 +56,7 @@ export class RetellBookingService {
   }
   async prepare(binding, args) {
     await this.ready;
-    if (!/^\+[1-9]\d{7,14}$/.test(binding.trustedCallerNumber || '')) return result('REJECTED', 'TRUSTED_CALLER_NUMBER_REQUIRED');
+    if (!validContactSelection(args)) return result('REJECTED', 'INVALID_CONTACT_SELECTION');
     const token = randomUUID(), row = await this.lock(binding, token);
     if (!row) return result('REJECTED', 'BOOKING_BUSY');
     try {
@@ -64,11 +66,17 @@ export class RetellBookingService {
       // its requested slot/bundle is subsequently rejected or unsupported.
       await this.repository.Model.updateOne({ _id: row._id, bookingLock: token }, { $unset: { bookingProposalId: 1 }, $inc: { revision: 1 } });
       if (args.serviceIds.length !== 1) return result('UNSUPPORTED', 'MULTI_ITEM_BOOKING_UNSUPPORTED');
+      // Only the persisted, signed incoming From is eligible for agreed reuse.
+      // Payload call.from_number and caller-provided contact are not identity.
+      const contact = resolveBookingContact(args, row.trustedCallerNumber, this.defaultCountry);
+      if (!contact.ok) return result('REJECTED', contact.reasonCode, { recovery: contact.recovery });
       const checked = await this.checked(binding, args);
       const facts = { serviceIds: [...args.serviceIds], serviceName: checked.serviceName, serviceLabel: checked.service.label,
         durationMinutes: checked.service.durationMinutes, price: checked.service.price, date: args.date, time: args.time,
         timeZone: checked.availability.timeZone, businessRevision: args.businessRevision,
-        clientName: args.clientName.trim(), contactNumber: args.contactNumber, trustedCallerNumber: binding.trustedCallerNumber };
+        clientName: args.clientName.trim(), contactNumber: contact.contactNumber,
+        contactSource: contact.contactSource, callerNumberUseAgreed: contact.callerNumberUseAgreed,
+        trustedCallerNumber: row.trustedCallerNumber ?? null };
       const id = randomUUID(), expiresAt = new Date(Math.min(+this.now() + 60000, +new Date(binding.expiresAt),
         row.bridgeRequired ? +new Date(row.bridgeExpiresAt) : Infinity));
       await this.ProposalModel.create({ _id: id, ...this.scope(binding), facts, factsHash: hash(facts), expiresAt, status: 'PREPARED' });

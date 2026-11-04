@@ -69,13 +69,13 @@ export async function fixture(harness, options = {}) {
   await installed.handoff.observeIncoming(req('/api/voice/incoming',{CallSid:parent,To:'+15550000001',From:'+15550000003'}),businessId);
   const bridged = await installed.handoff.fallback(req('/api/voice/dial-fallback',{CallSid:parent,To:'+15550000001',DialCallStatus:'no-answer'}));
   if (!bridged.twiml.includes('<Sip')) throw Error('FIXTURE_BRIDGE_FAILED');
-  await installed.handoff.webhook(req('/api/voice/retell-sandbox/screen',{ParentCallSid:parent,CallSid:childSid}), 'screen');
+  if (options.screenImmediately !== false) await installed.handoff.webhook(req('/api/voice/retell-sandbox/screen',{ParentCallSid:parent,CallSid:childSid}), 'screen');
   const row = await installed.repository.findByParentCallId(parent);
   const call = {call_id:callId,agent_id:'agent_actions',agent_version:0,call_status:'ongoing',metadata:{glo_registration_attempt:row.attemptId}};
   await installed.lifecycle.handleEvent({event:'call_started',call});
   const authorize = async () => { const b = await installed.repository.findByProviderCallId(callId); if(!b || !b.bookingAllowed) throw Object.assign(Error('CALL_NOT_AUTHORIZED'),{reasonCode:'CALL_NOT_AUTHORIZED'}); return b; };
   const service = new RetellBookingService({...bookingDependencies,repository:installed.repository,authorize,now});
   const context = await service.reads().context({businessId,language:options.language || 'en'});
-  const args = {serviceIds:[context.data.services[0].id],date:'2026-11-03',time:'15:00',businessRevision:context.businessRevision,clientName:'Alex Synthetic',contactNumber:'+15550000004'};
-  return {...installed, app,service,models,parent,callId,call,businessId,args,authorize,now,advance:ms=>{time+=ms;},req,context,bridged};
+  const args = {serviceIds:[context.data.services[0].id],date:'2026-11-03',time:'15:00',businessRevision:context.businessRevision,clientName:'Alex Synthetic',contactNumber:'+12025550123'};
+  return {...installed, app,service,models,parent,childSid,callId,call,businessId,args,authorize,now,advance:ms=>{time+=ms;},req,context,bridged};
 }

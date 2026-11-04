@@ -2,6 +2,7 @@ import twilio from 'twilio';
 import { validateTwilioTransportRequest } from '../../security/twilioTransportAuth.js';
 import { resolveBusinessByCalledNumber } from '../../business/resolveBusinessByCalledNumber.js';
 import { bridgeDurationSeconds } from './SandboxCallDuration.js';
+import { performance } from 'node:perf_hooks';
 
 const paths = Object.freeze({ fallback: '/api/voice/dial-fallback', screen: '/api/voice/retell-sandbox/screen',
   status: '/api/voice/retell-sandbox/status', complete: '/api/voice/retell-sandbox/complete' });
@@ -117,27 +118,59 @@ export function createRetellSandboxHandoff({ enabled = false, executionEnabled =
       }
     },
     async webhook(req, kind) {
-      if (!['screen', 'status', 'complete'].includes(kind) || !auth(req, kind)) return { status: 403, twiml: xml() };
+      const started = performance.now(), receivedAt = now().toISOString();
       let parent;
+      const respond = (status, reasonCode, twiml = xml(), extra = {}) => {
+        const sequence = req.body?.SequenceNumber;
+        const knownStatuses = ['queued','initiated','ringing','in-progress','completed','busy','failed','no-answer','canceled'];
+        emit(parent || req.body?.ParentCallSid, 'CALLBACK_RESULT', reasonCode, {
+          callbackKind: ['screen','status','complete'].includes(kind) ? kind : 'UNKNOWN',
+          childCallSid: callId(req.body?.CallSid) && kind !== 'complete' ? req.body.CallSid : null,
+          callbackStatus: knownStatuses.includes(req.body?.CallStatus) ? req.body.CallStatus : 'UNKNOWN',
+          sequenceNumber: typeof sequence === 'string' && /^(0|[1-9]\d{0,5})$/.test(sequence) ? Number(sequence) : null,
+          receivedAt, completedAt: now().toISOString(), handlerElapsedMs: Math.round(Math.max(0, performance.now() - started)),
+          httpStatus: status, ...extra,
+        });
+        return { status, twiml };
+      };
+      if (!['screen','status','complete'].includes(kind)) return respond(403, 'UNSUPPORTED_CALLBACK_KIND');
+      const verification = req.originalUrl === paths[kind] ? validateTwilioTransportRequest({ ...twilioAuth,
+        signature: req.headers?.['x-twilio-signature'], params: req.body, requestPath: paths[kind] })
+        : { valid: false, reason: 'CALLBACK_PATH_MISMATCH' };
+      if (!verification.valid) {
+        const reasons = new Set(['AUTH_TOKEN_MISSING','MISSING_SIGNATURE','PUBLIC_URL_UNAVAILABLE','INVALID_SIGNATURE','CALLBACK_PATH_MISMATCH']);
+        return respond(403, reasons.has(verification.reason) ? verification.reason : 'CALLBACK_AUTHENTICATION_FAILED');
+      }
       try {
         parent = kind === 'complete' ? req.body.CallSid : req.body.ParentCallSid;
         const budget = await budgets.find(budgetId, parent);
-        if (!callId(parent) || budget?.parentCallSid !== parent) return { status: 403, twiml: xml() };
-        if (kind === 'complete') { await retire(parent); return { status: 200, twiml: xml() }; }
-        if (!callId(req.body.CallSid)) return { status: 403, twiml: xml() };
+        if (!callId(parent) || budget?.parentCallSid !== parent) return respond(403, 'CALLBACK_PARENT_NOT_BOUND');
+        if (kind === 'complete') { await retire(parent); return respond(200, 'DIAL_COMPLETE_RETIRED'); }
+        if (!callId(req.body.CallSid)) return respond(403, 'INVALID_CALLBACK_CHILD_ID');
         if (kind === 'screen') {
           const fresh = await current(parent);
-          if (!fresh || !await budgets.screen(budgetId, parent, fresh.row.ownerEpoch, req.body.CallSid, now())) return { status: 200, twiml: xml() };
+          if (!fresh || !await budgets.screen(budgetId, parent, fresh.row.ownerEpoch, req.body.CallSid, now())) return respond(200, 'SCREEN_NOT_CURRENT_OR_CHILD_CONFLICT');
           // Final async ownership check after pinning the unique child leg.
-          if (!await current(parent) || !await repository.screenBridge(fresh.row, now())) return { status: 200, twiml: xml() };
-          if (!await current(parent)) return { status: 200, twiml: xml() };
-          return { status: 200, twiml: new twilio.twiml.VoiceResponse().toString() };
+          if (!await current(parent) || !await repository.screenBridge(fresh.row, now())) return respond(200, 'SCREEN_OWNER_CHANGED');
+          if (!await current(parent)) return respond(200, 'SCREEN_OWNER_CHANGED');
+          return respond(200, 'SCREEN_ACCEPTED', new twilio.twiml.VoiceResponse().toString());
         }
-        if (budget.childCallSid !== req.body.CallSid) return { status: 403, twiml: xml() };
+        if (budget.childCallSid !== req.body.CallSid) {
+          // Twilio's answered progress callback can arrive before the screening
+          // URL finishes. Observe only the exact signed/current expected SIP leg;
+          // never pin its child, acknowledge screening or authorize any tools here.
+          const fresh = budget.childCallSid === undefined && req.body.CallStatus === 'in-progress' ? await current(parent) : null;
+          const target = fresh && `sip:${fresh.row.providerCallId}@sip.retellai.com`;
+          if (fresh && (fresh.budget.childCallSid === undefined || fresh.budget.childCallSid === req.body.CallSid)
+            && fresh.budget.registrationAttemptId === fresh.row.attemptId && req.body.Direction === 'outbound-dial'
+            && req.body.To === target && (req.body.Called === undefined || req.body.Called === target))
+            return respond(200, 'STATUS_BEFORE_SCREEN_OBSERVED', new twilio.twiml.VoiceResponse().toString(), { observationalOnly: true });
+          return respond(403, 'CALLBACK_CHILD_NOT_BOUND');
+        }
         if (['completed', 'busy', 'failed', 'no-answer', 'canceled'].includes(req.body.CallStatus)) await retire(parent);
         else if (!await current(parent)) await retire(parent);
-        return { status: 200, twiml: xml() };
-      } catch { try { if (callId(parent)) await retire(parent); } catch {} return { status: 503, twiml: xml() }; }
+        return respond(200, 'BOUND_STATUS_OBSERVED', new twilio.twiml.VoiceResponse().toString());
+      } catch { try { if (callId(parent)) await retire(parent); } catch {} return respond(503, 'CALLBACK_OPERATION_FAILED'); }
     },
   });
 }
