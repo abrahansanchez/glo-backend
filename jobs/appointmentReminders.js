@@ -14,7 +14,8 @@ export const startAppointmentReminderJob = () => {
         startAt: { $gte: in23hours, $lte: in24hours },
         reminderSent: { $ne: true },
         notificationsSuppressed: { $ne: true },
-        status: { $ne: "canceled" },
+        notificationMode: { $ne: "outbox" },
+        status: { $in: ["confirmed", "pending"] },
       });
 
       console.log(`[REMINDER_JOB] found ${upcoming.length} appointments to remind`);

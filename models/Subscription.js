@@ -3,6 +3,9 @@ import mongoose from "mongoose";
 
 const SubscriptionSchema = new mongoose.Schema(
   {
+    providerVerifiedAt: {type:Date,default:null},
+    providerSubscriptionCreated: {type:Number,default:0},
+    providerEventCreated: {type:Number,default:0},
     // Who owns this subscription
     barber: {
       type: mongoose.Schema.Types.ObjectId,

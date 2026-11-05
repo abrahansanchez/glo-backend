@@ -1,3 +1,4 @@
+import {applyShopSubscriptionEvent} from '../services/booking/staff/ShopBilling.js';
 // routes/stripeWebhookRoutes.js
 import { stripe } from "../utils/stripe.js";
 import Barber from "../models/Barber.js";
@@ -96,6 +97,7 @@ export default async function stripeWebhookHandler(req, res) {
   console.log("Stripe Webhook received:", event.type);
 
   try {
+    if(await applyShopSubscriptionEvent({event,Barber,Subscription}))return res.json({received:true});
     switch (event.type) {
       case "customer.subscription.created": {
         const sub = event.data.object;

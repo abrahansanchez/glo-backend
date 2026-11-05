@@ -10,11 +10,12 @@ const result = reasonCode => Object.freeze({ registered: false, reasonCode, tele
 export function createRetellCallRegistration({ enabled = false, repository, provider,
   agentsByBusiness = {}, twilio = {}, resolveBusiness = resolveBusinessByCalledNumber,
   now = () => new Date(), deadlineMs = 3000, lifetimeMs = 600000, requireBridge = false, bookingAllowed = false,
-  bridgeDurationSeconds = 120 } = {}) {
+  bridgeDurationSeconds = 120, canary,managementCapabilities = [], notificationConsentAllowed = false } = {}) {
   if (enabled !== true) return Object.freeze({ observeIncoming: async () => result('NOT_ENABLED'),
     register: async () => result('NOT_ENABLED'), handleEvent: async () => false,
     supersede: async () => false });
   const agents = structuredClone(agentsByBusiness);
+  if(!Array.isArray(managementCapabilities)||managementCapabilities.some(v=>!['DELEGATE','VERIFY','LOOKUP','CANCEL','RESCHEDULE'].includes(v))||new Set(managementCapabilities).size!==managementCapabilities.length)throw Error('INVALID_MANAGEMENT_CAPABILITIES');
   if (!repository || typeof provider?.registerPhoneCall !== 'function'
     || !Number.isInteger(deadlineMs) || deadlineMs < 10 || deadlineMs > 10000
     || !Number.isInteger(lifetimeMs) || lifetimeMs < 1000 || lifetimeMs > 1800000 || ![120, 300].includes(bridgeDurationSeconds)
@@ -31,10 +32,13 @@ export function createRetellCallRegistration({ enabled = false, repository, prov
         const business = await resolveBusiness(params.To);
         const agent = business && agents[business.businessId];
         if (!agent) return result('BUSINESS_NOT_ALLOWED');
+        const admission=canary?await canary.current(business.businessId):null;
         const row = await repository.observe({ _id: params.CallSid, businessId: business.businessId, ...agent,
-          ownerEpoch: 1, revision: 1, attemptId: randomUUID(), status: 'OBSERVED', expiresAt: new Date(+now() + lifetimeMs),
+          ...(admission?{phaseAdmissionRevision:admission.revision}:{}),ownerEpoch: 1, revision: 1, attemptId: randomUUID(), status: 'OBSERVED', expiresAt: new Date(+now() + lifetimeMs),
           ...(typeof params.From === 'string' && /^\+[1-9]\d{7,14}$/.test(params.From) ? { trustedCallerNumber: params.From } : {}),
           ...(bookingAllowed === true ? { bookingAllowed: true } : {}),
+          ...(notificationConsentAllowed===true&&admission?.capabilities.includes('NOTIFICATIONS')?{notificationConsentAllowed:true}:{}),
+          ...(managementCapabilities.length&&admission?.capabilities.includes('MANAGEMENT')?{managementCapabilities:[...managementCapabilities]}:{}),
           ...(requireBridge ? { bridgeRequired: true, bridgeDurationSeconds } : {}) });
         if (row.businessId !== business.businessId || row.agentId !== agent.agentId || row.agentVersion !== agent.agentVersion
           || row.language !== agent.language || row.status !== 'OBSERVED' || +new Date(row.expiresAt) <= +now()) return result('CALL_ALREADY_OWNED');

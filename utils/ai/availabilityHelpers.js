@@ -1,3 +1,4 @@
+import {externalAvailable} from '../../services/calendar/CalendarBoundary.js';
 import Appointment from "../../models/Appointment.js";
 import moment from "moment-timezone";
 
@@ -22,7 +23,7 @@ export function getServiceDurationMinutes(barber, serviceName) {
  * Enforces: business hours, closed days, blackout dates, overlap, buffer.
  */
 export async function isSlotAvailable({ barber, date, time, durationMinutes, excludeAppointmentId, session,
-  findConflict = (query) => Appointment.findOne(query), observe = console.log }) {
+  findConflict = (query) => Appointment.findOne(query), observe = console.log, externalAvailability = input => externalAvailable({...input,AppointmentModel:Appointment}) }) {
   const tz = barber.availability?.timezone || "America/New_York";
   const duration = durationMinutes || barber.availability?.defaultServiceDurationMinutes || 30;
   const buffer = barber.availability?.bufferMinutes || 0;
@@ -61,6 +62,8 @@ export async function isSlotAvailable({ barber, date, time, durationMinutes, exc
     return blackoutDay === date;
   });
   if (isBlackedOut) return false;
+
+  if(barber.externalCalendarsRequired===true && !await externalAvailability({business:barber,startAt:start.toDate(),endAt:end.toDate(),session,now:new Date()}))return false;
 
   // 4. Check appointment overlap with buffer
   const bufferedStart = start.clone().subtract(buffer, "minutes").toDate();

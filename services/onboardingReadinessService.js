@@ -1,3 +1,4 @@
+import {shopConfiguration,shopEntitlement} from './booking/staff/ShopPolicy.js';
 import { randomUUID } from "node:crypto";
 
 export const SETUP_CONTRACT_VERSION = "phase2-payment-first-v1";
@@ -43,15 +44,16 @@ export function isNewIndividualOnboardingEnabled(barber, env = process.env) {
   return ids.some((value) => allowlist.includes(value));
 }
 
-export function deriveSetupReadiness(barber, { assignment = null, env = process.env, productTypeOverride = undefined } = {}) {
+export function deriveSetupReadiness(barber, { assignment = null, env = process.env, productTypeOverride = undefined, subscription } = {}) {
   const productType = normalizeProductType(productTypeOverride ?? barber?.productType);
-  const billingStatus = normalizeBillingStatus(barber?.subscriptionStatus);
+  const billingStatus = productType==='shop'?(shopEntitlement(barber,subscription,env)?subscription.status:'incomplete'):normalizeBillingStatus(barber?.subscriptionStatus);
   const strategy = normalizeStrategy(barber?.numberStrategy || barber?.phoneNumberStrategy);
   const stepMap = getStepMapObject(barber);
   const business = businessReadiness(barber, stepMap);
   const phone = phoneReadiness(barber, assignment, strategy);
   const legacyLive = isLegacyLiveAccount(barber, phone, strategy);
-  const enabled = isNewIndividualOnboardingEnabled(barber, env);
+  const shop=productType==='shop',commercial=shop?shopEntitlement(barber,subscription,env):ACTIVE_BILLING_STATUSES.has(billingStatus);
+  const enabled = shop?shopConfiguration(env).configured:isNewIndividualOnboardingEnabled(barber, env);
   const clientSetupState = deriveClientSetupState({
     barber,
     billingStatus,
@@ -66,44 +68,45 @@ export function deriveSetupReadiness(barber, { assignment = null, env = process.
     ok: true,
     enabled,
     contractVersion: barber?.onboardingContractVersion || SETUP_CONTRACT_VERSION,
-    clientSetupState,
+    clientSetupState:barber?.staffOnlyAccount?'workspace_selection':clientSetupState,
+    entryMode:barber?.staffOnlyAccount?'STAFF':'OWNER',
     product: Object.freeze({
       productType,
-      supportedProductTypes: Object.freeze(["individual"]),
-      shopAvailable: false,
+      supportedProductTypes: Object.freeze(shopConfiguration(env).configured?["individual","shop"]:["individual"]),
+      shopAvailable:shopConfiguration(env).configured,
     }),
     billing: Object.freeze({
       status: billingStatus,
-      commercialReady: ACTIVE_BILLING_STATUSES.has(billingStatus),
+      commercialReady:commercial,
     }),
     business,
     phone,
     readiness: Object.freeze({
-      commercialReady: ACTIVE_BILLING_STATUSES.has(billingStatus),
+      commercialReady:commercial,
       businessReady: business.complete,
       phoneReady: phone.ready,
       forwardingReady: phone.forwardingReady,
       live: clientSetupState === CLIENT_SETUP_STATES.LIVE,
     }),
     actions: Object.freeze({
-      canStartPhoneSetup: canStartPhoneSetup({ enabled, billingStatus, business, phone, productType, legacyLive }),
-      canChooseStrategy: Boolean(phone.phoneSetupIntentId) && ACTIVE_BILLING_STATUSES.has(billingStatus) && business.complete && !hasUnsafePhoneState(phone),
-      canOpenBilling: true,
+      canStartPhoneSetup: !barber?.staffOnlyAccount&&canStartPhoneSetup({ enabled, billingStatus, business, phone, productType, legacyLive }),
+      canChooseStrategy: !barber?.staffOnlyAccount&&Boolean(phone.phoneSetupIntentId) && ACTIVE_BILLING_STATUSES.has(billingStatus) && business.complete && !hasUnsafePhoneState(phone),
+      canOpenBilling:!barber?.staffOnlyAccount,
       canViewForwardingStatus: true,
       canContactSupport: true,
     }),
   });
 }
 
-export function validatePhoneSetupStart(barber, { assignment = null, env = process.env, productTypeOverride = undefined } = {}) {
-  if (normalizeProductType(barber?.productType) === "shop") return fail("SHOP_SETUP_NOT_AVAILABLE", 409, "Shop setup is not available in this phase.");
+export function validatePhoneSetupStart(barber, { assignment = null, env = process.env, productTypeOverride = undefined, subscription } = {}) {
+  const shop=normalizeProductType(barber?.productType)==='shop';if(shop&&env.GLO_SHOP_ONBOARDING_ENABLED!=='true')return fail('SHOP_SETUP_NOT_AVAILABLE',409,'Shop setup is not enabled.');if(shop&&!shopConfiguration(env).configured)return fail("SHOP_COMMERCIAL_CONFIGURATION_UNAVAILABLE",409,"Shop commercial configuration is unavailable.");
 
-  const readiness = deriveSetupReadiness(barber, { assignment, env, productTypeOverride });
+  const readiness = deriveSetupReadiness(barber, { assignment, env, productTypeOverride,subscription });
   const billingStatus = readiness.billing.status;
 
   if (!readiness.enabled) return fail("NEW_ONBOARDING_NOT_ENABLED", 404, "New Individual onboarding is not enabled for this account.");
-  if (readiness.product.productType !== SUPPORTED_LAUNCH_PRODUCT) return fail("SHOP_SETUP_NOT_AVAILABLE", 409, "Shop setup is not available in this phase.");
-  if (!ACTIVE_BILLING_STATUSES.has(billingStatus)) return fail("PAYMENT_REQUIRED", 402, "A trialing or active subscription is required before phone setup.");
+  if (!shop && readiness.product.productType !== SUPPORTED_LAUNCH_PRODUCT) return fail("SHOP_SETUP_NOT_AVAILABLE", 409, "Shop setup is not available in this phase.");
+  if (!readiness.billing.commercialReady) return fail("PAYMENT_REQUIRED", 402, "A trialing or active subscription is required before phone setup.");
   if (!readiness.business.complete) {
     return fail("BUSINESS_SETUP_INCOMPLETE", 409, "Complete business setup before starting phone setup.", {
       incomplete: readiness.business.incomplete,
@@ -124,7 +127,7 @@ export function ensurePhoneSetupIntent(barber, { now = new Date(), intentIdFacto
   barber.phoneSetupIntentId = intentId;
   barber.phoneSetupStartedAt = now;
   barber.onboardingContractVersion = SETUP_CONTRACT_VERSION;
-  barber.productType = SUPPORTED_LAUNCH_PRODUCT;
+  barber.productType = normalizeProductType(barber.productType)||SUPPORTED_LAUNCH_PRODUCT;
   return { created: true, intentId, startedAt: now };
 }
 
@@ -217,7 +220,7 @@ function canStartPhoneSetup({ enabled, billingStatus, business, phone, productTy
   return Boolean(
     enabled &&
     !legacyLive &&
-    productType === SUPPORTED_LAUNCH_PRODUCT &&
+    ['individual','shop'].includes(productType) &&
     ACTIVE_BILLING_STATUSES.has(billingStatus) &&
     business.complete &&
     !phone.phoneSetupIntentId &&

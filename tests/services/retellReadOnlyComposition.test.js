@@ -18,7 +18,7 @@ async function fixture(t, options = {}) {
     agentVersion: 1, businessId, language: 'en', parentCallSid: 'CA_SYNTHETIC', revision: 1, expiresAt: new Date(clock + 60000).toISOString() };
   const models = {
     BarberModel: { findById: id => { reads.push({ model: 'Barber', id }); return {
-      select: projection => { assert.equal(projection, '_id services availability'); return { lean: async () => structuredClone(business) }; },
+      select: projection => { assert.equal(projection, '_id services availability externalCalendarsRequired staffSchedulingEnabled'); return { lean: async () => structuredClone(business) }; },
     }; }, create: forbidden, updateOne: forbidden, deleteOne: forbidden },
     AppointmentModel: { findOne: query => { reads.push({ model: 'Appointment', query }); return {
       select: projection => { assert.equal(projection, '_id'); return { lean: async () => null }; },

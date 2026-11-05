@@ -33,7 +33,7 @@ const formatAppointmentDate = (value) => {
 };
 
 export async function sendAppointmentConfirmationSms(appointment) {
-  if (appointment?.notificationsSuppressed === true) return false;
+  if (appointment?.notificationsSuppressed === true || appointment?.notificationMode === "outbox") return false;
   try {
     const twilioClient = buildTwilioClient();
     const fromNumber = getFromNumber();
@@ -75,7 +75,7 @@ export async function sendAppointmentConfirmationSms(appointment) {
 }
 
 export async function sendAppointmentReminderSms(appointment) {
-  if (appointment?.notificationsSuppressed === true) return false;
+  if (appointment?.notificationsSuppressed === true || appointment?.notificationMode === "outbox") return false;
   const twilioClient = buildTwilioClient();
   const fromNumber = getFromNumber();
   const barber = await Barber.findById(getBarberId(appointment)).select("barberName shopName name");

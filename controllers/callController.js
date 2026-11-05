@@ -174,7 +174,7 @@ const getAiStreamTwimlString = async ({ req, barberId, barberName }) => {
   let businessHours = null;
   let timezone = "America/New_York";
   try {
-    const barber = await Barber.findById(barberId).select("services availability");
+    const barber = await Barber.findById(barberId).select("services availability externalCalendarsRequired");
     services = barber?.services || [];
     businessHours = barber?.availability?.businessHours || null;
     timezone = barber?.availability?.timezone || "America/New_York";

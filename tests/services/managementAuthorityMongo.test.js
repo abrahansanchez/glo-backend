@@ -1,0 +1,49 @@
+import test,{before,after} from 'node:test';
+import assert from 'node:assert/strict';
+import mongoose from 'mongoose';
+import {startHarness,mongoAvailable} from './retellActionsHarness.js';
+import {ManagementGrant,ManagementChallenge,ManagementRate,ManagementSelection,ManagementAction} from '../../models/AppointmentManagement.js';
+import {ManagementService} from '../../services/booking/management/ManagementService.js';
+import {ManagementAuthority} from '../../services/booking/management/ManagementAuthority.js';
+let h,M;const db={skip:!mongoAvailable,timeout:30000};
+before(async()=>{if(!mongoAvailable)return;h=await startHarness();M={};for(const [key,model]of Object.entries({Grant:ManagementGrant,Challenge:ManagementChallenge,Rate:ManagementRate,Selection:ManagementSelection,Action:ManagementAction})){M[key]=h.connection.model(model.modelName,model.schema.clone());await M[key].createCollection();await M[key].createIndexes();}},{timeout:30000});after(async()=>{await h?.close();});
+function fixture(){let clock=Date.parse('2026-11-04T15:00:00Z'),active=true,sends=0,checks=0;const businessId=String(new mongoose.Types.ObjectId()),binding={businessId,callId:`call_${businessId}`,expiresAt:new Date(clock+600000)};
+ const authority=new ManagementAuthority({...M,hashKey:'synthetic_key_012345678901234567890123456',authorize:async()=>active?binding:null,now:()=>new Date(clock),provider:{enabled:true,start:async()=>{sends++;return {id:'VE'+'1'.repeat(32),status:'pending'};},check:async()=>{checks++;return {id:'VE'+'1'.repeat(32),status:'approved'};}}});return {authority,binding,sends:()=>sends,checks:()=>checks,advance:ms=>clock+=ms,end:()=>active=false};}
+test('verified phone grants only explicitly delegated appointments, never all shared contacts',db,async()=>{const f=fixture(),a1=new mongoose.Types.ObjectId(),a2=new mongoose.Types.ObjectId();const contactHash=f.authority.contact(f.binding.businessId,'+12025550123');await M.Grant.create({businessId:f.binding.businessId,appointmentId:a1,contactHash,actions:['LOOKUP','CANCEL'],source:'OWNER_GRANT',issuedBy:'synthetic-owner'});await M.Grant.create({businessId:new mongoose.Types.ObjectId(),appointmentId:a2,contactHash,actions:['LOOKUP'],source:'OWNER_GRANT',issuedBy:'other-owner'});
+ const c=await f.authority.start(f.binding,'+12025550123');const proof=await f.authority.check(f.binding,c.challengeId,'654321');const rows=await f.authority.grants(f.binding,proof.authorityRef,'LOOKUP');assert.equal(rows.length,1);assert.equal(String(rows[0].appointmentId),String(a1));assert.equal((await f.authority.grants(f.binding,proof.authorityRef,'RESCHEDULE')).length,0);assert.ok(!JSON.stringify(await M.Challenge.findById(c.challengeId).lean()).includes('654321'));});
+test('OTP proof is single-use and cannot be replayed as a second verification',db,async()=>{const f=fixture(),c=await f.authority.start(f.binding,'+12025550123');await f.authority.check(f.binding,c.challengeId,'654321');await assert.rejects(()=>f.authority.check(f.binding,c.challengeId,'654321'));assert.equal(f.checks(),1);});
+test('challenge is bound to business and call, and expiry is checked without TTL deletion',db,async()=>{const f=fixture(),c=await f.authority.start(f.binding,'+12025550123');await assert.rejects(()=>f.authority.check({...f.binding,callId:'foreign'},c.challengeId,'654321'));f.advance(300001);await assert.rejects(()=>f.authority.check(f.binding,c.challengeId,'654321'));assert.equal(f.checks(),0);});
+test('resend cooldown and session rate limits are durable and precede provider dispatch',db,async()=>{const f=fixture();await f.authority.start(f.binding,'+12025550123');await assert.rejects(()=>f.authority.start(f.binding,'+12025550123'));assert.equal(f.sends(),1);});
+test('ended call cannot verify or use prior proof',db,async()=>{const f=fixture(),c=await f.authority.start(f.binding,'+12025550123');const p=await f.authority.check(f.binding,c.challengeId,'654321');f.end();await assert.rejects(()=>f.authority.grants(f.binding,p.authorityRef,'LOOKUP'));});
+test('revoked delegation ceases authorizing lookup without altering other grants',db,async()=>{const f=fixture(),hash=f.authority.contact(f.binding.businessId,'+12025550123');const g=await M.Grant.create({businessId:f.binding.businessId,appointmentId:new mongoose.Types.ObjectId(),contactHash:hash,actions:['LOOKUP'],source:'OWNER_GRANT',issuedBy:'synthetic-owner'});const c=await f.authority.start(f.binding,'+12025550123'),p=await f.authority.check(f.binding,c.challengeId,'654321');await M.Grant.updateOne({_id:g._id},{$set:{revoked:true}});assert.equal((await f.authority.grants(f.binding,p.authorityRef,'LOOKUP')).length,0);});
+
+async function managementFixture(){
+ const f=fixture(),businessId=f.binding.businessId;
+ await h.models.Barber.create({_id:businessId,services:[{name:'Haircut',durationMinutes:30,price:25}],availability:{timezone:'America/New_York',bufferMinutes:0}});
+ const appt=await h.models.Appointment.create({barberId:businessId,clientName:'Synthetic recipient',clientPhone:'+12025550123',service:'Haircut',startAt:new Date('2026-11-07T15:00:00Z'),endAt:new Date('2026-11-07T15:30:00Z'),status:'confirmed',notificationsSuppressed:true,bookingCommand:{commandId:'original',idempotencyKey:'original',requestHash:'original'}});
+ await M.Grant.create({businessId,appointmentId:appt._id,contactHash:f.authority.contact(businessId,'+12025550123'),actions:['LOOKUP','CANCEL','RESCHEDULE'],source:'OWNER_GRANT',issuedBy:'synthetic-owner'});
+ const c=await f.authority.start(f.binding,'+12025550123'),proof=await f.authority.check(f.binding,c.challengeId,'654321');
+ const service=new ManagementService({authority:f.authority,Selection:M.Selection,Action:M.Action,Appointment:h.models.Appointment,Barber:h.models.Barber,now:f.authority.now,atomicOptions:{ScheduleFenceModel:h.models.Fence,startSession:()=>h.connection.startSession()},fenceBinding:async()=>{await f.authority.binding(f.binding);},resolveReschedule:async(_b,_a,selection)=>({startAt:new Date(selection.startAt),endAt:new Date(+new Date(selection.startAt)+30*60000)})});
+ const list=await service.lookup(f.binding,proof.authorityRef);return {...f,service,appt,authorityRef:proof.authorityRef,selectionRef:list.appointments[0].selectionRef};
+}
+test('fresh-call lookup discloses only delegated record and opaque selection; cancellation is idempotent and preserves original booking command',db,async()=>{
+ const f=await managementFixture();const p=await f.service.prepare(f.binding,f.authorityRef,{kind:'CANCEL',selectionRef:f.selectionRef});
+ await assert.rejects(()=>f.service.commit(f.binding,f.authorityRef,{proposalId:p.proposalId,confirmation:'NO'}),e=>e.reasonCode==='EXPLICIT_CONFIRMATION_REQUIRED');
+ const a=await f.service.commit(f.binding,f.authorityRef,{proposalId:p.proposalId,confirmation:'AFFIRMATIVE'}),b=await f.service.commit(f.binding,f.authorityRef,{proposalId:p.proposalId,confirmation:'AFFIRMATIVE'});assert.equal(a.status,'CANCELED');assert.equal(b.replayed,true);
+ const row=await h.models.Appointment.findById(f.appt._id).lean();assert.equal(row.status,'canceled');assert.equal(row.bookingCommand.commandId,'original');assert.equal(row.notificationsSuppressed,true);assert.equal(await h.models.Appointment.countDocuments({barberId:f.binding.businessId}),1);
+});
+test('foreign selection and concurrently changed appointment reject atomically',db,async()=>{
+ const f=await managementFixture();await assert.rejects(()=>f.service.prepare(f.binding,f.authorityRef,{kind:'CANCEL',selectionRef:String(f.appt._id)}),e=>e.reasonCode==='STALE_OR_FOREIGN_SELECTION');
+ const p=await f.service.prepare(f.binding,f.authorityRef,{kind:'CANCEL',selectionRef:f.selectionRef});await h.models.Appointment.updateOne({_id:f.appt._id},{$inc:{scheduleRevision:1}});await assert.rejects(()=>f.service.commit(f.binding,f.authorityRef,{proposalId:p.proposalId,confirmation:'AFFIRMATIVE'}),e=>e.reasonCode==='APPOINTMENT_CHANGED');assert.equal((await h.models.Appointment.findById(f.appt._id)).status,'confirmed');
+});
+test('atomic reschedule conflict preserves original appointment and creates no replacement',db,async()=>{
+ const f=await managementFixture();await h.models.Appointment.create({barberId:f.binding.businessId,clientName:'Other',startAt:new Date('2026-11-07T17:00:00Z'),endAt:new Date('2026-11-07T18:00:00Z'),status:'confirmed'});
+ const p=await f.service.prepare(f.binding,f.authorityRef,{kind:'RESCHEDULE',selectionRef:f.selectionRef,selection:{startAt:'2026-11-07T17:30:00Z'}});
+ await assert.rejects(()=>f.service.commit(f.binding,f.authorityRef,{proposalId:p.proposalId,confirmation:'AFFIRMATIVE'}),e=>e.code==='SCHEDULE_CONFLICT');const row=await h.models.Appointment.findById(f.appt._id);assert.equal(row.startAt.toISOString(),'2026-11-07T15:00:00.000Z');assert.equal(await h.models.Appointment.countDocuments({barberId:f.binding.businessId}),2);
+});
+test('expired proposal cannot mutate while call is still active',db,async()=>{
+ const f=await managementFixture(),p=await f.service.prepare(f.binding,f.authorityRef,{kind:'CANCEL',selectionRef:f.selectionRef});f.advance(60001);await assert.rejects(()=>f.service.commit(f.binding,f.authorityRef,{proposalId:p.proposalId,confirmation:'AFFIRMATIVE'}),e=>e.reasonCode==='PROPOSAL_EXPIRED');assert.equal((await h.models.Appointment.findById(f.appt._id)).status,'confirmed');
+});
+
+
+test('disabled Verify dispatch cannot check or consume an existing pending challenge',db,async()=>{const f=fixture(),c=await f.authority.start(f.binding,'+12025550123');let attempts=0;f.authority.provider={enabled:false,check:async()=>{attempts++;return {id:'VE'+'1'.repeat(32),status:'approved'};}};await assert.rejects(()=>f.authority.check(f.binding,c.challengeId,'654321'));assert.equal(attempts,0);assert.equal((await M.Challenge.findById(c.challengeId)).status,'PENDING');});

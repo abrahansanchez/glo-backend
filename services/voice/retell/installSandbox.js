@@ -1,3 +1,5 @@
+import {createBusinessCanary} from '../../booking/BusinessCanary.js';
+import {composeRetellManagement} from '../../booking/management/composeRetellManagement.js';
 import { createRetellRegistrationRepository } from './RegistrationRepository.js';
 import { createRetellSandboxBudgetRepository } from './SandboxBudgetRepository.js';
 import { createRetellCallRegistration } from './CallRegistration.js';
@@ -10,11 +12,12 @@ import { createRetellDevelopmentBudgetRepository } from './DevelopmentBudgetRepo
 export function installRetellSandbox(app, { enabled = false, executionEnabled = false, businessId, budgetId,
   provider, agentsByBusiness, twilioAuth, signingKey, models, RegistrationModel, BudgetModel,
   resolveBusiness, now = () => new Date(), bookingEnabled = false, bookingDependencies, transcriptPolicy, transcriptDependencies,
-  developmentEnabled = false, developmentRunId, DevelopmentRunModel, allowanceAudit, bookingDefaultCountry } = {}) {
+  developmentEnabled = false, developmentRunId, DevelopmentRunModel, allowanceAudit, bookingDefaultCountry, managementConfig, managementDependencies, notificationPolicy, notificationConsentAllowed=false } = {}) {
   if (enabled !== true || executionEnabled !== true) return Object.freeze({ enabled: false });
   if (Object.keys(agentsByBusiness || {}).length !== 1 || !agentsByBusiness[businessId]) throw Error('SANDBOX_MAPPING_INVALID');
   if (typeof provider?.registerPhoneCall !== 'function') throw Error('SANDBOX_PROVIDER_REQUIRED');
-  const repository = createRetellRegistrationRepository({ Model: RegistrationModel, now });
+  const canary=createBusinessCanary({connection:RegistrationModel?.db,now});
+  const repository = createRetellRegistrationRepository({Model:RegistrationModel,now,canary});
   const singleBudgets = createRetellSandboxBudgetRepository({ Model: BudgetModel });
   const agent = agentsByBusiness[businessId];
   const budgets = developmentEnabled === true ? createRetellDevelopmentBudgetRepository({ budgets: singleBudgets,
@@ -35,9 +38,10 @@ export function installRetellSandbox(app, { enabled = false, executionEnabled = 
       throw Error('SANDBOX_OWNER_EXPIRED');
     return provider.registerPhoneCall(payload, controls);
   } };
+  const management=composeRetellManagement({enabled:managementConfig?.enabled===true,key:managementConfig?.key,capabilities:managementConfig?.capabilities||[],provider:managementConfig?.provider,uiOrigins:managementConfig?.uiOrigins,handoff:managementConfig?.handoff,repository,canary,now,models:{Barber:models?.BarberModel,Appointment:models?.AppointmentModel,...managementDependencies?.models},atomicOptions:managementDependencies?.atomicOptions||bookingDependencies?.atomicOptions});
   const lifecycle = createRetellCallRegistration({ enabled: true, repository, provider: guardedProvider, agentsByBusiness,
     twilio: twilioAuth, resolveBusiness, now, requireBridge: true, bookingAllowed: bookingEnabled === true,
-    bridgeDurationSeconds: developmentEnabled === true ? 300 : 120 });
+    canary,bridgeDurationSeconds: developmentEnabled === true ? 300 : 120, managementCapabilities:management.capabilities, notificationConsentAllowed:!!notificationPolicy&&notificationConsentAllowed===true });
   const handoff = createRetellSandboxHandoff({ enabled: true, executionEnabled: true, businessId, budgetId,
     repository, budgets, lifecycle, twilioAuth, resolveBusiness, now });
   let ingester;
@@ -47,11 +51,13 @@ export function installRetellSandbox(app, { enabled = false, executionEnabled = 
       ...transcriptDependencies, repository, retentionDays: transcriptPolicy.retentionDays, now }));
     return (await ingester).ingest(event);
   } } : undefined;
-  const mounted = mountRetellReadOnlyTools(app, { config: { enabled: true, signingKey, allowedBusinessIds: [businessId] },
+  const mounted = mountRetellReadOnlyTools(app, { config: { enabled: true, signingKey,twilioAuthToken:twilioAuth?.authToken, allowedBusinessIds: [businessId] },
     registration: { repository, lifecycle }, models, now, booking: { enabled: bookingEnabled === true,
       dependencies: { BarberModel: models?.BarberModel, AppointmentModel: models?.AppointmentModel, ...bookingDependencies,
-        ...(bookingDefaultCountry === undefined ? {} : { defaultCountry: bookingDefaultCountry }) } }, transcripts });
+        ...(bookingDefaultCountry === undefined ? {} : { defaultCountry: bookingDefaultCountry }),
+        ...(management.delegation?{delegation:management.delegation}:{}),...(notificationPolicy&&notificationConsentAllowed===true?{notifications:notificationPolicy}:{}) } }, transcripts, management });
   if (!mounted.enabled) throw Error('SANDBOX_READ_CONFIGURATION_INVALID');
   app.locals.retellSandbox = handoff;
-  return Object.freeze({ enabled: true, repository, budgets, lifecycle, handoff });
+  app.locals.retellManagement=management;
+  return Object.freeze({ enabled: true, repository, budgets, lifecycle, handoff, management });
 }

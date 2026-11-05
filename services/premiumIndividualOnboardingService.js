@@ -100,12 +100,12 @@ export function selectPremiumIndividualPlan(barber, { planId, env = process.env 
   return { ok: true, plan: planDto(barber, env) };
 }
 
-export function applyPremiumProfile(barber, payload = {}) {
+export function applyPremiumProfile(barber, payload = {}, {productType='individual'}={}) {
   const barberName = sanitizeText(payload.barberName ?? payload.businessName ?? payload.name, 120);
   if (!barberName) return fail("INVALID_PROFILE", 400, "A business or receptionist display name is required.");
   barber.barberName = barberName;
   barber.shopName = barberName;
-  barber.productType = "individual";
+  barber.productType = productType;
   barber.onboardingContractVersion = barber.onboardingContractVersion || SETUP_CONTRACT_VERSION;
   return { ok: true, profile: profileDto(barber) };
 }

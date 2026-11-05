@@ -37,7 +37,9 @@ export function canonicalizeBookingRequest(request, durationMinutes) {
     durationMinutes: Number(durationMinutes),
     callerNumber,
     clientName,
+    ...(request.staffCalendarId?{staffCalendarId:String(request.staffCalendarId),staffServiceId:request.staffServiceId,staffRevision:request.staffRevision,staffPrice:request.staffPrice}:{}),
     ...(request.notes !== undefined ? { notes: request.notes } : {}),
+    ...Object.fromEntries(['managementConsent','notificationConsent','reminderConsent'].filter(k=>request[k]==='AGREED').map(k=>[k,'AGREED'])),
   });
 }
 
@@ -118,6 +120,7 @@ export async function createIdempotentAppointment(request, dependencies = {}) {
     const appointment = atomicResult.appointment;
     return success(appointment, false, requestHash);
   } catch (error) {
+    if(error.reasonCode==='AVAILABILITY_UNVERIFIED'||error.readReason==='AVAILABILITY_UNVERIFIED')return failure('AVAILABILITY_UNVERIFIED');
     if (isScheduleConflict(error)) return failure("UNAVAILABLE");
     if (isReconciliationRequired(error)) return failure("SETTLEMENT_UNKNOWN");
     if (error?.code !== 11000) return failure("PERSISTENCE_ERROR");

@@ -14,10 +14,10 @@ export const readFailure = reason => Object.assign(Error(reason), { readReason: 
 // No default repository: importing this module cannot connect to Mongo or a provider.
 // Only read capabilities are accepted. There is no draft, booking or SMS executor.
 export class ReadOnlyBusinessTools {
-  constructor({ businessRepository, appointmentRepository, now = () => new Date(), signal }) {
+  constructor({ businessRepository, appointmentRepository, staffRepository, now = () => new Date(), signal }) {
     if (typeof businessRepository?.findById !== 'function' || typeof appointmentRepository?.findConflict !== 'function')
       throw readFailure('READ_CONFIGURATION_INVALID');
-    Object.assign(this, { businessRepository, appointmentRepository, now, signal });
+    Object.assign(this, { businessRepository, appointmentRepository, staffRepository, now, signal });
   }
   instant() {
     if (this.signal?.aborted) throw readFailure('READ_DEADLINE');
@@ -30,7 +30,7 @@ export class ReadOnlyBusinessTools {
     const loaded = await this.businessRepository.findById(binding.businessId);
     this.instant();
     if (!loaded || String(loaded._id) !== binding.businessId) throw readFailure('BUSINESS_UNAVAILABLE');
-    const raw = { _id: String(loaded._id), availability: structuredClone(loaded.availability),
+    const raw = { _id: String(loaded._id), externalCalendarsRequired:loaded.externalCalendarsRequired===true, availability: structuredClone(loaded.availability),
       services: Array.isArray(loaded.services) ? loaded.services.map(s => ({ ...s,
         ...(s?._id != null ? { _id: String(s._id) } : {}), ...(s?.id != null ? { id: String(s.id) } : {}) })) : null };
     const zone = raw.availability?.timezone;
@@ -68,8 +68,14 @@ export class ReadOnlyBusinessTools {
         durationMinutes: Number.isInteger(service.durationMinutes) && service.durationMinutes > 0
           && service.durationMinutes <= 480 ? service.durationMinutes : null });
     }
+    let staff;
+    if(loaded.staffSchedulingEnabled===true){
+      if(!this.staffRepository)throw readFailure('STAFF_CONFIGURATION_REQUIRED');
+      const rows=await this.staffRepository.list(binding.businessId);if(!rows.length||rows.length>100)throw readFailure('STAFF_CONFIGURATION_REQUIRED');
+      staff=rows.map(c=>({id:String(c._id),label:c.label,revision:c.revision,services:c.services.map(s=>({serviceId:s.serviceId,price:s.price,durationMinutes:s.durationMinutes}))}));
+    }
     const time = moment(this.instant()).tz(zone);
-    const data = { timeZone: zone, hours, bufferMinutes, services,
+    const data = { timeZone: zone, hours, bufferMinutes, services,...(staff?{staff,requiresStaffSelection:true}:{}),
       blackoutDates: blackouts.map(b => moment(b.date).tz(zone).format('YYYY-MM-DD')).sort() };
     return { raw, data, businessRevision: hash(data), clock: time.toISOString(),
       window: { start: time.format('YYYY-MM-DD'), end: time.clone().add(30, 'days').format('YYYY-MM-DD') } };
@@ -93,12 +99,14 @@ export class ReadOnlyBusinessTools {
     const local = this.parseSlot(date, time, snapshot);
     if (!local || local.valueOf() <= this.instant().getTime()) return false;
     const result = await isSlotAvailable({ barber: snapshot.raw, date, time: local.format('h:mm A'), durationMinutes,
-      findConflict: query => this.appointmentRepository.findConflict(query), observe: () => {} });
+      externalAvailability:async input=>{if(typeof this.appointmentRepository.checkExternal!=='function')throw readFailure('AVAILABILITY_UNVERIFIED');return this.appointmentRepository.checkExternal({...input,now:this.instant()});},findConflict: query => this.appointmentRepository.findConflict(query), observe: () => {} });
     return result && local.valueOf() > this.instant().getTime();
   }
   async availability(binding, args) {
     const s = await this.snapshot(binding);
     if (args.businessRevision !== s.businessRevision) throw readFailure('BUSINESS_CHANGED');
+    if(s.data.requiresStaffSelection)return this.staffAvailability(binding,args,s);
+    if(args.staffCalendarId!==undefined)throw readFailure('STAFF_NOT_ELIGIBLE');
     const bundle = args.serviceIds.map(id => s.data.services.find(service => service.id === id));
     if (bundle.some(service => !service)) throw readFailure('UNKNOWN_SERVICE');
     if (bundle.some(service => service.price === null || service.durationMinutes === null))
@@ -142,4 +150,20 @@ export class ReadOnlyBusinessTools {
       alternatives: released.filter(a => this.parseSlot(a.date, a.time, latest)?.valueOf() > this.instant().getTime()),
       checkedAt, expiresAt: new Date(this.instant().getTime() + 60000).toISOString(), reservation: false, canAuthorize: false } };
   }
+  async staffAvailability(binding,args,s){
+    if(!args.staffCalendarId)throw readFailure('STAFF_SELECTION_REQUIRED');
+    if(args.serviceIds.length!==1)throw readFailure('UNSUPPORTED_BUNDLE');
+    const serviceId=args.serviceIds[0],requested=this.parseSlot(args.date,args.time,s);if(!requested)throw readFailure('INVALID_SLOT');
+    const check=async(date,time)=>{this.instant();const slot=this.parseSlot(date,time,s);if(!slot)return null;try{return await this.staffRepository.select({businessId:binding.businessId,calendarId:args.staffCalendarId,serviceId,startAt:slot.toISOString()});}catch(e){if(['UNAVAILABLE','PAST_OR_INVALID_SLOT','BUSINESS_UNAVAILABLE','STAFF_UNAVAILABLE','STAFF_ABSENT','SERVICE_NOT_QUALIFIED'].includes(e.reasonCode))return null;throw readFailure(e.reasonCode||'READ_UNAVAILABLE');}};
+    let selected=await check(args.date,args.time);const alternatives=[];
+    if(!selected)for(let offset=0;offset<7&&alternatives.length<3;offset++){
+      const date=moment.tz(args.date,s.data.timeZone).add(offset,'days').format('YYYY-MM-DD'),h=s.data.hours[days[moment.tz(date,s.data.timeZone).day()]];if(!h||h.isClosed||date>s.window.end)continue;
+      for(let m=Number(h.open.slice(0,2))*60+Number(h.open.slice(3));m<Number(h.close.slice(0,2))*60+Number(h.close.slice(3))&&alternatives.length<3;m+=30){const time=`${String(Math.floor(m/60)).padStart(2,'0')}:${String(m%60).padStart(2,'0')}`,a=await check(date,time);if(a)alternatives.push({date,time,staffCalendarId:a.staffCalendarId,price:a.price,durationMinutes:a.durationMinutes});}
+    }
+    const latest=await this.snapshot(binding);if(latest.businessRevision!==s.businessRevision)throw readFailure('BUSINESS_CHANGED');
+    const released=[];for(const a of alternatives){const fresh=await this.staffRepository.select({businessId:binding.businessId,calendarId:a.staffCalendarId,serviceId,startAt:this.parseSlot(a.date,a.time,latest).toISOString()}).catch(()=>null);if(fresh)released.push(a);}
+    if(selected)selected=await check(args.date,args.time);
+    return {status:'OK',businessRevision:s.businessRevision,data:{serviceIds:[serviceId],requestedSlot:{date:args.date,time:args.time},available:!!selected,reasonCode:selected?null:'UNAVAILABLE',...(selected?{staffCalendarId:selected.staffCalendarId,staffRevision:selected.staffRevision,price:selected.price,durationMinutes:selected.durationMinutes}:{}),alternatives:released,timeZone:s.data.timeZone,checkedAt:this.instant().toISOString(),expiresAt:new Date(+this.instant()+60000).toISOString(),reservation:false,canAuthorize:false}};
+  }
+
 }

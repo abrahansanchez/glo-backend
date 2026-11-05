@@ -1,3 +1,4 @@
+import {shopEntitlement} from '../services/booking/staff/ShopPolicy.js';
 import Barber from "../models/Barber.js";
 import Subscription from "../models/Subscription.js";
 
@@ -60,6 +61,7 @@ export const requireActiveSubscription = async (req, res, next) => {
       });
     }
 
+    if(barber.productType==='shop'&&!shopEntitlement(barber,subscription))return res.status(403).json({code:'SHOP_ENTITLEMENT_REQUIRED'});
     const { status, gracePeriodEndsAt } = subscription;
 
     if (status === "active" || status === "trialing") {

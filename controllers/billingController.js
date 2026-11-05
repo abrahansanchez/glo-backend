@@ -1,3 +1,5 @@
+import {shopCheckout} from '../services/booking/staff/ShopBilling.js';
+import {createBusinessCanary} from '../services/booking/BusinessCanary.js';
 import { stripe } from "../utils/stripe.js";
 import Barber from "../models/Barber.js";
 
@@ -14,6 +16,8 @@ export const createCheckoutSession = async (req, res) => {
       return res.status(404).json({ error: "Barber not found" });
     }
 
+    if(barber.staffOnlyAccount)return res.status(403).json({reasonCode:'OWNER_ACCOUNT_REQUIRED'});
+    if(barber.productType==='shop'){await createBusinessCanary({connection:Barber.db}).assert(String(barberId),'BOOKING');return res.json(await shopCheckout({barber,provider:stripe,idempotencyKey:req.get('Idempotency-Key')}));}
     // ----------------------------------
     // Ensure Stripe Customer exists
     // ----------------------------------
@@ -79,6 +83,6 @@ export const createCheckoutSession = async (req, res) => {
     return res.json({ checkoutUrl: session.url, plan: selectedPlan });
   } catch (error) {
     console.error("❌ Stripe checkout error:", error);
-    return res.status(500).json({ error: "Unable to start checkout" });
+    return res.status(error.reasonCode?409:500).json({reasonCode:error.reasonCode||'CHECKOUT_UNAVAILABLE'});
   }
 };

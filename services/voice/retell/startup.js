@@ -31,8 +31,17 @@ function configuration(env) {
   const transcriptsEnabled = env.RETELL_TRANSCRIPTS_ENABLED === 'true';
   const retention = env.RETELL_TRANSCRIPT_RETENTION_DAYS;
   if (transcriptsEnabled && (!/^(?:[1-9]|[12]\d|30)$/.test(retention || ''))) throw Error('INVALID_TRANSCRIPT_POLICY');
+  let management;
+  if(env.RETELL_MANAGEMENT_ENABLED==='true'){
+    const key=env.RETELL_MANAGEMENT_HASH_KEY;if(typeof key!=='string'||Buffer.byteLength(key)<32)throw Error('MANAGEMENT_CONFIGURATION_INVALID');
+    const names={DELEGATE:'DELEGATION',VERIFY:'VERIFICATION',LOOKUP:'LOOKUP',CANCEL:'CANCELLATION',RESCHEDULE:'RESCHEDULING'};
+    const capabilities=Object.entries(names).filter(([,name])=>env[`RETELL_MANAGEMENT_${name}_ENABLED`]==='true').map(([cap])=>cap);
+    const uiOrigins=env.RETELL_MANAGEMENT_UI_ORIGINS?env.RETELL_MANAGEMENT_UI_ORIGINS.split(',').map(v=>v.trim()):[];
+    management={enabled:true,key,capabilities,uiOrigins,dispatch:env.RETELL_VERIFY_DISPATCH_ENABLED==='true'};
+    if(management.dispatch){management.accountSid=env.TWILIO_ACCOUNT_SID;management.serviceSid=env.RETELL_VERIFY_SERVICE_SID;}
+  }
   return { businessId, budgetId, agentId, agentVersion: Number(version), language, apiKey, signingKey, authToken, origin: origin.origin,
-    bookingEnabled, bookingDefaultCountry, developmentEnabled, developmentRunId,
+    bookingEnabled, bookingDefaultCountry, developmentEnabled, developmentRunId, management, notificationConsentAllowed:env.RETELL_NOTIFICATION_CONSENT_ENABLED==='true',
     transcriptPolicy: { enabled: transcriptsEnabled, retentionDays: transcriptsEnabled ? Number(retention) : undefined } };
 }
 
@@ -52,6 +61,12 @@ export async function mountRetellStartup(app, { env = process.env, http, depende
     const { installRetellSandbox } = await import('./installSandbox.js');
     // Stage routers privately. A failed installer cannot leave an enabled or
     // shadowing route on the real app, nor can it replace the normal phone owner.
+    let managementConfig=config.management;
+    if(managementConfig?.dispatch){
+      const {createVerifyTransport}=await import('../../booking/management/VerifyTransport.js');
+      managementConfig={...managementConfig,provider:createVerifyTransport({enabled:true,http:dependencies.verifyHttp||globalThis.fetch,accountSid:managementConfig.accountSid,serviceSid:managementConfig.serviceSid,authToken:config.authToken})};
+    }
+    if(managementConfig){const {createHandoffMessaging}=await import('../../booking/management/createHandoffMessaging.js');if(env.RETELL_VERIFICATION_LINK_DISPATCH_ENABLED==='true'&&!managementConfig.dispatch)throw Error('VERIFY_DISPATCH_REQUIRED');managementConfig={...managementConfig,handoff:dependencies.handoff||createHandoffMessaging({env,origin:config.origin,accountSid:managementConfig.accountSid,authToken:config.authToken,http:dependencies.linkHttp||globalThis.fetch,policy:dependencies.notificationPolicy||app.locals.notificationPolicy})};}
     const router = express.Router();
     const pending = { locals: {}, use: (...args) => router.use(...args) };
     installRetellSandbox(pending, { ...dependencies, enabled: true, executionEnabled: true,
@@ -59,9 +74,10 @@ export async function mountRetellStartup(app, { env = process.env, http, depende
       agentsByBusiness: { [config.businessId]: { agentId: config.agentId, agentVersion: config.agentVersion, language: config.language } },
       twilioAuth: { authToken: config.authToken, appBaseUrl: config.origin }, signingKey: config.signingKey,
       bookingEnabled: config.bookingEnabled, bookingDefaultCountry: config.bookingDefaultCountry, transcriptPolicy: config.transcriptPolicy,
-      developmentEnabled: config.developmentEnabled, developmentRunId: config.developmentRunId });
+      developmentEnabled: config.developmentEnabled, developmentRunId: config.developmentRunId, managementConfig, notificationPolicy:dependencies.notificationPolicy||app.locals.notificationPolicy,notificationConsentAllowed:config.notificationConsentAllowed });
     app.use(router);
     app.locals.retellSandbox = pending.locals.retellSandbox;
+    app.locals.retellManagement=pending.locals.retellManagement;
     return Object.freeze({ enabled: true, reasonCode: null, agentId: config.agentId, agentVersion: config.agentVersion });
   } catch { return disabled('SANDBOX_CONFIGURATION_INVALID'); }
 }

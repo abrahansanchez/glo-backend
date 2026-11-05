@@ -1,3 +1,4 @@
+import {admissionModel} from '../../models/BookingPhaseAdmission.js';
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { mkdtemp } from 'node:fs/promises';
@@ -39,7 +40,9 @@ export async function startHarness() {
     }
     const models = Object.fromEntries([['Registration',Registration],['Budget',Budget],['Proposal',Proposal],['Receipt',Receipt],
       ['VoiceRecord',VoiceRecord],['Appointment',Appointment],['Fence',Fence]].map(([key, model]) => [key, connection.model(model.modelName, model.schema.clone())]));
-    models.Barber = connection.model('ActionsBarber', new mongoose.Schema({ services: Array, availability: Object }, { collection: 'barbers' }));
+    const Admission=admissionModel(connection);await Admission.createCollection();await Admission.createIndexes();models.Admission=Admission;
+    const businessSchema=new mongoose.Schema({ services:Array,availability:Object },{collection:'barbers'});businessSchema.post('save',async function(){await Admission.updateOne({_id:String(this._id)},{$setOnInsert:{enabled:true,revision:1,capabilities:['BOOKING','MANAGEMENT','CALENDAR','NOTIFICATIONS'],expiresAt:new Date('2040-01-01T00:00:00Z'),changedBy:'SYNTHETIC_TEST_ONLY'}},{upsert:true});});
+    models.Barber=connection.model('ActionsBarber',businessSchema);
     for (const Model of Object.values(models)) { await Model.createCollection(); await Model.createIndexes(); }
     return { connection, models, close: async () => { await connection.close(); child.kill(); await exited; } };
   } catch (e) { await connection?.close(); child.kill(); await exited; throw e; }
@@ -61,7 +64,7 @@ export async function fixture(harness, options = {}) {
     twilioAuth:{authToken:secret,appBaseUrl:origin},signingKey:secret,
     provider:{registerPhoneCall:async p=>({call_id:callId,agent_id:p.agent_id,agent_version:p.agent_version,call_status:'registered'})},
     models:{BarberModel:models.Barber,AppointmentModel:models.Appointment},RegistrationModel:models.Registration,BudgetModel:models.Budget,
-    resolveBusiness:async()=>({businessId}),now,bookingEnabled:options.bookingEnabled !== false,bookingDependencies,
+    resolveBusiness:async()=>({businessId}),now,notificationPolicy:options.notificationPolicy,notificationConsentAllowed:options.notificationConsentAllowed,managementConfig:options.managementConfig,managementDependencies:options.managementDependencies,bookingEnabled:options.bookingEnabled !== false,bookingDependencies,
     developmentEnabled:options.developmentEnabled === true,developmentRunId:options.developmentRunId,DevelopmentRunModel:models.Run,
     transcriptPolicy:{enabled:options.transcriptsEnabled === true,retentionDays:30},
     transcriptDependencies:{VoiceCallRecordModel:models.VoiceRecord,ReceiptModel:models.Receipt} });

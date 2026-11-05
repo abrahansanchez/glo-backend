@@ -1,0 +1,6 @@
+import {randomBytes,createCipheriv,createDecipheriv} from 'node:crypto';
+export class TokenVault {
+ constructor({keys,activeKeyId}){if(!keys||!Object.hasOwn(keys,activeKeyId)||Object.entries(keys).some(([id,key])=>!/^[-a-zA-Z0-9_]{1,32}$/.test(id)||!Buffer.isBuffer(key)||key.length!==32))throw Error('CALENDAR_KEY_CONFIGURATION_INVALID');this.keys=keys;this.activeKeyId=activeKeyId;}
+ seal(value,context){const plaintext=Buffer.from(JSON.stringify(value));if(plaintext.length>32768)throw Error('CALENDAR_TOKEN_TOO_LARGE');const iv=randomBytes(12),cipher=createCipheriv('aes-256-gcm',this.keys[this.activeKeyId],iv);cipher.setAAD(Buffer.from(context));const body=Buffer.concat([cipher.update(plaintext),cipher.final()]);return {keyId:this.activeKeyId,iv:iv.toString('base64'),tag:cipher.getAuthTag().toString('base64'),body:body.toString('base64')};}
+ open(envelope,context){try{if(!envelope||!this.keys[envelope.keyId]||typeof envelope.body!=='string'||envelope.body.length>50000)throw Error();const d=createDecipheriv('aes-256-gcm',this.keys[envelope.keyId],Buffer.from(envelope.iv,'base64'));d.setAAD(Buffer.from(context));d.setAuthTag(Buffer.from(envelope.tag,'base64'));return JSON.parse(Buffer.concat([d.update(Buffer.from(envelope.body,'base64')),d.final()]).toString());}catch{throw Error('CALENDAR_CREDENTIAL_UNAVAILABLE');}}
+}

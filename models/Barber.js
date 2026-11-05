@@ -2,6 +2,11 @@ import mongoose from "mongoose";
 
 const BarberSchema = new mongoose.Schema(
   {
+    staffOnlyAccount:{type:Boolean,default:false},
+    activeWorkspaceId:{type:String,default:null},
+    shopSetupRevision:{type:Number,default:0},
+    shopBillingEventCreated:{type:Number,default:0},
+    shopSubscriptionCreated:{type:Number,default:0},
     name: {
       type: String,
       required: true,
@@ -119,6 +124,12 @@ const BarberSchema = new mongoose.Schema(
     },
     // ============================
 
+    appointmentNotificationPolicyEnabled:{type:Boolean,default:false},
+    notificationPolicyRevision:{type:Number,default:0},
+    staffSchedulingEnabled:{type:Boolean,default:false},
+    externalCalendarsRequired: {type:Boolean,default:false},
+    externalCalendarExportConfigured: {type:Boolean,default:false},
+    bookingConfigurationFence: {type:Number,default:0},
     availability: {
       timezone: {
         type: String,

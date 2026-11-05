@@ -5,7 +5,14 @@ const exact = (args, fields) => args && typeof args === 'object' && !Array.isArr
   && Object.keys(args).length === fields.length && fields.every(k => Object.hasOwn(args, k));
 const bounded = value => typeof value === 'string' && value.trim().length > 0 && value.length <= 64 && !/[\x00-\x1f]/.test(value);
 
-export function validContactSelection(args) {
+export function validContactSelection(args, {allowManagement=false,allowNotifications=false,allowReminders=false}={}) {
+  if(args?.staffCalendarId!==undefined){if(args.staffCalendarId!=='ANY'&&!/^[a-f0-9]{24}$/.test(args.staffCalendarId))return false;const base={...args};delete base.staffCalendarId;return validContactSelection(base,{allowManagement,allowNotifications,allowReminders});}
+  if(args && ['managementConsent','notificationConsent','reminderConsent'].some(k=>Object.hasOwn(args,k))){
+    if(Object.hasOwn(args,'managementConsent')&&(!allowManagement||args.managementConsent!=='AGREED'))return false;
+    if(Object.hasOwn(args,'notificationConsent')&&(!allowNotifications||args.notificationConsent!=='AGREED'))return false;
+    if(Object.hasOwn(args,'reminderConsent')&&(!allowReminders||args.reminderConsent!=='AGREED'||args.notificationConsent!=='AGREED'))return false;
+    const base={...args};delete base.managementConsent;delete base.notificationConsent;delete base.reminderConsent;return validContactSelection(base);
+  }
   if (!args || typeof args !== 'object') return false;
   if (!Object.hasOwn(args, 'contactSource')) return exact(args, [...common,'contactNumber'])
     && typeof args.contactNumber === 'string' && /^\+[1-9]\d{7,14}$/.test(args.contactNumber);

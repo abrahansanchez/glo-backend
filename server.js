@@ -1,3 +1,4 @@
+import {mountWorkspaceStartup} from './services/booking/staff/workspaceStartup.js';
 // server.js
 // ⚠️ dotenv MUST load before ANY other imports (ESM requirement)
 import "dotenv/config";
@@ -23,6 +24,11 @@ import { attachMediaWebSocketServer } from "./realtime/mediaStreamServer.js";
 import { attachIsolatedVoiceRoutes } from "./realtime/voice-v2/routing/attachIsolatedVoiceRoutes.js";
 import { createVoiceV2ProductionInitializer } from "./realtime/voice-v2/production/createVoiceV2ProductionInitializer.js";
 import { startAppointmentReminderJob } from "./jobs/appointmentReminders.js";
+import { mountManagementFoundation } from "./services/booking/management/startup.js";
+import { mountNotificationStartup } from "./services/messaging/startup.js";
+import { mountCalendarStartup } from "./services/calendar/startup.js";
+import { mountManagementOwnerRoutes } from "./routes/managementOwnerRoutes.js";
+import { mountBookingFoundation } from "./services/booking/staff/startup.js";
 import { mountRetellStartup } from "./services/voice/retell/startup.js";
 
 // ---------------------------------------------------------
@@ -107,7 +113,11 @@ app.use(
 app.use("/api/stripe", stripeWebhookRoutes);
 // Exactly one composition before JSON parsing. Missing/invalid sandbox settings
 // leave the existing phone owner and disabled read-only prefix intact.
+await mountNotificationStartup(app);
+await mountManagementFoundation(app);
 await mountRetellStartup(app);
+await mountCalendarStartup(app);
+await mountWorkspaceStartup(app);
 // ---------------------------------------------------------
 // JSON + FORM parsing (AFTER Stripe raw body)
 // ---------------------------------------------------------
@@ -176,6 +186,9 @@ app.use("/api/hours", hoursRoutes);
 app.use("/api/services", servicesRoutes);
 
 // 1️⃣1️⃣ Appointments
+if(app.locals.notificationPolicyRouter)app.use('/api/booking/v1',app.locals.notificationPolicyRouter);
+await mountBookingFoundation(app);
+mountManagementOwnerRoutes(app,{enabled:process.env.GLO_APPOINTMENT_MANAGEMENT_ENABLED==='true'});
 app.use("/api/appointments", appointmentRoutes);
 
 // 1️⃣2️⃣ Analytics

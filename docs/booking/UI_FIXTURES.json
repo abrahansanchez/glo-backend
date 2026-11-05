@@ -1,0 +1,313 @@
+{
+  "_meta": {
+    "syntheticOnly": true,
+    "fixedClock": "2026-11-04T15:00:00.000Z",
+    "notLiveRecords": true,
+    "verificationReferenceDelivery": "IMPLEMENTED_OFFLINE_ONLY; private link plus separate code; receipt not guaranteed",
+    "use": "UI mocks only. Paths are implemented; opaque references must come from the running server in real use. No provider credentials are included."
+  },
+  "workspaceContext": {
+    "method": "GET",
+    "path": "/api/booking/v1/businesses/507f1f77bcf86cd799439001/context",
+    "response": {
+      "data": {
+        "businessId": "507f1f77bcf86cd799439001",
+        "accountId": "507f1f77bcf86cd799439001",
+        "role": "owner",
+        "timeZone": "America/New_York",
+        "clock": "2026-11-04T15:00:00.000Z",
+        "window": {
+          "start": "2026-11-04",
+          "end": "2026-12-04"
+        },
+        "calendarIds": null,
+        "services": [
+          {
+            "id": "507f1f77bcf86cd799439003",
+            "name": "Haircut",
+            "price": 25,
+            "durationMinutes": 30
+          }
+        ],
+        "calendars": [],
+        "capabilities": {
+          "prepare": true,
+          "membership": true,
+          "googleProvider": "google",
+          "googleEnabled": false,
+          "notificationPolicyAdministration": false,
+          "appointmentDelegation": true,
+          "notificationConsent": false,
+          "reminderConsent": false,
+          "arbitraryBundles": false,
+          "appointmentNotificationPolicyEnabled": false
+        }
+      }
+    }
+  },
+  "prepareBooking": {
+    "method": "POST",
+    "path": "/api/booking/v1/businesses/507f1f77bcf86cd799439001/appointments/prepare",
+    "body": {
+      "calendarId": "OWNER",
+      "serviceId": "507f1f77bcf86cd799439003",
+      "startAt": "2026-11-07T15:00:00.000Z",
+      "clientName": "Synthetic recipient A",
+      "contactNumber": "+12025550123",
+      "managementConsent": "AGREED"
+    },
+    "response": {
+      "data": {
+        "status": "PREPARED",
+        "proposalId": "22222222-2222-4222-8222-222222222222",
+        "expiresAt": "2026-11-04T15:01:00.000Z",
+        "summary": {
+          "staffCalendarId": null,
+          "serviceId": "507f1f77bcf86cd799439003",
+          "service": "Haircut",
+          "startAt": "2026-11-07T15:00:00.000Z",
+          "endAt": "2026-11-07T15:30:00.000Z",
+          "price": 25,
+          "durationMinutes": 30,
+          "managementDelegationAgreed": true,
+          "clientName": "Synthetic recipient A",
+          "contactNumber": "+12025550123",
+          "businessRevision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "requiresExplicitConfirmation": true
+      }
+    }
+  },
+  "commitBooking": {
+    "method": "POST",
+    "path": "/api/booking/v1/businesses/507f1f77bcf86cd799439001/appointments/commit",
+    "body": {
+      "proposalId": "22222222-2222-4222-8222-222222222222",
+      "confirmation": "AFFIRMATIVE"
+    },
+    "response": {
+      "data": {
+        "status": "BOOKED",
+        "appointmentId": "507f1f77bcf86cd799439004",
+        "replayed": false
+      }
+    }
+  },
+  "range": {
+    "method": "GET",
+    "path": "/api/booking/v1/businesses/507f1f77bcf86cd799439001/calendars/range?from=2026-11-07T00:00:00Z&to=2026-11-08T00:00:00Z&limit=100",
+    "response": {
+      "data": {
+        "from": "2026-11-07T00:00:00.000Z",
+        "to": "2026-11-08T00:00:00.000Z",
+        "timeZone": "America/New_York",
+        "items": [
+          {
+            "id": "507f1f77bcf86cd799439004",
+            "source": "APPOINTMENT",
+            "startAt": "2026-11-07T15:00:00.000Z",
+            "endAt": "2026-11-07T15:30:00.000Z",
+            "recipient": "Synthetic recipient A",
+            "service": "Haircut",
+            "status": "confirmed",
+            "calendarId": "OWNER",
+            "revision": 0,
+            "allowedActions": {
+              "prepareCancellation": true,
+              "prepareRescheduling": true,
+              "ownerGrant": true,
+              "editRecipient": true,
+              "hardDelete": false
+            }
+          }
+        ],
+        "nextCursor": null,
+        "sourceHealth": []
+      }
+    }
+  },
+  "prepareOwnerCancellation": {
+    "method": "POST",
+    "path": "/api/booking/v1/businesses/507f1f77bcf86cd799439001/appointments/507f1f77bcf86cd799439004/actions/prepare",
+    "body": {
+      "kind": "CANCEL",
+      "expectedRevision": 0
+    }
+  },
+  "prepareOwnerRescheduling": {
+    "method": "POST",
+    "path": "/api/booking/v1/businesses/507f1f77bcf86cd799439001/appointments/507f1f77bcf86cd799439004/actions/prepare",
+    "body": {
+      "kind": "RESCHEDULE",
+      "expectedRevision": 0,
+      "selection": {
+        "calendarId": "OWNER",
+        "serviceId": "507f1f77bcf86cd799439003",
+        "startAt": "2026-11-07T17:00:00.000Z"
+      }
+    }
+  },
+  "commitOwnerAction": {
+    "method": "POST",
+    "path": "/api/booking/v1/businesses/507f1f77bcf86cd799439001/actions/commit",
+    "body": {
+      "proposalId": "22222222-2222-4222-8222-222222222222",
+      "confirmation": "AFFIRMATIVE"
+    },
+    "response": {
+      "data": {
+        "status": "RESCHEDULED",
+        "appointmentId": "507f1f77bcf86cd799439004",
+        "replayed": false
+      }
+    }
+  },
+  "startVerificationTool": {
+    "method": "POST",
+    "path": "/api/voice/retell/tools/start-management-verification",
+    "providerEnvelope": {
+      "name": "start_management_verification",
+      "call": {
+        "call_id": "call_synthetic_later_call",
+        "agent_id": "agent_synthetic",
+        "agent_version": 99,
+        "call_status": "ongoing"
+      },
+      "args": {
+        "contactSource": "PROVIDED_NUMBER",
+        "contactNumber": "+12025550123",
+        "verificationConsent": "AGREED"
+      }
+    },
+    "response": {
+      "status": "VERIFICATION_PENDING",
+      "expiresAt": "2026-11-04T15:05:00.000Z",
+      "linkDelivery": "REQUEST_ACCEPTED_DELIVERY_UNCONFIRMED",
+      "codeDelivery": "NOT_MEASURED"
+    }
+  },
+  "privateVerification": {
+    "page": "/customer/verification/#AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "syntheticTokenOnly": true,
+    "exchange": {
+      "method": "POST",
+      "path": "/customer/verification/session",
+      "body": {
+        "token": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+      },
+      "response": {
+        "status": "CODE_REQUIRED",
+        "csrf": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+        "expiresAt": "2026-11-04T15:05:00.000Z"
+      }
+    },
+    "complete": {
+      "method": "POST",
+      "path": "/customer/verification/complete",
+      "body": {
+        "csrf": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+        "code": "654321"
+      },
+      "response": {
+        "status": "VERIFIED"
+      }
+    },
+    "requires": "same exact HTTPS Origin, Secure HttpOnly SameSite=Strict session cookie; no barber login",
+    "mustNotSendToRetell": [
+      "token",
+      "csrf",
+      "cookie",
+      "code"
+    ],
+    "statusToolArgs": {}
+  },
+  "signedLookup": {
+    "method": "POST",
+    "path": "/api/voice/retell/tools/lookup-appointments",
+    "args": {
+      "authorityRef": "11111111-1111-4111-8111-111111111111"
+    },
+    "response": {
+      "status": "OK",
+      "appointments": [
+        {
+          "selectionRef": "33333333-3333-4333-8333-333333333333",
+          "recipient": "Synthetic recipient A",
+          "service": "Haircut",
+          "startAt": "2026-11-07T15:00:00.000Z",
+          "endAt": "2026-11-07T15:30:00.000Z",
+          "staffCalendarId": null,
+          "allowedActions": [
+            "CANCEL",
+            "RESCHEDULE"
+          ]
+        }
+      ],
+      "moreAvailable": false
+    }
+  },
+  "googleOAuth": {
+    "method": "POST",
+    "path": "/api/calendar/businesses/507f1f77bcf86cd799439001/oauth",
+    "body": {
+      "mode": "busy",
+      "returnUrl": "https://app.example.invalid/calendar"
+    }
+  },
+  "googleSelection": {
+    "method": "PUT",
+    "path": "/api/calendar/businesses/507f1f77bcf86cd799439001/connections/44444444-4444-4444-8444-444444444444/sources",
+    "body": {
+      "sources": [
+        {
+          "calendarId": "synthetic_calendar@example.invalid",
+          "staffCalendarId": null,
+          "visibility": "busy",
+          "required": true,
+          "exportEnabled": false
+        }
+      ]
+    }
+  },
+  "errors": [
+    {
+      "http": 401,
+      "body": {
+        "message": "Not authorized, no token"
+      }
+    },
+    {
+      "http": 403,
+      "body": {
+        "reasonCode": "FORBIDDEN"
+      }
+    },
+    {
+      "http": 409,
+      "body": {
+        "reasonCode": "SCHEDULE_CONFLICT"
+      }
+    },
+    {
+      "http": 409,
+      "body": {
+        "reasonCode": "STALE_REVISION"
+      }
+    },
+    {
+      "http": 409,
+      "body": {
+        "reasonCode": "AVAILABILITY_UNVERIFIED"
+      }
+    },
+    {
+      "http": 200,
+      "body": {
+        "data": {
+          "status": "UNKNOWN",
+          "reasonCode": "SETTLEMENT_UNKNOWN"
+        }
+      }
+    }
+  ]
+}

@@ -1,3 +1,5 @@
+import {createBusinessCanary} from '../services/booking/BusinessCanary.js';
+import Subscription from '../models/Subscription.js';
 import { randomUUID } from "node:crypto";
 import twilio from "twilio";
 import Barber from "../models/Barber.js";
@@ -331,10 +333,14 @@ export const selectNumberStrategy = async (req, res) => {
     if (!currentBarber) {
       return res.status(404).json({ code: "BARBER_NOT_FOUND", message: "Barber not found" });
     }
+    if(currentBarber.staffOnlyAccount)return res.status(403).json({code:'STAFF_OWNER_SETUP_NOT_REQUIRED'});
+    if(currentBarber.productType==='shop'&&process.env.GLO_SHOP_ONBOARDING_ENABLED!=='true')return res.status(409).json({code:'SHOP_SETUP_NOT_AVAILABLE'});
+    if(currentBarber.productType==='shop')await createBusinessCanary({connection:Barber.db}).assert(String(barberId),'BOOKING');
     const currentAssignment = await readRoutingAssignment(barberId);
     const gate = validatePaymentFirstProvisioningGate(currentBarber, {
       strategy,
       assignment: currentAssignment,
+      subscription:currentBarber.productType==='shop'?await Subscription.findOne({barber:barberId}).sort({createdAt:-1}).lean():undefined,
     });
     if (!gate.ok) {
       return res.status(gate.status).json({
@@ -466,7 +472,7 @@ const notAlreadyLiveFilter = [
   { $or: [{ assignedTwilioNumber: { $exists: false } }, { assignedTwilioNumber: null }, { assignedTwilioNumber: "" }] },
 ];
 
-const claimPhoneSetupIntent = async (barberId, { now = new Date(), intentIdFactory = randomUUID } = {}) => {
+const claimPhoneSetupIntent = async (barberId, { now = new Date(), intentIdFactory = randomUUID,productType="individual" } = {}) => {
   const intentId = intentIdFactory();
   const updated = await Barber.findOneAndUpdate(
     {
@@ -474,7 +480,7 @@ const claimPhoneSetupIntent = async (barberId, { now = new Date(), intentIdFacto
       $and: [
         { $or: intentMissingFilter },
         { subscriptionStatus: { $in: ["trialing", "active"] } },
-        { $or: compatibleProductFilter },
+        { $or: productType==='shop'?[{productType:'shop'}]:compatibleProductFilter },
         ...notAlreadyLiveFilter,
       ],
     },
@@ -483,7 +489,7 @@ const claimPhoneSetupIntent = async (barberId, { now = new Date(), intentIdFacto
         phoneSetupIntentId: intentId,
         phoneSetupStartedAt: now,
         onboardingContractVersion: SETUP_CONTRACT_VERSION,
-        productType: "individual",
+        productType,
       },
     },
     { new: true }
@@ -525,8 +531,11 @@ export const getPhoneSetupReadiness = async (req, res) => {
       return res.status(404).json({ code: "BARBER_NOT_FOUND", message: "Barber not found" });
     }
 
+    if(barber.staffOnlyAccount)return res.status(403).json({code:'STAFF_OWNER_SETUP_NOT_REQUIRED'});
+    if(barber.productType==='shop'&&process.env.GLO_SHOP_ONBOARDING_ENABLED!=='true')return res.status(409).json({code:'SHOP_SETUP_NOT_AVAILABLE'});
     const assignment = await readRoutingAssignment(barberId);
-    return res.json(deriveSetupReadiness(barber, { assignment }));
+    const subscription=barber.productType==='shop'?await Subscription.findOne({barber:barberId}).sort({createdAt:-1}).lean():undefined;
+    return res.json(deriveSetupReadiness(barber, { assignment,subscription }));
   } catch (err) {
     console.error("getPhoneSetupReadiness error:", err);
     if (err?.code === "BARBER_NOT_FOUND") {
@@ -547,7 +556,7 @@ export const startPhoneSetup = async (req, res) => {
     }
 
     const productType = String(req.body?.productType || "individual").trim().toLowerCase();
-    if (productType !== "individual") {
+    if (!["individual","shop"].includes(productType)||productType==='shop'&&process.env.GLO_SHOP_ONBOARDING_ENABLED!=='true') {
       return res.status(409).json({
         ok: false,
         code: "SHOP_SETUP_NOT_AVAILABLE",
@@ -560,8 +569,12 @@ export const startPhoneSetup = async (req, res) => {
       return res.status(404).json({ code: "BARBER_NOT_FOUND", message: "Barber not found" });
     }
 
+    if(barber.staffOnlyAccount)return res.status(403).json({code:'STAFF_OWNER_SETUP_NOT_REQUIRED'});
+    if(barber.productType==='shop'&&process.env.GLO_SHOP_ONBOARDING_ENABLED!=='true')return res.status(409).json({code:'SHOP_SETUP_NOT_AVAILABLE'});
     const assignment = await readRoutingAssignment(barberId);
-    const validation = validatePhoneSetupStart(barber, { assignment, productTypeOverride: productType });
+    const subscription=barber.productType==='shop'?await Subscription.findOne({barber:barberId}).sort({createdAt:-1}).lean():undefined;
+    if(barber.productType==='shop'){await createBusinessCanary({connection:Barber.db}).assert(String(barberId),'BOOKING');if(productType!=='shop')return res.status(409).json({code:'PRODUCT_TYPE_MISMATCH'});}
+    const validation = validatePhoneSetupStart(barber, { assignment,subscription, productTypeOverride: productType });
     if (!validation.ok) {
       return res.status(validation.status).json({
         ok: false,
@@ -571,13 +584,13 @@ export const startPhoneSetup = async (req, res) => {
       });
     }
 
-    const claim = await claimPhoneSetupIntent(barberId);
+    const claim = await claimPhoneSetupIntent(barberId,{productType:barber.productType==='shop'?'shop':'individual'});
     if (!claim.ok) {
       if (!claim.barber) {
         return res.status(404).json({ code: "BARBER_NOT_FOUND", message: "Barber not found" });
       }
       const currentAssignment = await readRoutingAssignment(barberId);
-      const currentValidation = validatePhoneSetupStart(claim.barber, { assignment: currentAssignment, productTypeOverride: productType });
+      const currentValidation = validatePhoneSetupStart(claim.barber, { assignment: currentAssignment, subscription,productTypeOverride: productType });
       return res.status(currentValidation.status || 409).json({
         ok: false,
         code: currentValidation.code || "PHONE_SETUP_START_NOT_AVAILABLE",
@@ -591,7 +604,7 @@ export const startPhoneSetup = async (req, res) => {
       idempotent: !claim.created,
       phoneSetupIntentId: claim.intentId,
       phoneSetupStartedAt: claim.startedAt,
-      readiness: deriveSetupReadiness(claim.barber, { assignment }),
+      readiness: deriveSetupReadiness(claim.barber, { assignment,subscription }),
       nextStep: "choose_number_strategy",
       supportedStrategies: ["new_number", "forward_existing"],
     });

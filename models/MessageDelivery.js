@@ -2,6 +2,10 @@ import mongoose from "mongoose";
 
 const MessageDeliverySchema = new mongoose.Schema(
   {
+    verificationLink:{type:Boolean},admissionRevision:{type:Number},
+    notificationOutbox: {type:Boolean},
+    appointmentId: {type:String}, appointmentRevision: {type:Number}, consentId:{type:String},recipientHash:{type:String},keyId:{type:String},sender:{type:String},
+    notBefore:{type:Date},expiresAt:{type:Date},nextAttemptAt:{type:Date},staleAfterSubmission:{type:Boolean},callbackConflict:{type:Boolean},
     barberId: { type: mongoose.Schema.Types.ObjectId, ref: "Barber", required: true },
     purpose: { type: String, required: true },
     commandId: { type: String, required: true },

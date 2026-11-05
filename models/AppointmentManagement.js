@@ -1,0 +1,15 @@
+import mongoose from 'mongoose';
+const opts={timestamps:true,strict:'throw',autoCreate:false,autoIndex:false};
+const grant=new mongoose.Schema({businessId:{type:mongoose.Schema.Types.ObjectId,required:true},appointmentId:{type:mongoose.Schema.Types.ObjectId,required:true},contactHash:{type:String,required:true},actions:{type:[String],enum:['LOOKUP','CANCEL','RESCHEDULE'],required:true},source:{type:String,enum:['BOOKING_AGREEMENT','OWNER_GRANT'],required:true},issuedBy:{type:String,required:true},revoked:{type:Boolean,default:false},revision:{type:Number,default:1} },opts);
+grant.index({businessId:1,appointmentId:1,contactHash:1},{unique:true});
+const challenge=new mongoose.Schema({_id:String,businessId:{type:String,required:true},callId:{type:String,required:true},contactHash:{type:String,required:true},purpose:{type:String,enum:['APPOINTMENT_MANAGEMENT'],required:true},providerId:String,admissionRevision:Number,parentCallSid:String,ownerEpoch:Number,handoffTokenHash:String,handoffUsedAt:Date,privateSessionHash:String,csrfHash:String,linkDeliveryId:String,consentAt:Date,status:{type:String,enum:['SENDING','PENDING','CHECKING','VERIFIED','FAILED','UNKNOWN'],required:true},attempts:{type:Number,default:0},expiresAt:{type:Date,required:true}},opts);
+challenge.index({expiresAt:1},{expireAfterSeconds:0});challenge.index({handoffTokenHash:1},{unique:true,partialFilterExpression:{handoffTokenHash:{$type:'string'}}});challenge.index({privateSessionHash:1},{unique:true,partialFilterExpression:{privateSessionHash:{$type:'string'}}});
+const rate=new mongoose.Schema({_id:String,used:{type:Number,default:0},expiresAt:{type:Date,required:true}},{...opts});rate.index({expiresAt:1},{expireAfterSeconds:0});
+export const ManagementGrant=mongoose.models.ManagementGrant||mongoose.model('ManagementGrant',grant);
+export const ManagementChallenge=mongoose.models.ManagementChallenge||mongoose.model('ManagementChallenge',challenge);
+export const ManagementRate=mongoose.models.ManagementRate||mongoose.model('ManagementRate',rate);
+
+const selection=new mongoose.Schema({_id:String,businessId:String,callId:String,authorityRef:String,appointmentId:mongoose.Schema.Types.ObjectId,grantId:mongoose.Schema.Types.ObjectId,snapshotHash:String,expiresAt:Date},opts);selection.index({expiresAt:1},{expireAfterSeconds:0});
+const action=new mongoose.Schema({_id:String,businessId:String,callId:String,authorityRef:String,appointmentId:mongoose.Schema.Types.ObjectId,grantId:mongoose.Schema.Types.ObjectId,kind:{type:String,enum:['CANCEL','RESCHEDULE']},snapshotHash:String,facts:mongoose.Schema.Types.Mixed,factsHash:String,expiresAt:Date,status:{type:String,enum:['PREPARED','COMMITTING','SETTLED','FAILED','UNKNOWN']},commitToken:String,result:mongoose.Schema.Types.Mixed},opts);action.index({businessId:1,appointmentId:1,status:1});
+export const ManagementSelection=mongoose.models.ManagementSelection||mongoose.model('ManagementSelection',selection);
+export const ManagementAction=mongoose.models.ManagementAction||mongoose.model('ManagementAction',action);

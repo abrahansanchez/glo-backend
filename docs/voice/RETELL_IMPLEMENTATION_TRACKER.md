@@ -205,3 +205,30 @@ Contact-slice evidence: 460/460 affected checks pass in worktree and exact task-
 Callback follow-up: see RETELL_CALLBACK_AND_HANDOFF_REVIEW.md for the operator-verified two-booking milestone, reproduced pre-screen callback race, bounded observational repair and separate unresolved greeting evidence. No live activation/version/budget changes.
 
 Combined contact/callback follow-up validation:471/471 in worktree and exact20-file clean-HEAD overlay; focused callback11/11; zero skips/failures. See RETELL_CALLBACK_AND_HANDOFF_REVIEW.md and external retell-callback-audio-20261103 evidence.
+
+
+## 2026-11-04 consolidated booking phase: partial foundation, NOT phase completion
+
+See ../booking/BACKEND_PHASE_CONTRACT.md for source-grounded discovery, approved explicit appointment-level delegation, current staff API, checkpoint inventories/evidence and unimplemented work. A discovery/contracts completed. B staff foundation and C verification/authority core implemented offline, but staff is not yet selected through Retell and C is not yet wired to new-booking/owner delegation or secure code entry. D later-call management, E/F Google, G durable notification dispatch and full H handoff remain NOT_COMPLETE. New staff route gate defaults off; no provider/configuration/agent change. Preserve publishedV2/run glo_retell_contact_dev_002 deferred contact live acceptance and all verified earlier bookings, suppression, settled budgets and transcripts. Do not represent these partial checkpoints as finished booking phase.
+
+D core continuation: opaque scoped lookup and transactional cancel/reschedule service added with isolated Mongo regressions; production call-fence composition, secure verification entry, provider routes and live acceptance remain NOT_COMPLETE. This supersedes only the earlier statement that no D library exists, not end-to-end readiness.
+
+
+### 2026-11-04 consolidated booking continuation (unstaged)
+
+C/D actual delegated booking -> fresh-call verification -> signed authorized lookup/cancel/reschedule implemented through durable registration/screening/deadline and transactional appointment/grant/revision fences. Owner grants independently composed. E/F Google OAuth/import/combined scheduling/export/reconciliation implemented with fake HTTP boundaries. G explicit SMS/reminder consent, post-commit MessageDelivery outbox and signed callback/opt-out path implemented; all dispatch default-off. H scoped workspace APIs and complete unprovisioned bilingual tool templates implemented. See docs/booking/UI_API_HANDOFF.md and OPERATIONS_AND_ACCEPTANCE.md for implemented contracts and remaining external prerequisites. Final continuation manifest identifies exact task-only overlay/tests/hashes. No agent/budget/config changes, deployment or live acceptance; contactV2 and original greeting observation remain unverified. Existing successful two-booking milestone preserved. This entry supersedes the older partial B/C foundation status, not the live evidence ledger.
+
+
+### 2026-11-04 booking integration readiness review (unstaged)
+
+Verified all original80 files against saved569-test hashes. Reproduced/fixed notification webhook root interception, export calendar-scope loss after provider reads/reconciliation, private Verify gate/dispatch bypass on pending challenges, managed rescheduled occupancy bypass, UI error/capability mismatches, polling-only sync error and worker cadence/freshness mismatch. New before/after probes use isolated Mongo/fake providers; no expectations weakened. INTEGRATION_READINESS.md provides production composition, private-reference delivery BLOCKER, status ledger and ordered manual rollout/rollback. UI_API_HANDOFF.md reconciles actual envelopes/permissions; UI_FIXTURES.json is synthetic only. No provider/production/agent/configuration/budget operation occurred; nothing staged/committed. No new feature is live-validated or launch-complete.
+
+
+### 2026-11-04 private handoff and controlled canaries (offline only)
+
+Backend now serves the bilingual no-login customer verification page, private one-use link exchange and code completion. Explicit permission covers separate link/Verify messages, never appointment/marketing consent. Fake-provider composed Mongo tests cover private completion to current-call status and grant-only lookup. New durable per-business BookingPhaseAdmission gates BOOKING/MANAGEMENT/CALENDAR/NOTIFICATIONS in addition to master flags; no admissions/configuration were created outside isolated tests. Calendar due-source polling, connection request accounting and failure backoff retain30second commit freshness. See docs/booking/PRIVATE_VERIFICATION_AND_CANARIES.md for exact configuration, volume calculations and ordered rollout. All provider/sender/device, quota/load, production prerequisite and new-version Retell acceptance remain UNVERIFIED. Existing two-booking milestone and all consumed development/checkpoint records preserved.
+
+
+### Shop onboarding, invitation lifecycle and workspace discovery ? offline completion
+
+See docs/booking/SHOP_WORKSPACE_API.md. Existing tenant/account ownership retained (one owned business plus memberships), explicit configured shop Checkout/subscription event proof, paid phone setup and recovery, durable private invitations/Verify acceptance and membership lifecycle, current workspace discovery/selection. New flags all default false. No agent publication/version changes or provider/live acceptance performed. Preserve existing successful booking/transcript milestone, publishedV2 deferred contact acceptance and all consumed/current run bindings. Previous88-file release package is superseded by the newly generated inventory/package, not modified.

@@ -7,7 +7,7 @@ const keys = (value, expected) => value && typeof value === 'object' && !Array.i
 const handle = v => typeof v === 'string' && /^[A-Za-z0-9_.:-]{1,128}$/.test(v);
 // Full Retell call envelopes include conversation/tool history, not just args.
 export const RETELL_BOOKING_BODY_LIMIT = 256 * 1024;
-const reasons = new Set(['BUSINESS_CHANGED','UNKNOWN_SERVICE','INVALID_CATALOGUE','INVALID_SCHEDULE','BUSINESS_UNAVAILABLE',
+const reasons = new Set(['NOTIFICATIONS_NOT_ALLOWED','MANAGEMENT_NOT_ALLOWED','STAFF_SELECTION_REQUIRED','STAFF_NOT_ELIGIBLE','STAFF_CONFIGURATION_REQUIRED','SERVICE_NOT_QUALIFIED','AVAILABILITY_UNVERIFIED','BUSINESS_CHANGED','UNKNOWN_SERVICE','INVALID_CATALOGUE','INVALID_SCHEDULE','BUSINESS_UNAVAILABLE',
   'UNAVAILABLE','INVALID_SLOT','CALL_NOT_AUTHORIZED','IDEMPOTENCY_CONFLICT','BOOKING_BUSY','PROPOSAL_EXPIRED','MISSING_CATALOGUE_FACTS']);
 export function createRetellBookingRouter({ enabled = false, signingKey, allowedBusinessIds, repository, dependencies = {}, now = () => new Date() }) {
   const router = express.Router();
@@ -22,7 +22,7 @@ export function createRetellBookingRouter({ enabled = false, signingKey, allowed
         || !Number.isSafeInteger(request.call.agent_version) || request.call.agent_version < 0 || request.call.call_status !== 'ongoing')
         return res.status(400).json({ status: 'REJECTED', reasonCode: 'INVALID_REQUEST' });
       const a = request.args;
-      const valid = name === 'prepare_booking' ? validContactSelection(a)
+      const valid = name === 'prepare_booking' ? validContactSelection(a,{allowManagement:!!dependencies.delegation,allowNotifications:!!dependencies.notifications,allowReminders:dependencies.notifications?.allowReminders===true})
         && Array.isArray(a.serviceIds) && a.serviceIds.length >= 1 && a.serviceIds.length <= 8 && a.serviceIds.every(handle)
         && new Set(a.serviceIds).size === a.serviceIds.length && typeof a.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(a.date)
         && typeof a.time === 'string' && /^\d{2}:\d{2}$/.test(a.time) && typeof a.businessRevision === 'string' && /^[a-f\d]{64}$/.test(a.businessRevision)
@@ -44,7 +44,7 @@ export function createRetellBookingRouter({ enabled = false, signingKey, allowed
         const output = name === 'prepare_booking' ? await service.prepare(binding, a) : await service.commit(binding, a);
         return res.json(output);
       } catch (error) {
-        const reasonCode = reasons.has(error?.reasonCode) ? error.reasonCode : 'BOOKING_UNAVAILABLE';
+        const reasonCode = reasons.has(error?.reasonCode||error?.readReason) ? (error.reasonCode||error.readReason) : 'BOOKING_UNAVAILABLE';
         return res.status(reasonCode === 'CALL_NOT_AUTHORIZED' ? 403 : reasonCode === 'BOOKING_UNAVAILABLE' ? 503 : 409)
           .json({ status: 'REJECTED', reasonCode, ...(error?.availability ? { availability: error.availability } : {}) });
       }

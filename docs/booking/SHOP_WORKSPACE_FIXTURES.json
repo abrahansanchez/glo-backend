@@ -1,0 +1,182 @@
+{
+  "_meta": {
+    "syntheticOnly": true,
+    "implementedOfflineOnly": true,
+    "notDeployed": true
+  },
+  "registerStaff": {
+    "method": "POST",
+    "path": "/api/auth/register",
+    "body": {
+      "name": "Synthetic colleague",
+      "email": "staff@example.invalid",
+      "phone": "+12025550123",
+      "password": "SYNTHETIC_LOCAL_TEST_ONLY",
+      "entryMode": "staff"
+    },
+    "response": {
+      "message": "Barber registered successfully"
+    }
+  },
+  "discover": {
+    "method": "GET",
+    "path": "/api/booking/v1/workspaces",
+    "response": {
+      "data": {
+        "workspaces": [
+          {
+            "businessId": "507f1f77bcf86cd799439001",
+            "label": "Synthetic shop",
+            "productType": "shop",
+            "role": "staff",
+            "calendarIds": [
+              "507f1f77bcf86cd799439002"
+            ],
+            "revision": 1,
+            "entitlement": "READY",
+            "capabilities": [
+              "BOOKING"
+            ],
+            "accessible": true
+          }
+        ],
+        "selectedBusinessId": null,
+        "requiresSelection": true,
+        "invitationState": "READY"
+      }
+    }
+  },
+  "invite": {
+    "method": "POST",
+    "path": "/api/booking/v1/businesses/507f1f77bcf86cd799439001/invitations",
+    "body": {
+      "contactNumber": "+12025550123",
+      "role": "staff",
+      "calendarIds": [
+        "507f1f77bcf86cd799439002"
+      ]
+    },
+    "response": {
+      "data": {
+        "invitationId": "11111111-1111-4111-8111-111111111111",
+        "status": "PENDING",
+        "role": "staff",
+        "calendarIds": [
+          "507f1f77bcf86cd799439002"
+        ],
+        "revision": 1,
+        "expiresAt": "2026-11-05T15:00:00Z",
+        "delivery": "REQUEST_ACCEPTED_DELIVERY_UNCONFIRMED"
+      }
+    }
+  },
+  "proof": {
+    "method": "POST",
+    "path": "/api/booking/v1/invitations/verification/start",
+    "body": {
+      "token": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "verificationConsent": "AGREED"
+    },
+    "response": {
+      "data": {
+        "status": "VERIFICATION_PENDING",
+        "delivery": "NOT_MEASURED"
+      }
+    }
+  },
+  "accept": {
+    "method": "POST",
+    "path": "/api/booking/v1/invitations/accept",
+    "body": {
+      "token": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "code": "654321",
+      "acceptance": "AGREED"
+    },
+    "response": {
+      "data": {
+        "status": "MEMBER",
+        "businessId": "507f1f77bcf86cd799439001",
+        "replayed": false
+      }
+    }
+  },
+  "shopSetup": {
+    "method": "PUT",
+    "path": "/api/booking/v1/shop/setup",
+    "body": {
+      "expectedRevision": 0,
+      "profile": {
+        "businessName": "Synthetic shop"
+      },
+      "services": [
+        {
+          "name": "Haircut",
+          "price": 0,
+          "durationMinutes": 30
+        }
+      ],
+      "schedule": {
+        "timezone": "America/New_York",
+        "businessHours": {
+          "sun": {
+            "isClosed": false,
+            "open": "09:00",
+            "close": "18:00"
+          },
+          "mon": {
+            "isClosed": false,
+            "open": "09:00",
+            "close": "18:00"
+          },
+          "tue": {
+            "isClosed": false,
+            "open": "09:00",
+            "close": "18:00"
+          },
+          "wed": {
+            "isClosed": false,
+            "open": "09:00",
+            "close": "18:00"
+          },
+          "thu": {
+            "isClosed": false,
+            "open": "09:00",
+            "close": "18:00"
+          },
+          "fri": {
+            "isClosed": false,
+            "open": "09:00",
+            "close": "18:00"
+          },
+          "sat": {
+            "isClosed": false,
+            "open": "09:00",
+            "close": "18:00"
+          }
+        }
+      },
+      "receptionist": {
+        "preferredLanguage": "es",
+        "greeting": "Hola, soy Glo."
+      }
+    }
+  },
+  "errors": [
+    "INVITATION_UNAVAILABLE",
+    "INVITATION_SCOPE_CHANGED",
+    "INVITATION_RATE_LIMIT",
+    "INVITATION_DELIVERY_DISABLED",
+    "INVITATION_DELIVERY_UNKNOWN",
+    "INVITATION_CONFIGURATION_REQUIRED",
+    "INVITATIONS_DISABLED",
+    "INVITATION_REQUIRED",
+    "EXPLICIT_ACCEPTANCE_REQUIRED",
+    "VERIFICATION_CONSENT_REQUIRED",
+    "SHOP_COMMERCIAL_CONFIGURATION_UNAVAILABLE",
+    "SHOP_BILLING_DISPATCH_DISABLED",
+    "EXISTING_BUSINESS_CONVERSION_REQUIRES_OWNER_ASSISTANCE",
+    "STALE_REVISION",
+    "FORBIDDEN",
+    "WORKSPACE_LIMIT"
+  ]
+}

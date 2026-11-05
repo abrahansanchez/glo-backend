@@ -1,0 +1,16 @@
+export async function mountNotificationStartup(app,{env=process.env,dependencies={}}={}){
+ if(env.GLO_APPOINTMENT_NOTIFICATIONS_ENABLED!=='true')return {enabled:false};
+ try{
+  const [{notificationModels},{NotificationPolicy},{NotificationDispatcher},{createAppointmentSmsTransport},{createNotificationWebhooks,createNotificationPolicyRouter},{default:Appointment},{default:Barber},{default:Client},{default:Delivery}]=await Promise.all([import('../../models/AppointmentNotification.js'),import('./NotificationPolicy.js'),import('./NotificationDispatcher.js'),import('./AppointmentSmsTransport.js'),import('../../routes/appointmentNotificationRoutes.js'),import('../../models/Appointment.js'),import('../../models/Barber.js'),import('../../models/Client.js'),import('../../models/MessageDelivery.js')]);
+  const input=JSON.parse(env.APPOINTMENT_NOTIFICATION_KEYS_JSON||'{}'),keys=Object.fromEntries(Object.entries(input).map(([k,v])=>[k,Buffer.from(v,'base64')]));
+  const policy=dependencies.policy||new NotificationPolicy({models:notificationModels(Appointment.db),Delivery,Barber,keys,activeKeyId:env.APPOINTMENT_NOTIFICATION_ACTIVE_KEY,allowReminders:env.GLO_APPOINTMENT_REMINDER_CONSENT_ENABLED==='true'});await policy.ready();
+  const dispatch=env.GLO_APPOINTMENT_SMS_DISPATCH_ENABLED==='true',webhooks=env.GLO_APPOINTMENT_NOTIFICATION_WEBHOOKS_ENABLED==='true';if(dispatch&&!webhooks)throw Error('WEBHOOK_CONFIGURATION_REQUIRED');
+  const provider=dependencies.provider||createAppointmentSmsTransport(dispatch?{enabled:true,http:dependencies.http||globalThis.fetch,accountSid:env.TWILIO_ACCOUNT_SID,authToken:env.TWILIO_AUTH_TOKEN,fromNumber:env.APPOINTMENT_NOTIFICATION_FROM_NUMBER,callbackBase:`${new URL(env.APP_BASE_URL).origin}/api/booking/v1/notifications/status`}:{enabled:false});
+  const dispatcher=new NotificationDispatcher({policy,Appointment:dependencies.Appointment||Appointment,Client:dependencies.Client||Client,provider,now:policy.now,remindersEnabled:env.GLO_APPOINTMENT_REMINDERS_ENABLED==='true'});
+  if(webhooks){if(!/^AC[a-f0-9]{32}$/i.test(env.TWILIO_ACCOUNT_SID)||!env.TWILIO_AUTH_TOKEN||!/^\+[1-9]\d{7,14}$/.test(env.APPOINTMENT_NOTIFICATION_FROM_NUMBER))throw Error('WEBHOOK_CONFIGURATION_REQUIRED');const origin=new URL(env.APP_BASE_URL);if(origin.protocol!=='https:'||origin.username||origin.password||origin.pathname!=='/'||origin.search||origin.hash)throw Error('WEBHOOK_CONFIGURATION_REQUIRED');app.use(createNotificationWebhooks({policy,dispatcher,accountSid:env.TWILIO_ACCOUNT_SID,authToken:env.TWILIO_AUTH_TOKEN,appBaseUrl:origin.origin,fromNumber:env.APPOINTMENT_NOTIFICATION_FROM_NUMBER}));}
+  // Owner policy router is mounted after general CORS/auth setup by server.js.
+  app.locals.notificationPolicyRouter=createNotificationPolicyRouter({policy});app.locals.notificationPolicy=policy;
+  let timer,running=false,stopped=false;if(dispatch&&env.GLO_NOTIFICATION_WORKER_ENABLED==='true'){timer=setInterval(async()=>{if(running||stopped)return;running=true;try{await dispatcher.tick();}catch{}finally{running=false;}},60000);timer.unref();}
+  return {enabled:true,dispatchEnabled:dispatch,policy,dispatcher,stop:()=>{stopped=true;clearInterval(timer);}};
+ }catch{return {enabled:false,reasonCode:'NOTIFICATION_CONFIGURATION_OR_INDEX_PREREQUISITE_MISSING'};}
+}

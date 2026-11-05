@@ -75,6 +75,8 @@ router.post("/setup-intent", protect, async (req, res) => {
       });
     }
 
+    if(barber.staffOnlyAccount)return res.status(403).json({code:'OWNER_ACCOUNT_REQUIRED'});
+    if(barber.productType==='shop'&&process.env.GLO_SHOP_BILLING_DISPATCH_ENABLED!=='true')return res.status(409).json({code:'SHOP_BILLING_DISPATCH_DISABLED'});
     const customerId = await ensureStripeCustomer(barber);
     const setupIntent = await stripe.setupIntents.create({
       customer: customerId,
@@ -137,6 +139,7 @@ router.post("/trial/start", protect, async (req, res) => {
         message: "Barber not found",
       });
     }
+    if(barber.staffOnlyAccount||barber.productType==='shop')return res.status(409).json({code:'SHOP_OR_STAFF_USE_VERIFIED_CHECKOUT',message:'Staff need no owner trial; shop trials use the configured checkout.'});
     await ensureStripeCustomer(barber);
 
     const customer = await getCustomerWithDefaultPaymentMethod(barber.stripeCustomerId);

@@ -582,3 +582,10 @@ function stripBarberDoc(value) {
   }
   return plain;
 }
+
+
+test("shop reuses durable phone provisioning and mirror recovery without changing product ownership", async()=>{
+ const state=setup({barber:{productType:'shop'},failNextSave:true});
+ await assert.rejects(provision(state,'barber-1'));
+ const result=await provision(state,'barber-1');assert.equal(result.status,'assigned');assert.equal(state.provider.purchases.length,1);assert.equal(state.barbers.records.get('barber-1').productType,'shop');
+});

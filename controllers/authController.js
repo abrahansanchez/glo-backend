@@ -19,6 +19,7 @@ export const registerBarber = async (req, res) => {
     // Create new barber
     const barber = new Barber({
       name,
+      staffOnlyAccount:req.body.entryMode==='staff',
       email,
       phone,
       password: hashedPassword,
@@ -62,6 +63,8 @@ export const loginBarber = async (req, res) => {
       token,
       barber: {
         id: barber._id,
+        staffOnlyAccount:barber.staffOnlyAccount===true,
+        workspaceDiscoveryPath:'/api/booking/v1/workspaces',
         name: barber.name,
         email: barber.email,
         phone: barber.phone,

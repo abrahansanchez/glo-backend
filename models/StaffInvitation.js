@@ -1,0 +1,7 @@
+import mongoose from 'mongoose';
+const options={timestamps:true,strict:'throw',autoIndex:false,autoCreate:false};
+const invitation=new mongoose.Schema({_id:String,businessId:{type:String,required:true},contactHash:{type:String,required:true},contactEnvelope:mongoose.Schema.Types.Mixed,tokenHash:{type:String,required:true},role:{type:String,enum:['manager','staff'],required:true},calendars:[{_id:false,id:String,revision:Number}],membershipRevision:Number,intendedAccountId:String,status:{type:String,enum:['PENDING','ACCEPTED','REVOKED','FAILED','UNKNOWN'],required:true},expiresAt:{type:Date,required:true},admissionRevision:Number,deliveryId:String,acceptedAccountId:String,acceptedAt:Date,revision:{type:Number,default:1},proofAccountId:String,proofId:String,proofStatus:String,proofAttempts:{type:Number,default:0},proofExpiresAt:Date},options);
+invitation.index({tokenHash:1},{unique:true});invitation.index({businessId:1,contactHash:1},{unique:true,partialFilterExpression:{status:'PENDING'}});invitation.index({businessId:1,status:1,createdAt:1});
+// Keep terminal history. Direct expiry predicates govern access; no TTL.
+const rate=new mongoose.Schema({_id:String,used:{type:Number,default:0},expiresAt:Date},options);rate.index({expiresAt:1},{expireAfterSeconds:0});
+export function invitationModels(connection=mongoose.connection){return {Invitation:connection.models.StaffInvitation||connection.model('StaffInvitation',invitation),InvitationRate:connection.models.StaffInvitationRate||connection.model('StaffInvitationRate',rate)};}

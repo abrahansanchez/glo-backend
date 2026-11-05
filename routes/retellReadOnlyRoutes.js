@@ -7,8 +7,8 @@ const identifier = value => typeof value === 'string' && /^[A-Za-z0-9_.:-]{1,128
 const ownKeys = (value, keys) => value && typeof value === 'object' && !Array.isArray(value)
   && Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key));
 const toolNames = Object.freeze({ context: 'read_business_context', availability: 'check_bundle_availability' });
-const reasons = new Set(['BUSINESS_UNAVAILABLE', 'INVALID_SCHEDULE', 'INVALID_CATALOGUE', 'BUSINESS_CHANGED',
-  'UNKNOWN_SERVICE', 'UNSUPPORTED_BUNDLE', 'INVALID_SLOT', 'READ_STALE', 'CALL_NOT_AUTHORIZED', 'READ_DEADLINE']);
+const reasons = new Set(['STAFF_SELECTION_REQUIRED','STAFF_NOT_ELIGIBLE','STAFF_CONFIGURATION_REQUIRED','BUSINESS_UNAVAILABLE', 'INVALID_SCHEDULE', 'INVALID_CATALOGUE', 'BUSINESS_CHANGED',
+  'UNKNOWN_SERVICE', 'UNSUPPORTED_BUNDLE', 'INVALID_SLOT', 'AVAILABILITY_UNVERIFIED', 'READ_STALE', 'CALL_NOT_AUTHORIZED', 'READ_DEADLINE']);
 
 // Public Retell contract: HMAC-SHA256(exact raw bytes + timestamp), five-minute window.
 // Key is injected by composition; this module never inspects credentials/environment.
@@ -23,7 +23,7 @@ export function verifyRetellSignature(raw, signature, signingKey, nowMs) {
 // Mounted disabled by server.js before JSON parsing. All dependencies, including
 // a trusted server-owned call binding repository, are mandatory when enabled.
 export function createRetellReadOnlyRouter({ enabled = false, allowedBusinessIds = [], signingKey,
-  callBindings, businessRepository, appointmentRepository, now = () => new Date(),
+  callBindings, businessRepository, appointmentRepository, staffRepository, now = () => new Date(),
   deadlineMs = 3000, audit = () => {} } = {}) {
   const router = express.Router();
   if (enabled !== true) { router.use((_req, res) => res.status(404).json({ reasonCode: 'NOT_ENABLED' })); return router; }
@@ -33,7 +33,7 @@ export function createRetellReadOnlyRouter({ enabled = false, allowedBusinessIds
     || !Number.isInteger(deadlineMs) || deadlineMs < 10 || deadlineMs > 3000)
     throw readFailure('READ_CONFIGURATION_INVALID');
   const allowed = new Set(allowedBusinessIds);
-  new ReadOnlyBusinessTools({ businessRepository, appointmentRepository, now });
+  new ReadOnlyBusinessTools({ businessRepository, appointmentRepository, staffRepository, now });
   let inFlight = 0;
   router.use(express.raw({ type: 'application/json', limit: '128kb', inflate: false }));
   for (const [path, name] of Object.entries(toolNames)) router.post(`/tools/${path}`, async (req, res) => {
@@ -49,7 +49,8 @@ export function createRetellReadOnlyRouter({ enabled = false, allowedBusinessIds
       || !Number.isSafeInteger(request.call.agent_version) || request.call.agent_version < 0
       || request.call.call_status !== 'ongoing') return fail(400, 'INVALID_REQUEST');
     const args = request.args;
-    if (path === 'context' ? !ownKeys(args, []) : !ownKeys(args, ['serviceIds', 'date', 'time', 'businessRevision'])
+    if (path === 'context' ? !ownKeys(args, []) : !ownKeys(args, ['serviceIds', 'date', 'time', 'businessRevision',...(args?.staffCalendarId!==undefined?['staffCalendarId']:[])])
+      || args?.staffCalendarId!==undefined&&args.staffCalendarId!=='ANY'&&!/^[a-f0-9]{24}$/.test(args.staffCalendarId)
       || !Array.isArray(args.serviceIds) || args.serviceIds.length < 1 || args.serviceIds.length > 8
       || args.serviceIds.some(id => !identifier(id)) || new Set(args.serviceIds).size !== args.serviceIds.length
       || typeof args.date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(args.date)
@@ -82,7 +83,7 @@ export function createRetellReadOnlyRouter({ enabled = false, allowedBusinessIds
       const work = async () => {
         const b = await binding();
         auditContext = { callId: b.callId, parentCallSid: b.parentCallSid, bindingRevision: b.revision };
-        const service = new ReadOnlyBusinessTools({ businessRepository, appointmentRepository, now, signal: controller.signal });
+        const service = new ReadOnlyBusinessTools({ businessRepository, appointmentRepository, staffRepository, now, signal: controller.signal });
         const result = path === 'context' ? await service.context(b) : await service.availability(b, args);
         const currentContext = await service.context(b);
         if (currentContext.businessRevision !== result.businessRevision) throw readFailure('BUSINESS_CHANGED');

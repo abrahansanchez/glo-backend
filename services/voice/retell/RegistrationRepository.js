@@ -3,7 +3,7 @@ import { bridgeDurationSeconds, bridgeDeadline } from './SandboxCallDuration.js'
 
 // Atomic database predicates, not a process-local ownership lock. Model injection
 // permits offline tests; the production default performs no I/O until invoked.
-export function createRetellRegistrationRepository({ Model = RetellCallRegistration, now = () => new Date() } = {}) {
+export function createRetellRegistrationRepository({ Model = RetellCallRegistration, canary, now = () => new Date() } = {}) {
   let ready;
   // Do not rely on deployment autoIndex defaults for ownership uniqueness.
   // Any failure leaves registration/tools closed; no query runs first.
@@ -61,6 +61,26 @@ export function createRetellRegistrationRepository({ Model = RetellCallRegistrat
       if (bound) return bound;
       return update({ ...identity, status: 'REGISTERING' }, { status: 'START_OBSERVED', observedCallId: callId });
     },
+    async fenceNotificationConsent(binding,session){
+      const admission=await canary.assert(binding.businessId,'NOTIFICATIONS',{expectedRevision:binding.phaseAdmissionRevision??-1,session,fence:true});binding.expiresAt=new Date(Math.min(+new Date(binding.expiresAt),+new Date(admission.expiresAt)));
+      const at=now(),result=await Model.updateOne({_id:binding.parentCallSid,businessId:binding.businessId,providerCallId:binding.callId,agentId:binding.agentId,agentVersion:binding.agentVersion,ownerEpoch:binding.ownerEpoch,status:'ACTIVE',notificationConsentAllowed:true,expiresAt:{$gt:at},$or:[{bridgeRequired:{$ne:true}},{bridgeRequired:true,bridgeScreenedAt:{$exists:true},bridgeReservedAt:{$exists:true},bridgeExpiresAt:{$gt:at}}]},{$inc:{bookingFence:1}},{session});if(result.matchedCount!==1)throw Object.assign(Error('NOTIFICATIONS_NOT_ALLOWED'),{reasonCode:'NOTIFICATIONS_NOT_ALLOWED'});
+    },
+    async reserveManagementRequest(binding, capability) {
+      await canary.assert(binding.businessId,'MANAGEMENT',{expectedRevision:binding.phaseAdmissionRevision??-1});
+      const at=now();
+      const result=await Model.updateOne({_id:binding.parentCallSid,providerCallId:binding.callId,businessId:binding.businessId,ownerEpoch:binding.ownerEpoch,agentId:binding.agentId,agentVersion:binding.agentVersion,status:'ACTIVE',managementCapabilities:capability,expiresAt:{$gt:at},$and:[{$or:[{managementRequestCount:{$exists:false}},{managementRequestCount:{$lt:40}}]},{$or:[{bridgeRequired:{$ne:true}},{bridgeRequired:true,bridgeReservedAt:{$exists:true},bridgeScreenedAt:{$exists:true},bridgeExpiresAt:{$gt:at}}]}]},{$inc:{managementRequestCount:1}});
+      if(result.matchedCount!==1)throw Object.assign(Error('MANAGEMENT_LIMIT_OR_AUTHORIZATION'),{reasonCode:'MANAGEMENT_LIMIT_OR_AUTHORIZATION'});
+    },
+    async fenceManagement(binding, capability, session) {
+        const admission=await canary.assert(binding.businessId,'MANAGEMENT',{expectedRevision:binding.phaseAdmissionRevision??-1,session,fence:true});binding.expiresAt=new Date(Math.min(+new Date(binding.expiresAt),+new Date(admission.expiresAt)));
+      if(!session||!['DELEGATE','VERIFY','LOOKUP','CANCEL','RESCHEDULE'].includes(capability))throw Error('MANAGEMENT_NOT_AUTHORIZED');
+      const at=now();
+      const filter={_id:binding.parentCallSid,businessId:binding.businessId,providerCallId:binding.callId,agentId:binding.agentId,agentVersion:binding.agentVersion,ownerEpoch:binding.ownerEpoch,status:'ACTIVE',managementCapabilities:capability,expiresAt:{$gt:at}};
+      // Both unbridged fixtures and screened real phone registrations are supported.
+      filter.$or=[{bridgeRequired:{$ne:true}},{bridgeRequired:true,bridgeReservedAt:{$exists:true},bridgeScreenedAt:{$exists:true},bridgeExpiresAt:{$gt:at}}];
+      const result=await Model.updateOne(filter,{$inc:{bookingFence:1}},{session});
+      if(result.matchedCount!==1)throw Object.assign(Error('CALL_NOT_AUTHORIZED'),{reasonCode:'CALL_NOT_AUTHORIZED'});
+    },
     async findByProviderCallId(callId) {
       const row = await find({ providerCallId: callId, status: 'ACTIVE', expiresAt: { $gt: now() } });
       if (!row) return null;
@@ -69,9 +89,9 @@ export function createRetellRegistrationRepository({ Model = RetellCallRegistrat
       if (row.bridgeRequired && (!row.bridgeReservedAt || !row.bridgeScreenedAt || !(+new Date(row.bridgeExpiresAt) > +now()))) return null;
       return { provider: 'retell', mode: 'READ_ONLY', status: 'ACTIVE', callId: row.providerCallId,
         parentCallSid: row._id, businessId: row.businessId, agentId: row.agentId, agentVersion: row.agentVersion,
-        language: row.language, revision: row.revision,
+        phaseAdmissionRevision:row.phaseAdmissionRevision,language: row.language, revision: row.revision, ownerEpoch:row.ownerEpoch, managementCapabilities:row.managementCapabilities || [],
         expiresAt: row.bridgeRequired ? new Date(Math.min(+new Date(row.expiresAt), +new Date(row.bridgeExpiresAt))) : row.expiresAt,
-        bookingAllowed: row.bookingAllowed === true, trustedCallerNumber: row.trustedCallerNumber };
+        bookingAllowed: row.bookingAllowed === true,notificationConsentAllowed:row.notificationConsentAllowed===true, trustedCallerNumber: row.trustedCallerNumber };
     },
   });
 }

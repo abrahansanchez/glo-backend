@@ -1,3 +1,4 @@
+import {shopConfiguration} from './booking/staff/ShopPolicy.js';
 import {
   deriveSetupReadiness,
   isNewIndividualOnboardingEnabled,
@@ -9,6 +10,7 @@ export function validatePaymentFirstProvisioningGate(barber, {
   strategy,
   assignment = null,
   env = process.env,
+  subscription,
 } = {}) {
   const normalizedStrategy = String(strategy || "").trim().toLowerCase();
 
@@ -20,15 +22,15 @@ export function validatePaymentFirstProvisioningGate(barber, {
     return fail("STRATEGY_UNAVAILABLE", 409, "This number strategy is not available in this launch flow.");
   }
 
-  if (!isNewIndividualOnboardingEnabled(barber, env)) {
+  const shop=barber?.productType==='shop';
+  if (!shop&&!isNewIndividualOnboardingEnabled(barber, env)) {
     return fail("NEW_ONBOARDING_NOT_ENABLED", 404, "New Individual onboarding is not enabled for this account.");
   }
 
-  if (String(barber?.productType || "individual").trim().toLowerCase() === "shop") {
-    return fail("SHOP_SETUP_NOT_AVAILABLE", 409, "Shop setup is not available in this phase.");
-  }
+  if(shop&&env.GLO_SHOP_ONBOARDING_ENABLED!=='true')return fail("SHOP_SETUP_NOT_AVAILABLE",409,"Shop setup is not enabled.");
+  if(shop&&!shopConfiguration(env).configured)return fail("SHOP_COMMERCIAL_CONFIGURATION_UNAVAILABLE",409,"Shop commercial configuration is unavailable.");
 
-  const readiness = deriveSetupReadiness(barber, { assignment, env, productTypeOverride: "individual" });
+  const readiness = deriveSetupReadiness(barber, { assignment, env, productTypeOverride:shop?"shop":"individual",subscription });
   if (!readiness.billing.commercialReady) {
     return fail("PAYMENT_REQUIRED", 402, "A trialing or active subscription is required before phone provisioning.");
   }

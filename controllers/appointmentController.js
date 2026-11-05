@@ -3,6 +3,7 @@ import Barber from "../models/Barber.js";
 import { getServiceDurationMinutes, isSlotAvailable } from "../utils/ai/availabilityHelpers.js";
 import { sendAppointmentConfirmationSms } from "../utils/appointments/appointmentSms.js";
 import {
+  isManagedAppointment,
   createAppointmentAtomically,
   deleteAppointmentAtomically,
   isReconciliationRequired,
@@ -130,7 +131,7 @@ export const createAppointment = async (req, res) => {
       return res.status(400).json({ message: "Invalid date/startAt" });
     }
 
-    const barber = await Barber.findById(barberId).select("services availability").lean();
+    const barber = await Barber.findById(barberId).select("services availability externalCalendarsRequired").lean();
     if (!barber) return res.status(404).json({ message: "Barber not found" });
 
     const tz = barber.availability?.timezone || "America/New_York";
@@ -172,6 +173,7 @@ export const createAppointment = async (req, res) => {
 
     return res.status(201).json({ message: "Appointment created", appointment: appt });
   } catch (err) {
+    if(['STALE_REVISION','AVAILABILITY_UNVERIFIED'].includes(err.reasonCode))return res.status(409).json({reasonCode:err.reasonCode});
     if (isScheduleConflict(err)) {
       return res.status(409).json({
         message: "This time slot is not available. Please choose a different time.",
@@ -195,7 +197,11 @@ export const updateAppointment = async (req, res) => {
     const existing = await Appointment.findOne({ _id: apptId, barberId });
     if (!existing) return res.status(404).json({ message: "Appointment not found" });
 
-    const update = { ...req.body };
+    const allowed=new Set(['clientName','clientPhone','date','time','startAt','endAt','service','status','source','expectedRevision']);
+    const original=existing.toObject();
+    if(Object.keys(req.body).some(k=>!allowed.has(k)&&JSON.stringify(req.body[k])!==JSON.stringify(original[k])))return res.status(400).json({reasonCode:'INVALID_ARGUMENTS'});
+    const {expectedRevision,...update}=Object.fromEntries(Object.entries(req.body).filter(([k])=>allowed.has(k)));
+    if(isManagedAppointment(existing)&&(!Number.isInteger(expectedRevision)||expectedRevision!==(existing.scheduleRevision||0)))return res.status(409).json({reasonCode:'STALE_REVISION'});
 
     if (Object.prototype.hasOwnProperty.call(update, "status")) {
       update.status = normalizeStatus(update.status);
@@ -213,7 +219,7 @@ export const updateAppointment = async (req, res) => {
       const parsedStart = parseIsoDate(update.startAt) || parseIsoDate(update.date);
       if (!parsedStart) return res.status(400).json({ message: "Invalid startAt" });
 
-      const barber = await Barber.findById(barberId).select("services availability").lean();
+      const barber = await Barber.findById(barberId).select("services availability externalCalendarsRequired").lean();
       if (!barber) return res.status(404).json({ message: "Barber not found" });
 
       const effectiveService = update.service || existing.service;
@@ -251,12 +257,13 @@ export const updateAppointment = async (req, res) => {
       update.endAt = parsedEnd;
     }
 
-    const result = await updateAppointmentAtomically({ appointmentId: apptId, barberId, update });
+    const result = await updateAppointmentAtomically({ appointmentId: apptId, barberId, update }, {authorizeManagedMutation:({existing:current})=>{if(String(current.barberId)!==String(barberId)||(current.scheduleRevision||0)!==expectedRevision)throw Object.assign(Error('STALE_REVISION'),{reasonCode:'STALE_REVISION'});}});
     if (result?.notFound || !result?.appointment) return res.status(404).json({ message: "Appointment not found" });
     const appt = result.appointment;
 
     return res.json({ message: "Appointment updated", appointment: appt });
   } catch (err) {
+    if(['STALE_REVISION','AVAILABILITY_UNVERIFIED'].includes(err.reasonCode))return res.status(409).json({reasonCode:err.reasonCode});
     if (isScheduleConflict(err)) {
       return res.status(409).json({
         message: "This time slot is not available. Please choose a different time.",
@@ -280,7 +287,8 @@ export const deleteAppointment = async (req, res) => {
       return res.status(401).json({ message: "Unauthorized: No barber on token" });
     }
 
-    const result = await deleteAppointmentAtomically({ appointmentId: apptId, barberId });
+    const current=await Appointment.findOne({_id:apptId,barberId}).lean();
+    const result=isManagedAppointment(current)?await updateAppointmentAtomically({appointmentId:apptId,barberId,update:{status:'canceled',cancelledAt:new Date(),cancelledBy:'owner'}},{authorizeManagedMutation:({existing})=>{if(!Number.isInteger(req.body?.expectedRevision)||(existing.scheduleRevision||0)!==req.body.expectedRevision||String(existing.barberId)!==String(barberId))throw Object.assign(Error('STALE_REVISION'),{reasonCode:'STALE_REVISION'});}}):await deleteAppointmentAtomically({ appointmentId: apptId, barberId });
     const appt = result?.appointment;
 
     if (!appt) {
